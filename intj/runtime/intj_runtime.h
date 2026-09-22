@@ -22,26 +22,26 @@
 
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
-/* CPython 3.12 PyLongObject layout, see cpython/longintrepr.h. */
-#define INTJ_SIGN_MASK 3
-#define INTJ_NON_SIZE_BITS 3
+/* The compact case has a public reader (`PyUnstable_Long_*`, 3.12+).  Above it
+ * the digits have none before `PyLong_AsNativeBytes` in 3.13, so the rest walks
+ * `ob_digit` with CPython's own layout macros from cpython/longintrepr.h.
+ */
 
 /* 0 = ok, -1 = does not fit, 1 = not an exact int */
 static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
-  uintptr_t tag = v->long_value.lv_tag;
-  if (tag < (2 << INTJ_NON_SIZE_BITS)) { /* |value| < 2**30 */
-    int64_t sign = 1 - (int64_t)(tag & INTJ_SIGN_MASK);
-    *out = sign * (int64_t)v->long_value.ob_digit[0];
+  if (PyUnstable_Long_IsCompact(v)) { /* |value| < 2**30 */
+    *out = (int64_t)PyUnstable_Long_CompactValue(v);
     return 0;
   }
-  size_t nd = (size_t)(tag >> INTJ_NON_SIZE_BITS);
+  uintptr_t tag = v->long_value.lv_tag;
+  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
   if (nd > 3) /* > 90 bits */
     return -1;
   __uint128_t acc = 0;
   for (size_t i = nd; i-- > 0;)
     acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & INTJ_SIGN_MASK) == 2) {
+  if ((tag & _PyLong_SIGN_MASK) == 2) {
     if (acc > ((__uint128_t)1 << 63))
       return -1;
     *out = (int64_t)(-(__int128_t)acc);
@@ -63,19 +63,18 @@ static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
 
 static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
-  uintptr_t tag = v->long_value.lv_tag;
-  if (tag < (2 << INTJ_NON_SIZE_BITS)) { /* |value| < 2**30 */
-    int64_t sign = 1 - (int64_t)(tag & INTJ_SIGN_MASK);
-    *out = (uint64_t)(sign * (int64_t)v->long_value.ob_digit[0]);
+  if (PyUnstable_Long_IsCompact(v)) { /* |value| < 2**30 */
+    *out = (uint64_t)(int64_t)PyUnstable_Long_CompactValue(v);
     return INTJ_INT_I64;
   }
-  size_t nd = (size_t)(tag >> INTJ_NON_SIZE_BITS);
+  uintptr_t tag = v->long_value.lv_tag;
+  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
   if (nd > 3) /* > 90 bits */
     return INTJ_INT_TOO_BIG;
   __uint128_t acc = 0;
   for (size_t i = nd; i-- > 0;)
     acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & INTJ_SIGN_MASK) == 2) { /* negative: int64 or nothing */
+  if ((tag & _PyLong_SIGN_MASK) == 2) { /* negative: int64 or nothing */
     if (acc > ((__uint128_t)1 << 63))
       return INTJ_INT_TOO_BIG;
     *out = (uint64_t)(int64_t)(-(__int128_t)acc);

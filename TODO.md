@@ -21,6 +21,10 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   measured identical codegen with and without, because intj has no non-trivial
   destructors and so no landing pads to elide.
 
+- **`PyLong_AsNativeBytes` for the non-compact int path**, once 3.13 is the floor.
+  The compact case already goes through `PyUnstable_Long_*`; above 2**30 there is
+  no public reader on 3.12, so the digit walk uses CPython's own layout macros.
+
 ## Coverage (all currently refused loudly)
 
 - Callable grids (`dynamic_grid`). The expensive part is `ConstexprFunction.__call__`
