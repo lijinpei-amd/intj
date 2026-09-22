@@ -203,18 +203,17 @@ def test_options_are_baked_in():
 
 
 def test_launchers_of_one_kernel_stay_independent():
-    """Two launchers share a C symbol, so they must not share a module.
+    """Two launchers share a C symbol and a module name, so they must not share a module.
 
     The symbol is the kernel's name, for legible `perf` output; the digest in
-    the path and the spec name is what keeps the two builds apart.
+    the artifact path is what keeps the two builds apart.
     """
     # num_warps values no other test uses, so both modules are loaded here and
     # their kernel caches are cold; a warm one would not compile anything.
     narrow = getattr(create_launcher(scale, options={"num_warps": 2}), "__self__")
     wide = getattr(create_launcher(scale, options={"num_warps": 16}), "__self__")
-    assert narrow.__name__.rsplit(".", 1)[-1] == wide.__name__.rsplit(".", 1)[-1] == "scale"
-    assert narrow.__name__ != wide.__name__
-    assert narrow is not wide
+    assert narrow.__name__ == wide.__name__ == "intj.scale"  # one name ...
+    assert narrow is not wide  # ... two modules, told apart by their file
     assert narrow.__file__ != wide.__file__
 
     x = torch.randn(1024, device="cuda")

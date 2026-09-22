@@ -64,14 +64,15 @@ class RenderContext:
     error_style: str  # "return" | "outparam"
     libtorch_path: str
 
-    def spec_name(self, digest: str) -> str:
+    @property
+    def spec_name(self) -> str:
         """The name the module is loaded under.
 
-        A label, not a key: the module never reaches `sys.modules`. Only the last
-        component is load-bearing, as `PyInit_<leaf>`; the digest is in there so a
-        traceback says which build the frame is in.
+        A label, not a key: the module never reaches `sys.modules`, so only the
+        last component is load-bearing, as `PyInit_<leaf>`. Which build a module
+        is, is a question `__file__` already answers.
         """
-        return f"intj.{digest[:16]}.{self.module_name}"
+        return f"intj.{self.module_name}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -244,7 +245,7 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
     # sys.modules: intj's own dict owns it, so dropping a launcher can free it.
     # The interpreter does not cache it either -- that only happens for
     # single-phase extensions, and the template uses PyModuleDef_Init.
-    spec = importlib.util.spec_from_file_location(context.spec_name(digest), so_path)
+    spec = importlib.util.spec_from_file_location(context.spec_name, so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so_path}")
     module = importlib.util.module_from_spec(spec)
