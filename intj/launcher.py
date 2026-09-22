@@ -76,6 +76,7 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
 
     target = driver.active.get_current_target()
     backend = BACKENDS[target.backend]
+    canonical_options = _canonical_options(target, options)
     context = RenderContext(
         module_name="intj_placeholder",  # replaced below, once the digest is known
         kernel_repr=f"{jit_func.module}.{jit_func.__qualname__}",
@@ -108,7 +109,7 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
                     for p in jit_func.params
                 ],
                 "target": [target.backend, target.arch, target.warp_size],
-                "options": options,
+                "options": canonical_options.hash(),
                 "triton": _triton_identity(),
                 "compiler": _compiler_identity(),
                 "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
@@ -192,6 +193,26 @@ register(CudaBackend())
 
 
 # --------------------------------------------------------------------- checks
+
+
+def _canonical_options(target, options):
+    """Run `options` through the triton compiler backend's `parse_options`.
+
+    That fills in defaults and normalizes the odd fields (`extern_libs`,
+    `llvm_fn_attrs`, `warp_size`), so `{}` and `{"num_warps": 4}` reach the same
+    rendered module instead of building it twice.  It also rejects what the
+    backend rejects, at `create_launcher` time rather than on the first launch.
+
+    `parse_options` ignores keys it does not know, so unknown ones are caught
+    here -- otherwise a typo would silently compile with the default.
+    """
+    from triton.compiler import make_backend
+
+    parsed = make_backend(target).parse_options(dict(options))
+    unknown = set(options) - {f.name for f in dataclasses.fields(parsed)}
+    if unknown:
+        raise UnsupportedKernel(f"intj: unknown compile option(s) {sorted(unknown)}")
+    return parsed
 
 
 def _check_kernel(jit_func, options):

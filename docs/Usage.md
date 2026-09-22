@@ -21,13 +21,17 @@ returns its `entry` function. It is slow; call it once, outside any hot loop.
 `options` are forwarded verbatim to `JITFunction.warmup` on every compile, so they
 must be valid triton options (`num_warps`, `num_stages`, `waves_per_eu`, ...) and are
 fixed for the lifetime of the launcher. `device`, `stream`, `device_type` and
-`warp_size` are rejected.
+`warp_size` are rejected, and an unknown option name is an error here rather than a
+silent fall back to the default.
+
+They are canonicalized through the compiler backend's `parse_options`, so spellings
+that mean the same thing — `{}` and `{"num_warps": 4}` on AMD — share one rendered
+module instead of building it twice.
 
 Most things intj cannot handle raise `intj.launcher.UnsupportedKernel` here. The
-rest — an invalid option, `num_ctas > 1`, a cooperative launch, a kernel needing
-scratch memory — can only be seen once triton has compiled, so they raise on the
-first launch that misses the cache. An unsupported *argument* raises `TypeError` at
-the launch that passes it.
+rest — `num_ctas > 1`, a cooperative launch, a kernel needing scratch memory — can
+only be seen once triton has compiled, so they raise on the first launch that misses
+the cache. An unsupported *argument* raises `TypeError` at the launch that passes it.
 
 ## Calling the launcher
 
@@ -125,5 +129,5 @@ cache miss re-checks it against triton's own binder.
 
 The rendered extension is keyed on the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,
-the options, intj's own `runtime/` bytes, the triton build, the compiler, and `EXT_SUFFIX`. Artifacts live in triton's cache directory
+the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler, and `EXT_SUFFIX`. Artifacts live in triton's cache directory
 (`TRITON_CACHE_DIR`), so `rm -rf ~/.triton/cache` clears them.
