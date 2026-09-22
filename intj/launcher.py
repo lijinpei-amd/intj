@@ -1,5 +1,6 @@
 """Render, build and load the C launcher for a `@triton.jit` kernel."""
 
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -19,6 +20,27 @@ _RUNTIME_HEADER = _RUNTIME / "intj_runtime.h"
 
 class UnsupportedKernel(NotImplementedError):
     """Raised for kernels or options outside intj's (deliberately small) scope."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RenderContext:
+    """Everything `entry.c.jinja` renders from, and nothing else.
+
+    Fixed fields on purpose: a typo fails here instead of silently rendering an
+    empty value into C (the template also runs with `StrictUndefined`).
+    """
+
+    module_name: str
+    kernel_repr: str
+    params: list  # _render_params() descriptors, one per declared parameter
+    nwords: int  # spec-key length, in uint64 words
+    max_slots: int  # kernel param slots, upper bound
+    spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
+    driver_path: str
+    launch_symbol: str
+    error_symbol: str
+    error_style: str  # "return" | "outparam"
+    libtorch_path: str
 
 
 def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_annotation=None, options=None):
@@ -53,24 +75,25 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
 
     target = driver.active.get_current_target()
     backend = BACKENDS[target.backend]
-    context = {
-        "kernel_repr": f"{jit_func.module}.{jit_func.__qualname__}",
-        "params": params,
-        "nwords": 1 + sum(2 if p["is_constexpr"] else 1 for p in params),
-        "max_slots": sum(0 if p["is_constexpr"] else 1 for p in params),
+    context = RenderContext(
+        module_name="intj_placeholder",  # replaced below, once the digest is known
+        kernel_repr=f"{jit_func.module}.{jit_func.__qualname__}",
+        params=params,
+        nwords=1 + sum(2 if p["is_constexpr"] else 1 for p in params),
+        max_slots=sum(0 if p["is_constexpr"] else 1 for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
         # after the knob is flipped back on.
-        "spec_pointer_range": 1 if backend["pointer_range"] else 0,
-        "driver_path": backend["library"](),
-        "launch_symbol": backend["launch_symbol"],
-        "error_symbol": backend["error_symbol"],
-        "error_style": backend["error_style"],
-        "libtorch_path": os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
-    }
+        spec_pointer_range=1 if backend["pointer_range"] else 0,
+        driver_path=backend["library"](),
+        launch_symbol=backend["launch_symbol"],
+        error_symbol=backend["error_symbol"],
+        error_style=backend["error_style"],
+        libtorch_path=os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
+    )
 
-    src = _render(context, module_name="intj_module")
+    src = _render(context)
     digest = hashlib.sha256(
         json.dumps(
             {
@@ -95,7 +118,7 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
 
     module_name = "intj_" + digest[:32]
     module = compile_module_from_src(
-        src=_render(context, module_name=module_name),
+        src=_render(dataclasses.replace(context, module_name=module_name)),
         name=module_name,
         include_dirs=[str(_RUNTIME)],
         language="c",
@@ -201,11 +224,11 @@ def _render_params(jit_func):
 # -------------------------------------------------------------------- render
 
 
-def _render(context, module_name):
+def _render(context: RenderContext):
     import jinja2
 
     template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
-    return template.render(module_name=module_name, **context)
+    return template.render(**dataclasses.asdict(context))
 
 
 @functools.lru_cache(maxsize=1)
