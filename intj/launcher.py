@@ -78,7 +78,7 @@ class ModuleKey:
 
     template: str  # entry.c.jinja bytes, hex
     runtime_header: str  # intj_runtime.h bytes, hex
-    context: RenderContext  # with an empty module name: the digest is what names it
+    context: RenderContext  # the render is a pure function of this and the template
     cache_key: str  # jit_func.cache_key: the kernel source and its callees
     params: tuple[tuple[Any, ...], ...]  # per-parameter decorator state, which cache_key misses
     target: tuple[Any, ...]  # backend, arch, warp size
@@ -131,8 +131,12 @@ def create_launcher(
     target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
+    # the kernel's own name, unless python allows something C does not
+    module_name = jit_func.__name__
+    if not (module_name.isidentifier() and module_name.isascii()):
+        module_name = "kernel"
     context = RenderContext(
-        module_name="",  # the digest below names the module, so it is filled in last
+        module_name=module_name,
         kernel_repr=get_full_name(jit_func),
         params=params,
         nwords=1 + sum(2 if p.is_constexpr else 1 for p in params),
@@ -150,8 +154,7 @@ def create_launcher(
     )
 
     # The rendered source is a pure function of the template, the runtime header
-    # and the context, so hash those instead of the render -- otherwise naming the
-    # module after the digest would need a throwaway render first.
+    # and the context, so hash those rather than the render itself.
     key = ModuleKey(
         template=_ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
@@ -219,17 +222,10 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
     """
     from triton import knobs
 
-    # the kernel's own name, unless python allows something C does not
-    module_name = jit_func.__name__
-    if not (module_name.isidentifier() and module_name.isascii()):
-        module_name = "kernel"
-    context = dataclasses.replace(context, module_name=module_name)
-
-    digest = key.digest()
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
     # a sibling of triton's own cache
-    directory = Path(knobs.cache.get_triton_dir("intj")) / digest / jit_func.__module__
-    so_path = directory / f"{module_name}{suffix}"
+    directory = Path(knobs.cache.get_triton_dir("intj")) / key.digest() / jit_func.__module__
+    so_path = directory / f"{context.module_name}{suffix}"
     if not so_path.exists():
         _build(so_path, context)
 
