@@ -19,8 +19,8 @@ typedef struct {
   intj_get_storage_size_t get_storage_size;
   intj_get_dtype_t get_dtype;
   intj_launch_t launch;
-{% if backend == 'hip' %}  intj_hip_error_string_t error_string;
-{% else %}  intj_cuda_error_string_t error_string;
+{% if error_style == 'return' %}  intj_error_string_ret_t error_string;
+{% else %}  intj_error_string_out_t error_string;
 {% endif %}
   intj_map cache;
 } intj_state;
@@ -198,7 +198,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
                  kernel->shared, (void *)(uintptr_t)stream, params, NULL);
   if (status != 0) {
     const char *message = NULL;
-{% if backend == 'hip' %}
+{% if error_style == 'return' %}
     if (st->error_string)
       message = st->error_string(status);
 {% else %}
@@ -305,10 +305,10 @@ static int intj_exec(PyObject *m) {
   st->launch = (intj_launch_t)intj_dlsym(gpu, "{{ launch_symbol }}");
   if (!st->launch)
     return -1;
-{% if backend == 'hip' %}
-  st->error_string = (intj_hip_error_string_t)dlsym(gpu, "hipGetErrorString");
+{% if error_style == 'return' %}
+  st->error_string = (intj_error_string_ret_t)dlsym(gpu, "{{ error_symbol }}");
 {% else %}
-  st->error_string = (intj_cuda_error_string_t)dlsym(gpu, "cuGetErrorString");
+  st->error_string = (intj_error_string_out_t)dlsym(gpu, "{{ error_symbol }}");
 {% endif %}
 
   if (intj_map_init(&st->cache, 16) != 0) {

@@ -52,19 +52,21 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
     from triton.runtime.driver import driver
 
     target = driver.active.get_current_target()
+    backend = BACKENDS[target.backend]
     context = {
         "kernel_repr": f"{jit_func.module}.{jit_func.__qualname__}",
         "params": params,
         "nwords": 1 + sum(2 if p["is_constexpr"] else 1 for p in params),
         "max_slots": sum(0 if p["is_constexpr"] else 1 for p in params),
-        "backend": target.backend,
-        # AMD only. The pointer-range bit is always part of the key, even when
-        # buffer ops are off: the knob is read by triton per specialization, so a
-        # key that cannot tell a > 2 GiB buffer apart would launch a
-        # tt.pointer_range=32 binary on it after the knob is flipped back on.
-        "spec_pointer_range": 1 if target.backend == "hip" else 0,
-        "driver_path": _driver_library(target.backend),
-        "launch_symbol": "hipModuleLaunchKernel" if target.backend == "hip" else "cuLaunchKernel",
+        # Where the backend specializes on it, the pointer-range bit is always in
+        # the key, even when the knob that emits it is off: a key that cannot tell
+        # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
+        # after the knob is flipped back on.
+        "spec_pointer_range": 1 if backend["pointer_range"] else 0,
+        "driver_path": backend["library"](),
+        "launch_symbol": backend["launch_symbol"],
+        "error_symbol": backend["error_symbol"],
+        "error_style": backend["error_style"],
         "libtorch_path": os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
     }
 
@@ -102,16 +104,37 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
     return module.entry
 
 
-SUPPORTED_BACKENDS = ("hip", "cuda")
+def _hip_library():
+    from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+
+    return _get_path_to_hip_runtime_dylib()
 
 
-def _driver_library(backend):
-    """The GPU driver dylib to dlopen, the same one triton itself uses."""
-    if backend == "hip":
-        from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
-
-        return _get_path_to_hip_runtime_dylib()
-    return "libcuda.so.1"  # already mapped by torch; resolved through the normal search path
+BACKENDS = {
+    # Everything backend-specific lives here. A triton backend whose driver
+    # exposes a `cuLaunchKernel`-shaped entry point is supported by adding an
+    # entry -- no other code or template change.
+    #
+    # library:        dylib to dlopen, the one triton itself uses
+    # launch_symbol:  f(fn, gx,gy,gz, bx,by,bz, shared, stream, params, extra)
+    # error_style:    "return"   const char *f(int)
+    #                 "outparam" int f(int, const char **)
+    # pointer_range:  backend specializes pointers on a 2 GiB range (AMD's "S")
+    "hip": {
+        "library": _hip_library,
+        "launch_symbol": "hipModuleLaunchKernel",
+        "error_symbol": "hipGetErrorString",
+        "error_style": "return",
+        "pointer_range": True,
+    },
+    "cuda": {
+        "library": lambda: "libcuda.so.1",  # already mapped by torch
+        "launch_symbol": "cuLaunchKernel",
+        "error_symbol": "cuGetErrorString",
+        "error_style": "outparam",
+        "pointer_range": False,
+    },
+}
 
 
 # --------------------------------------------------------------------- checks
@@ -130,9 +153,10 @@ def _check_kernel(jit_func, options):
             "autotuned and heuristic kernels are not supported"
         )
     target = driver.active.get_current_target()
-    if target.backend not in SUPPORTED_BACKENDS:
+    if target.backend not in BACKENDS:
         raise UnsupportedKernel(
-            f"intj: only the {'/'.join(SUPPORTED_BACKENDS)} backends are supported, got {target.backend!r}"
+            f"intj: backend {target.backend!r} is unknown; add an entry to intj.launcher.BACKENDS "
+            f"(have: {', '.join(sorted(BACKENDS))})"
         )
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")

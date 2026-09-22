@@ -85,7 +85,7 @@ static inline uint64_t intj_hash(const uint64_t *w) {
 /* ------------------------------------------------------------ kernel cache */
 
 typedef struct {
-  void *function;     /* hipFunction_t */
+  void *function;     /* hipFunction_t / CUfunction */
   uint32_t block_dim; /* warp_size * num_warps */
   uint32_t shared;    /* dynamic LDS bytes */
   uint32_t nparams;   /* kernel params, scratch slots excluded */
@@ -183,8 +183,8 @@ typedef int32_t (*intj_launch_t)(void *f, uint32_t gx, uint32_t gy, uint32_t gz,
                                  uint32_t bx, uint32_t by, uint32_t bz,
                                  uint32_t shared, void *stream, void **params,
                                  void **extra);
-typedef const char *(*intj_hip_error_string_t)(int32_t);
-typedef int32_t (*intj_cuda_error_string_t)(int32_t, const char **);
+typedef const char *(*intj_error_string_ret_t)(int32_t);
+typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
 
 /* ----------------------------------------------------------- spec-key tags */
 
@@ -213,7 +213,8 @@ typedef int32_t (*intj_cuda_error_string_t)(int32_t, const char **);
 
 /* Decode one non-constexpr kernel argument: fills one key word, and appends at
  * most one value slot.  SPEC/ALIGN/SBIT are render-time constants
- * (do_not_specialize, do_not_specialize_on_alignment, knobs.amd.use_buffer_ops).
+ * (do_not_specialize, do_not_specialize_on_alignment, and whether the backend
+ * specializes pointers on a 2 GiB range).
  *
  * `st` must expose tensor_type/param_type and the three torch shims.
  * On failure it sets a python error and jumps to `error`.

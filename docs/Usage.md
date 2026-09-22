@@ -75,9 +75,11 @@ buffer-ops binary on a > 2 GiB tensor.
 Everything below is refused at `create_launcher` time, or on the first launch that
 hits it:
 
-- Backends other than AMD (`hipModuleLaunchKernel`) and NVIDIA (`cuLaunchKernel`).
-  **NVIDIA is untested** -- it is written against triton's CUDA driver but there is
-  no NVIDIA GPU on the development machine.
+- Backends with no entry in `intj.launcher.BACKENDS`. AMD and NVIDIA ship there;
+  any triton backend whose driver exposes a `cuLaunchKernel`-shaped entry point is
+  supported by adding a dict entry (dylib, launch symbol, error-string convention,
+  whether it specializes pointers on a 2 GiB range). **NVIDIA is untested** -- there
+  is no NVIDIA GPU on the development machine.
 - `@triton.autotune` / `@triton.heuristics` wrappers, and `TRITON_INTERPRET=1`.
 - Callable grids (`dynamic_grid`), per-launch options (`dynamic_options`), and
   argument annotations (`extra_annotation`).

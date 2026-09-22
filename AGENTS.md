@@ -15,6 +15,12 @@ first thing that actually needs sharing.
 `intj/runtime/` also holds the launcher runtime itself: `intj_runtime.h` (helpers
 included by every rendered module) and `entry.c.jinja` (the rendered entry point).
 
+## Backends are data, not branches
+
+Everything backend-specific lives in the `BACKENDS` dict in `launcher.py`, and the
+template branches on its fields (`error_style`), never on a backend name. Supporting
+another triton backend should be one dict entry.
+
 ## Refusals are loud and early
 
 Anything intj cannot do raises `UnsupportedKernel`, preferably in `create_launcher`,
