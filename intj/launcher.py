@@ -90,6 +90,7 @@ class ModuleKey:
     options: str  # canonicalized compile options, hashed by triton
     triton: tuple[Any, ...]  # triton version and libtriton identity
     compiler: tuple[str, ...]  # the C compiler triton would invoke
+    build: str  # the flags that compiler is handed, canonicalized
     ext_suffix: str | None
     schema: int = SCHEMA_VERSION
 
@@ -181,6 +182,9 @@ def create_launcher(
         options=canonical_options.hash(),
         triton=_triton_identity(),
         compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
+        # Without this a flag change reuses the .so compiled under the old ones:
+        # triton's build cache keys on them, but intj's artifact path does not.
+        build=json.dumps(_build_flags(context), sort_keys=True),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
     )
     # the c++ mode gets it too, not to read from but to check its own

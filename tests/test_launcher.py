@@ -292,6 +292,28 @@ def test_modules_stay_out_of_the_import_system():
     assert reference() is None
 
 
+def test_compile_flags_reach_the_digest():
+    """A flag change must not reuse the .so compiled under the old flags.
+
+    triton's build cache keys on the flags, but intj's artifact path is its own
+    digest -- so the flags have to be in there too.
+    """
+    import intj.launcher as launcher_module
+
+    before = pathlib.Path(getattr(create_launcher(scale), "__self__").__file__).parent.parent.name
+    original = launcher_module._build_flags
+    launcher_module._build_flags = lambda ctx: {
+        **original(ctx), "ccflags": [*original(ctx)["ccflags"], "-DINTJ_TEST_FLAG=1"]
+    }
+    launcher_module._LOADED.clear()
+    try:
+        after = pathlib.Path(getattr(create_launcher(scale), "__self__").__file__).parent.parent.name
+    finally:
+        launcher_module._build_flags = original
+        launcher_module._LOADED.clear()
+    assert before != after
+
+
 def test_source_and_binary_are_cached_on_disk():
     launcher = create_launcher(scale, options={"num_stages": 4}, torch_access=TorchAccess.SHIM)
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
@@ -403,7 +425,7 @@ def _module_key(**overrides):
         template="aa", runtime_header="bb", context=_render_context(module_name=""), cache_key="c",
         params=(("x", "", False, False, False, False, False, "None"),),
         target=("hip", "gfx942", 64), options="o", triton=("3.8.0", 1, 2.0),
-        compiler=("gcc", "13"), ext_suffix=".so",
+        compiler=("gcc", "13"), build='{"language": "c"}', ext_suffix=".so",
     )
     return ModuleKey(**{**fields, **overrides})
 
