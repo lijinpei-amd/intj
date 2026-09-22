@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import struct
 import subprocess
 import sysconfig
@@ -102,7 +103,7 @@ def create_launcher(
     canonical_options = _canonical_options(target, options)
     context = RenderContext(
         module_name="",  # the digest below names the module, so it is filled in last
-        kernel_repr=f"{jit_func.module}.{jit_func.__qualname__}",
+        kernel_repr=get_full_name(jit_func),
         params=params,
         nwords=1 + sum(2 if p.is_constexpr else 1 for p in params),
         max_slots=sum(0 if p.is_constexpr else 1 for p in params),
@@ -144,15 +145,27 @@ def create_launcher(
         ).encode()
     ).hexdigest()
 
-    module_name = "intj_" + digest[:32]
+    # The symbol is the kernel's name, so `perf` and /proc/<pid>/maps stay
+    # readable; the digest rides along in the source, which is what triton's
+    # build cache keys on, so two versions of one kernel get two .so files.
+    module_name = _module_name(jit_func)
     module = compile_module_from_src(
-        src=_render(dataclasses.replace(context, module_name=module_name)),
+        src=f"/* intj {digest} */\n" + _render(dataclasses.replace(context, module_name=module_name)),
         name=module_name,
         include_dirs=[str(_RUNTIME)],
         language="c",
     )
     module.set_compile_callback(_make_compile_callback(jit_func, params, options))
     return module.entry
+
+
+def get_full_name(fn: Any) -> str:
+    return f"{fn.__module__}.{fn.__qualname__}"
+
+
+def _module_name(jit_func: JitFunction) -> str:
+    """`get_full_name` as a C identifier -- it becomes `PyInit_<name>`."""
+    return "intj_" + re.sub(r"[^0-9a-zA-Z_]", "_", get_full_name(jit_func))
 
 
 class Backend(abc.ABC):

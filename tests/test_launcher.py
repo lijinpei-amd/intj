@@ -192,6 +192,27 @@ def test_options_are_baked_in():
     assert {k.metadata.num_warps for k in kernel_cache.values()} == {8}
 
 
+def test_launchers_of_one_kernel_stay_independent():
+    """Two launchers share a module *name*, so they must not share a module.
+
+    The name is the kernel's, for legible `perf` output; only the digest in the
+    rendered source keeps the two .so files apart.
+    """
+    default = getattr(create_launcher(scale), "__self__")
+    wide = getattr(create_launcher(scale, options={"num_warps": 8}), "__self__")
+    assert default.__name__ == wide.__name__
+    assert default is not wide
+
+    x = torch.randn(1024, device="cuda")
+    o = torch.empty(1024, device="cuda")
+    kernel_cache = scale.device_caches[torch.cuda.current_device()][0]
+    for launcher, num_warps in ((default.entry, 4), (wide.entry, 8)):
+        kernel_cache.clear()
+        launch(launcher, (8,), x, o, 1024, 2.0, 128)
+        torch.testing.assert_close(o, x * 2.0)
+        assert {k.metadata.num_warps for k in kernel_cache.values()} == {num_warps}
+
+
 def test_wrong_argument_count(scale_launcher):
     x = torch.randn(1024, device="cuda")
     with pytest.raises(TypeError, match="takes exactly"):
