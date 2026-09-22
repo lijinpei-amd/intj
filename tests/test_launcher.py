@@ -620,3 +620,32 @@ def test_modes_agree_on_rejecting_a_storageless_tensor():
         module = getattr(create_launcher(scale, torch_access=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(sparse, o, 1024, 2.0, 128)
+
+
+def test_modes_agree_on_tensors_with_unusual_impls():
+    """The shim cannot see the bitfields that make torch's accessors throw.
+
+    `storage_access_should_throw_`, `throw_on_immutable_data_ptr_` and
+    `size_bytes_is_heap_allocated_` are invisible to offset arithmetic, so the
+    shim could in principle accept a tensor the c++ mode rejects.  In practice
+    the impls carrying them belong to `Tensor` *subclasses*, which INTJ_DECODE's
+    exact-type test already refuses -- this pins that reasoning.
+    """
+    modules = {m: getattr(create_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES}
+    o = torch.empty(1024, device="cuda")
+
+    with torch.inference_mode():
+        inference = torch.randn(1024, device="cuda")
+    cases = {"inference": inference, "meta": torch.zeros(1024, device="meta")}
+
+    for label, t in cases.items():
+        keys = {m: mod.spec_key(t, o, 1024, 2.0, 128) for m, mod in modules.items()}
+        assert len(set(keys.values())) == 1, f"{label}: {keys}"
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode() as fake_mode:
+        fake = fake_mode.from_tensor(torch.randn(1024, device="cuda"))
+    for m, mod in modules.items():
+        with pytest.raises(TypeError):  # a subclass: refused before any read
+            mod.spec_key(fake, o, 1024, 2.0, 128)
