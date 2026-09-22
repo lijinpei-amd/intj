@@ -390,9 +390,9 @@ Implemented and measured on torch 2.14.0.dev+rocm7.2, gfx942, triton 3.8.0.
 
 | mode | decode + spec key (3 tensor args) | first build | `.so` rebuilt on torch upgrade |
 |---|---|---|---|
-| `SHIM` | 0.11 us | 0.6 s | no |
-| `CXX` | 0.13 us | 11.5 s | yes |
-| `CPYTHON` | 0.9 us | 0.6 s | no |
+| `SHIM` | 89 ns | 0.6 s | no |
+| `CXX` | 101 ns | 11.5 s | yes |
+| `CPYTHON` | ~300 ns | 0.6 s | no |
 
 `SHIM` and `CXX` land in the same place, as predicted -- both inline the reads.
 `SHIM` is marginally faster than the AOTI-shim path it replaces (0.11 us against
@@ -424,3 +424,43 @@ decode time than `SHIM`, and it is the only mode that must be rebuilt when torch
 changes. The build is cached by triton across processes, so the cost is paid once
 per kernel rather than once per run, which is milder than feared -- but `SHIM`
 gets the same speed for 0.6 s and never rebuilds.
+
+## Postscript: why `CXX` does not reach `SHIM`
+
+`CXX` was rewritten to use torch's check-free accessors (`unsafe_storage`,
+`_mutable_data_ptr_no_checks`, `numel_default`, `storage_offset_default`,
+`nbytes`), which is the same set of reads the shim makes. It still lands ~4 ns per
+tensor behind. Four things were measured on the way, three of which were wrong
+guesses:
+
+1. **The five `TORCH_CHECK`s are not the cost.** Removing them changed nothing:
+   they are predicted-not-taken branches on flags already in cache.
+2. **The policy dispatch in `numel()`/`storage_offset()` is not the cost either.**
+   `*_default()` changed nothing measurable.
+3. **Inlining was.** g++ left `intj_read_tensor` out of line -- a real call per
+   argument -- because a `try` block inside it inflated the size estimate. The
+   exception machinery is free at runtime; its effect on the inliner is not. The
+   fix is one `try` around the whole decode in the template, not one per read.
+4. **`sym_nbytes()` was.** It returns a `SymInt` by value whose destructor does not
+   inline: ten PLT calls per `spec_key`. `nbytes()` is a bitfield test instead.
+
+After those, `CXX` is within 48 instructions of `SHIM` with no out-of-line calls
+left on the hot path. The remaining gap is the handful of bitfield tests that are
+the entire difference in what the two modes verify, so closing it means deleting
+the checks that distinguish them.
+
+`intj_as_i64` carries `__attribute__((always_inline))` for the same reason as (3);
+it improved every mode, including the C ones (94 -> 89 ns for `SHIM`).
+
+## Postscript: a limitation both modes share
+
+A tensor whose `TensorImpl` overrides `numel()` rather than storing it reads as
+empty. `torch.nested.nested_tensor(...)` stores `numel_ == 0` and reports 8, and it
+is *exact-type* `torch.Tensor`, so the type gate does not catch it -- my earlier
+claim that the gate filters everything with a custom impl was wrong. intj passes a
+null pointer and the kernel faults on the GPU.
+
+`SHIM` cannot see the policy bit at all, so `CXX` reads the raw field too rather
+than diverge. Documented in `docs/Usage.md` and pinned by a test, not fixed:
+neither a nested nor an mkldnn tensor is a usable triton kernel argument. `mkldnn`
+has no storage and *is* refused cleanly.

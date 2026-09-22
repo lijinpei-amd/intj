@@ -10,6 +10,16 @@
 #include <stdint.h>
 #include <string.h>
 
+/* g++ and gcc disagree about what is worth inlining here: a `try` block inflates
+ * g++'s size estimate enough that it leaves the tensor reader and the integer
+ * decoder out of line, costing a real call per argument on the hot path.  The
+ * exception machinery is free at runtime; its effect on the inliner is not. */
+#if defined(__GNUC__) || defined(__clang__)
+#define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
+#else
+#define INTJ_ALWAYS_INLINE inline
+#endif
+
 /* ---------------------------------------------------------------- integers */
 
 #if PY_VERSION_HEX < 0x030C0000
@@ -25,7 +35,7 @@ static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 #define INTJ_NON_SIZE_BITS 3
 
 /* 0 = ok, -1 = does not fit, 1 = not an exact int */
-static inline int intj_as_i64(PyObject *o, int64_t *out) {
+static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
   uintptr_t tag = v->long_value.lv_tag;
   if (tag < (2 << INTJ_NON_SIZE_BITS)) { /* |value| < 2**30 */
@@ -53,7 +63,7 @@ static inline int intj_as_i64(PyObject *o, int64_t *out) {
 
 /* Only called after intj_as_i64 reported overflow, i.e. for values that do not
  * fit in int64.  Mirrors PyLong_AsUnsignedLongLong. */
-static inline int intj_as_u64(PyObject *o, uint64_t *out) {
+static INTJ_ALWAYS_INLINE int intj_as_u64(PyObject *o, uint64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
   uintptr_t tag = v->long_value.lv_tag;
   if ((tag & INTJ_SIGN_MASK) == 2)
@@ -300,25 +310,67 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
 
 #elif defined(INTJ_ACCESS_CXX)
 
-static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
-                                   void **p, int32_t *dt, int want_size,
-                                   int64_t *sz) {
+/* The same reads as the shim mode, with the compiler resolving the field offsets
+ * instead of a probe.
+ *
+ * Deliberately the check-free accessors.  The convenient `t.data_ptr()` and
+ * `t.storage().nbytes()` hide five TORCH_CHECKs between them and every one is a
+ * throw; an exception escaping into CPython's C frames is not an error you catch
+ * upstream, it is `std::terminate` -- measured, a core dump on a sparse tensor.
+ * Each condition intj cares about is its own branch here instead.
+ *
+ * `numel_default()` and `storage_offset_default()` rather than `numel()` and
+ * `storage_offset()`: those dispatch through a sizes/strides policy to a virtual
+ * `*_custom()`, and impls whose stored fields disagree with their accessors -- a
+ * nested tensor has `numel_ == 0` while `numel()` is 8 -- are *not* filtered by
+ * the exact-type test, because `torch.nested.nested_tensor(...)` and
+ * `.to_mkldnn()` are exact-type `torch.Tensor`.  Reading the raw field makes
+ * this mode behave identically to the shim mode, which cannot see the policy bit
+ * at all.  One documented limitation shared by both beats two modes that
+ * disagree; see `docs/Usage.md`.
+ *
+ * No try/catch here, on purpose.  The remaining throw sites are unreachable for
+ * the tensors that get this far, and a `try` in this function inflates g++'s
+ * inlining cost estimate enough that it leaves the whole reader out of line --
+ * a real call per argument.  The template wraps the entire decode in one catch
+ * instead, which costs nothing and still cannot let an exception reach CPython.
+ */
+static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
+                                               PyObject *o, void **p, int32_t *dt,
+                                               int want_size, int64_t *sz) {
   (void)abi;
-  /* torch throws; an exception reaching CPython's C frames is undefined, so it
-   * stops here and becomes a python error like every other decode failure. */
-  try {
-    const at::Tensor &t = THPVariable_Unpack(o);
-    *p = t.data_ptr();
-    *dt = static_cast<int32_t>(t.scalar_type());
-    if (want_size)
-      *sz = static_cast<int64_t>(t.storage().nbytes());
-  } catch (const std::exception &e) {
-    PyErr_SetString(PyExc_RuntimeError, e.what());
-    return -1;
-  } catch (...) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: unknown c++ exception from torch");
+  const at::Tensor &t = THPVariable_Unpack(o);
+  c10::TensorImpl *impl = t.unsafeGetTensorImpl();
+
+  const c10::Storage &storage = impl->unsafe_storage();
+  if (!storage) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "intj: cannot access data pointer of a tensor with no "
+                    "storage (a sparse tensor?)");
     return -1;
   }
+  c10::StorageImpl *si = storage.unsafeGetStorageImpl();
+
+  const caffe2::TypeMeta meta = impl->dtype();
+  if (!meta.isScalarType()) { /* makes toScalarType() unable to throw */
+    PyErr_SetString(PyExc_RuntimeError, "intj: tensor has no scalar dtype");
+    return -1;
+  }
+  *dt = (int32_t)meta.toScalarType();
+
+  /* `nbytes()` rather than `sym_nbytes()`: the symbolic form returns a SymInt by
+   * value whose destructor does not inline, costing a real call per argument.
+   * This form is a bitfield test, and it throws only for a symbolic size, which
+   * the decode's outer catch covers. */
+  if (want_size)
+    *sz = (int64_t)si->nbytes();
+
+  /* torch returns null for every zero-element tensor, even one whose storage is
+   * live and whose storage_offset is not zero; see the shim reader. */
+  *p = impl->numel_default() == 0
+           ? NULL
+           : (void *)((char *)si->_mutable_data_ptr_no_checks().get() +
+                      impl->storage_offset_default() * (int64_t)meta.itemsize());
   return 0;
 }
 

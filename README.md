@@ -83,13 +83,14 @@ kernel with three tensor arguments:
 
 | `TorchAccess` | decode + spec key | first build |
 |---|---|---|
-| `SHIM` — torch's structs, at offsets discovered at load | 0.11 us | 0.6 s |
-| `CXX` — compiled against torch's headers | 0.13 us | 11.5 s |
-| `CPYTHON` — through the interpreter | 0.9 us | 0.6 s |
+| `SHIM` — torch's structs, at offsets discovered at load | 89 ns | 0.6 s |
+| `CXX` — compiled against torch's headers | 101 ns | 11.5 s |
+| `CPYTHON` — through the interpreter | 300 ns | 0.6 s |
 
-`SHIM` and `CXX` are the same speed: both inline the reads, neither calls into
-torch or the interpreter. `CXX` pays for that with build time and is the only
-mode whose `.so` must be rebuilt when torch is upgraded.
+`CXX` stays ~4 ns per tensor behind `SHIM`, and that residue is exactly the
+bitfield tests it keeps and `SHIM` cannot see. `CXX` also pays for the safety with
+build time, and is the only mode whose `.so` must be rebuilt when torch is
+upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
 which is the third row's 0.15 us. Host overhead is therefore ~0.3 us against

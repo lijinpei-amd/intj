@@ -92,10 +92,48 @@ hits it:
 - Tuple, `tl.constexpr` object, `TensorDescriptor`, JIT-function and string arguments.
 - Tensor subclasses other than `torch.nn.Parameter` — the fast path gates on exact
   type, because a subclass can redefine what `data_ptr()` means.
+
+Not refused, and **not detected**: a tensor whose `TensorImpl` overrides `numel()` or
+`storage_offset()` rather than storing them, i.e. one with a custom sizes/strides
+policy. `torch.nested.nested_tensor(...)` is the case that exists today, and it is
+*exact-type* `torch.Tensor`, so the type gate above does not catch it. Its stored
+`numel_` is 0 while `numel()` reports the real count, so intj reads it as empty and
+passes a null pointer to the kernel; the launch then faults on the GPU rather than
+raising. `.to_mkldnn()` has no storage at all and is refused cleanly.
+
+This is a deliberate limitation of reading the fields rather than calling the
+accessors, and it is shared by the `shim` and `cxx` modes alike — they are kept
+consistent on purpose, since the `shim` mode cannot see the policy bit at all. Neither
+kind of tensor is a usable triton kernel argument in the first place.
 - Kernels that read global variables (triton revalidates those on every launch;
   intj cannot, so it refuses instead of silently launching a stale kernel).
 - Kernels with pre-run hooks, `num_ctas > 1`, cooperative launches, or non-zero
   global/profile scratch.
+
+## Reaching torch: `torch_access`
+
+Every launch reads three things off each tensor: the data pointer, the dtype, and (on
+AMD) the storage size. `create_launcher(..., torch_access=...)` picks how, with
+`intj.TorchAccess`:
+
+| | how it reads | decode + key, 3 tensors | first build | rebuilt when torch changes |
+|---|---|---|---|---|
+| `SHIM` | `TensorImpl`/`StorageImpl` at offsets probed from the running torch | 89 ns | 0.6 s | no |
+| `CXX` | compiled against torch's headers | 101 ns | 11.5 s | yes |
+| `CPYTHON` | `data_ptr()` / `untyped_storage().nbytes()` through the interpreter | 300 ns | 0.6 s | no |
+| `AUTO` (default) | `CXX` if a C++ compiler and torch's headers are present, else `SHIM`, else `CPYTHON` | | | |
+
+No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
+
+`SHIM` discovers the offsets at load by probing the live torch — matching field values
+against what torch's own accessors report — so the `.so` is valid on any torch version,
+including one intj has never seen. If any offset cannot be pinned to exactly one
+candidate the mode is refused rather than guessed at; `torch_access=TorchAccess.SHIM`
+then raises and `AUTO` falls through to `CPYTHON`.
+
+`CPYTHON` assumes nothing about torch's layout except `THPDtype`, which checks itself at
+load against the name the struct embeds. It is the independent oracle the test suite
+compares the other two against.
 
 ## How a launch works
 

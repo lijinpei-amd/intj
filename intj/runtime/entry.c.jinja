@@ -114,6 +114,12 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   key[0] = (uint64_t)device;
+{% if torch_access == 'cxx' %}
+  /* One catch for the whole decode rather than one per read: an exception
+   * reaching CPython's C frames is std::terminate, and a `try` inside the
+   * per-argument reader stops g++ inlining it.  Free when nothing throws. */
+  try {
+{% endif %}
 {% for p in params %}
 {% if p.is_constexpr %}
   INTJ_DECODE_CONSTEXPR(args[{{ 3 + loop.index0 }}], key[{{ p.word }}],
@@ -124,6 +130,15 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
               intj_param_names[{{ loop.index0 }}]);
 {% endif %}
 {% endfor %}
+{% if torch_access == 'cxx' %}
+  } catch (const std::exception &e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return NULL;
+  } catch (...) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: unknown c++ exception from torch");
+    return NULL;
+  }
+{% endif %}
 
   uint64_t hash = intj_hash(key);
   intj_kernel *kernel = intj_map_get(&st->cache, key, hash);
@@ -236,6 +251,12 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   key[0] = 0;
+{% if torch_access == 'cxx' %}
+  /* One catch for the whole decode rather than one per read: an exception
+   * reaching CPython's C frames is std::terminate, and a `try` inside the
+   * per-argument reader stops g++ inlining it.  Free when nothing throws. */
+  try {
+{% endif %}
 {% for p in params %}
 {% if p.is_constexpr %}
   INTJ_DECODE_CONSTEXPR(args[{{ loop.index0 }}], key[{{ p.word }}],
@@ -246,6 +267,15 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
               intj_param_names[{{ loop.index0 }}]);
 {% endif %}
 {% endfor %}
+{% if torch_access == 'cxx' %}
+  } catch (const std::exception &e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return NULL;
+  } catch (...) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: unknown c++ exception from torch");
+    return NULL;
+  }
+{% endif %}
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)sizeof(key), np);
 }
 

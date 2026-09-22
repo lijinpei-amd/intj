@@ -649,3 +649,33 @@ def test_modes_agree_on_tensors_with_unusual_impls():
     for m, mod in modules.items():
         with pytest.raises(TypeError):  # a subclass: refused before any read
             mod.spec_key(fake, o, 1024, 2.0, 128)
+
+
+def test_custom_sizes_policy_tensors_are_a_known_limitation():
+    """Nested tensors read as empty, identically in every mode.  Documented, not fixed.
+
+    A nested tensor stores `numel_ == 0` and reports `numel() == 8` through a
+    virtual override.  `shim` cannot see the policy bit that says so, and `cxx`
+    reads the field too rather than diverge from it -- one documented limitation
+    beats two modes that disagree.  See `docs/Usage.md`.
+
+    This pins the behaviour so that a torch change, or a decision to start
+    detecting these, shows up here instead of silently.
+    """
+    from intj.torch_abi import _read
+
+    layout = cached_layout()
+    assert layout is not None
+    nested = torch.nested.nested_tensor([torch.randn(3), torch.randn(5)])
+    assert nested.numel() == 8 and nested.data_ptr() != 0
+    assert _read(layout, nested)[0] == 0, "expected the known-wrong null pointer"
+
+    # mkldnn has no storage at all, and that *is* detected
+    mkl = torch.randn(4, 4).to_mkldnn()
+    with pytest.raises(RuntimeError):
+        _read(layout, mkl)
+    o = torch.empty(16, device="cuda")
+    for m in ACCESS_MODES:
+        module = getattr(create_launcher(scale, torch_access=m), "__self__")
+        with pytest.raises(RuntimeError):
+            module.spec_key(mkl, o, 16, 2.0, 128)
