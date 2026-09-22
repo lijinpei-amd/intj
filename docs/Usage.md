@@ -119,7 +119,7 @@ AMD) the storage size. `create_launcher(..., torch_access=...)` picks how, with
 | | how it reads | decode + key, 3 tensors | first build | rebuilt when torch changes |
 |---|---|---|---|---|
 | `SHIM` | `TensorImpl`/`StorageImpl` at offsets probed from the running torch | 89 ns | 0.6 s | no |
-| `CXX` | the same fields, offsets supplied by the compiler | 90 ns | 11.5 s | yes |
+| `CXX` | the same fields, offsets supplied by the compiler | 90 ns | 1.9 s | yes |
 | `CPYTHON` | `data_ptr()` / `untyped_storage().nbytes()` through the interpreter | 300 ns | 0.6 s | no |
 | `AUTO` (default) | `CXX` if a C++ compiler and torch's headers are present, else `SHIM`, else `CPYTHON` | | | |
 

@@ -391,7 +391,7 @@ Implemented and measured on torch 2.14.0.dev+rocm7.2, gfx942, triton 3.8.0.
 | mode | decode + spec key (3 tensor args) | first build | `.so` rebuilt on torch upgrade |
 |---|---|---|---|
 | `SHIM` | 89 ns | 0.6 s | no |
-| `CXX` | 90 ns | 11.5 s | yes |
+| `CXX` | 90 ns | 1.9 s | yes |
 | `CPYTHON` | ~300 ns | 0.6 s | no |
 
 `SHIM` and `CXX` land in the same place, as predicted -- both inline the reads.
@@ -498,3 +498,33 @@ The final reader reaches torch's private fields through the explicit-instantiati
 trick, so it makes exactly the loads the shim makes. That is what removed the last
 throw site and let the try/catch go entirely -- the reason it is worth the
 unusual technique is correctness, not the ~1 ns.
+
+## Postscript: not including pybind11
+
+`python_variable.h` was the wrong header to include. It declares the four-line
+`THPVariable` struct intj needs and nothing else it uses, but it also pulls in
+pybind11, which accounted for **79% of the resulting `.text`** (101,279 of
+127,783 bytes) -- `cpp_function::dispatcher` alone is 14.8 KB -- none of it
+reachable from intj's code. pybind11 is header-only with vague linkage, so every
+translation unit that includes it gets its own copy of the machinery.
+
+`ATen/core/Tensor.h`, `c10/core/TensorImpl.h` and `c10/core/StorageImpl.h` are
+pybind11-free (0 of 1064 headers). Declaring the struct head locally and
+including only those gives **byte-identical generated code** for the reader --
+39 instructions either way -- at a fraction of the cost:
+
+| | compile | module `.text` |
+|---|---|---|
+| via `python_variable.h` | 10.9 s | 176,492 |
+| via `ATen/core/Tensor.h` + c10 | 1.4 s | 24,087 |
+
+Cold build for the whole `CXX` mode: **11.5 s -> 1.9 s**. The test suite went from
+75 s to 17 s. The inlining-budget problem that produced the earlier postscript
+disappears with it, since the budget is per translation unit and the unit is now
+the same size as the C modes'.
+
+The one thing declaring the struct asserts is that `cdata` is the first member
+after `PyObject_HEAD`. That is not trusted: `set_torch_version` compares the
+compiled-in `offsetof` against the offset the probe found by scanning the object
+for the `TensorImpl` pointer, and refuses the module if they disagree. `CXX`
+therefore now requires the probe to succeed, the same as `SHIM`.

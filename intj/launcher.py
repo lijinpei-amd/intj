@@ -185,7 +185,9 @@ def create_launcher(
         compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
     )
-    layout = cached_layout() if access is TorchAccess.SHIM else None
+    # the c++ mode gets it too, not to read from but to check its own
+    # compiled-in offset against
+    layout = cached_layout() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
     return _loaded_module(key, jit_func, context, params, options, layout).entry
 
 
@@ -210,9 +212,15 @@ def _resolve_access(requested: TorchAccess) -> TorchAccess:
             "intj: the c++ access mode needs a c++ compiler and torch's headers; "
             "set $CXX or pass torch_access=TorchAccess.SHIM"
         )
+    if requested is TorchAccess.CXX and cached_layout() is None:
+        raise UnsupportedKernel(
+            "intj: the c++ access mode checks its compiled-in tensor offset against "
+            "the probed one, and the probe failed on this torch "
+            f"({_torch_version_string()}); pass torch_access=TorchAccess.CPYTHON"
+        )
     if requested is not TorchAccess.AUTO:
         return requested
-    if _cxx_toolchain():
+    if _cxx_toolchain() and cached_layout() is not None:
         return TorchAccess.CXX
     if cached_layout() is not None:
         return TorchAccess.SHIM
