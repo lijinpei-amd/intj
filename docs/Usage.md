@@ -137,9 +137,10 @@ you read when a launch misbehaves. The symbol is the kernel's own name
 (`PyInit_<kernel>`) — what `perf` and `/proc/<pid>/maps` show. Two builds of one kernel
 are two directories and two independent modules.
 
-Within a process a `ModuleKey` maps to one loaded module, so repeating
-`create_launcher` for the same kernel and options hands back the same module — and
-therefore the same kernel cache — rather than loading a second copy.
+`create_launcher` looks for its module in three places, in order: the process-level
+`ModuleKey` dict (same module, so the same kernel cache), the `.so` on disk (loaded
+as-is, nothing rendered or compiled), and only then renders and builds. A warm
+process takes ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build.
 
 The digest covers the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,

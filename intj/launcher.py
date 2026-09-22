@@ -197,45 +197,39 @@ def _loaded_module(
     with _LOAD_LOCK:
         module = _LOADED.get(key)
         if module is None:
-            import jinja2
-
-            # the kernel's own name, unless python allows something C does not
-            name = jit_func.__name__
-            if not (name.isidentifier() and name.isascii()):
-                name = "kernel"
-            template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
-            src = template.render(**dataclasses.asdict(dataclasses.replace(context, module_name=name)))
-            module = _load(jit_func, name, key.digest(), src)
+            module = _load(key, jit_func, context)
             module.set_compile_callback(_make_compile_callback(jit_func, params, options))
             _LOADED[key] = module
         return module
 
 
-def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> types.ModuleType:
-    """Build (once) and load the extension for this kernel and this digest.
+def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> types.ModuleType:
+    """Load the extension for this key, rendering and building it only if needed.
 
     The `.so` lands in `<cache>/loaded_modules/<digest>/<module>/<kernel>`, so the
     artifact says where the kernel came from and which build it is. Its leaf name
     is the kernel's own name, because CPython derives `PyInit_<leaf>` from the
     last dotted component of the spec name -- that is also what `perf` and
     /proc/<pid>/maps show.
+
+    An existing `.so` is loaded as-is: its path already encodes the digest, so
+    rendering the source again would only reproduce what was compiled from it.
     """
     from triton import knobs
 
+    # the kernel's own name, unless python allows something C does not
+    module_name = jit_func.__name__
+    if not (module_name.isidentifier() and module_name.isascii()):
+        module_name = "kernel"
+
+    digest = key.digest()
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
     # $TRITON_HOME/.triton/intj, a sibling of triton's own cache
     root = Path(knobs.cache.get_triton_dir("intj")) / "loaded_modules"
     directory = root / digest / jit_func.__module__
     so_path = directory / f"{module_name}{suffix}"
     if not so_path.exists():
-        from triton.runtime.build import compile_so_from_src
-
-        built = compile_so_from_src(src=src, name=module_name, include_dirs=[str(_RUNTIME)], language="c")
-        directory.mkdir(parents=True, exist_ok=True)
-        # The source is kept next to the binary: it is what you read when a
-        # launch misbehaves, and what you recompile by hand to debug it.
-        _install(src.encode(), directory / f"{module_name}.c")
-        _install(Path(built).read_bytes(), so_path)
+        _build(so_path, module_name, dataclasses.replace(context, module_name=module_name))
 
     # A distinct spec name per digest keeps two builds of one kernel apart.
     spec_name = f"intj.loaded_modules.{get_full_name(jit_func)}.{digest[:16]}.{module_name}"
@@ -245,6 +239,23 @@ def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> typ
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _build(so_path: Path, module_name: str, context: RenderContext) -> None:
+    """Render and compile, then install both artifacts next to each other."""
+    import jinja2
+
+    from triton.runtime.build import compile_so_from_src
+
+    template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
+    src = template.render(**dataclasses.asdict(context))
+    built = compile_so_from_src(src=src, name=module_name, include_dirs=[str(_RUNTIME)], language="c")
+
+    so_path.parent.mkdir(parents=True, exist_ok=True)
+    # The source is kept next to the binary: it is what you read when a launch
+    # misbehaves, and what you recompile by hand to debug it.
+    _install(src.encode(), so_path.with_name(f"{module_name}.c"))
+    _install(Path(built).read_bytes(), so_path)
 
 
 def _install(content: bytes, path: Path) -> None:

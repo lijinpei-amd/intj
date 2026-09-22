@@ -239,6 +239,23 @@ def test_one_module_per_key():
     assert first == second
 
 
+def test_cached_build_is_reused_without_rendering():
+    """A dict miss with the .so already on disk must not render or compile again."""
+    import intj.launcher as launcher_module
+
+    create_launcher(scale, options={"num_stages": 5})
+    launcher_module._LOADED.clear()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("rebuilt a module that was already on disk")
+
+    original, launcher_module._build = launcher_module._build, fail
+    try:
+        create_launcher(scale, options={"num_stages": 5})
+    finally:
+        launcher_module._build = original
+
+
 def test_source_and_binary_are_cached_on_disk():
     launcher = create_launcher(scale, options={"num_stages": 4})
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
