@@ -138,8 +138,8 @@ you read when a launch misbehaves. The symbol is the kernel's own name
 are two directories and two independent modules.
 
 Modules are loaded by hand, so none of this reaches `sys.modules`: the module's name
-(`intj.<kernel>`) is a label, not a lookup key — two builds of one kernel share it and
-are told apart by `__file__`.
+is just the kernel's, a label rather than a lookup key — two builds of one kernel share
+it and are told apart by `__file__`.
 
 `create_launcher` looks for its module in three places, in order: the process-level
 `ModuleKey` dict (same module, so the same kernel cache), the `.so` on disk (loaded

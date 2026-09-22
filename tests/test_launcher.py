@@ -212,7 +212,7 @@ def test_launchers_of_one_kernel_stay_independent():
     # their kernel caches are cold; a warm one would not compile anything.
     narrow = getattr(create_launcher(scale, options={"num_warps": 2}), "__self__")
     wide = getattr(create_launcher(scale, options={"num_warps": 16}), "__self__")
-    assert narrow.__name__ == wide.__name__ == "intj.scale"  # one name ...
+    assert narrow.__name__ == wide.__name__ == "scale"  # one name ...
     assert narrow is not wide  # ... two modules, told apart by their file
     assert narrow.__file__ != wide.__file__
 
@@ -269,8 +269,6 @@ def test_modules_stay_out_of_the_import_system():
 
     before = set(sys.modules)
     first = getattr(create_launcher(scale, options={"num_stages": 6}), "__self__")
-    # triton may register modules of its own here (hip_utils); only ours matter
-    assert [m for m in set(sys.modules) - before if m.startswith("intj.")] == []
     assert first.__spec__.name not in sys.modules
 
     launcher_module._LOADED.clear()
