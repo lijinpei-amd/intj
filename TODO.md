@@ -14,6 +14,12 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   `create_launcher` keeps launching the old binary. Same for `use_buffer_ops`, which
   is only stale-but-valid since the `S` bit is unconditionally keyed.
 - **Run the NVIDIA path on an NVIDIA GPU.** It is compile-checked only.
+- **`noexcept` at the CPython boundary**, once the C++ access mode lands. An
+  exception escaping `entry` into CPython's C frames is UB; `INTJ_NOEXCEPT` on the
+  functions CPython calls turns that into a deterministic `std::terminate`. Not a
+  gap today (the extension is C, nothing can throw), and *not* a performance item:
+  measured identical codegen with and without, because intj has no non-trivial
+  destructors and so no landing pads to elide.
 
 ## Coverage (all currently refused loudly)
 
