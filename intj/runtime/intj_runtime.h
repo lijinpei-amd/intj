@@ -53,23 +53,38 @@ static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
   return 0;
 }
 
-/* Only called after intj_as_i64 reported overflow, i.e. for values that do not
- * fit in int64.  Mirrors PyLong_AsUnsignedLongLong. */
-static INTJ_ALWAYS_INLINE int intj_as_u64(PyObject *o, uint64_t *out) {
+/* Which of the two integer widths a python int lands in, if either.  Triton
+ * buckets an int by what it fits (i32/i64, else u64), so a caller wants both
+ * answers from one decode -- asking `intj_as_i64` and then `intj_as_u64` walks
+ * the digits twice for every value above INT64_MAX. */
+#define INTJ_INT_TOO_BIG 0 /* fits neither: |value| is over 64 bits */
+#define INTJ_INT_I64 1     /* *out is the int64, cast back from the bits */
+#define INTJ_INT_U64 2     /* *out is the uint64: above INT64_MAX */
+
+static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
   uintptr_t tag = v->long_value.lv_tag;
-  if ((tag & INTJ_SIGN_MASK) == 2)
-    return -1;
+  if (tag < (2 << INTJ_NON_SIZE_BITS)) { /* |value| < 2**30 */
+    int64_t sign = 1 - (int64_t)(tag & INTJ_SIGN_MASK);
+    *out = (uint64_t)(sign * (int64_t)v->long_value.ob_digit[0]);
+    return INTJ_INT_I64;
+  }
   size_t nd = (size_t)(tag >> INTJ_NON_SIZE_BITS);
-  if (nd > 3)
-    return -1;
+  if (nd > 3) /* > 90 bits */
+    return INTJ_INT_TOO_BIG;
   __uint128_t acc = 0;
   for (size_t i = nd; i-- > 0;)
     acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
+  if ((tag & INTJ_SIGN_MASK) == 2) { /* negative: int64 or nothing */
+    if (acc > ((__uint128_t)1 << 63))
+      return INTJ_INT_TOO_BIG;
+    *out = (uint64_t)(int64_t)(-(__int128_t)acc);
+    return INTJ_INT_I64;
+  }
   if (acc > (__uint128_t)UINT64_MAX)
-    return -1;
+    return INTJ_INT_TOO_BIG;
   *out = (uint64_t)acc;
-  return 0;
+  return acc > (__uint128_t)INT64_MAX ? INTJ_INT_U64 : INTJ_INT_I64;
 }
 
 static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
@@ -541,31 +556,24 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
       (vals)[(np)] = (uint64_t)(_o == Py_True);                                \
       (np)++;                                                                  \
     } else if (PyLong_CheckExact(_o)) {                                        \
-      int64_t _v;                                                              \
-      int _rc = intj_as_i64(_o, &_v);                                          \
-      if (_rc == 0) {                                                          \
-        if (SPEC && _v == 1) {                                                 \
-          (word) = INTJ_WORD(INTJ_T_ONE, 0, 0);                                \
-        } else {                                                               \
-          uint32_t _flags =                                                    \
-              (SPEC && ALIGN && ((_v & 15) == 0)) ? INTJ_FLAG_D : 0;           \
-          uint32_t _tag = (_v >= INT32_MIN && _v <= INT32_MAX) ? INTJ_T_I32    \
-                                                               : INTJ_T_I64;   \
-          (word) = INTJ_WORD(_tag, 0, _flags);                                 \
-          (vals)[(np)] = (uint64_t)_v;                                         \
-          (np)++;                                                              \
-        }                                                                      \
+      uint64_t _bits;                                                          \
+      int _kind = intj_as_int(_o, &_bits);                                     \
+      if (_kind == INTJ_INT_TOO_BIG) {                                         \
+        PyErr_Format(PyExc_OverflowError,                                      \
+                     "intj: integer argument '%s' is too large", pname);       \
+        return NULL;                                                           \
+      }                                                                        \
+      int64_t _v = (int64_t)_bits;                                             \
+      if (_kind == INTJ_INT_I64 && SPEC && _v == 1) {                          \
+        (word) = INTJ_WORD(INTJ_T_ONE, 0, 0);                                  \
       } else {                                                                 \
-        uint64_t _u;                                                           \
-        if (intj_as_u64(_o, &_u) != 0) {                                       \
-          PyErr_Format(PyExc_OverflowError,                                    \
-                       "intj: integer argument '%s' is too large", pname);     \
-          return NULL;                                                         \
-        }                                                                      \
         uint32_t _flags =                                                      \
-            (SPEC && ALIGN && ((_u & 15u) == 0)) ? INTJ_FLAG_D : 0;            \
-        (word) = INTJ_WORD(INTJ_T_U64, 0, _flags);                             \
-        (vals)[(np)] = _u;                                                     \
+            (SPEC && ALIGN && ((_bits & 15u) == 0)) ? INTJ_FLAG_D : 0;         \
+        uint32_t _tag = _kind == INTJ_INT_U64  ? INTJ_T_U64                    \
+                        : (_v >= INT32_MIN && _v <= INT32_MAX) ? INTJ_T_I32    \
+                                                               : INTJ_T_I64;   \
+        (word) = INTJ_WORD(_tag, 0, _flags);                                   \
+        (vals)[(np)] = _bits;                                                  \
         (np)++;                                                                \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
@@ -597,20 +605,16 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
       (w0) = INTJ_WORD(INTJ_T_CX_BOOL, 0, 0);                                  \
       (w1) = (uint64_t)(_o == Py_True);                                        \
     } else if (PyLong_CheckExact(_o)) {                                        \
-      int64_t _v;                                                              \
-      if (intj_as_i64(_o, &_v) == 0) {                                         \
-        (w0) = INTJ_WORD(INTJ_T_CX_INT, 0, 0);                                 \
-        (w1) = (uint64_t)_v;                                                   \
-      } else {                                                                 \
-        uint64_t _u;                                                           \
-        if (intj_as_u64(_o, &_u) != 0) {                                       \
-          PyErr_Format(PyExc_OverflowError,                                    \
-                       "intj: constexpr argument '%s' is too large", pname);   \
-          return NULL;                                                         \
-        }                                                                      \
-        (w0) = INTJ_WORD(INTJ_T_CX_UINT, 0, 0);                                \
-        (w1) = _u;                                                             \
+      uint64_t _bits;                                                          \
+      int _kind = intj_as_int(_o, &_bits);                                     \
+      if (_kind == INTJ_INT_TOO_BIG) {                                         \
+        PyErr_Format(PyExc_OverflowError,                                      \
+                     "intj: constexpr argument '%s' is too large", pname);     \
+        return NULL;                                                           \
       }                                                                        \
+      (w0) = INTJ_WORD(                                                        \
+          _kind == INTJ_INT_U64 ? INTJ_T_CX_UINT : INTJ_T_CX_INT, 0, 0);       \
+      (w1) = _bits;                                                            \
     } else if (PyFloat_CheckExact(_o)) {                                       \
       double _d = ((PyFloatObject *)_o)->ob_fval;                           \
       (w0) = INTJ_WORD(INTJ_T_CX_FLOAT, 0, 0);                                 \

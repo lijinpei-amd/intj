@@ -316,6 +316,33 @@ def test_unsupported_argument_type(scale_launcher):
         launch(scale_launcher, (8,), x, o, "1024", 2.0, 128)
 
 
+def test_int_boundaries_match_triton(axpy_launcher):
+    """One decode now serves both widths, so every bucket boundary is a risk.
+
+    Covers what the fold-to-1, i32/i64/u64 and too-large branches disagree about:
+    two values share an intj key only where triton specializes them alike, and
+    intj refuses exactly the values triton refuses.
+    """
+    module = getattr(axpy_launcher, "__self__")
+    base = torch.randn(64, device="cuda")
+    values = [0, 1, 16, 17, -16, -17, 2**31 - 1, 2**31, 2**63 - 1, 2**63,
+              2**64 - 16, 2**64 - 1, -(2**63), -(2**63) - 1, 2**64, 2**100]
+
+    seen = {}
+    for value in values:
+        args = (base, base, base, value, 1.5, True, None, 128)
+        try:
+            spec = repr(triton_specialization(axpy, args)[3])
+        except OverflowError:
+            with pytest.raises(OverflowError):
+                module.spec_key(*args)
+            continue
+
+        key, _ = module.spec_key(*args)
+        previous = seen.setdefault(key, (spec, value))
+        assert previous[0] == spec, f"{previous[1]} and {value} share a key, {previous[0]} != {spec}"
+
+
 def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
     """The load-bearing invariant: same intj key => same triton specialization.
 
