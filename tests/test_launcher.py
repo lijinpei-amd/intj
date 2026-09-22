@@ -6,6 +6,7 @@ Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 
 import dataclasses
 import json
+import pathlib
 
 import pytest
 import torch
@@ -18,7 +19,7 @@ from intj.launcher import (
     Param,
     RenderContext,
     UnsupportedKernel,
-    _module_name,
+    _symbol_name,
     to_json,
     triton_specialization,
 )
@@ -204,15 +205,17 @@ def test_options_are_baked_in():
 
 
 def test_launchers_of_one_kernel_stay_independent():
-    """Two launchers share a module *name*, so they must not share a module.
+    """Two launchers share a C symbol, so they must not share a module.
 
-    The name is the kernel's, for legible `perf` output; only the digest in the
-    rendered source keeps the two .so files apart.
+    The symbol is the kernel's name, for legible `perf` output; the digest in
+    the path and the spec name is what keeps the two builds apart.
     """
     default = getattr(create_launcher(scale), "__self__")
     wide = getattr(create_launcher(scale, options={"num_warps": 8}), "__self__")
-    assert default.__name__ == wide.__name__
+    assert default.__name__.rsplit(".", 1)[-1] == wide.__name__.rsplit(".", 1)[-1] == "scale"
+    assert default.__name__ != wide.__name__
     assert default is not wide
+    assert default.__file__ != wide.__file__
 
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
@@ -328,8 +331,8 @@ def test_module_key_digest_tracks_every_field():
         assert dataclasses.replace(key, **{field.name: changed}).digest() != key.digest(), field.name
 
 
-def test_module_name_is_a_c_identifier():
-    """It is rendered into `PyInit_<name>`, so dots and `<locals>` cannot survive."""
+def test_artifact_layout_and_nested_kernels():
+    """The symbol is the kernel's name; the path says which kernel and which build."""
 
     def make():
         @triton.jit
@@ -340,14 +343,18 @@ def test_module_name_is_a_c_identifier():
 
         return inner
 
-    nested = make()
-    assert "<locals>" in f"{nested.__module__}.{nested.__qualname__}"
-    assert _module_name(nested).isidentifier()
+    nested = make()  # qualname carries `<locals>`, which a C symbol cannot
+    assert _symbol_name(nested) == "inner"
 
-    launcher = create_launcher(nested)
+    module = getattr(create_launcher(nested), "__self__")
+    path = pathlib.Path(module.__file__)
+    assert path.name.startswith("inner.")
+    assert path.parent.parent.name == f"{nested.__module__}.{nested.__qualname__}"
+    assert len(path.parent.name) == 64  # the ModuleKey digest
+
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
-    launch(launcher, (8,), x, o, 1024, 128)
+    launch(module.entry, (8,), x, o, 1024, 128)
     torch.testing.assert_close(o, x * 2.0)
 
 

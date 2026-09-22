@@ -4,13 +4,15 @@ import abc
 import dataclasses
 import functools
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
-import re
+import shutil
 import struct
 import subprocess
 import sysconfig
+import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -126,7 +128,6 @@ def create_launcher(
     params = _render_params(jit_func)
 
     import torch
-    from triton.runtime.build import compile_module_from_src
 
     target = _current_target()
     backend = BACKENDS[target.backend]
@@ -169,16 +170,9 @@ def create_launcher(
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
     ).digest()
 
-    # The symbol is the kernel's name, so `perf` and /proc/<pid>/maps stay
-    # readable; the digest rides along in the source, which is what triton's
-    # build cache keys on, so two versions of one kernel get two .so files.
-    module_name = _module_name(jit_func)
-    module = compile_module_from_src(
-        src=f"/* intj {digest} */\n" + _render(dataclasses.replace(context, module_name=module_name)),
-        name=module_name,
-        include_dirs=[str(_RUNTIME)],
-        language="c",
-    )
+    module_name = _symbol_name(jit_func)
+    src = _render(dataclasses.replace(context, module_name=module_name))
+    module = _load(jit_func, module_name, digest, src)
     module.set_compile_callback(_make_compile_callback(jit_func, params, options))
     return module.entry
 
@@ -187,19 +181,48 @@ def get_full_name(fn: Any) -> str:
     return f"{fn.__module__}.{fn.__qualname__}"
 
 
-def _module_name(jit_func: JitFunction) -> str:
-    """`get_full_name` as a C identifier: it is rendered into `PyInit_<name>`.
+def _symbol_name(jit_func: JitFunction) -> str:
+    """The kernel's own name, unless python allows something C does not."""
+    name = jit_func.__name__
+    return name if name.isidentifier() and name.isascii() else "kernel"
 
-    The full name always carries dots from the module path, and `<locals>` when
-    the kernel is nested, neither of which is legal in a C identifier -- and
-    CPython derives the init symbol from the last dotted component, so leaving
-    the dots in would make it look for `PyInit_<last component>`.
 
-    Two kernels can sanitize to one name (`a.b` and `a_b`). That is harmless:
-    modules are keyed by name *and* path, and the digest in the source keeps
-    the paths apart.
+def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> types.ModuleType:
+    """Build (once) and load the extension for this kernel and this digest.
+
+    The `.so` lands in `<cache>/loaded_modules/<module>.<qualname>/<digest>/`, so
+    the artifact says which kernel it belongs to and which build it is. Its leaf
+    name is the kernel's own name, because CPython derives `PyInit_<leaf>` from
+    the last dotted component of the spec name -- that is also what `perf` and
+    /proc/<pid>/maps show.
     """
-    return "intj_" + re.sub(r"[^0-9a-zA-Z_]", "_", get_full_name(jit_func))
+    suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    directory = _cache_root() / get_full_name(jit_func) / digest
+    so_path = directory / f"{module_name}{suffix}"
+    if not so_path.exists():
+        from triton.runtime.build import compile_so_from_src
+
+        built = compile_so_from_src(src=src, name=module_name, include_dirs=[str(_RUNTIME)], language="c")
+        directory.mkdir(parents=True, exist_ok=True)
+        staged = directory / f".{module_name}.{os.getpid()}{suffix}"
+        shutil.copyfile(built, staged)
+        os.replace(staged, so_path)  # atomic, so a racing build cannot be half-read
+
+    # A distinct spec name per digest keeps two builds of one kernel apart.
+    spec_name = f"intj.loaded_modules.{get_full_name(jit_func)}.{digest[:16]}.{module_name}"
+    spec = importlib.util.spec_from_file_location(spec_name, so_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"intj: cannot load {so_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.lru_cache(maxsize=1)
+def _cache_root() -> Path:
+    from triton import knobs
+
+    return Path(knobs.cache.dir) / "intj" / "loaded_modules"
 
 
 class Backend(abc.ABC):

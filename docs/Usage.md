@@ -127,11 +127,15 @@ cache miss re-checks it against triton's own binder.
 
 ## Cache
 
-The rendered module is named after the kernel (`intj_<module>_<qualname>`), so `perf`
-and `/proc/<pid>/maps` stay readable; the digest below rides in the source instead, so
-two builds of one kernel are two different `.so` files and two independent modules.
+Artifacts land at
+
+    $TRITON_CACHE_DIR/intj/loaded_modules/<module>.<qualname>/<digest>/<kernel><EXT_SUFFIX>
+
+so the file says which kernel it belongs to and which build it is, and the symbol is
+the kernel's own name (`PyInit_<kernel>`) — what `perf` and `/proc/<pid>/maps` show.
+Two builds of one kernel are two directories and two independent modules.
 
 The digest covers the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,
-the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler, and `EXT_SUFFIX`. Artifacts live in triton's cache directory
-(`TRITON_CACHE_DIR`), so `rm -rf ~/.triton/cache` clears them.
+the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler,
+and `EXT_SUFFIX`. `rm -rf $TRITON_CACHE_DIR/intj` clears every intj artifact.
