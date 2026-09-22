@@ -232,6 +232,11 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
         _build(so_path, module_name, dataclasses.replace(context, module_name=module_name))
 
     # A distinct spec name per digest keeps two builds of one kernel apart.
+    #
+    # Loading by hand, rather than through import_module, keeps the module out of
+    # sys.modules: intj's own dict owns it, so dropping a launcher can free it.
+    # The interpreter does not cache it either -- that only happens for
+    # single-phase extensions, and the template uses PyModuleDef_Init.
     spec_name = f"intj.loaded_modules.{get_full_name(jit_func)}.{digest[:16]}.{module_name}"
     spec = importlib.util.spec_from_file_location(spec_name, so_path)
     if spec is None or spec.loader is None:

@@ -28,6 +28,15 @@ Everything backend-specific lives in a `Backend` subclass in `launcher.py`
 (`error_style`), never on a backend name. Supporting another triton backend should be
 a subclass plus `register()`.
 
+## Modules stay out of the import system
+
+Rendered extensions are loaded by hand (`spec_from_file_location` +
+`module_from_spec` + `exec_module`), never through `import_module`, so nothing lands
+in `sys.modules` and intj's `_LOADED` dict is the only owner. The template must stay
+multi-phase (`PyModuleDef_Init`): a single-phase `m_size = -1` module gets cached by
+the interpreter per (name, path), and two launchers would then share one module's
+state. `test_modules_stay_out_of_the_import_system` guards both halves.
+
 ## Refusals are loud and early
 
 Anything intj cannot do raises `UnsupportedKernel`, preferably in `create_launcher`,

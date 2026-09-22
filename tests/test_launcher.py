@@ -256,6 +256,36 @@ def test_cached_build_is_reused_without_rendering():
         launcher_module._build = original
 
 
+def test_modules_stay_out_of_the_import_system():
+    """intj's dict owns the module: nothing in sys.modules, nothing interpreter-cached.
+
+    Loading through `import_module`, or a single-phase `m_size = -1` template,
+    would break both halves and make two launchers share one module's state.
+    """
+    import gc
+    import sys
+    import weakref
+
+    import intj.launcher as launcher_module
+
+    before = set(sys.modules)
+    first = getattr(create_launcher(scale, options={"num_stages": 6}), "__self__")
+    # triton may register modules of its own here (hip_utils); only ours matter
+    assert [m for m in set(sys.modules) - before if m.startswith("intj.loaded_modules")] == []
+    assert first.__spec__.name not in sys.modules
+
+    launcher_module._LOADED.clear()
+    second = getattr(create_launcher(scale, options={"num_stages": 6}), "__self__")
+    assert second.__file__ == first.__file__  # same .so ...
+    assert second is not first  # ... but a module of its own
+
+    reference = weakref.ref(second)
+    del second
+    launcher_module._LOADED.clear()
+    gc.collect()
+    assert reference() is None
+
+
 def test_source_and_binary_are_cached_on_disk():
     launcher = create_launcher(scale, options={"num_stages": 4})
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
