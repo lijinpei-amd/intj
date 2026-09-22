@@ -14,12 +14,6 @@
 #error "intj requires CPython 3.12 or newer (PyLongObject layout)"
 #endif
 
-/* g++ and gcc disagree about what is worth inlining here: a `try` block
- * inflates g++'s size estimate enough that it leaves the tensor reader and the
- * integer decoder out of line, costing a real call per argument on the hot
- * path.  The exception machinery is free at runtime; its effect on the inliner
- * is not.
- */
 #if defined(__GNUC__) || defined(__clang__)
 #define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
@@ -28,10 +22,6 @@
 
 /* ---------------------------------------------------------------- integers */
 
-/* `static_assert` rather than `_Static_assert`: the former is spelled the same
- * in C11 (via assert.h, which Python.h pulls in) and in C++, and the CXX access
- * mode compiles this header as C++.
- */
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
 /* CPython 3.12 PyLongObject layout, see cpython/longintrepr.h. */
@@ -339,8 +329,9 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
  * offsets instead of a probe.
  *
  * The fields are private, so they are reached through the
- * explicit-instantiation trick: [temp.spec]/6 says access checking does not apply to names appearing
- * in an explicit instantiation, so a pointer-to-private-member is legal there,
+ * explicit-instantiation trick: [temp.spec]/6 says access checking does not
+ * apply to names in an explicit instantiation, so a pointer-to-private-member
+ * is legal there,
  * and the friend injected by `Rob` hands it back.  (Johannes Schaub, 2010:
  * bloglitb.blogspot.com/2010/07/access-to-private-members-thats-easy.html)
  *
