@@ -85,7 +85,7 @@ per mode:
 |---|---|---|
 | `SHIM` | six struct offsets, itemsize table | set at load, not built in |
 | `CPYTHON` | none | - |
-| `CXX` | the headers and libraries it links | `torch_version` in the key |
+| `CXX` | the headers and libraries it links | `torch_version` + ABI flag in the key |
 
 So only `CXX` keys on the version, because only `CXX` bakes something
 version-specific into the binary. The other two produce a `.so` that is valid on
@@ -134,7 +134,7 @@ it is the point where the `THPDtype` self-check runs.
 selects which layout constants `set_torch_version` installs.
 
 One asymmetry worth stating plainly: in `CXX` mode it cannot select, because
-the headers come from the installed torch. There it is validated instead, and
+the headers come from the loaded torch. There it is validated instead, and
 `create_launcher` raises if it disagrees with `torch.__version__`.
 
 ### `SHIM`: reading the structs
@@ -223,10 +223,28 @@ benchmark the same, and `CXX` gets there without asserting any offset.
 
 That is why `AUTO` prefers it. Costs, all accepted:
 
-- **The build stops being self-contained.** It needs `torch/include`,
-  `torch/include/torch/csrc/api/include`, `-L <torch>/lib`, `-ltorch_cpu -lc10
-  -ltorch_python`, and `-D_GLIBCXX_USE_CXX11_ABI=` matching how torch was built.
-  Read that flag from `torch._C._GLIBCXX_USE_CXX11_ABI` rather than guessing.
+- **The build stops being self-contained.** Every path and flag is read off the
+  loaded `torch` module -- never hardcoded, never derived from
+  `os.path.dirname(torch.__file__)` by hand:
+
+  | need | source |
+  |---|---|
+  | include dirs | `torch.utils.cpp_extension.include_paths()` |
+  | library dirs | `torch.utils.cpp_extension.library_paths()` |
+  | ABI flag | `torch._C._GLIBCXX_USE_CXX11_ABI` |
+
+  Libraries are `-ltorch_cpu -lc10 -ltorch_python`. On torch 2.14 the helpers
+  return `<torch>/include`, `<torch>/include/torch/csrc/api/include` and
+  `<torch>/lib`, which is what the feasibility compile used; taking them from the
+  helpers instead means a torch that reorganises its tree, or an out-of-tree
+  build, keeps working without a change here. `include_paths()` takes no
+  required argument on any version.
+
+  Do not add these paths to `ModuleKey`. Two installs of the same torch version
+  in different virtualenvs are ABI-identical, and keying on the path would
+  rebuild for no reason. `_GLIBCXX_USE_CXX11_ABI` *is* keyed, because a torch
+  rebuilt with the other ABI is a genuine incompatibility that
+  `torch_version` alone does not capture.
 - **A language standard that depends on the torch version.** torch 2.14 requires
   `-std=c++20`: `ATen/core/TensorBase.h` uses `requires` clauses, and C++17
   fails with `'requires' does not name a type`. Older torch needed less. The
@@ -289,7 +307,7 @@ same number by another route does not need reconciling.
 
 - `torch_access=TorchAccess.SHIM` with a version absent from the layout table:
   `UnsupportedKernel` at `create_launcher` time, naming the version.
-- `torch_access=TorchAccess.CXX` with `torch_version` disagreeing with the installed
+- `torch_access=TorchAccess.CXX` with `torch_version` disagreeing with the loaded
   torch: `UnsupportedKernel`, since the headers cannot be selected.
 - `CXX` with no C++ compiler, or a failed build: the build error propagates
   unwrapped. A link error naming a torch symbol beats anything intj would
@@ -320,7 +338,7 @@ Extends `tests/test_launcher.py`, which is already differential against triton.
    constants mapping and the `AUTO` -> mode resolution, including the
    unrecognised-version path and every raising case. No GPU needed.
 5. **Module key granularity.** Assert the digest changes when `torch_access`
-   changes, and when `torch_version` changes in `CXX`. Assert it does *not*
+   changes, and when `torch_version` or the CXX11 ABI flag changes in `CXX`. Assert it does *not*
    change when the torch version moves in `SHIM` or `CPYTHON` -- those binaries
    are version-independent, and a digest that moved would mean something
    version-specific had leaked into the render.
