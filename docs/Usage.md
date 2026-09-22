@@ -125,11 +125,20 @@ AMD) the storage size. `create_launcher(..., torch_access=...)` picks how, with
 
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
-`SHIM` discovers the offsets at load by probing the live torch — matching field values
-against what torch's own accessors report — so the `.so` is valid on any torch version,
-including one intj has never seen. If any offset cannot be pinned to exactly one
-candidate the mode is refused rather than guessed at; `torch_access=TorchAccess.SHIM`
-then raises and `AUTO` falls through to `CPYTHON`.
+`SHIM` reads offsets from a table of torch versions intj has been verified against
+(`intj.torch_abi._LAYOUTS`), installed at load by `set_torch_version`. A torch with no
+row is **refused, never guessed at** — a wrong offset cannot raise, it reads whatever
+lies at that address and hands the kernel a pointer built from it. On an unverified
+torch, `torch_access=TorchAccess.SHIM` raises and `AUTO` falls through to `CPYTHON`.
+
+`CXX` needs a row too, but only to check itself: it compares its compiled-in
+`offsetof(THPVariable, cdata)` against the table's, and refuses the module if they
+disagree.
+
+To add a version, run `python -m intj.torch_abi` on it and paste the line it prints.
+That derives each offset by matching field values against what torch's own accessors
+report, so a row produced that way is verified rather than reasoned about — and the
+test suite re-checks the row against the torch it runs on.
 
 `CPYTHON` assumes nothing about torch's layout except `THPDtype`, which checks itself at
 load against the name the struct embeds. It is the independent oracle the test suite

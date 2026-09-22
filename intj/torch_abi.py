@@ -155,7 +155,12 @@ def _find_u8(blob: bytes, want: int) -> set[int]:
 
 
 def probe_layout() -> TensorLayout | None:
-    """Discover the `SHIM` offsets from the running torch, or return None.
+    """Discover the offsets from the running torch, or return None.
+
+    Not used when launching: `_LAYOUTS` is consulted instead, so a torch intj has
+    not been verified against is refused rather than read at guessed offsets.
+    This is what *generates* those rows (`python -m intj.torch_abi`) and what the
+    test suite checks them against.
 
     Each offset is the intersection, over every probe tensor, of the positions
     whose value matches what torch's own python accessors report.  Anything that
@@ -246,10 +251,43 @@ def _expected(t: Any) -> tuple[int, int, int]:
     return (t.data_ptr(), dtype_code(t.dtype), t.untyped_storage().nbytes())
 
 
-@functools.lru_cache(maxsize=1)
-def cached_layout() -> TensorLayout | None:
-    """`probe_layout()` once per process; torch cannot change under us."""
-    return probe_layout()
+#: Verified tensor layouts, by torch (major, minor).
+#:
+#: Offsets only -- `itemsize` is filled from the running torch, since it is a
+#: property of which dtypes exist rather than of where fields sit, and a torch
+#: that adds one should not need a new row.
+#:
+#: Each row must be *measured*, never reasoned about: run
+#: `python -m intj.torch_abi` on the target torch and paste what it prints.
+#: `probe_layout()` finds each offset by matching field values against what
+#: torch's own accessors report, so a row generated that way is verified by
+#: construction.  `test_hardcoded_layout_matches_this_torch` re-checks the row
+#: for whatever torch the suite runs against.
+_LAYOUTS: dict[tuple[int, int], dict[str, int]] = {
+    # torch 2.14.0.dev+rocm7.2, x86-64
+    (2, 14): {
+        "cdata": 16, "storage": 16, "storage_offset": 144, "numel": 152,
+        "data_type": 160, "s_data": 16, "s_nbytes": 48,
+    },
+}
+
+
+def supported_versions() -> list[tuple[int, int]]:
+    return sorted(_LAYOUTS)
+
+
+@functools.lru_cache(maxsize=4)
+def layout_for(version: tuple[int, int] | None = None) -> TensorLayout | None:
+    """The layout for `version`, or None if intj has no verified row for it.
+
+    None rather than a guess: a wrong offset cannot raise, it reads whatever
+    happens to be at that address and hands the kernel a pointer built from it.
+    """
+    version = version or torch_version()
+    offsets = _LAYOUTS.get(version)
+    if offsets is None:
+        return None
+    return TensorLayout(itemsize=itemsize_table(), **offsets)
 
 
 @functools.lru_cache(maxsize=1)
@@ -259,3 +297,20 @@ def torch_version() -> tuple[int, int]:
     major, _, rest = torch.__version__.partition(".")
     minor = rest.partition(".")[0]
     return (int(major), int(minor))
+
+
+def _main() -> None:
+    """Print the `_LAYOUTS` row for the running torch, to paste into the table."""
+    import torch
+
+    layout = probe_layout()
+    if layout is None:
+        raise SystemExit(f"intj: cannot pin torch {torch.__version__}'s layout")
+    fields = ("cdata", "storage", "storage_offset", "numel", "data_type", "s_data", "s_nbytes")
+    body = ", ".join(f'"{f}": {getattr(layout, f)}' for f in fields)
+    print(f"    # torch {torch.__version__}, x86-64")
+    print(f"    {torch_version()}: {{{body}}},")
+
+
+if __name__ == "__main__":
+    _main()

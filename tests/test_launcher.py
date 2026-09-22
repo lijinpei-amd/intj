@@ -22,7 +22,14 @@ from intj.launcher import (
     UnsupportedKernel,
     triton_specialization,
 )
-from intj.torch_abi import NDTYPES, TorchAccess, cached_layout, dtype_code, itemsize_table
+from intj.torch_abi import (
+    NDTYPES,
+    TorchAccess,
+    dtype_code,
+    itemsize_table,
+    layout_for,
+    probe_layout,
+)
 
 
 @triton.jit
@@ -537,7 +544,7 @@ def test_dtype_code_matches_torch(dtype_name):
 
 def test_layout_probe_reproduces_torch():
     """Every offset the shim mode reads, checked against torch's own accessors."""
-    layout = cached_layout()
+    layout = layout_for()
     assert layout is not None, "probe failed on a torch intj is expected to support"
     assert len(layout.itemsize) == NDTYPES
     for x in _read_corpus() + [torch.arange(9, dtype=torch.float64)[2:]]:
@@ -564,11 +571,24 @@ def test_auto_resolves_and_explicit_modes_validate():
         assert _resolve_access(m) is m
 
 
+def test_hardcoded_layout_matches_this_torch():
+    """The table is data, and data goes stale.  Check the row against reality.
+
+    `probe_layout` finds each offset by matching field values against torch's own
+    accessors, so it is an independent oracle for the hardcoded row -- and the
+    thing that generates rows in the first place (`python -m intj.torch_abi`).
+    """
+    table, probed = layout_for(), probe_layout()
+    assert table is not None, "no row for the torch the suite is running against"
+    assert probed is not None, "probe could not pin this torch's layout"
+    assert table == probed
+
+
 def test_shim_is_refused_rather_than_guessed(monkeypatch):
-    """A layout intj cannot pin must raise, never fall back to a guessed offset."""
+    """An unverified torch must raise, never fall back to a guessed offset."""
     from intj import launcher as launcher_mod
 
-    monkeypatch.setattr(launcher_mod, "cached_layout", lambda: None)
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
         create_launcher(scale, torch_access=TorchAccess.SHIM)
 
@@ -599,7 +619,7 @@ def test_unconfigured_module_refuses_to_launch():
     assert hasattr(module, "set_torch_version")
     with pytest.raises(ValueError, match="needs a tensor layout"):
         module.set_torch_version((2, 14), None)
-    layout = cached_layout()
+    layout = layout_for()
     assert layout is not None
     cpython = getattr(create_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
     with pytest.raises(ValueError, match="takes no tensor layout"):
@@ -664,7 +684,7 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
     """
     from intj.torch_abi import _read
 
-    layout = cached_layout()
+    layout = layout_for()
     assert layout is not None
     nested = torch.nested.nested_tensor([torch.randn(3), torch.randn(5)])
     assert nested.numel() == 8 and nested.data_ptr() != 0

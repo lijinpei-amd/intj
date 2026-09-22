@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .torch_abi import TensorLayout, TorchAccess, cached_layout, torch_version
+from .torch_abi import TensorLayout, TorchAccess, layout_for, supported_versions, torch_version
 
 # triton and torch ship no type information, so everything reaching into them is
 # typed `Any` on purpose.
@@ -187,7 +187,7 @@ def create_launcher(
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
-    layout = cached_layout() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
+    layout = layout_for() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
     return _loaded_module(key, jit_func, context, params, options, layout).entry
 
 
@@ -202,29 +202,31 @@ def _resolve_access(requested: TorchAccess) -> TorchAccess:
     asked for `SHIM` because they measured it wants to hear that it is
     unavailable, not to get `CPYTHON` and wonder where the time went.
     """
-    if requested is TorchAccess.SHIM and cached_layout() is None:
-        raise UnsupportedKernel(
-            "intj: cannot read torch's tensor layout on this build "
-            f"(torch {_torch_version_string()}); pass torch_access=TorchAccess.CPYTHON"
-        )
+    if requested is TorchAccess.SHIM and layout_for() is None:
+        raise UnsupportedKernel(_unverified_torch_message())
     if requested is TorchAccess.CXX and not _cxx_toolchain():
         raise UnsupportedKernel(
             "intj: the c++ access mode needs a c++ compiler and torch's headers; "
             "set $CXX or pass torch_access=TorchAccess.SHIM"
         )
-    if requested is TorchAccess.CXX and cached_layout() is None:
-        raise UnsupportedKernel(
-            "intj: the c++ access mode checks its compiled-in tensor offset against "
-            "the probed one, and the probe failed on this torch "
-            f"({_torch_version_string()}); pass torch_access=TorchAccess.CPYTHON"
-        )
+    if requested is TorchAccess.CXX and layout_for() is None:
+        raise UnsupportedKernel(_unverified_torch_message())
     if requested is not TorchAccess.AUTO:
         return requested
-    if _cxx_toolchain() and cached_layout() is not None:
+    if _cxx_toolchain() and layout_for() is not None:
         return TorchAccess.CXX
-    if cached_layout() is not None:
+    if layout_for() is not None:
         return TorchAccess.SHIM
     return TorchAccess.CPYTHON
+
+
+def _unverified_torch_message() -> str:
+    return (
+        f"intj: no verified tensor layout for torch {_torch_version_string()} "
+        f"(have {', '.join('%d.%d' % v for v in supported_versions())}); pass "
+        "torch_access=TorchAccess.CPYTHON, or add a row to intj.torch_abi._LAYOUTS "
+        "with `python -m intj.torch_abi` on this torch"
+    )
 
 
 def _torch_version_string() -> str:

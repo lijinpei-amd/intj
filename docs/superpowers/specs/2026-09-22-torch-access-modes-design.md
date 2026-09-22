@@ -528,3 +528,29 @@ after `PyObject_HEAD`. That is not trusted: `set_torch_version` compares the
 compiled-in `offsetof` against the offset the probe found by scanning the object
 for the `TensorImpl` pointer, and refuses the module if they disagree. `CXX`
 therefore now requires the probe to succeed, the same as `SHIM`.
+
+## Postscript: back to a version table
+
+The layout is no longer probed on the load path. `_LAYOUTS` maps `(major, minor)`
+to verified offsets, and a torch with no row is refused -- for `SHIM`, which
+would read them, and for `CXX`, which needs one to check its compiled-in
+`offsetof` against.
+
+This reverses the earlier decision to probe, and the trade is worth stating
+plainly, because it is a real loss of reach: probing worked on *any* torch,
+including one intj had never seen, and the table works on one. Against that, the
+table is inspectable, is what a reviewer can reason about, and cannot be fooled
+by a probe set that happens not to disambiguate a field on some future layout.
+
+The probe survives as `probe_layout()`, off the load path, doing two jobs:
+
+* `python -m intj.torch_abi` prints the row to paste, so rows are *measured*
+  rather than read out of a header,
+* `test_hardcoded_layout_matches_this_torch` checks the row against the running
+  torch, so a stale table fails the suite rather than a launch.
+
+One measurement that did not go as expected: removing the probe from the load
+path saved almost nothing, 4.6 ms -> 3.9 ms. The scanning was never the cost --
+`itemsize_table()` is, since it allocates a tensor per dtype. That is still built
+from the live torch on purpose: which dtypes exist is not a layout question, and
+a torch that adds one should not need a new row.
