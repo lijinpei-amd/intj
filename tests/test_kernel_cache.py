@@ -6,9 +6,10 @@ The C++ benchmark is the honest place to compare the backends: it drives
 builds one binary per backend (the implementation is a compile-time choice),
 runs them, and prints one table.
 
-Needs google/benchmark: `$INTJ_BENCHMARK_ROOT` pointing at a build tree, or an
-installed copy. Everything is skipped without it -- including in CI, where the
-numbers would be noise anyway.
+The backends come from intj's own cache directory (`python -m intj.kernel_cache
+all`), so whichever are provisioned get measured. google/benchmark itself is the
+one thing still taken from the environment: `$INTJ_BENCHMARK_ROOT` pointing at a
+build tree, or an installed copy. Everything is skipped without it.
 """
 
 import json

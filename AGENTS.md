@@ -45,6 +45,13 @@ kernel records it is given (`intj_cache_free` releases them) and must not let an
 exception escape -- the C++ maps throw where intj returns -1. Numbers live in
 `tests/bench_kernel_cache.cpp`; add a backend there when you add one.
 
+A backend's library is downloaded at a pinned version and checksum into
+`$TRITON_HOME/.triton/intj/deps/`, never taken from the host: what a module was
+built against has to be a property of intj's cache, or the same digest means
+different binaries on two machines. Never fetch implicitly from
+`create_launcher` -- `python -m intj.kernel_cache <name>` is the only thing that
+touches the network.
+
 ## Refusals are loud and early
 
 Anything intj cannot do raises `UnsupportedKernel`, preferably in `create_launcher`,

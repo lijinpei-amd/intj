@@ -6,19 +6,34 @@ per launch.  Measured on this workload -- key of N uint64 words, insert-only,
 of each other, and `INTJ` wins at the sizes a kernel cache actually reaches:
 
     ns/lookup, 40-byte key         1 entry   8 entries   512 entries
-    INTJ                              1.93        1.95          2.53
-    TSL   (precalculated_hash)        2.18        2.36          3.13
-    ABSL                              2.15        9.63         10.50
+    INTJ                              4.18        3.24          4.55
+    TSL   (precalculated_hash)        3.88        3.93          5.59
+    ABSL                              2.95       10.40         12.55
 
 `ABSL` is fast at one entry only because its small-object path skips hashing
 entirely; past that it re-computes the hash the caller already has, which no
 abseil API lets you pass in.  `TSL` does take one.  They are here to be
 measured, not because they are expected to win.
+
+`TSL` and `ABSL` are **downloaded and built into intj's own cache directory**,
+at a pinned version and checksum.  Nothing installed on the machine is searched
+for or used: what a module was built against is then a property of intj's cache,
+not of the host.  Provision with
+
+    python -m intj.kernel_cache tsl      # or absl, or all
 """
 
+import dataclasses
 import enum
 import functools
+import hashlib
 import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
 from pathlib import Path
 
 
@@ -30,75 +45,191 @@ class KernelCache(enum.Enum):
     INTJ = "intj"
     #: `tsl::robin_map`, header-only.  Takes the precomputed hash on lookup.
     TSL = "tsl"
-    #: `absl::flat_hash_map`.  Needs abseil's headers *and* its libraries.
+    #: `absl::flat_hash_map`.  Headers plus libraries, so it has to be built.
     ABSL = "absl"
 
 
-def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
-    """Include and library directories for `cache`, or None if it is unavailable.
+@dataclasses.dataclass(frozen=True)
+class Dependency:
+    """A pinned source release intj fetches for itself."""
 
-    `TSL` and `ABSL` are found through `$INTJ_TSL_INCLUDE`, `$INTJ_ABSL_INCLUDE`
-    and `$INTJ_ABSL_LIB`, falling back to the usual system directories.  Neither
-    is vendored: they are options to measure, so the build points at whichever
-    copy the caller already has.
+    version: str
+    url: str
+    sha256: str
+    #: proof the unpacked tree is what it claims, relative to its root
+    marker: str
+    #: where the headers are, relative to the root
+    include: str
+    #: built with cmake, rather than header-only
+    builds: bool = False
+
+
+_SOURCES: dict[KernelCache, Dependency] = {
+    KernelCache.TSL: Dependency(
+        version="1.3.0",
+        url="https://github.com/Tessil/robin-map/archive/refs/tags/v1.3.0.tar.gz",
+        sha256="a8424ad3b0affd4c57ed26f0f3d8a29604f0e1f2ef2089f497f614b1c94c7236",
+        marker="include/tsl/robin_map.h",
+        include="include",
+    ),
+    KernelCache.ABSL: Dependency(
+        version="20250814.1",
+        url="https://github.com/abseil/abseil-cpp/archive/refs/tags/20250814.1.tar.gz",
+        sha256="1692f77d1739bacf3f94337188b78583cf09bab7e420d2dc6c5605a4f86785a1",
+        marker="absl/container/flat_hash_map.h",
+        include=".",
+        builds=True,
+    ),
+}
+
+
+def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
+    """Include and library directories for `cache`, or None if not provisioned.
+
+    Only intj's own cache directory is consulted.  `install` is what puts
+    anything there, and it is never called implicitly: a `create_launcher` that
+    quietly reached for the network would be a surprise at an unpredictable
+    moment.
     """
     if cache is KernelCache.INTJ:
         return {"include_dirs": (), "library_dirs": (), "archives": ()}
-    if cache is KernelCache.TSL:
-        include = _find_include("INTJ_TSL_INCLUDE", "tsl/robin_map.h")
-        if include is None:
-            return None
+
+    source = _SOURCES[cache]
+    root = _source_root(cache)
+    if not (root / source.marker).exists():
+        return None
+    include = str((root / source.include).resolve())
+    if not source.builds:
         return {"include_dirs": (include,), "library_dirs": (), "archives": ()}
 
-    include = _find_include("INTJ_ABSL_INCLUDE", "absl/container/flat_hash_map.h")
-    library = _find_absl_libraries()
-    if include is None or library is None:
+    archives = _archives(root / "build")
+    if not archives:
         return None
-    directory, archives = library
-    return {"include_dirs": (include,), "library_dirs": (directory,), "archives": archives}
+    return {
+        "include_dirs": (include,),
+        "library_dirs": (str(root / "build"),),
+        "archives": archives,
+    }
+
+
+def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, ...]]:
+    """Download (and build, for abseil) `cache` into intj's cache directory.
+
+    Returns the same toolchain `toolchain_for` does.  Idempotent: an existing
+    tree is reused unless `force`.
+    """
+    if cache is KernelCache.INTJ:
+        return {"include_dirs": (), "library_dirs": (), "archives": ()}
+
+    source = _SOURCES[cache]
+    root = _source_root(cache)
+    if force:
+        shutil.rmtree(root, ignore_errors=True)
+    if not (root / source.marker).exists():
+        _unpack(source, root)
+    if source.builds and not _archives(root / "build"):
+        _cmake_build(root)
+
+    toolchain = toolchain_for(cache)
+    if toolchain is None:  # pragma: no cover - a build that produced nothing
+        raise RuntimeError(f"intj: {cache.value} is still unusable after installing it into {root}")
+    return toolchain
 
 
 def unavailable_message(cache: KernelCache) -> str:
-    if cache is KernelCache.TSL:
-        return (
-            "intj: kernel_cache=KernelCache.TSL needs tsl/robin_map.h; set "
-            "$INTJ_TSL_INCLUDE to the directory containing `tsl/`"
-        )
     return (
-        "intj: kernel_cache=KernelCache.ABSL needs abseil's headers and libraries; set "
-        "$INTJ_ABSL_INCLUDE to the directory containing `absl/` and $INTJ_ABSL_LIB to "
-        "the one containing libabsl_*.a or .so"
+        f"intj: kernel_cache=KernelCache.{cache.name} is not provisioned; run "
+        f"`{Path(sys.executable).name} -m intj.kernel_cache {cache.value}` to download "
+        f"{'and build ' if _SOURCES[cache].builds else ''}"
+        f"{cache.value} {_SOURCES[cache].version} into {_deps_root()}"
     )
 
 
-_SYSTEM_INCLUDES = ("/usr/local/include", "/usr/include")
-_SYSTEM_LIBRARIES = ("/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib")
-
-
-@functools.lru_cache(maxsize=None)
-def _find_include(variable: str, header: str) -> str | None:
-    candidates = [os.environ[variable]] if variable in os.environ else list(_SYSTEM_INCLUDES)
-    for directory in candidates:
-        if (Path(directory) / header).exists():
-            return directory
-    return None
-
-
 @functools.lru_cache(maxsize=1)
-def _find_absl_libraries() -> tuple[str, tuple[str, ...]] | None:
-    """The directory holding libabsl_*, and every archive in it.
+def _deps_root() -> Path:
+    """`$TRITON_HOME/.triton/intj/deps`, beside the modules intj builds."""
+    from triton import knobs
 
-    Every archive, because abseil's own dependency order is not something intj
-    should encode: the link line wraps them in `--start-group`.  A shared-library
-    install lands here too -- the `.so`s are passed the same way.
+    return Path(knobs.cache.get_triton_dir("intj")) / "deps"
+
+
+def _source_root(cache: KernelCache) -> Path:
+    return _deps_root() / f"{cache.value}-{_SOURCES[cache].version}"
+
+
+def _archives(directory: Path) -> tuple[str, ...]:
+    """Every abseil library under `directory`.
+
+    All of them, because abseil's own dependency order is not something intj
+    should encode: the link line wraps them in `--start-group`.
     """
-    roots = [os.environ["INTJ_ABSL_LIB"]] if "INTJ_ABSL_LIB" in os.environ else list(_SYSTEM_LIBRARIES)
-    for root in roots:
-        directory = Path(root)
-        if not directory.is_dir():
+    if not directory.is_dir():
+        return ()
+    found = sorted(str(p) for p in directory.rglob("libabsl_*.a"))
+    return tuple(found or sorted(str(p) for p in directory.rglob("libabsl_*.so")))
+
+
+def _unpack(source: Dependency, root: Path) -> None:
+    """Fetch, verify, extract -- then move into place, so a kill leaves nothing."""
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root.parent) as scratch:
+        archive = Path(scratch) / "source.tar.gz"
+        with urllib.request.urlopen(source.url) as response:  # noqa: S310 - pinned https URL
+            archive.write_bytes(response.read())
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if digest != source.sha256:
+            raise RuntimeError(
+                f"intj: {source.url} hashed to {digest}, expected {source.sha256}"
+            )
+        with tarfile.open(archive) as tar:
+            tar.extractall(Path(scratch) / "tree", filter="data")
+        # one directory in, the way github archives are laid out
+        (inner,) = (Path(scratch) / "tree").iterdir()
+        if (root / source.marker).exists():  # a racing install won
+            return
+        os.replace(inner, root)
+
+
+def _cmake_build(root: Path) -> None:
+    build = root / "build"
+    configure = [
+        "cmake", "-S", str(root), "-B", str(build),
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_TESTING=OFF",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        # the modules that link this are built with -std=c++20; abseil mixes
+        # standards badly, which is what ABSL_PROPAGATE_CXX_STD exists to stop
+        "-DABSL_PROPAGATE_CXX_STD=ON",
+        "-DCMAKE_CXX_STANDARD=20",
+    ]
+    for command in (configure, ["cmake", "--build", str(build), "-j", str(os.cpu_count() or 8)]):
+        done = subprocess.run(command, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise RuntimeError(
+                f"intj: {' '.join(command[:2])} failed for {root.name}:\n{done.stderr[-2000:]}"
+            )
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    wanted = [c for c in KernelCache if c is not KernelCache.INTJ]
+    if argv and argv != ["all"]:
+        try:
+            wanted = [KernelCache(name) for name in argv]
+        except ValueError:
+            print(f"usage: python -m intj.kernel_cache [tsl|absl|all]", file=sys.stderr)
+            return 2
+    for cache in wanted:
+        if cache is KernelCache.INTJ:
             continue
-        archives = sorted(str(p) for p in directory.rglob("libabsl_*.a"))
-        archives += sorted(str(p) for p in directory.rglob("libabsl_*.so"))
-        if archives:
-            return (str(directory), tuple(archives))
-    return None
+        source = _SOURCES[cache]
+        print(f"intj: installing {cache.value} {source.version} into {_source_root(cache)}")
+        toolchain = install(cache)
+        print(f"  include {toolchain['include_dirs'][0]}")
+        if toolchain["archives"]:
+            print(f"  {len(toolchain['archives'])} libraries in {toolchain['library_dirs'][0]}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

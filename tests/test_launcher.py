@@ -502,7 +502,7 @@ def test_kernel_cache_choice_reaches_the_digest():
 
 def test_unavailable_kernel_cache_is_refused(monkeypatch):
     monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
-    with pytest.raises(UnsupportedKernel, match="INTJ_TSL_INCLUDE"):
+    with pytest.raises(UnsupportedKernel, match="python -m intj.kernel_cache tsl"):
         create_launcher(scale, kernel_cache=KernelCache.TSL)
 
 

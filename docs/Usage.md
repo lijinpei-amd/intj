@@ -149,16 +149,21 @@ compares the other two against.
 Every launch turns the spec key into a compiled kernel through a hash map.
 `create_launcher(..., kernel_cache=...)` picks which, with `intj.KernelCache`:
 
-| | what it is | needs |
+| | what it is | provision with |
 |---|---|---|
 | `INTJ` (default) | intj's open-addressed table, 72 lines | nothing |
-| `TSL` | `tsl::robin_map`, handed the precomputed hash | `$INTJ_TSL_INCLUDE` |
-| `ABSL` | `absl::flat_hash_map` | `$INTJ_ABSL_INCLUDE`, `$INTJ_ABSL_LIB` |
+| `TSL` | `tsl::robin_map`, handed the precomputed hash | `python -m intj.kernel_cache tsl` |
+| `ABSL` | `absl::flat_hash_map` | `python -m intj.kernel_cache absl` |
 
 `TSL` and `ABSL` are C++ maps, so either one compiles the whole module as C++
-even under `SHIM` or `CPYTHON` access. Neither is vendored; both are found
-through those variables, and asking for one that is not there is an error rather
-than a silent fall back to `INTJ`.
+even under `SHIM` or `CPYTHON` access.
+
+Neither is vendored, and **nothing installed on the machine is searched for**:
+that command downloads a pinned version, checks its sha256, and (for abseil)
+builds it into `$TRITON_HOME/.triton/intj/deps/`. What a module was built
+against is then a property of intj's cache rather than of the host. Asking for a
+backend that is not provisioned is an error naming that command, never a silent
+fall back to `INTJ`.
 
 Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, 5-word key,
 ns per lookup, hit):
