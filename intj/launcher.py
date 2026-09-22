@@ -1,5 +1,6 @@
 """Render, build and load the C launcher for a `@triton.jit` kernel."""
 
+import abc
 import dataclasses
 import functools
 import hashlib
@@ -85,11 +86,11 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
         # after the knob is flipped back on.
-        spec_pointer_range=1 if backend["pointer_range"] else 0,
-        driver_path=backend["library"](),
-        launch_symbol=backend["launch_symbol"],
-        error_symbol=backend["error_symbol"],
-        error_style=backend["error_style"],
+        spec_pointer_range=1 if backend.pointer_range else 0,
+        driver_path=backend.library_path(),
+        launch_symbol=backend.launch_symbol,
+        error_symbol=backend.error_symbol,
+        error_style=backend.error_style,
         libtorch_path=os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
     )
 
@@ -127,37 +128,67 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
     return module.entry
 
 
-def _hip_library():
-    from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+class Backend(abc.ABC):
+    """How intj reaches one triton backend's driver API.
 
-    return _get_path_to_hip_runtime_dylib()
+    Everything backend-specific lives in a subclass; nothing else in intj, and
+    nothing in the template, branches on a backend name.  Supporting another
+    triton backend is a subclass plus a `register()` call, provided its driver
+    exposes a `cuLaunchKernel`-shaped launch entry point.
+    """
+
+    #: triton target backend name, i.e. `get_current_target().backend`
+    name: str
+    #: f(fn, gx,gy,gz, bx,by,bz, shared, stream, params, extra) -> error code
+    launch_symbol: str
+    #: error-string lookup, called as `error_style` says
+    error_symbol: str
+    #: "return"   const char *f(int)
+    #: "outparam" int f(int, const char **)
+    error_style: str
+    #: backend specializes pointers on a 2 GiB range (AMD's "S" spec bit)
+    pointer_range: bool
+
+    @abc.abstractmethod
+    def library_path(self) -> str:
+        """The driver dylib to dlopen -- the same one triton itself uses."""
 
 
-BACKENDS = {
-    # Everything backend-specific lives here. A triton backend whose driver
-    # exposes a `cuLaunchKernel`-shaped entry point is supported by adding an
-    # entry -- no other code or template change.
-    #
-    # library:        dylib to dlopen, the one triton itself uses
-    # launch_symbol:  f(fn, gx,gy,gz, bx,by,bz, shared, stream, params, extra)
-    # error_style:    "return"   const char *f(int)
-    #                 "outparam" int f(int, const char **)
-    # pointer_range:  backend specializes pointers on a 2 GiB range (AMD's "S")
-    "hip": {
-        "library": _hip_library,
-        "launch_symbol": "hipModuleLaunchKernel",
-        "error_symbol": "hipGetErrorString",
-        "error_style": "return",
-        "pointer_range": True,
-    },
-    "cuda": {
-        "library": lambda: "libcuda.so.1",  # already mapped by torch
-        "launch_symbol": "cuLaunchKernel",
-        "error_symbol": "cuGetErrorString",
-        "error_style": "outparam",
-        "pointer_range": False,
-    },
-}
+class HipBackend(Backend):
+    name = "hip"
+    launch_symbol = "hipModuleLaunchKernel"
+    error_symbol = "hipGetErrorString"
+    error_style = "return"
+    pointer_range = True
+
+    def library_path(self):
+        from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+
+        return _get_path_to_hip_runtime_dylib()
+
+
+class CudaBackend(Backend):
+    name = "cuda"
+    launch_symbol = "cuLaunchKernel"
+    error_symbol = "cuGetErrorString"
+    error_style = "outparam"
+    pointer_range = False
+
+    def library_path(self):
+        return "libcuda.so.1"  # already mapped by torch, resolved through the normal search path
+
+
+BACKENDS: dict[str, Backend] = {}
+
+
+def register(backend: Backend):
+    """Make `backend` usable by `create_launcher`, replacing any same-named one."""
+    BACKENDS[backend.name] = backend
+    return backend
+
+
+register(HipBackend())
+register(CudaBackend())
 
 
 # --------------------------------------------------------------------- checks
@@ -178,8 +209,8 @@ def _check_kernel(jit_func, options):
     target = driver.active.get_current_target()
     if target.backend not in BACKENDS:
         raise UnsupportedKernel(
-            f"intj: backend {target.backend!r} is unknown; add an entry to intj.launcher.BACKENDS "
-            f"(have: {', '.join(sorted(BACKENDS))})"
+            f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
+            f"register() it (have: {', '.join(sorted(BACKENDS))})"
         )
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")
