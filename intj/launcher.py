@@ -206,7 +206,7 @@ def _loaded_module(
 def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> types.ModuleType:
     """Load the extension for this key, rendering and building it only if needed.
 
-    The `.so` lands in `<cache>/loaded_modules/<digest>/<module>/<kernel>`, so the
+    The `.so` lands in `$TRITON_HOME/.triton/intj/<digest>/<module>/<kernel>`, so the
     artifact says where the kernel came from and which build it is. Its leaf name
     is the kernel's own name, because CPython derives `PyInit_<leaf>` from the
     last dotted component of the spec name -- that is also what `perf` and
@@ -224,20 +224,19 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
 
     digest = key.digest()
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-    # $TRITON_HOME/.triton/intj, a sibling of triton's own cache
-    root = Path(knobs.cache.get_triton_dir("intj")) / "loaded_modules"
-    directory = root / digest / jit_func.__module__
+    # a sibling of triton's own cache
+    directory = Path(knobs.cache.get_triton_dir("intj")) / digest / jit_func.__module__
     so_path = directory / f"{module_name}{suffix}"
     if not so_path.exists():
         _build(so_path, module_name, dataclasses.replace(context, module_name=module_name))
 
-    # A distinct spec name per digest keeps two builds of one kernel apart.
-    #
     # Loading by hand, rather than through import_module, keeps the module out of
     # sys.modules: intj's own dict owns it, so dropping a launcher can free it.
     # The interpreter does not cache it either -- that only happens for
-    # single-phase extensions, and the template uses PyModuleDef_Init.
-    spec_name = f"intj.loaded_modules.{get_full_name(jit_func)}.{digest[:16]}.{module_name}"
+    # single-phase extensions, and the template uses PyModuleDef_Init. So the
+    # spec name is a label, not a key; only its last component is load-bearing,
+    # as `PyInit_<leaf>`. The digest is in there to say which build this is.
+    spec_name = f"intj.{digest[:16]}.{module_name}"
     spec = importlib.util.spec_from_file_location(spec_name, so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so_path}")

@@ -271,7 +271,7 @@ def test_modules_stay_out_of_the_import_system():
     before = set(sys.modules)
     first = getattr(create_launcher(scale, options={"num_stages": 6}), "__self__")
     # triton may register modules of its own here (hip_utils); only ours matter
-    assert [m for m in set(sys.modules) - before if m.startswith("intj.loaded_modules")] == []
+    assert [m for m in set(sys.modules) - before if m.startswith("intj.")] == []
     assert first.__spec__.name not in sys.modules
 
     launcher_module._LOADED.clear()
@@ -292,7 +292,7 @@ def test_source_and_binary_are_cached_on_disk():
     source = so_path.with_name("scale.c")
     assert so_path.exists() and source.exists()
     assert "PyInit_scale" in source.read_text()
-    assert so_path.parent.parent.parent.name == "loaded_modules"
+    assert so_path.parent.parent.parent.name == "intj"
     # no half-written artifacts left behind by the atomic install
     assert not [p for p in so_path.parent.iterdir() if p.name.startswith(".")]
 

@@ -129,13 +129,16 @@ cache miss re-checks it against triton's own binder.
 
 Artifacts land at
 
-    $TRITON_HOME/.triton/intj/loaded_modules/<digest>/<module>/<kernel><EXT_SUFFIX>
-    $TRITON_HOME/.triton/intj/loaded_modules/<digest>/<module>/<kernel>.c
+    $TRITON_HOME/.triton/intj/<digest>/<module>/<kernel><EXT_SUFFIX>
+    $TRITON_HOME/.triton/intj/<digest>/<module>/<kernel>.c
 
 next to triton's own caches. The rendered source is kept beside the binary: it is what
 you read when a launch misbehaves. The symbol is the kernel's own name
 (`PyInit_<kernel>`) — what `perf` and `/proc/<pid>/maps` show. Two builds of one kernel
 are two directories and two independent modules.
+
+Modules are loaded by hand, so none of this reaches `sys.modules`: the module's name
+(`intj.<digest>.<kernel>`) is a label for tracebacks, not a lookup key.
 
 `create_launcher` looks for its module in three places, in order: the process-level
 `ModuleKey` dict (same module, so the same kernel cache), the `.so` on disk (loaded
