@@ -10,10 +10,16 @@
 #include <stdint.h>
 #include <string.h>
 
-/* g++ and gcc disagree about what is worth inlining here: a `try` block inflates
- * g++'s size estimate enough that it leaves the tensor reader and the integer
- * decoder out of line, costing a real call per argument on the hot path.  The
- * exception machinery is free at runtime; its effect on the inliner is not. */
+#if PY_VERSION_HEX < 0x030C0000
+#error "intj requires CPython 3.12 or newer (PyLongObject layout)"
+#endif
+
+/* g++ and gcc disagree about what is worth inlining here: a `try` block
+ * inflates g++'s size estimate enough that it leaves the tensor reader and the
+ * integer decoder out of line, costing a real call per argument on the hot
+ * path.  The exception machinery is free at runtime; its effect on the inliner
+ * is not.
+ */
 #if defined(__GNUC__) || defined(__clang__)
 #define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
@@ -22,12 +28,10 @@
 
 /* ---------------------------------------------------------------- integers */
 
-#if PY_VERSION_HEX < 0x030C0000
-#error "intj requires CPython 3.12 or newer (PyLongObject layout)"
-#endif
-/* `static_assert` rather than `_Static_assert`: the former is spelled the same in
- * C11 (via assert.h, which Python.h pulls in) and in C++, and the CXX access mode
- * compiles this header as C++. */
+/* `static_assert` rather than `_Static_assert`: the former is spelled the same
+ * in C11 (via assert.h, which Python.h pulls in) and in C++, and the CXX access
+ * mode compiles this header as C++.
+ */
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
 /* CPython 3.12 PyLongObject layout, see cpython/longintrepr.h. */
@@ -181,7 +185,7 @@ static int intj_map_put(intj_map *m, const uint64_t *k, uint64_t h,
  * opaque int32 discriminator) and, where the backend specializes on pointer
  * range, the storage size.  Exactly one of three strategies is compiled in.
  *
- *   INTJ_ACCESS_SHIM     read torch's structs at offsets supplied at load time
+ *   INTJ_ACCESS_SHIM     read torch's structs at offsets installed at load
  *   INTJ_ACCESS_CPYTHON  call through the interpreter
  *   INTJ_ACCESS_CXX      C++, against torch's own headers
  *
@@ -207,16 +211,18 @@ typedef struct {
 #ifdef INTJ_ACCESS_CXX
 /* Deliberately NOT torch/csrc/autograd/python_variable.h.  That header declares
  * the four-line struct below and nothing else intj needs, but it also pulls in
- * pybind11 -- 79% of the resulting .text, none of it reachable, and 9.5 s of the
- * 11 s build.  These three give byte-identical code for the reader. */
+ * pybind11 -- 79% of the resulting .text, none of it reachable, and 9.5 s of
+ * the 11 s build.  These three give byte-identical code for the reader.
+ */
 #include <ATen/core/Tensor.h>
 #include <c10/core/StorageImpl.h>
 #include <c10/core/TensorImpl.h>
 
-/* The head of THPVariable.  Declaring it here rather than including torch's copy
- * asserts one thing: that `cdata` is the first member after PyObject_HEAD.  That
- * assertion is checked at load against the probe, which finds the offset by
- * scanning the object for the TensorImpl pointer -- see set_torch_version. */
+/* The head of THPVariable.  Declaring it here rather than including torch's
+ * copy asserts one thing: that `cdata` is the first member after PyObject_HEAD.
+ * That assertion is checked at load against the verified layout for this torch
+ * -- see set_torch_version.
+ */
 struct intj_THPVariable {
   PyObject_HEAD
   at::Tensor cdata;
@@ -233,7 +239,8 @@ static PyObject *intj_str_nbytes;
 #if defined(INTJ_ACCESS_SHIM)
 
 /* Reads torch's structs directly. `want_size` is a compile-time-ish flag: the
- * storage size is only needed where the backend specializes on pointer range. */
+ * storage size is only needed where the backend specializes on pointer range.
+ */
 static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
                                    void **p, int32_t *dt, int want_size,
                                    int64_t *sz) {
@@ -242,10 +249,11 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   int64_t numel = *(const int64_t *)(ti + abi->numel);
   uint8_t code = *(const uint8_t *)(ti + abi->data_type);
   *dt = (int32_t)code;
-  /* A null storage means the tensor has none at all -- sparse, and anything else
-   * with a non-dense impl.  torch raises there, and so must this: handing the
-   * kernel a null pointer instead would be a silent wrong launch.  Every dense
-   * tensor has a storage, including a zero-element one. */
+  /* A null storage means the tensor has none at all -- sparse, and anything
+   * else with a non-dense impl.  torch raises there, and so must this: handing
+   * the kernel a null pointer instead would be a silent wrong launch.  Every
+   * dense tensor has a storage, including a zero-element one.
+   */
   if (!si) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: cannot access data pointer of a tensor with no "
@@ -264,12 +272,13 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
     return 0;
   }
   if (code >= INTJ_NDTYPES || !abi->itemsize[code]) {
-    /* A dtype intj has no element size for means the offsets are wrong, or torch
-     * grew a dtype after the table was built.  Either way, refuse rather than
-     * compute a pointer from a guess. */
+    /* A dtype intj has no element size for means the offsets are wrong, or
+     * torch grew a dtype after the table was built.  Either way, refuse rather
+     * than compute a pointer from a guess.
+     */
     PyErr_Format(PyExc_RuntimeError,
-                 "intj: unknown torch dtype code %d; this build's tensor layout "
-                 "does not match the running torch",
+                 "intj: unknown torch dtype code %d; this build's tensor "
+                 "layout does not match the running torch",
                  (int)code);
     return -1;
   }
@@ -292,10 +301,11 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   PyObject *d = PyObject_GetAttr(o, intj_str_dtype);
   if (!d)
     return -1;
-  /* struct THPDtype { PyObject_HEAD at::ScalarType scalar_type; char name[65]; }
-   * ScalarType is `enum class : int8_t`, so this is the first byte of payload.
-   * Only reached after INTJ_DECODE's exact-type test, so `o` really is a tensor
-   * and `d` really is a THPDtype. */
+  /* struct THPDtype { PyObject_HEAD at::ScalarType scalar_type; char name[65];
+   * } ScalarType is `enum class : int8_t`, so this is the first byte of
+   * payload. Only reached after INTJ_DECODE's exact-type test, so `o` really is
+   * a tensor and `d` really is a THPDtype.
+   */
   *dt = (int32_t) * (const int8_t *)((char *)d + sizeof(PyObject));
   Py_DECREF(d);
 
@@ -328,30 +338,30 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
 /* Exactly the loads the shim mode makes, with the compiler supplying the field
  * offsets instead of a probe.
  *
- * The fields are private, so they are reached through the explicit-instantiation
- * trick: [temp.spec]/6 says access checking does not apply to names appearing in
- * an explicit instantiation, so a pointer-to-private-member is legal there, and
- * the friend injected by `Rob` hands it back.  (Johannes Schaub,
- * bloglitb.blogspot.com/2010/07/access-to-private-members-thats-easy.html.)
+ * The fields are private, so they are reached through the
+ * explicit-instantiation trick: [temp.spec]/6 says access checking does not apply to names appearing
+ * in an explicit instantiation, so a pointer-to-private-member is legal there,
+ * and the friend injected by `Rob` hands it back.  (Johannes Schaub, 2010:
+ * bloglitb.blogspot.com/2010/07/access-to-private-members-thats-easy.html)
  *
- * This is deliberate, and it buys two things that the public accessors cannot:
+ * This is deliberate, and it buys two things the public accessors cannot:
  *
  *  - No throw sites at all.  `t.data_ptr()`, `t.storage()`, `storage.nbytes()`
- *    and even `numel()` each hide a TORCH_CHECK, and an exception crossing into
- *    CPython's C frames is `std::terminate` -- measured, a core dump on a sparse
- *    tensor.  Reading the fields means every failure intj can reach is an
+ *    and even `numel()` each hide a TORCH_CHECK, and an exception crossing
+ *    into CPython's C frames is `std::terminate` -- measured, a core dump on a
+ *    sparse tensor.  Reading the fields makes every failure intj can reach an
  *    explicit branch below, so this path needs no try/catch, which is worth
  *    ~4 ns per decode in inlining and block layout alone.
- *  - No accessor that torch declines to inline.  `StorageImpl::nbytes()` is
- *    defined in-class but goes through the PLT in a module this size, and
+ *
+ *  - No accessor torch declines to inline.  `StorageImpl::nbytes()` is defined
+ *    in-class but goes through the PLT in a module this size, and
  *    `sym_nbytes()` materialises a `SymInt` whose refcounting copy and destroy
- *    cost ~129 instructions for a value that is never heap-allocated here.
+ *    cost ~129 instructions for a value never heap-allocated here.
  *
  * The cost is that a torch release renaming any of these fields breaks the
  * build.  That is the right failure: a compile error, not a wrong pointer --
  * which is what the shim mode would get, since it cannot see names at all.
- */
-namespace intj_rob {
+ */namespace intj_rob {
 template <typename Tag, typename Tag::type M>
 struct Rob {
   friend typename Tag::type get(Tag) { return M; }
@@ -373,8 +383,9 @@ INTJ_ROB(si_data_ptr, c10::StorageImpl, data_ptr_, c10::DataPtr)
 }  // namespace intj_rob
 
 static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
-                                               PyObject *o, void **p, int32_t *dt,
-                                               int want_size, int64_t *sz) {
+                                               PyObject *o, void **p,
+                                               int32_t *dt, int want_size,
+                                               int64_t *sz) {
   using namespace intj_rob;
   (void)abi;
   const at::Tensor &t = ((intj_THPVariable *)o)->cdata;
@@ -405,10 +416,11 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
    * live and whose storage_offset is not zero; see the shim reader.  Reading
    * `numel_` rather than calling `numel()` also matches the shim mode on a
    * tensor whose impl overrides it -- see docs/Usage.md. */
+  const int64_t itemsize = (int64_t)meta.itemsize();
   *p = (ti->*get(ti_numel())) == 0
            ? NULL
            : (void *)((char *)(si->*get(si_data_ptr())).get() +
-                      (ti->*get(ti_storage_offset())) * (int64_t)meta.itemsize());
+                      (ti->*get(ti_storage_offset())) * itemsize);
   return 0;
 }
 
@@ -421,7 +433,8 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
  * parameter it was reading. */
 static inline void intj_note_param(const char *pname) {
   PyObject *exc = PyErr_GetRaisedException();
-  PyErr_Format(PyExc_RuntimeError, "intj: cannot read tensor argument '%s'", pname);
+  PyErr_Format(PyExc_RuntimeError, "intj: cannot read tensor argument '%s'",
+               pname);
   if (exc) {
     PyObject *raised = PyErr_GetRaisedException();
     PyException_SetCause(raised, Py_NewRef(exc));
@@ -458,13 +471,14 @@ static inline int intj_dtype_selfcheck(PyObject *torch) {
     return -1;
   const char *payload = (const char *)f32 + sizeof(PyObject);
   int code = (int)*(const int8_t *)payload;
-  int ok = code >= 0 && code < INTJ_NDTYPES && strncmp(payload + 1, "float32", 8) == 0;
+  int ok = code >= 0 && code < INTJ_NDTYPES &&
+           strncmp(payload + 1, "float32", 8) == 0;
   Py_DECREF(f32);
   if (!ok) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: torch.dtype is not laid out as intj expects "
                     "(THPDtype { PyObject_HEAD ScalarType; char name[] }); "
-                    "this torch is too new or too old for the cpython access mode");
+                    "this torch is too new or too old for the cpython mode");
     return -1;
   }
   return 0;
@@ -513,14 +527,14 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
  *
  * Reads `ob_fval` rather than calling `PyFloat_AS_DOUBLE`: that is a static
  * inline in CPython's headers, and in the c++ mode's much larger translation
- * unit g++ leaves it out of line -- a real call per float argument.  The two are
- * the same field read.
+ * unit g++ leaves it out of line -- a real call per float argument.  The two
+ * are the same field read.
  *
- * `st` must expose tensor_type/param_type and the torch ABI block.
- * On failure it sets a python error and returns NULL from the enclosing
- * function -- which must therefore return PyObject *.  (A `goto` to a shared
- * label would be tidier, but C++ forbids jumping over the initializations that
- * follow in `entry`, and the CXX access mode compiles this as C++.)
+ * `st` must expose tensor_type/param_type and the torch ABI block. On failure
+ * it sets a python error and returns NULL from the enclosing function -- which
+ * must therefore return PyObject *.  (A `goto` to a shared label would be
+ * tidier, but C++ forbids jumping over the initializations that follow in
+ * `entry`, and the CXX access mode compiles this as C++.) /
  */
 #define INTJ_DECODE(st, o, word, vals, np, SPEC, ALIGN, SBIT, pname)           \
   do {                                                                         \
@@ -578,7 +592,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         (np)++;                                                                \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      float _f = (float)((PyFloatObject *)_o)->ob_fval;                                 \
+      float _f = (float)((PyFloatObject *)_o)->ob_fval;                     \
       uint32_t _bits;                                                          \
       memcpy(&_bits, &_f, 4);                                                  \
       (word) = INTJ_WORD(INTJ_T_FP32, 0, 0);                                   \
@@ -621,7 +635,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         (w1) = _u;                                                             \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      double _d = ((PyFloatObject *)_o)->ob_fval;                                       \
+      double _d = ((PyFloatObject *)_o)->ob_fval;                           \
       (w0) = INTJ_WORD(INTJ_T_CX_FLOAT, 0, 0);                                 \
       memcpy(&(w1), &_d, 8);                                                   \
     } else {                                                                   \

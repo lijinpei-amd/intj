@@ -29,7 +29,7 @@ class TorchAccess(enum.Enum):
     AUTO = "auto"
     #: Call through the interpreter.  Assumes nothing but THPDtype, which self-checks.
     CPYTHON = "cpython"
-    #: Read torch's structs at offsets discovered at load.  No torch code runs.
+    #: Read torch's structs at verified offsets.  No torch code runs.
     SHIM = "shim"
     #: Compile the extension as C++ against torch's headers.
     CXX = "cxx"
@@ -39,9 +39,9 @@ class TorchAccess(enum.Enum):
 class TensorLayout:
     """Byte offsets the `SHIM` mode reads, plus the dtype-to-element-size table.
 
-    Discovered from the running process rather than from a table keyed on
-    `torch.__version__`: the offsets are then true by construction for whatever
-    torch is loaded, including one intj has never seen.
+    The offsets come from `_LAYOUTS`, keyed on the torch version; `itemsize` is
+    built from the running torch, since which dtypes exist is not a question
+    about where fields sit.
     """
 
     cdata: int  # PyObject*    -> TensorImpl*
