@@ -18,7 +18,7 @@ included by every rendered module) and `entry.c.jinja` (the rendered entry point
 ## RenderContext and ModuleKey are value types
 
 Frozen, every field immutable (tuples, never lists), so both compare by value, hash,
-and serialize through `to_json()`. A list field anywhere in either compares fine and
+and serialize to JSON (what `ModuleKey.digest()` hashes). A list field anywhere in either compares fine and
 blows up on `hash()`; `test_value_types_compare_hash_and_serialize` guards that.
 
 ## Backends are data, not branches

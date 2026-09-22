@@ -19,8 +19,6 @@ from intj.launcher import (
     Param,
     RenderContext,
     UnsupportedKernel,
-    _symbol_name,
-    to_json,
     triton_specialization,
 )
 
@@ -342,8 +340,8 @@ def test_value_types_compare_hash_and_serialize(build, differing):
     assert one == same and one != other
     assert hash(one) == hash(same) and hash(one) != hash(other)
     assert len({one: 1, same: 2, other: 3}) == 2
-    assert json.loads(to_json(one)) == json.loads(to_json(same))
-    assert json.loads(to_json(one)) != json.loads(to_json(other))
+    dump = lambda v: json.dumps(dataclasses.asdict(v), sort_keys=True)  # noqa: E731
+    assert dump(one) == dump(same) and dump(one) != dump(other)
 
 
 def test_module_key_digest_tracks_every_field():
@@ -369,8 +367,6 @@ def test_artifact_layout_and_nested_kernels():
         return inner
 
     nested = make()  # qualname carries `<locals>`, which a C symbol cannot
-    assert _symbol_name(nested) == "inner"
-
     module = getattr(create_launcher(nested), "__self__")
     path = pathlib.Path(module.__file__)
     assert path.name.startswith("inner.")

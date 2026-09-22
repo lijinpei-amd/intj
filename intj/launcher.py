@@ -33,11 +33,6 @@ class UnsupportedKernel(NotImplementedError):
     """Raised for kernels or options outside intj's (deliberately small) scope."""
 
 
-def to_json(value: Any) -> str:
-    """Serialize a frozen dataclass, nested ones included, deterministically."""
-    return json.dumps(dataclasses.asdict(value), sort_keys=True)
-
-
 @dataclasses.dataclass(frozen=True)
 class Param:
     """One declared kernel parameter, as the template needs it."""
@@ -92,7 +87,9 @@ class ModuleKey:
     schema: int = SCHEMA_VERSION
 
     def digest(self) -> str:
-        return hashlib.sha256(to_json(self).encode()).hexdigest()
+        # sort_keys so the digest does not depend on field order
+        blob = json.dumps(dataclasses.asdict(self), sort_keys=True)
+        return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def create_launcher(
@@ -200,18 +197,18 @@ def _loaded_module(
     with _LOAD_LOCK:
         module = _LOADED.get(key)
         if module is None:
-            name = _symbol_name(jit_func)
-            src = _render(dataclasses.replace(context, module_name=name))
+            import jinja2
+
+            # the kernel's own name, unless python allows something C does not
+            name = jit_func.__name__
+            if not (name.isidentifier() and name.isascii()):
+                name = "kernel"
+            template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
+            src = template.render(**dataclasses.asdict(dataclasses.replace(context, module_name=name)))
             module = _load(jit_func, name, key.digest(), src)
             module.set_compile_callback(_make_compile_callback(jit_func, params, options))
             _LOADED[key] = module
         return module
-
-
-def _symbol_name(jit_func: JitFunction) -> str:
-    """The kernel's own name, unless python allows something C does not."""
-    name = jit_func.__name__
-    return name if name.isidentifier() and name.isascii() else "kernel"
 
 
 def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> types.ModuleType:
@@ -223,8 +220,12 @@ def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> typ
     last dotted component of the spec name -- that is also what `perf` and
     /proc/<pid>/maps show.
     """
+    from triton import knobs
+
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-    directory = _cache_root() / digest / jit_func.__module__
+    # $TRITON_HOME/.triton/intj, a sibling of triton's own cache
+    root = Path(knobs.cache.get_triton_dir("intj")) / "loaded_modules"
+    directory = root / digest / jit_func.__module__
     so_path = directory / f"{module_name}{suffix}"
     if not so_path.exists():
         from triton.runtime.build import compile_so_from_src
@@ -251,14 +252,6 @@ def _install(content: bytes, path: Path) -> None:
     staged = path.with_name(f".{path.name}.{os.getpid()}")
     staged.write_bytes(content)
     os.replace(staged, path)
-
-
-@functools.lru_cache(maxsize=1)
-def _cache_root() -> Path:
-    """`$TRITON_HOME/.triton/intj`, a sibling of triton's own cache."""
-    from triton import knobs
-
-    return Path(knobs.cache.get_triton_dir("intj")) / "loaded_modules"
 
 
 class Backend(abc.ABC):
@@ -424,13 +417,6 @@ def _render_params(jit_func: JitFunction) -> tuple[Param, ...]:
 
 
 # -------------------------------------------------------------------- render
-
-
-def _render(context: RenderContext) -> str:
-    import jinja2
-
-    template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
-    return template.render(**dataclasses.asdict(context))
 
 
 @functools.lru_cache(maxsize=1)
