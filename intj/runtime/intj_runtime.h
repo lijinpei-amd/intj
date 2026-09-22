@@ -20,8 +20,6 @@
 #define INTJ_ALWAYS_INLINE inline
 #endif
 
-/* ---------------------------------------------------------------- integers */
-
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
 /* CPython 3.12 PyLongObject layout, see cpython/longintrepr.h. */
@@ -74,8 +72,6 @@ static INTJ_ALWAYS_INLINE int intj_as_u64(PyObject *o, uint64_t *out) {
   return 0;
 }
 
-/* ------------------------------------------------------------------- hash */
-
 static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
   __uint128_t r = (__uint128_t)a * b;
   return (uint64_t)(r >> 64) ^ (uint64_t)r;
@@ -88,8 +84,6 @@ static inline uint64_t intj_hash(const uint64_t *w) {
     h = intj_mix(h ^ s1, w[i] ^ s0);
   return intj_mix(h, INTJ_NWORDS * 8 + s1);
 }
-
-/* ------------------------------------------------------------ kernel cache */
 
 typedef struct {
   void *function;     /* hipFunction_t / CUfunction */
@@ -168,8 +162,6 @@ static int intj_map_put(intj_map *m, const uint64_t *k, uint64_t h,
   intj_map_insert(m, k, h, val);
   return 0;
 }
-
-/* ------------------------------------------------------------ torch access */
 
 /* intj reads three things off a tensor: the data pointer, the dtype (as an
  * opaque int32 discriminator) and, where the backend specializes on pointer
@@ -475,8 +467,6 @@ static inline int intj_dtype_selfcheck(PyObject *torch) {
   return 0;
 }
 
-/* ----------------------------------------------------------- gpu  runtime */
-
 /* hipModuleLaunchKernel and cuLaunchKernel take the same arguments in the same
  * order.  Their error-string calls do not, hence the two typedefs. */
 typedef int32_t (*intj_launch_t)(void *f, uint32_t gx, uint32_t gy, uint32_t gz,
@@ -485,8 +475,6 @@ typedef int32_t (*intj_launch_t)(void *f, uint32_t gx, uint32_t gy, uint32_t gz,
                                  void **extra);
 typedef const char *(*intj_error_string_ret_t)(int32_t);
 typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
-
-/* ----------------------------------------------------------- spec-key tags */
 
 #define INTJ_T_NONE 1u     /* ("constexpr", None) */
 #define INTJ_T_ONE 2u      /* int 1 folded to ("constexpr", 1) */
@@ -508,8 +496,6 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
 #define INTJ_WORD(tag, dtype, flags)                                           \
   (((uint64_t)(tag) << 56) | ((uint64_t)(uint32_t)(dtype) << 8) |              \
    (uint64_t)(flags))
-
-/* --------------------------------------------------------- argument decode */
 
 /* Decode one non-constexpr kernel argument: fills one key word, and appends at
  * most one value slot.  SPEC/ALIGN/SBIT are render-time constants

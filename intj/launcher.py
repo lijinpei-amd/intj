@@ -72,8 +72,6 @@ class RenderContext:
     cxx_abi: int | None
 
 
-
-
 @dataclasses.dataclass(frozen=True)
 class ModuleKey:
     """Everything the rendered `.so` depends on, hashed into its digest.
@@ -477,9 +475,6 @@ register(HipBackend())
 register(CudaBackend())
 
 
-# --------------------------------------------------------------------- checks
-
-
 def _current_target() -> Any:
     """The active triton target, which triton types as optional."""
     from triton.runtime.driver import driver
@@ -575,9 +570,6 @@ def _render_params(jit_func: JitFunction) -> tuple[Param, ...]:
     return tuple(params)
 
 
-# -------------------------------------------------------------------- render
-
-
 @functools.lru_cache(maxsize=1)
 def _triton_identity() -> tuple[Any, ...]:
     import triton
@@ -598,9 +590,6 @@ def _compiler_identity(language: str = "c") -> tuple[str, ...]:
     except Exception:  # pragma: no cover - compiler without --version
         version = ""
     return (str(cc), version)
-
-
-# ------------------------------------------------------------- compile hook
 
 
 def _make_compile_callback(
