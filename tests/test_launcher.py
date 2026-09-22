@@ -349,8 +349,8 @@ def test_artifact_layout_and_nested_kernels():
     module = getattr(create_launcher(nested), "__self__")
     path = pathlib.Path(module.__file__)
     assert path.name.startswith("inner.")
-    assert path.parent.parent.name == nested.__module__
-    assert len(path.parent.name) == 64  # the ModuleKey digest
+    assert path.parent.name == nested.__module__
+    assert len(path.parent.parent.name) == 64  # the ModuleKey digest
 
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")

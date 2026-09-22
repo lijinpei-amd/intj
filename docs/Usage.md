@@ -129,7 +129,7 @@ cache miss re-checks it against triton's own binder.
 
 Artifacts land at
 
-    $TRITON_CACHE_DIR/intj/loaded_modules/<module>/<digest>/<kernel><EXT_SUFFIX>
+    $TRITON_CACHE_DIR/intj/loaded_modules/<digest>/<module>/<kernel><EXT_SUFFIX>
 
 so the file says where the kernel came from and which build it is, and the symbol is
 the kernel's own name (`PyInit_<kernel>`) — what `perf` and `/proc/<pid>/maps` show.
