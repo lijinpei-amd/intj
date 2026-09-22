@@ -31,6 +31,11 @@ class UnsupportedKernel(NotImplementedError):
     """Raised for kernels or options outside intj's (deliberately small) scope."""
 
 
+def to_json(value: Any) -> str:
+    """Serialize a frozen dataclass, nested ones included, deterministically."""
+    return json.dumps(dataclasses.asdict(value), sort_keys=True)
+
+
 @dataclasses.dataclass(frozen=True)
 class Param:
     """One declared kernel parameter, as the template needs it."""
@@ -52,7 +57,7 @@ class RenderContext:
 
     module_name: str
     kernel_repr: str
-    params: list[Param]
+    params: tuple[Param, ...]
     nwords: int  # spec-key length, in uint64 words
     max_slots: int  # kernel param slots, upper bound
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
@@ -76,16 +81,16 @@ class ModuleKey:
     runtime_header: str  # intj_runtime.h bytes, hex
     context: RenderContext  # with an empty module name: the digest is what names it
     cache_key: str  # jit_func.cache_key: the kernel source and its callees
-    params: list[list[Any]]  # per-parameter decorator state, which cache_key misses
-    target: list[Any]  # backend, arch, warp size
+    params: tuple[tuple[Any, ...], ...]  # per-parameter decorator state, which cache_key misses
+    target: tuple[Any, ...]  # backend, arch, warp size
     options: str  # canonicalized compile options, hashed by triton
-    triton: list[Any]  # triton version and libtriton identity
-    compiler: list[str]  # the C compiler triton would invoke
+    triton: tuple[Any, ...]  # triton version and libtriton identity
+    compiler: tuple[str, ...]  # the C compiler triton would invoke
     ext_suffix: str | None
     schema: int = SCHEMA_VERSION
 
     def digest(self) -> str:
-        return hashlib.sha256(json.dumps(dataclasses.asdict(self), sort_keys=True).encode()).hexdigest()
+        return hashlib.sha256(to_json(self).encode()).hexdigest()
 
 
 def create_launcher(
@@ -152,12 +157,12 @@ def create_launcher(
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
         context=context,
         cache_key=jit_func.cache_key,
-        params=[
-            [p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
-             p.do_not_specialize_on_alignment, p.has_default, repr(p.default)]
+        params=tuple(
+            (p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
+             p.do_not_specialize_on_alignment, p.has_default, repr(p.default))
             for p in jit_func.params
-        ],
-        target=[target.backend, target.arch, target.warp_size],
+        ),
+        target=(target.backend, target.arch, target.warp_size),
         options=canonical_options.hash(),
         triton=_triton_identity(),
         compiler=_compiler_identity(),
@@ -323,7 +328,7 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
     return jit_func
 
 
-def _render_params(jit_func: JitFunction) -> list[Param]:
+def _render_params(jit_func: JitFunction) -> tuple[Param, ...]:
     """One render-time descriptor per declared kernel parameter."""
     params: list[Param] = []
     word = 1
@@ -346,7 +351,7 @@ def _render_params(jit_func: JitFunction) -> list[Param]:
             )
         )
         word += 2 if p.is_constexpr else 1
-    return params
+    return tuple(params)
 
 
 # -------------------------------------------------------------------- render
@@ -360,16 +365,16 @@ def _render(context: RenderContext) -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def _triton_identity() -> list[Any]:
+def _triton_identity() -> tuple[Any, ...]:
     import triton
 
     libtriton = Path(triton.__file__).parent / "_C" / "libtriton.so"
     stat = libtriton.stat()
-    return [triton.__version__, stat.st_size, stat.st_mtime]
+    return (triton.__version__, stat.st_size, stat.st_mtime)
 
 
 @functools.lru_cache(maxsize=1)
-def _compiler_identity() -> list[str]:
+def _compiler_identity() -> tuple[str, ...]:
     from triton.runtime import build
 
     cc = build._find_compiler("c")  # pyright: ignore[reportPrivateUsage]  # the compiler triton itself picks
@@ -378,7 +383,7 @@ def _compiler_identity() -> list[str]:
         version = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
     except Exception:  # pragma: no cover - compiler without --version
         version = ""
-    return [str(cc), version]
+    return (str(cc), version)
 
 
 # ------------------------------------------------------------- compile hook

@@ -4,13 +4,16 @@
 Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 """
 
+import dataclasses
+import json
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
 from intj import create_launcher
-from intj.launcher import UnsupportedKernel, triton_specialization
+from intj.launcher import ModuleKey, Param, RenderContext, UnsupportedKernel, to_json, triton_specialization
 
 
 @triton.jit
@@ -268,6 +271,53 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
             f"  {previous[1]} -> {previous[0]}\n  {args} -> {spec}"
         )
         assert nparams == sum(1 for ty, _ in spec if ty != "constexpr")
+
+
+def _render_context(**overrides):
+    fields = dict(
+        module_name="m", kernel_repr="a.b",
+        params=(Param("x", False, 1, 1, 1), Param("BLOCK", True, 1, 1, 2)),
+        nwords=4, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
+        launch_symbol="launch", error_symbol="error", error_style="return", libtorch_path="/torch.so",
+    )
+    return RenderContext(**{**fields, **overrides})
+
+
+def _module_key(**overrides):
+    fields = dict(
+        template="aa", runtime_header="bb", context=_render_context(module_name=""), cache_key="c",
+        params=(("x", "", False, False, False, False, False, "None"),),
+        target=("hip", "gfx942", 64), options="o", triton=("3.8.0", 1, 2.0),
+        compiler=("gcc", "13"), ext_suffix=".so",
+    )
+    return ModuleKey(**{**fields, **overrides})
+
+
+@pytest.mark.parametrize(
+    "build,differing",
+    [(_render_context, {"nwords": 5}), (_module_key, {"cache_key": "d"})],
+)
+def test_value_types_compare_hash_and_serialize(build, differing):
+    """Both carry only immutable fields, so they behave as values.
+
+    A list field anywhere in either would compare fine and raise on hash().
+    """
+    one, same, other = build(), build(), build(**differing)
+    assert one == same and one != other
+    assert hash(one) == hash(same) and hash(one) != hash(other)
+    assert len({one: 1, same: 2, other: 3}) == 2
+    assert json.loads(to_json(one)) == json.loads(to_json(same))
+    assert json.loads(to_json(one)) != json.loads(to_json(other))
+
+
+def test_module_key_digest_tracks_every_field():
+    key = _module_key()
+    for field in dataclasses.fields(key):
+        value = getattr(key, field.name)
+        changed = "zz" if isinstance(value, str) else (value + 1 if isinstance(value, int) else None)
+        if changed is None:
+            continue
+        assert dataclasses.replace(key, **{field.name: changed}).digest() != key.digest(), field.name
 
 
 def test_refuses_non_jit_function():
