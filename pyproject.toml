@@ -1,0 +1,16 @@
+[project]
+name = "intj"
+version = "0.1.0"
+description = "Incompatible Triton Jit: a low-overhead host launcher for triton kernels on AMD GPUs"
+requires-python = ">=3.12"
+dependencies = ["jinja2", "triton>=3.8", "torch"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["intj*"]
+
+[tool.setuptools.package-data]
+intj = ["templates/*"]
