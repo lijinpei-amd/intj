@@ -17,6 +17,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .torch_abi import TensorLayout, TorchAccess, cached_layout, torch_version
+
 # triton and torch ship no type information, so everything reaching into them is
 # typed `Any` on purpose.
 JitFunction = Any
@@ -62,7 +64,12 @@ class RenderContext:
     launch_symbol: str
     error_symbol: str
     error_style: str  # "return" | "outparam"
-    libtorch_path: str
+    torch_access: str  # TorchAccess value; never "auto" by this point
+    #: `cxx` only: what the binary was compiled against.  The other modes
+    #: discover everything at load, so their `.so` is torch-version-independent
+    #: and these stay None -- which is what keeps them out of the digest.
+    torch_version: tuple[int, int] | None
+    cxx_abi: int | None
 
 
 
@@ -100,6 +107,7 @@ def create_launcher(
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, str] | None = None,
     options: Mapping[str, Any] | None = None,
+    torch_access: TorchAccess = TorchAccess.AUTO,
 ) -> Callable[..., None]:
     """Build a fast launcher for `jit_func`.
 
@@ -112,7 +120,8 @@ def create_launcher(
     kernel's parameters, positionally, in declaration order.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
-    into every launch.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
+    into every launch.  `torch_access` picks how the module reads a tensor; see
+    `TorchAccess`.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
     are reserved and currently unsupported.
     """
     if dynamic_grid:
@@ -128,6 +137,7 @@ def create_launcher(
 
     import torch
 
+    access = _resolve_access(torch_access)
     target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
@@ -150,7 +160,13 @@ def create_launcher(
         launch_symbol=backend.launch_symbol,
         error_symbol=backend.error_symbol,
         error_style=backend.error_style,
-        libtorch_path=os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
+        torch_access=access.value,
+        # Only the c++ mode compiles anything torch-specific in, so only it has
+        # to be rebuilt when torch changes.  Leaving these None for the other
+        # two is what keeps their digest -- and so their cached `.so` -- stable
+        # across torch versions.
+        torch_version=torch_version() if access is TorchAccess.CXX else None,
+        cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -168,14 +184,79 @@ def create_launcher(
         target=(target.backend, target.arch, target.warp_size),
         options=canonical_options.hash(),
         triton=_triton_identity(),
-        compiler=_compiler_identity(),
+        compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
     )
-    return _loaded_module(key, jit_func, context, params, options).entry
+    layout = cached_layout() if access is TorchAccess.SHIM else None
+    return _loaded_module(key, jit_func, context, params, options, layout).entry
 
 
 def get_full_name(fn: Any) -> str:
     return f"{fn.__module__}.{fn.__qualname__}"
+
+
+def _resolve_access(requested: TorchAccess) -> TorchAccess:
+    """Turn `AUTO` into a concrete mode, or check the one the caller asked for.
+
+    Explicit modes are validated rather than silently downgraded: a caller who
+    asked for `SHIM` because they measured it wants to hear that it is
+    unavailable, not to get `CPYTHON` and wonder where the time went.
+    """
+    if requested is TorchAccess.SHIM and cached_layout() is None:
+        raise UnsupportedKernel(
+            "intj: cannot read torch's tensor layout on this build "
+            f"(torch {_torch_version_string()}); pass torch_access=TorchAccess.CPYTHON"
+        )
+    if requested is TorchAccess.CXX and not _cxx_toolchain():
+        raise UnsupportedKernel(
+            "intj: the c++ access mode needs a c++ compiler and torch's headers; "
+            "set $CXX or pass torch_access=TorchAccess.SHIM"
+        )
+    if requested is not TorchAccess.AUTO:
+        return requested
+    if _cxx_toolchain():
+        return TorchAccess.CXX
+    if cached_layout() is not None:
+        return TorchAccess.SHIM
+    return TorchAccess.CPYTHON
+
+
+def _torch_version_string() -> str:
+    import torch
+
+    return str(torch.__version__)
+
+
+def _cxx_abi() -> int:
+    """How torch was built.  A mismatch here links, then misbehaves at runtime."""
+    import torch
+
+    return int(torch._C._GLIBCXX_USE_CXX11_ABI)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@functools.lru_cache(maxsize=1)
+def _cxx_toolchain() -> tuple[list[str], list[str]] | None:
+    """(include dirs, library dirs) for the c++ mode, or None if unavailable.
+
+    Both come from the loaded torch rather than from `torch.__file__`, so a torch
+    that reorganises its tree, or one built out of tree, keeps working.
+    """
+    from triton.runtime import build
+
+    try:
+        build._find_compiler("c++")  # pyright: ignore[reportPrivateUsage]
+    except Exception:
+        return None
+    try:
+        from torch.utils import cpp_extension
+    except Exception:  # pragma: no cover - torch without the build helpers
+        return None
+    includes = [p for p in cpp_extension.include_paths() if os.path.isdir(p)]
+    libs = [p for p in cpp_extension.library_paths() if os.path.isdir(p)]
+    header = "torch/csrc/autograd/python_variable.h"
+    if not libs or not any(os.path.exists(os.path.join(d, header)) for d in includes):
+        return None
+    return (includes, libs)
 
 
 _LOADED: dict[ModuleKey, types.ModuleType] = {}
@@ -188,6 +269,7 @@ def _loaded_module(
     context: RenderContext,
     params: Sequence[Param],
     options: Mapping[str, Any],
+    layout: TensorLayout | None,
 ) -> types.ModuleType:
     """One module per `ModuleKey`, for the life of the process.
 
@@ -204,6 +286,9 @@ def _loaded_module(
         if module is None:
             module = _load(key, jit_func, context)
             module.set_compile_callback(_make_compile_callback(jit_func, params, options))
+            # The tensor layout is installed, not compiled in, so it describes the
+            # torch running now rather than the one this `.so` was built against.
+            module.set_torch_version(torch_version(), layout.as_args() if layout else None)
             _LOADED[key] = module
         return module
 
@@ -248,14 +333,45 @@ def _build(so_path: Path, context: RenderContext) -> None:
     template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
     src = template.render(**dataclasses.asdict(context))
     built = compile_so_from_src(
-        src=src, name=context.module_name, include_dirs=[str(_RUNTIME)], language="c"
+        src=src, name=context.module_name, **_build_flags(context)
     )
 
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
     # misbehaves, and what you recompile by hand to debug it.
-    _install(src.encode(), so_path.with_name(f"{context.module_name}.c"))
+    suffix = ".cpp" if context.torch_access == TorchAccess.CXX.value else ".c"
+    _install(src.encode(), so_path.with_name(f"{context.module_name}{suffix}"))
     _install(Path(built).read_bytes(), so_path)
+
+
+def _build_flags(context: RenderContext) -> dict[str, Any]:
+    """Compiler arguments beyond intj's own include directory.
+
+    Only the c++ mode needs anything: torch's headers, and `libc10` for the
+    handful of error-path symbols `THPVariable_Unpack` pulls in.  Those are the
+    reason this cannot be header-only -- torch loads libc10 `RTLD_LOCAL`, so an
+    unlinked module builds fine and then fails at import with an undefined
+    `throw_data_ptr_access_error`.  libtorch_cpu and libtorch_python are *not*
+    needed.
+    """
+    if context.torch_access != TorchAccess.CXX.value:
+        return {"language": "c", "include_dirs": [str(_RUNTIME)]}
+    toolchain = _cxx_toolchain()
+    assert toolchain is not None, "create_launcher validated this"
+    includes, libs = toolchain
+    return {
+        "language": "c++",
+        "include_dirs": [str(_RUNTIME), *includes],
+        "library_dirs": list(libs),
+        "libraries": ["c10"],
+        # triton puts its own -std=c++17 early and appends ccflags last, so this
+        # wins.  torch >= 2.14 needs c++20 to compile warning-clean.
+        "ccflags": [
+            "-std=c++20",
+            f"-D_GLIBCXX_USE_CXX11_ABI={context.cxx_abi}",
+            *(f"-Wl,-rpath,{d}" for d in libs),
+        ],
+    }
 
 
 def _install(content: bytes, path: Path) -> None:
@@ -439,11 +555,11 @@ def _triton_identity() -> tuple[Any, ...]:
     return (triton.__version__, stat.st_size, stat.st_mtime)
 
 
-@functools.lru_cache(maxsize=1)
-def _compiler_identity() -> tuple[str, ...]:
+@functools.lru_cache(maxsize=2)
+def _compiler_identity(language: str = "c") -> tuple[str, ...]:
     from triton.runtime import build
 
-    cc = build._find_compiler("c")  # pyright: ignore[reportPrivateUsage]  # the compiler triton itself picks
+    cc = build._find_compiler(language)  # pyright: ignore[reportPrivateUsage]  # the compiler triton itself picks
     cc = cc[0] if isinstance(cc, tuple) else cc
     try:
         version = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]

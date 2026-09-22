@@ -10,7 +10,8 @@ Reports wall-clock per launch for a trivial kernel:
 - `grid=(0,)`: both launchers skip the driver call. intj also returns before
   decoding arguments, so this row is its early-out path, not its full host cost.
 - `spec_key`: intj's argument decoding plus key computation, i.e. the work the
-  zero-volume row skips.
+  zero-volume row skips.  Reported per `TorchAccess` mode, since the mode only
+  changes how a tensor argument is read -- everything else is identical.
 """
 
 import sys
@@ -21,6 +22,7 @@ import triton
 import triton.language as tl
 
 from intj import create_launcher
+from intj.torch_abi import TorchAccess
 
 
 @triton.jit
@@ -58,8 +60,15 @@ def main(iters=20000):
         intj_us = bench(lambda: launcher(device, stream, grid, *args), iters)
         print(f"{label:>10}: triton {triton_us:6.2f} us | intj {intj_us:6.2f} us | {triton_us / intj_us:5.1f}x")
 
-    spec_key = getattr(launcher, "__self__").spec_key
-    print(f"{'spec_key':>10}: {bench(lambda: spec_key(*args), iters):6.2f} us (intj decode + key only)")
+    print()
+    for mode in (TorchAccess.SHIM, TorchAccess.CXX, TorchAccess.CPYTHON):
+        built = time.perf_counter()
+        module = getattr(create_launcher(noop, torch_access=mode), "__self__")
+        built = time.perf_counter() - built
+        spec_key = module.spec_key
+        decode = bench(lambda: spec_key(*args), iters)
+        print(f"{'spec_key':>10} {mode.name.lower():>8}: {decode:6.2f} us "
+              f"(decode + key, 3 tensor args) | build {built:5.2f} s")
 
 
 if __name__ == "__main__":

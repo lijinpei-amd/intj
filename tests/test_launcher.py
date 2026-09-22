@@ -4,6 +4,7 @@
 Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 """
 
+import ctypes
 import dataclasses
 import json
 import pathlib
@@ -21,6 +22,7 @@ from intj.launcher import (
     UnsupportedKernel,
     triton_specialization,
 )
+from intj.torch_abi import NDTYPES, TorchAccess, cached_layout, dtype_code, itemsize_table
 
 
 @triton.jit
@@ -284,7 +286,7 @@ def test_modules_stay_out_of_the_import_system():
 
 
 def test_source_and_binary_are_cached_on_disk():
-    launcher = create_launcher(scale, options={"num_stages": 4})
+    launcher = create_launcher(scale, options={"num_stages": 4}, torch_access=TorchAccess.SHIM)
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
     source = so_path.with_name("scale.c")
     assert so_path.exists() and source.exists()
@@ -356,7 +358,8 @@ def _render_context(**overrides):
         module_name="m", kernel_repr="a.b",
         params=(Param("x", False, 1, 1, 1), Param("BLOCK", True, 1, 1, 2)),
         nwords=4, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
-        launch_symbol="launch", error_symbol="error", error_style="return", libtorch_path="/torch.so",
+        launch_symbol="launch", error_symbol="error", error_style="return",
+        torch_access="shim", torch_version=None, cxx_abi=None,
     )
     return RenderContext(**{**fields, **overrides})
 
@@ -396,6 +399,18 @@ def test_module_key_digest_tracks_every_field():
         if changed is None:
             continue
         assert dataclasses.replace(key, **{field.name: changed}).digest() != key.digest(), field.name
+
+
+def test_render_context_digest_tracks_every_field():
+    """`context` is one field of ModuleKey, so the loop above never varies its parts."""
+    base = _module_key()
+    for field in dataclasses.fields(base.context):
+        value = getattr(base.context, field.name)
+        changed = "zz" if isinstance(value, str) else (value + 1 if isinstance(value, int) else (1, 2))
+        if value == changed:
+            continue
+        other = dataclasses.replace(base, context=dataclasses.replace(base.context, **{field.name: changed}))
+        assert other.digest() != base.digest(), field.name
 
 
 def test_artifact_layout_and_nested_kernels():
@@ -441,3 +456,149 @@ def uses_global(x, o, n, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = off < n
     tl.store(o + off, tl.load(x + off, mask=mask) * GLOBAL_SCALE, mask=mask)
+
+
+# ---------------------------------------------------------------- torch access
+
+ACCESS_MODES = [TorchAccess.SHIM, TorchAccess.CPYTHON, TorchAccess.CXX]
+
+
+@pytest.fixture(scope="module", params=ACCESS_MODES, ids=lambda m: m.name.lower())
+def mode(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def scale_by_mode(mode):
+    return mode, create_launcher(scale, torch_access=mode)
+
+
+def _read_corpus():
+    """Tensors whose pointer/dtype/storage-size the three modes must agree on.
+
+    The empty views matter most: `Tensor::data_ptr()` returns null for any
+    zero-element tensor even when its storage is live and its storage_offset is
+    not, so the shim's `data + offset * itemsize` arithmetic has to special-case
+    them or it keys differently from the other two modes.
+    """
+    base = torch.randn(4096, device="cuda")
+    half = torch.randn(4096, device="cuda", dtype=torch.float16)
+    return [
+        base,
+        base[1:],  # unaligned
+        base[4:],  # aligned view
+        half,
+        half[3:],
+        torch.zeros(0, device="cuda"),  # empty, no storage
+        base[4096:],  # empty, live storage, non-zero storage_offset
+        half[4096:],
+        torch.zeros(4096, device="cuda", dtype=torch.int32),
+        torch.nn.Parameter(torch.randn(4096, device="cuda")),
+    ]
+
+
+def test_every_mode_matches_triton_specialization(scale_by_mode):
+    """The load-bearing invariant, checked per mode rather than once."""
+    _, launcher = scale_by_mode
+    module = getattr(launcher, "__self__")
+    o = torch.empty(4096, device="cuda")
+    seen = {}
+    for x in _read_corpus():
+        args = (x, o, 1024, 2.0, 128)
+        key = module.spec_key(*args)
+        spec = repr(triton_specialization(scale, args))
+        assert seen.setdefault(key, spec) == spec, f"key collides for {x.dtype} {x.shape}"
+
+
+def test_modes_agree_on_every_read():
+    """The independent-oracle test: cpython assumes nothing about TensorImpl.
+
+    If torch moves a field, the shim mode keeps reading the old offset and this
+    is what notices.
+    """
+    modules = {
+        m: getattr(create_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES
+    }
+    o = torch.empty(4096, device="cuda")
+    for x in _read_corpus():
+        keys = {m: mod.spec_key(x, o, 1024, 2.0, 128) for m, mod in modules.items()}
+        distinct = set(keys.values())
+        assert len(distinct) == 1, f"modes disagree on {x.dtype} numel={x.numel()}: {keys}"
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "float16", "bfloat16", "int32", "uint8"])
+def test_dtype_code_matches_torch(dtype_name):
+    """The THPDtype offset read, and the itemsize table built from it."""
+    dtype = getattr(torch, dtype_name)
+    code = dtype_code(dtype)
+    assert 0 <= code < NDTYPES
+    assert itemsize_table()[code] == torch.empty(0, dtype=dtype).element_size()
+
+
+def test_layout_probe_reproduces_torch():
+    """Every offset the shim mode reads, checked against torch's own accessors."""
+    layout = cached_layout()
+    assert layout is not None, "probe failed on a torch intj is expected to support"
+    assert len(layout.itemsize) == NDTYPES
+    for x in _read_corpus() + [torch.arange(9, dtype=torch.float64)[2:]]:
+        impl = ctypes.c_size_t.from_address(id(x) + layout.cdata).value
+        assert impl == x._cdata
+        assert ctypes.c_int64.from_address(impl + layout.numel).value == x.numel()
+        assert ctypes.c_int64.from_address(impl + layout.storage_offset).value == x.storage_offset()
+        assert ctypes.c_uint8.from_address(impl + layout.data_type).value == dtype_code(x.dtype)
+
+
+def test_launch_correctness_per_mode(scale_by_mode):
+    _, launcher = scale_by_mode
+    x = torch.randn(1024, device="cuda")
+    o = torch.empty(1024, device="cuda")
+    check_matches_triton(scale, launcher, (8,), (x, o, 1024, 2.0, 128), 1)
+    check_matches_triton(scale, launcher, (8,), (x[1:], o, 1023, 2.0, 128), 1)
+
+
+def test_auto_resolves_and_explicit_modes_validate():
+    from intj.launcher import _resolve_access
+
+    assert _resolve_access(TorchAccess.AUTO) in set(ACCESS_MODES)
+    for m in ACCESS_MODES:
+        assert _resolve_access(m) is m
+
+
+def test_shim_is_refused_rather_than_guessed(monkeypatch):
+    """A layout intj cannot pin must raise, never fall back to a guessed offset."""
+    from intj import launcher as launcher_mod
+
+    monkeypatch.setattr(launcher_mod, "cached_layout", lambda: None)
+    with pytest.raises(UnsupportedKernel, match="tensor layout"):
+        create_launcher(scale, torch_access=TorchAccess.SHIM)
+
+
+def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
+    """shim and cpython bake in nothing torch-specific, so their `.so` is reusable.
+
+    Moving the reported torch version must not move their digest -- and must move
+    the c++ one, which really did compile against those headers.
+    """
+    from intj import launcher as launcher_mod
+
+    def digest_dir(m):
+        return pathlib.Path(getattr(create_launcher(scale, torch_access=m), "__self__").__file__).parent.parent.name
+
+    before = {m: digest_dir(m) for m in ACCESS_MODES}
+    monkeypatch.setattr(launcher_mod, "torch_version", lambda: (99, 99))
+    after = {m: digest_dir(m) for m in ACCESS_MODES}
+
+    assert after[TorchAccess.SHIM] == before[TorchAccess.SHIM]
+    assert after[TorchAccess.CPYTHON] == before[TorchAccess.CPYTHON]
+    assert after[TorchAccess.CXX] != before[TorchAccess.CXX]
+
+
+def test_unconfigured_module_refuses_to_launch():
+    """`entry` is unreachable before set_torch_version; prove the guard exists."""
+    module = getattr(create_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    assert hasattr(module, "set_torch_version")
+    with pytest.raises(ValueError, match="needs a tensor layout"):
+        module.set_torch_version((2, 14), None)
+    cpython = getattr(create_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
+    with pytest.raises(ValueError, match="takes no tensor layout"):
+        cpython.set_torch_version((2, 14), cached_layout().as_args())

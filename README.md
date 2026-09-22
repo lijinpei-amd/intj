@@ -74,9 +74,22 @@ torch 2.14+rocm7.2, 20k iterations:
 
 | | triton `JitFunction` | INTJ |
 |---|---|---|
-| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.4 us) | 17.78 us | 3.57 us |
-| `grid=(0,)`, i.e. no driver call | 13.97 us | 0.15 us |
-| argument decoding + spec key only | — | 0.15 us |
+| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.4 us) | 18.7 us | 3.8 us |
+| `grid=(0,)`, i.e. no driver call | 14.0 us | 0.15 us |
+| argument decoding + spec key only | — | 0.11 us |
+
+Argument decoding depends on how the module reads a tensor (`torch_access`), for a
+kernel with three tensor arguments:
+
+| `TorchAccess` | decode + spec key | first build |
+|---|---|---|
+| `SHIM` — torch's structs, at offsets discovered at load | 0.11 us | 0.6 s |
+| `CXX` — compiled against torch's headers | 0.13 us | 11.5 s |
+| `CPYTHON` — through the interpreter | 0.9 us | 0.6 s |
+
+`SHIM` and `CXX` are the same speed: both inline the reads, neither calls into
+torch or the interpreter. `CXX` pays for that with build time and is the only
+mode whose `.so` must be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
 which is the third row's 0.15 us. Host overhead is therefore ~0.3 us against

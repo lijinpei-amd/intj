@@ -6,6 +6,7 @@
 #include <Python.h>
 
 #define INTJ_NWORDS {{ nwords }}
+#define INTJ_ACCESS_{{ torch_access | upper }} 1
 #include "intj_runtime.h"
 
 #define INTJ_NPARAMS {{ params | length }}
@@ -15,9 +16,7 @@ typedef struct {
   PyObject *compile_cb;
   PyTypeObject *tensor_type;
   PyTypeObject *param_type;
-  intj_get_data_ptr_t get_data_ptr;
-  intj_get_storage_size_t get_storage_size;
-  intj_get_dtype_t get_dtype;
+  intj_torch_abi abi;
   intj_launch_t launch;
 {% if error_style == 'return' %}  intj_error_string_ret_t error_string;
 {% else %}  intj_error_string_out_t error_string;
@@ -44,6 +43,11 @@ static int intj_grid_dim(PyObject *o, uint32_t *out) {
 
 static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
+  if (!st->abi.ready) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "intj: set_torch_version has not been called");
+    return NULL;
+  }
   if (nargs != 3 + INTJ_NPARAMS) {
     PyErr_Format(PyExc_TypeError,
                  "intj: %s takes exactly %d arguments (device, stream, grid and "
@@ -210,9 +214,6 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
     return NULL;
   }
   Py_RETURN_NONE;
-
-error:
-  return NULL;
 }
 
 /* Debug/test entry point: the spec key intj would compute for these arguments,
@@ -221,6 +222,11 @@ error:
 static PyObject *spec_key(PyObject *self, PyObject *const *args,
                           Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
+  if (!st->abi.ready) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "intj: set_torch_version has not been called");
+    return NULL;
+  }
   if (nargs != INTJ_NPARAMS) {
     PyErr_Format(PyExc_TypeError, "intj: spec_key takes %d arguments, got %zd",
                  INTJ_NPARAMS, nargs);
@@ -241,15 +247,72 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
 {% endif %}
 {% endfor %}
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)sizeof(key), np);
-
-error:
-  return NULL;
 }
 
 static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   Py_INCREF(cb);
   Py_XSETREF(st->compile_cb, cb);
+  Py_RETURN_NONE;
+}
+
+/* set_torch_version((major, minor), layout) -- install the torch ABI.
+ *
+ * Deliberately not baked into the binary: the offsets come from the torch that
+ * is running now, so there is no window in which a cached .so built against one
+ * torch is loaded against another.  `layout` is None outside the shim mode.
+ */
+static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
+                                   Py_ssize_t nargs) {
+  intj_state *st = (intj_state *)PyModule_GetState(self);
+  PyObject *layout;
+  if (nargs != 2) {
+    PyErr_SetString(PyExc_TypeError,
+                    "intj: set_torch_version takes (version, layout)");
+    return NULL;
+  }
+  layout = args[1];
+
+{% if torch_access == 'shim' %}
+  unsigned int off[7];
+  PyObject *sizes;
+  if (!PyTuple_Check(layout)) {
+    PyErr_Format(PyExc_ValueError,
+                 "intj: this module was built with the shim access mode and needs "
+                 "a tensor layout, got %s",
+                 Py_TYPE(layout)->tp_name);
+    return NULL;
+  }
+  if (!PyArg_ParseTuple(layout, "IIIIIIIO", &off[0], &off[1], &off[2], &off[3],
+                        &off[4], &off[5], &off[6], &sizes))
+    return NULL;
+  st->abi.cdata = (uint16_t)off[0];
+  st->abi.storage = (uint16_t)off[1];
+  st->abi.storage_offset = (uint16_t)off[2];
+  st->abi.numel = (uint16_t)off[3];
+  st->abi.data_type = (uint16_t)off[4];
+  st->abi.s_data = (uint16_t)off[5];
+  st->abi.s_nbytes = (uint16_t)off[6];
+
+  Py_ssize_t n = PyBytes_Size(sizes);
+  if (n < 0)
+    return NULL;
+  if (n != INTJ_NDTYPES) {
+    PyErr_Format(PyExc_ValueError, "intj: itemsize table must be %d bytes, got %zd",
+                 INTJ_NDTYPES, n);
+    return NULL;
+  }
+  memcpy(st->abi.itemsize, PyBytes_AS_STRING(sizes), INTJ_NDTYPES);
+{% else %}
+  if (layout != Py_None) {
+    PyErr_SetString(PyExc_ValueError,
+                    "intj: this module was built without the shim access mode, "
+                    "so it takes no tensor layout");
+    return NULL;
+  }
+{% endif %}
+
+  st->abi.ready = 1;
   Py_RETURN_NONE;
 }
 
@@ -288,16 +351,20 @@ static int intj_exec(PyObject *m) {
   st->tensor_type = (PyTypeObject *)tensor;
   st->param_type = (PyTypeObject *)parameter;
 
-  void *torch_lib = intj_dlopen("{{ libtorch_path }}");
-  if (!torch_lib)
+  if (intj_intern_names() != 0)
     return -1;
-  st->get_data_ptr =
-      (intj_get_data_ptr_t)intj_dlsym(torch_lib, "aoti_torch_get_data_ptr");
-  st->get_storage_size = (intj_get_storage_size_t)intj_dlsym(
-      torch_lib, "aoti_torch_get_storage_size");
-  st->get_dtype = (intj_get_dtype_t)intj_dlsym(torch_lib, "aoti_torch_get_dtype");
-  if (!st->get_data_ptr || !st->get_storage_size || !st->get_dtype)
-    return -1;
+{% if torch_access == 'cpython' %}
+  /* The one layout bet this mode makes, and the only one that can check itself. */
+  {
+    PyObject *t = PyImport_ImportModule("torch");
+    if (!t)
+      return -1;
+    int rc = intj_dtype_selfcheck(t);
+    Py_DECREF(t);
+    if (rc != 0)
+      return -1;
+  }
+{% endif %}
 
   void *gpu = intj_dlopen("{{ driver_path }}");
   if (!gpu)
@@ -350,6 +417,8 @@ static PyMethodDef intj_methods[] = {
     {"entry", (PyCFunction)(void (*)(void))entry, METH_FASTCALL, NULL},
     {"spec_key", (PyCFunction)(void (*)(void))spec_key, METH_FASTCALL, NULL},
     {"set_compile_callback", set_compile_callback, METH_O, NULL},
+    {"set_torch_version", (PyCFunction)(void (*)(void))set_torch_version,
+     METH_FASTCALL, NULL},
     {NULL, NULL, 0, NULL}};
 
 static PyModuleDef_Slot intj_slots[] = {

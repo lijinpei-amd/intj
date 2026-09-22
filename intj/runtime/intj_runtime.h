@@ -15,7 +15,10 @@
 #if PY_VERSION_HEX < 0x030C0000
 #error "intj requires CPython 3.12 or newer (PyLongObject layout)"
 #endif
-_Static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
+/* `static_assert` rather than `_Static_assert`: the former is spelled the same in
+ * C11 (via assert.h, which Python.h pulls in) and in C++, and the CXX access mode
+ * compiles this header as C++. */
+static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
 /* CPython 3.12 PyLongObject layout, see cpython/longintrepr.h. */
 #define INTJ_SIGN_MASK 3
@@ -164,16 +167,208 @@ static int intj_map_put(intj_map *m, const uint64_t *k, uint64_t h,
 
 /* ------------------------------------------------------------ torch access */
 
-/* ABI-stable C shims exported by libtorch_cpu.so; see
- * torch/csrc/inductor/aoti_torch/c/shim.h.  THPVariable stores the at::Tensor
- * right after PyObject_HEAD, so the handle is a fixed offset from the object.
+/* intj reads three things off a tensor: the data pointer, the dtype (as an
+ * opaque int32 discriminator) and, where the backend specializes on pointer
+ * range, the storage size.  Exactly one of three strategies is compiled in.
+ *
+ *   INTJ_ACCESS_SHIM     read torch's structs at offsets supplied at load time
+ *   INTJ_ACCESS_CPYTHON  call through the interpreter
+ *   INTJ_ACCESS_CXX      C++, against torch's own headers
+ *
+ * No mode calls libtorch's aoti_torch_* shims, and no mode dlopens libtorch.
  */
-typedef void *intj_tensor_handle;
-#define INTJ_TENSOR_HANDLE(o) ((intj_tensor_handle)((char *)(o) + sizeof(PyObject)))
 
-typedef int32_t (*intj_get_data_ptr_t)(intj_tensor_handle, void **);
-typedef int32_t (*intj_get_storage_size_t)(intj_tensor_handle, int64_t *);
-typedef int32_t (*intj_get_dtype_t)(intj_tensor_handle, int32_t *);
+#define INTJ_NDTYPES 64
+
+typedef struct {
+  /* SHIM: byte offsets into THPVariable / TensorImpl / StorageImpl. Unused, and
+   * left zero, in the other two modes. */
+  uint16_t cdata;          /* PyObject*   -> TensorImpl**   */
+  uint16_t storage;        /* TensorImpl* -> StorageImpl**  */
+  uint16_t storage_offset; /* TensorImpl* -> int64_t        */
+  uint16_t numel;          /* TensorImpl* -> int64_t        */
+  uint16_t data_type;      /* TensorImpl* -> TypeMeta index (low byte)  */
+  uint16_t s_data;         /* StorageImpl* -> void*         */
+  uint16_t s_nbytes;       /* StorageImpl* -> int64_t       */
+  uint8_t itemsize[INTJ_NDTYPES]; /* dtype code -> element size */
+  int ready;               /* set_torch_version has run */
+} intj_torch_abi;
+
+#ifdef INTJ_ACCESS_CXX
+#include <torch/csrc/autograd/python_variable.h>
+#endif
+
+/* Interned method names, used only by the CPYTHON reader. Filled by
+ * intj_abi_init; never released, like every other module-lifetime singleton. */
+static PyObject *intj_str_dtype;
+static PyObject *intj_str_data_ptr;
+static PyObject *intj_str_untyped_storage;
+static PyObject *intj_str_nbytes;
+
+#if defined(INTJ_ACCESS_SHIM)
+
+/* Reads torch's structs directly. `want_size` is a compile-time-ish flag: the
+ * storage size is only needed where the backend specializes on pointer range. */
+static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
+                                   void **p, int32_t *dt, int want_size,
+                                   int64_t *sz) {
+  char *ti = *(char **)((char *)o + abi->cdata);
+  char *si = *(char **)(ti + abi->storage);
+  int64_t numel = *(const int64_t *)(ti + abi->numel);
+  uint8_t code = *(const uint8_t *)(ti + abi->data_type);
+  *dt = (int32_t)code;
+  /* torch's Tensor::data_ptr() returns null for every zero-element tensor, even
+   * one whose storage is live and whose storage_offset is not zero (an empty
+   * slice at the end of a buffer).  Reproduce that: the pointer feeds the
+   * alignment bit of the spec key, so a past-the-end pointer here would key
+   * differently from the other two modes for the same arguments. */
+  if (numel == 0 || !si) {
+    *p = NULL;
+    if (want_size)
+      *sz = si ? *(const int64_t *)(si + abi->s_nbytes) : 0;
+    return 0;
+  }
+  if (code >= INTJ_NDTYPES || !abi->itemsize[code]) {
+    /* A dtype intj has no element size for means the offsets are wrong, or torch
+     * grew a dtype after the table was built.  Either way, refuse rather than
+     * compute a pointer from a guess. */
+    PyErr_Format(PyExc_RuntimeError,
+                 "intj: unknown torch dtype code %d; this build's tensor layout "
+                 "does not match the running torch",
+                 (int)code);
+    return -1;
+  }
+  char *data = *(char **)(si + abi->s_data);
+  int64_t off = *(const int64_t *)(ti + abi->storage_offset);
+  *p = data + off * (int64_t)abi->itemsize[code];
+  if (want_size)
+    *sz = *(const int64_t *)(si + abi->s_nbytes);
+  return 0;
+}
+
+#elif defined(INTJ_ACCESS_CPYTHON)
+
+/* Calls through the interpreter.  Slowest, but assumes nothing about torch's
+ * layout beyond THPDtype, which self-checks at load. */
+static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
+                                   void **p, int32_t *dt, int want_size,
+                                   int64_t *sz) {
+  (void)abi;
+  PyObject *d = PyObject_GetAttr(o, intj_str_dtype);
+  if (!d)
+    return -1;
+  /* struct THPDtype { PyObject_HEAD at::ScalarType scalar_type; char name[65]; }
+   * ScalarType is `enum class : int8_t`, so this is the first byte of payload.
+   * Only reached after INTJ_DECODE's exact-type test, so `o` really is a tensor
+   * and `d` really is a THPDtype. */
+  *dt = (int32_t) * (const int8_t *)((char *)d + sizeof(PyObject));
+  Py_DECREF(d);
+
+  PyObject *v = PyObject_CallMethodNoArgs(o, intj_str_data_ptr);
+  if (!v)
+    return -1;
+  *p = PyLong_AsVoidPtr(v);
+  Py_DECREF(v);
+  if (!*p && PyErr_Occurred()) /* a real 0 is legal: any zero-element tensor */
+    return -1;
+
+  if (want_size) {
+    PyObject *st = PyObject_CallMethodNoArgs(o, intj_str_untyped_storage);
+    if (!st)
+      return -1;
+    PyObject *n = PyObject_CallMethodNoArgs(st, intj_str_nbytes);
+    Py_DECREF(st);
+    if (!n)
+      return -1;
+    *sz = PyLong_AsLongLong(n);
+    Py_DECREF(n);
+    if (*sz == -1 && PyErr_Occurred())
+      return -1;
+  }
+  return 0;
+}
+
+#elif defined(INTJ_ACCESS_CXX)
+
+static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
+                                   void **p, int32_t *dt, int want_size,
+                                   int64_t *sz) {
+  (void)abi;
+  /* torch throws; an exception reaching CPython's C frames is undefined, so it
+   * stops here and becomes a python error like every other decode failure. */
+  try {
+    const at::Tensor &t = THPVariable_Unpack(o);
+    *p = t.data_ptr();
+    *dt = static_cast<int32_t>(t.scalar_type());
+    if (want_size)
+      *sz = static_cast<int64_t>(t.storage().nbytes());
+  } catch (const std::exception &e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    return -1;
+  } catch (...) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: unknown c++ exception from torch");
+    return -1;
+  }
+  return 0;
+}
+
+#else
+#error "intj: define one of INTJ_ACCESS_{SHIM,CPYTHON,CXX}"
+#endif
+
+/* Re-raise the reader's error as "which argument", keeping torch's own message
+ * as __cause__.  The reader knows what went wrong; only the caller knows which
+ * parameter it was reading. */
+static inline void intj_note_param(const char *pname) {
+  PyObject *exc = PyErr_GetRaisedException();
+  PyErr_Format(PyExc_RuntimeError, "intj: cannot read tensor argument '%s'", pname);
+  if (exc) {
+    PyObject *raised = PyErr_GetRaisedException();
+    PyException_SetCause(raised, Py_NewRef(exc));
+    PyException_SetContext(raised, exc); /* steals the reference */
+    PyErr_SetRaisedException(raised);
+  }
+}
+
+/* Intern the method names the CPYTHON reader uses.  Interning once and holding
+ * the references for the module's life keeps the reader down to a pointer
+ * compare in the attribute lookup.  Returns -1 with a python error set. */
+static inline int intj_intern_names(void) {
+  intj_str_dtype = PyUnicode_InternFromString("dtype");
+  intj_str_data_ptr = PyUnicode_InternFromString("data_ptr");
+  intj_str_untyped_storage = PyUnicode_InternFromString("untyped_storage");
+  intj_str_nbytes = PyUnicode_InternFromString("nbytes");
+  return (intj_str_dtype && intj_str_data_ptr && intj_str_untyped_storage &&
+          intj_str_nbytes)
+             ? 0
+             : -1;
+}
+
+/* Confirm that `torch.dtype` still starts with the ScalarType byte.
+ *
+ * This is the one layout bet in the design that can check itself: THPDtype is
+ * `{ PyObject_HEAD at::ScalarType scalar_type; char name[65]; }`, so the object
+ * carries the name of the dtype it claims to be.  The object is at least 82
+ * bytes, so the read cannot fault even if the layout moved.  Returns -1 with a
+ * python error set.
+ */
+static inline int intj_dtype_selfcheck(PyObject *torch) {
+  PyObject *f32 = PyObject_GetAttrString(torch, "float32");
+  if (!f32)
+    return -1;
+  const char *payload = (const char *)f32 + sizeof(PyObject);
+  int code = (int)*(const int8_t *)payload;
+  int ok = code >= 0 && code < INTJ_NDTYPES && strncmp(payload + 1, "float32", 8) == 0;
+  Py_DECREF(f32);
+  if (!ok) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "intj: torch.dtype is not laid out as intj expects "
+                    "(THPDtype { PyObject_HEAD ScalarType; char name[] }); "
+                    "this torch is too new or too old for the cpython access mode");
+    return -1;
+  }
+  return 0;
+}
 
 /* ----------------------------------------------------------- gpu  runtime */
 
@@ -216,36 +411,31 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
  * (do_not_specialize, do_not_specialize_on_alignment, and whether the backend
  * specializes pointers on a 2 GiB range).
  *
- * `st` must expose tensor_type/param_type and the three torch shims.
- * On failure it sets a python error and jumps to `error`.
+ * `st` must expose tensor_type/param_type and the torch ABI block.
+ * On failure it sets a python error and returns NULL from the enclosing
+ * function -- which must therefore return PyObject *.  (A `goto` to a shared
+ * label would be tidier, but C++ forbids jumping over the initializations that
+ * follow in `entry`, and the CXX access mode compiles this as C++.)
  */
 #define INTJ_DECODE(st, o, word, vals, np, SPEC, ALIGN, SBIT, pname)           \
   do {                                                                         \
     PyObject *_o = (o);                                                        \
     PyTypeObject *_t = Py_TYPE(_o);                                            \
     if (_t == (st)->tensor_type || _t == (st)->param_type) {                   \
-      intj_tensor_handle _h = INTJ_TENSOR_HANDLE(_o);                          \
       void *_p = NULL;                                                         \
       int32_t _dt = -1;                                                        \
-      if ((st)->get_data_ptr(_h, &_p) != 0 || (st)->get_dtype(_h, &_dt) != 0) { \
-        PyErr_Format(PyExc_RuntimeError,                                       \
-                     "intj: failed to read tensor argument '%s'", pname);      \
-        goto error;                                                            \
+      int64_t _sz = 0;                                                         \
+      int _want = (SPEC) && (SBIT);                                            \
+      if (intj_read_tensor(&(st)->abi, _o, &_p, &_dt, _want, &_sz) != 0) {     \
+        intj_note_param(pname);                                                \
+        return NULL;                                                           \
       }                                                                        \
       uint32_t _flags = 0;                                                     \
       if (SPEC) {                                                              \
         if (ALIGN && (((uintptr_t)_p & 15u) == 0))                             \
           _flags |= INTJ_FLAG_D;                                               \
-        if (SBIT) {                                                            \
-          int64_t _sz = 0;                                                     \
-          if ((st)->get_storage_size(_h, &_sz) != 0) {                         \
-            PyErr_Format(PyExc_RuntimeError,                                   \
-                         "intj: failed to read storage size of '%s'", pname);  \
-            goto error;                                                        \
-          }                                                                    \
-          if (_sz <= 2147483647LL)                                             \
-            _flags |= INTJ_FLAG_S;                                             \
-        }                                                                      \
+        if (_want && _sz <= 2147483647LL)                                      \
+          _flags |= INTJ_FLAG_S;                                               \
       }                                                                        \
       (word) = INTJ_WORD(INTJ_T_PTR, _dt, _flags);                             \
       (vals)[(np)] = (uint64_t)(uintptr_t)_p;                                  \
@@ -274,7 +464,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         if (intj_as_u64(_o, &_u) != 0) {                                       \
           PyErr_Format(PyExc_OverflowError,                                    \
                        "intj: integer argument '%s' is too large", pname);     \
-          goto error;                                                          \
+          return NULL;                                                         \
         }                                                                      \
         uint32_t _flags =                                                      \
             (SPEC && ALIGN && ((_u & 15u) == 0)) ? INTJ_FLAG_D : 0;            \
@@ -296,7 +486,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
                    "intj: unsupported argument '%s' of type %s; pass a "       \
                    "torch.Tensor, int, float, bool or None",                   \
                    pname, Py_TYPE(_o)->tp_name);                               \
-      goto error;                                                              \
+      return NULL;                                                             \
     }                                                                          \
   } while (0)
 
@@ -320,7 +510,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         if (intj_as_u64(_o, &_u) != 0) {                                       \
           PyErr_Format(PyExc_OverflowError,                                    \
                        "intj: constexpr argument '%s' is too large", pname);   \
-          goto error;                                                          \
+          return NULL;                                                         \
         }                                                                      \
         (w0) = INTJ_WORD(INTJ_T_CX_UINT, 0, 0);                                \
         (w1) = _u;                                                             \
@@ -334,6 +524,6 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
                    "intj: unsupported constexpr argument '%s' of type %s; "    \
                    "pass an int, float, bool or None",                         \
                    pname, Py_TYPE(_o)->tp_name);                               \
-      goto error;                                                              \
+      return NULL;                                                             \
     }                                                                          \
   } while (0)

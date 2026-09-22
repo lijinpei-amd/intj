@@ -83,7 +83,7 @@ per mode:
 
 | mode | version-dependent input | how it is handled |
 |---|---|---|
-| `SHIM` | six struct offsets, itemsize table | set at load, not built in |
+| `SHIM` | seven struct offsets, itemsize table | probed at load, not built in |
 | `CPYTHON` | none | - |
 | `CXX` | the headers and libraries it links | `torch_version` + ABI flag in the key |
 
@@ -130,8 +130,17 @@ it is the point where the `THPDtype` self-check runs.
 | `CXX` | `THPVariable_Unpack`, inlined `at::Tensor` methods. | torch headers, a C++ compiler |
 | `AUTO` | `CXX` if supported, else `SHIM` if the version is in the table, else `CPYTHON`. | - |
 
-`torch_version` defaults to the installed `torch.__version__`. When given, it
-selects which layout constants `set_torch_version` installs.
+The layout is **discovered**, not looked up. `torch_abi.probe_layout()` pins each
+offset by intersecting, over a set of probe tensors, the positions whose value
+matches what torch's own accessors report (`t._cdata` is the `TensorImpl*`,
+`storage._cdata` the `StorageImpl*`). Anything that does not come down to exactly
+one candidate yields None and `SHIM` is refused. Measured at **4.6 ms**, once per
+process.
+
+That replaces the per-version table this spec originally proposed, and is
+strictly better: the offsets are true by construction for whatever torch is
+loaded, including one intj has never seen, so there is no closed-ended table to
+maintain and no "unrecognised version" cliff.
 
 One asymmetry worth stating plainly: in `CXX` mode it cannot select, because
 the headers come from the loaded torch. There it is validated instead, and
@@ -154,10 +163,17 @@ int64_t nbytes  = *(int64_t *)((char *)si + L->storageimpl_nbytes);
 p = (char *)data + off * L->itemsize[dt];
 ```
 
-Measured on torch 2.14, x86-64: `thpvariable_cdata` 16, `tensorimpl_storage` 16,
-`tensorimpl_storage_offset` 144, `tensorimpl_data_type` 160, `storageimpl_data`
-16, `storageimpl_nbytes` 48. Checked against a view (`base[3:]`, f16) so the
-`storage_offset_` multiply is exercised, not just the contiguous case.
+Probed on torch 2.14, x86-64: `cdata` 16, `storage` 16, `storage_offset` 144,
+`numel` 152, `data_type` 160, `s_data` 16, `s_nbytes` 48.
+
+`numel` is the seventh offset, and it exists only to canonicalize. torch's
+`Tensor::data_ptr()` returns null for **every** zero-element tensor, including an
+empty slice at the end of a live buffer whose `storage_offset` is not zero --
+verified: `torch.zeros(4096, dtype=f16)[4096:]` has storage at `0x17...` and
+`storage_offset` 4096, yet `data_ptr()` is 0. The raw arithmetic cannot see that
+and would return a past-the-end pointer, which flips the `INTJ_FLAG_D` alignment
+bit and makes `SHIM` key differently from the other two modes for identical
+arguments. So `SHIM` reads `numel_` and returns NULL when it is zero.
 
 `itemsize[]` is built from the live torch rather than hardcoded: iterate the
 `torch.dtype` singletons and record `torch.empty(0, dtype=d).element_size()`.
@@ -182,11 +198,11 @@ unavailable rather than wrong.
 
 ### `CPYTHON`: no layout knowledge except dtype
 
-- `data_ptr`: `PyObject_CallMethodNoArgs(o, "data_ptr")`, unbox. Roughly
-  100-200 ns, the one unavoidably expensive call.
-- `storage_size`: `o.untyped_storage().nbytes()`. Only read when the backend
-  specializes on pointer range, i.e. AMD.
-- `dtype`: read off the `torch.dtype` singleton.
+- `data_ptr`: `PyObject_CallMethodNoArgs(o, "data_ptr")`, unbox. Measured
+  **71.5 ns**, the one unavoidably expensive call.
+- `storage_size`: `o.untyped_storage().nbytes()`, **108 ns**. Only read when the
+  backend specializes on pointer range, i.e. AMD.
+- `dtype`: read off the `torch.dtype` singleton, **52.6 ns**.
 
 ```c
 /* torch/csrc/Dtype.h:
@@ -233,7 +249,11 @@ That is why `AUTO` prefers it. Costs, all accepted:
   | library dirs | `torch.utils.cpp_extension.library_paths()` |
   | ABI flag | `torch._C._GLIBCXX_USE_CXX11_ABI` |
 
-  Libraries are `-ltorch_cpu -lc10 -ltorch_python`. On torch 2.14 the helpers
+  The only library needed is **`-lc10`**, and it *is* needed: `THPVariable_Unpack`
+  is header-inline but pulls in six undefined c10 error-path symbols, and torch
+  loads libc10 `RTLD_LOCAL`, so an unlinked module links fine and then dies at
+  import with `undefined symbol: ...throw_data_ptr_access_error`. `-ltorch_cpu`
+  and `-ltorch_python` are not needed. On torch 2.14 the helpers
   return `<torch>/include`, `<torch>/include/torch/csrc/api/include` and
   `<torch>/lib`, which is what the feasibility compile used; taking them from the
   helpers instead means a torch that reorganises its tree, or an out-of-tree
@@ -245,11 +265,12 @@ That is why `AUTO` prefers it. Costs, all accepted:
   rebuild for no reason. `_GLIBCXX_USE_CXX11_ABI` *is* keyed, because a torch
   rebuilt with the other ABI is a genuine incompatibility that
   `torch_version` alone does not capture.
-- **A language standard that depends on the torch version.** torch 2.14 requires
-  `-std=c++20`: `ATen/core/TensorBase.h` uses `requires` clauses, and C++17
-  fails with `'requires' does not name a type`. Older torch needed less. The
-  standard is therefore another version-dependent input, already covered by
-  `torch_version` in the key.
+- **A language standard that depends on the torch version.** intj passes
+  `-std=c++20`. On g++ 13.3, C++17 also compiles torch 2.14 but only with a
+  `-Wc++20-extensions` warning, so "requires C++20" is really "requires C++20 to
+  be warning-clean"; clang may be stricter. triton inserts its own `-std=c++17`
+  early and appends `ccflags` last, so intj's flag wins -- do not try to suppress
+  triton's.
 - **Build latency, measured: 10.9 s** for one translation unit
   (`g++ -std=c++20 -O2`, torch 2.14, warm page cache), against 0.011 s for an
   empty C one. This is per kernel, on first launch, in the caller's foreground.
@@ -362,3 +383,32 @@ hashed into `ModuleKey`. After that, rebuild frequency depends on the mode:
 changes, `CPYTHON` never.
 
 Bump `SCHEMA_VERSION`.
+
+## Outcome
+
+Implemented and measured on torch 2.14.0.dev+rocm7.2, gfx942, triton 3.8.0.
+
+| mode | decode + spec key (3 tensor args) | first build | `.so` rebuilt on torch upgrade |
+|---|---|---|---|
+| `SHIM` | 0.11 us | 0.6 s | no |
+| `CXX` | 0.13 us | 11.5 s | yes |
+| `CPYTHON` | 0.9 us | 0.6 s | no |
+
+`SHIM` and `CXX` land in the same place, as predicted -- both inline the reads.
+`SHIM` is marginally faster than the AOTI-shim path it replaces (0.11 us against
+0.15 us) because the three indirect calls are gone.
+
+All three modes produce byte-identical spec keys over a corpus that includes
+unaligned views, every dtype, `nn.Parameter`, and both kinds of empty tensor.
+Test suite: 64 passed.
+
+Two things this spec claimed that turned out differently, both recorded above:
+the link set is `-lc10` alone rather than three libraries, and the layout is
+probed rather than looked up by version.
+
+Still open, now with numbers behind it: whether `AUTO` should resolve to `CXX`.
+It costs 11.5 s on first build of each distinct kernel source for 0.02 us more
+decode time than `SHIM`, and it is the only mode that must be rebuilt when torch
+changes. The build is cached by triton across processes, so the cost is paid once
+per kernel rather than once per run, which is milder than feared -- but `SHIM`
+gets the same speed for 0.6 s and never rebuilds.
