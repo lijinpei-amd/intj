@@ -64,6 +64,15 @@ class RenderContext:
     error_style: str  # "return" | "outparam"
     libtorch_path: str
 
+    def spec_name(self, digest: str) -> str:
+        """The name the module is loaded under.
+
+        A label, not a key: the module never reaches `sys.modules`. Only the last
+        component is load-bearing, as `PyInit_<leaf>`; the digest is in there so a
+        traceback says which build the frame is in.
+        """
+        return f"intj.{digest[:16]}.{self.module_name}"
+
 
 @dataclasses.dataclass(frozen=True)
 class ModuleKey:
@@ -221,6 +230,7 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
     module_name = jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
         module_name = "kernel"
+    context = dataclasses.replace(context, module_name=module_name)
 
     digest = key.digest()
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -228,16 +238,13 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
     directory = Path(knobs.cache.get_triton_dir("intj")) / digest / jit_func.__module__
     so_path = directory / f"{module_name}{suffix}"
     if not so_path.exists():
-        _build(so_path, module_name, dataclasses.replace(context, module_name=module_name))
+        _build(so_path, context)
 
     # Loading by hand, rather than through import_module, keeps the module out of
     # sys.modules: intj's own dict owns it, so dropping a launcher can free it.
     # The interpreter does not cache it either -- that only happens for
-    # single-phase extensions, and the template uses PyModuleDef_Init. So the
-    # spec name is a label, not a key; only its last component is load-bearing,
-    # as `PyInit_<leaf>`. The digest is in there to say which build this is.
-    spec_name = f"intj.{digest[:16]}.{module_name}"
-    spec = importlib.util.spec_from_file_location(spec_name, so_path)
+    # single-phase extensions, and the template uses PyModuleDef_Init.
+    spec = importlib.util.spec_from_file_location(context.spec_name(digest), so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so_path}")
     module = importlib.util.module_from_spec(spec)
@@ -245,7 +252,7 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
     return module
 
 
-def _build(so_path: Path, module_name: str, context: RenderContext) -> None:
+def _build(so_path: Path, context: RenderContext) -> None:
     """Render and compile, then install both artifacts next to each other."""
     import jinja2
 
@@ -253,12 +260,14 @@ def _build(so_path: Path, module_name: str, context: RenderContext) -> None:
 
     template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
     src = template.render(**dataclasses.asdict(context))
-    built = compile_so_from_src(src=src, name=module_name, include_dirs=[str(_RUNTIME)], language="c")
+    built = compile_so_from_src(
+        src=src, name=context.module_name, include_dirs=[str(_RUNTIME)], language="c"
+    )
 
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
     # misbehaves, and what you recompile by hand to debug it.
-    _install(src.encode(), so_path.with_name(f"{module_name}.c"))
+    _install(src.encode(), so_path.with_name(f"{context.module_name}.c"))
     _install(Path(built).read_bytes(), so_path)
 
 
