@@ -21,7 +21,7 @@ typedef struct {
 {% if error_style == 'return' %}  intj_error_string_ret_t error_string;
 {% else %}  intj_error_string_out_t error_string;
 {% endif %}
-  intj_map cache;
+  intj_cache cache;
 } intj_state;
 
 static const char *const intj_param_names[INTJ_NPARAMS + 1] = {
@@ -127,7 +127,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
 {% endfor %}
 
   uint64_t hash = intj_hash(key);
-  intj_kernel *kernel = intj_map_get(&st->cache, key, hash);
+  intj_kernel *kernel = intj_cache_get(&st->cache, key, hash);
   if (INTJ_UNLIKELY(!kernel)) {
     /* Cold path: hand the original arguments back to python, which compiles
      * through JITFunction.warmup and validates our spec key against triton's. */
@@ -165,7 +165,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
     }
     Py_DECREF(res);
     /* The callback ran python, so another thread may have filled this key. */
-    kernel = intj_map_get(&st->cache, key, hash);
+    kernel = intj_cache_get(&st->cache, key, hash);
     if (!kernel) {
       kernel = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
       if (!kernel)
@@ -174,7 +174,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
       kernel->block_dim = block_dim;
       kernel->shared = shared;
       kernel->nparams = nparams;
-      if (intj_map_put(&st->cache, key, hash, kernel) != 0) {
+      if (intj_cache_put(&st->cache, key, hash, kernel) != 0) {
         PyMem_RawFree(kernel);
         return PyErr_NoMemory();
       }
@@ -404,7 +404,7 @@ static int intj_exec(PyObject *m) {
   st->error_string = (intj_error_string_out_t)dlsym(gpu, "{{ error_symbol }}");
 {% endif %}
 
-  if (intj_map_init(&st->cache, 16) != 0) {
+  if (intj_cache_init(&st->cache) != 0) {
     PyErr_NoMemory();
     return -1;
   }
@@ -431,12 +431,7 @@ static int intj_clear(PyObject *m) {
  * CompiledKernels the compile callback keeps alive, and are unloaded by triton. */
 static void intj_free(void *module) {
   intj_state *st = (intj_state *)PyModule_GetState((PyObject *)module);
-  if (!st->cache.slots)
-    return;
-  for (uint32_t i = 0; i <= st->cache.mask; i++)
-    PyMem_RawFree(st->cache.slots[i].val);
-  PyMem_RawFree(st->cache.slots);
-  st->cache.slots = NULL;
+  intj_cache_free(&st->cache);
 }
 
 static PyMethodDef intj_methods[] = {

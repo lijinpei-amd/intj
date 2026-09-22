@@ -22,6 +22,7 @@ from intj.launcher import (
     UnsupportedKernel,
     triton_specialization,
 )
+from intj.kernel_cache import KernelCache, toolchain_for
 from intj.torch_abi import (
     NDTYPES,
     TorchAccess,
@@ -394,6 +395,7 @@ def _render_context(**overrides):
         nwords=4, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
         launch_symbol="launch", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
+        kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
     )
     return RenderContext(**{**fields, **overrides})
 
@@ -470,6 +472,38 @@ def test_artifact_layout_and_nested_kernels():
     o = torch.empty(1024, device="cuda")
     launch(module.entry, (8,), x, o, 1024, 128)
     torch.testing.assert_close(o, x * 2.0)
+
+
+CACHES = [c for c in KernelCache if toolchain_for(c) is not None]
+
+
+@pytest.mark.parametrize("cache", CACHES, ids=[c.value for c in CACHES])
+def test_kernel_cache_backends_launch_the_same(cache):
+    """Every backend is a kernel cache: same key in, same kernel out.
+
+    tsl and absl are C++ maps, so they also drag a shim-mode module into a C++
+    build -- which is the part most likely to break.
+    """
+    launcher = create_launcher(scale, torch_access=TorchAccess.SHIM, kernel_cache=cache)
+    x = torch.randn(1024, device="cuda")
+    o = torch.empty(1024, device="cuda")
+    for block in (64, 128):  # two specializations, so the cache is used
+        check_matches_triton(scale, launcher, (triton.cdiv(1024, block),), (x, o, 1024, 2.0, block), 1)
+
+
+def test_kernel_cache_choice_reaches_the_digest():
+    modules = {
+        c: pathlib.Path(getattr(create_launcher(scale, kernel_cache=c), "__self__").__file__)
+        for c in CACHES
+    }
+    digests = {c: path.parent.parent.name for c, path in modules.items()}
+    assert len(set(digests.values())) == len(CACHES)
+
+
+def test_unavailable_kernel_cache_is_refused(monkeypatch):
+    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
+    with pytest.raises(UnsupportedKernel, match="INTJ_TSL_INCLUDE"):
+        create_launcher(scale, kernel_cache=KernelCache.TSL)
 
 
 def test_refuses_non_jit_function():

@@ -186,6 +186,122 @@ static int intj_map_put(intj_map *m, const uint64_t *k, uint64_t h,
   return 0;
 }
 
+/* The kernel cache behind four calls, so the entry template never names an
+ * implementation.  INTJ_CACHE_{INTJ,TSL,ABSL} selects one; the last two are
+ * C++ and so force the module to be compiled as C++.
+ *
+ * `intj_cache` is POD in every mode -- it lives in module state, which CPython
+ * hands out as zeroed memory, so a member with a constructor would need a
+ * placement new the template should not have to know about.  The C++ maps are
+ * held by pointer for the same reason.
+ *
+ * Lookups are handed the hash the caller already computed.  Only tsl can take
+ * it; abseil has no such API and re-computes it, which is the measured cost of
+ * that option rather than an oversight.
+ */
+#if defined(INTJ_CACHE_TSL) || defined(INTJ_CACHE_ABSL)
+
+#include <cstring>
+#include <new>
+#if defined(INTJ_CACHE_TSL)
+#include <tsl/robin_map.h>
+#else
+#include <absl/container/flat_hash_map.h>
+#endif
+
+struct intj_key {
+  uint64_t w[INTJ_NWORDS];
+  bool operator==(const intj_key &o) const {
+    return memcmp(w, o.w, sizeof(w)) == 0;
+  }
+};
+
+struct intj_key_hash {
+  using is_avalanching = void; /* wyhash output: no further mixing wanted */
+  size_t operator()(const intj_key &k) const { return (size_t)intj_hash(k.w); }
+};
+
+#if defined(INTJ_CACHE_TSL)
+using intj_cache_map = tsl::robin_map<intj_key, intj_kernel *, intj_key_hash>;
+#else
+using intj_cache_map = absl::flat_hash_map<intj_key, intj_kernel *, intj_key_hash>;
+#endif
+
+typedef struct {
+  intj_cache_map *map;
+} intj_cache;
+
+static inline int intj_cache_init(intj_cache *c) {
+  c->map = new (std::nothrow) intj_cache_map();
+  return c->map ? 0 : -1;
+}
+
+static inline intj_kernel *intj_cache_get(const intj_cache *c,
+                                          const uint64_t *k, uint64_t h) {
+  const intj_key *key = (const intj_key *)k;
+#if defined(INTJ_CACHE_TSL)
+  auto it = c->map->find(*key, (size_t)h);
+#else
+  (void)h;
+  auto it = c->map->find(*key);
+#endif
+  return it == c->map->end() ? NULL : it->second;
+}
+
+/* Returns -1 on allocation failure (with no python error set).  The maps throw
+ * where intj returns, and an exception reaching CPython's C frames is
+ * std::terminate, so the throw stops here. */
+static inline int intj_cache_put(intj_cache *c, const uint64_t *k, uint64_t h,
+                                 intj_kernel *val) {
+  (void)h;
+  try {
+    (*c->map)[*(const intj_key *)k] = val;
+  } catch (...) {
+    return -1;
+  }
+  return 0;
+}
+
+/* Frees intj's own allocations only -- the same contract as the intj backend:
+ * the cache owns the kernel records, triton owns the kernels behind them. */
+static inline void intj_cache_free(intj_cache *c) {
+  if (!c->map)
+    return;
+  for (auto &entry : *c->map)
+    PyMem_RawFree(entry.second);
+  delete c->map;
+  c->map = NULL;
+}
+
+#else /* INTJ_CACHE_INTJ */
+
+typedef intj_map intj_cache;
+
+static inline int intj_cache_init(intj_cache *c) { return intj_map_init(c, 16); }
+
+static inline intj_kernel *intj_cache_get(const intj_cache *c,
+                                          const uint64_t *k, uint64_t h) {
+  return intj_map_get(c, k, h);
+}
+
+static inline int intj_cache_put(intj_cache *c, const uint64_t *k, uint64_t h,
+                                 intj_kernel *val) {
+  return intj_map_put(c, k, h, val);
+}
+
+/* Frees intj's own allocations only.  The kernel records are the cache's; the
+ * kernels behind them belong to the callback's CompiledKernels. */
+static inline void intj_cache_free(intj_cache *c) {
+  if (!c->slots)
+    return;
+  for (uint32_t i = 0; i <= c->mask; i++)
+    PyMem_RawFree(c->slots[i].val);
+  PyMem_RawFree(c->slots);
+  c->slots = NULL;
+}
+
+#endif
+
 /* intj reads three things off a tensor: the data pointer, the dtype (as an
  * opaque int32 discriminator) and, where the backend specializes on pointer
  * range, the storage size.  Exactly one of three strategies is compiled in.

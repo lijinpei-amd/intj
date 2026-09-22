@@ -37,6 +37,14 @@ multi-phase (`PyModuleDef_Init`): a single-phase `m_size = -1` module gets cache
 the interpreter per (name, path), and two launchers would then share one module's
 state. `test_modules_stay_out_of_the_import_system` guards both halves.
 
+## The kernel cache is swappable, and intj's own is the default
+
+`intj_cache_{init,get,put,free}` in `runtime/intj_runtime.h` is the whole
+interface; the entry template never names an implementation. A backend owns the
+kernel records it is given (`intj_cache_free` releases them) and must not let an
+exception escape -- the C++ maps throw where intj returns -1. Numbers live in
+`tests/bench_kernel_cache.cpp`; add a backend there when you add one.
+
 ## Refusals are loud and early
 
 Anything intj cannot do raises `UnsupportedKernel`, preferably in `create_launcher`,

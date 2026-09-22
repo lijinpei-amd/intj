@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .kernel_cache import KernelCache, toolchain_for, unavailable_message
 from .torch_abi import TensorLayout, TorchAccess, layout_for, supported_versions, torch_version
 
 # triton and torch ship no type information, so everything reaching into them is
@@ -65,6 +66,11 @@ class RenderContext:
     error_symbol: str
     error_style: str  # "return" | "outparam"
     torch_access: str  # TorchAccess value; never "auto" by this point
+    kernel_cache: str  # KernelCache value: which hash map holds the kernels
+    #: where that map comes from, when it is not intj's own. In the digest
+    #: because the module is built against it.
+    cache_include_dirs: tuple[str, ...]
+    cache_archives: tuple[str, ...]
     #: `cxx` only: what the binary was compiled against.  The other modes
     #: discover everything at load, so their `.so` is torch-version-independent
     #: and these stay None -- which is what keeps them out of the digest.
@@ -106,6 +112,7 @@ def create_launcher(
     extra_annotation: Mapping[str, str] | None = None,
     options: Mapping[str, Any] | None = None,
     torch_access: TorchAccess = TorchAccess.AUTO,
+    kernel_cache: KernelCache = KernelCache.INTJ,
 ) -> Callable[..., None]:
     """Build a fast launcher for `jit_func`.
 
@@ -119,7 +126,8 @@ def create_launcher(
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
-    `TorchAccess`.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
+    `TorchAccess`.  `kernel_cache` picks the hash map behind the kernel cache;
+    see `KernelCache`.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
     are reserved and currently unsupported.
     """
     if dynamic_grid:
@@ -134,6 +142,9 @@ def create_launcher(
     params = _render_params(jit_func)
 
     access = _resolve_access(torch_access)
+    cache_toolchain = toolchain_for(kernel_cache)
+    if cache_toolchain is None:
+        raise UnsupportedKernel(unavailable_message(kernel_cache))
     target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
@@ -157,6 +168,9 @@ def create_launcher(
         error_symbol=backend.error_symbol,
         error_style=backend.error_style,
         torch_access=access.value,
+        kernel_cache=kernel_cache.value,
+        cache_include_dirs=cache_toolchain["include_dirs"],
+        cache_archives=cache_toolchain["archives"],
         # Only the c++ mode compiles anything torch-specific in, so only it has
         # to be rebuilt when torch changes.  Leaving these None for the other
         # two is what keeps their digest -- and so their cached `.so` -- stable
@@ -346,7 +360,7 @@ def _build(so_path: Path, context: RenderContext) -> None:
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
     # misbehaves, and what you recompile by hand to debug it.
-    suffix = ".cpp" if context.torch_access == TorchAccess.CXX.value else ".c"
+    suffix = ".cpp" if _build_flags(context)["language"] == "c++" else ".c"
     _install(src.encode(), so_path.with_name(f"{context.module_name}{suffix}"))
     _install(Path(built).read_bytes(), so_path)
 
@@ -367,41 +381,52 @@ def _runtime_header_flag() -> str:
 def _build_flags(context: RenderContext) -> dict[str, Any]:
     """Compiler arguments beyond intj's own include directory.
 
-    Only the c++ mode needs anything: torch's headers, and `libc10` for the
-    handful of error-path symbols `THPVariable_Unpack` pulls in.  Those are the
-    reason this cannot be header-only -- torch loads libc10 `RTLD_LOCAL`, so an
-    unlinked module builds fine and then fails at import with an undefined
+    The c++ access mode needs torch's headers, and `libc10` for the handful of
+    error-path symbols `THPVariable_Unpack` pulls in.  Those are the reason it
+    cannot be header-only -- torch loads libc10 `RTLD_LOCAL`, so an unlinked
+    module builds fine and then fails at import with an undefined
     `throw_data_ptr_access_error`.  libtorch_cpu and libtorch_python are *not*
     needed.
+
+    A kernel cache other than intj's is a C++ map, so it drags the whole module
+    into C++ even where the tensor reader would not have.
     """
-    if context.torch_access != TorchAccess.CXX.value:
-        return {
-            "language": "c",
-            "include_dirs": [str(_RUNTIME)],
-            "ccflags": [_runtime_header_flag()],
-        }
+    cxx_access = context.torch_access == TorchAccess.CXX.value
+    cxx_cache = context.kernel_cache != KernelCache.INTJ.value
+    flags: dict[str, Any] = {
+        "include_dirs": [str(_RUNTIME), *context.cache_include_dirs],
+        "ccflags": [_runtime_header_flag(), f"-DINTJ_CACHE_{context.kernel_cache.upper()}"],
+    }
+    if context.cache_archives:
+        # abseil's own link order is not intj's to encode, so the archives go in
+        # a group and the linker sorts it out.
+        flags["ccflags"] += ["-Wl,--start-group", *context.cache_archives, "-Wl,--end-group"]
+    if not cxx_access and not cxx_cache:
+        return {"language": "c", **flags}
+
+    flags["language"] = "c++"
+    # triton puts its own -std=c++17 early and appends ccflags last, so this
+    # wins.  torch >= 2.14 needs c++20 to compile warning-clean.
+    flags["ccflags"].insert(0, "-std=c++20")
+    if not cxx_access:
+        return flags
+
     toolchain = _cxx_toolchain()
     assert toolchain is not None, "create_launcher validated this"
     includes, libs = toolchain
-    return {
-        "language": "c++",
-        "include_dirs": [str(_RUNTIME), *includes],
-        "library_dirs": list(libs),
-        "libraries": ["c10"],
-        # triton puts its own -std=c++17 early and appends ccflags last, so this
-        # wins.  torch >= 2.14 needs c++20 to compile warning-clean.
-        "ccflags": [
-            "-std=c++20",
-            # torch's headers make the translation unit ~7x bigger, and g++'s
-            # inlining budget is per unit: past a size threshold it stops
-            # inlining the tensor reader and PyFloat_AS_DOUBLE into the decode,
-            # costing a real call per argument.  Measured: ~5 ns per launch on a
-            # 3-tensor kernel.  Nothing here is about the torch code itself.
-            f"-D_GLIBCXX_USE_CXX11_ABI={context.cxx_abi}",
-            _runtime_header_flag(),
-            *(f"-Wl,-rpath,{d}" for d in libs),
-        ],
-    }
+    flags["include_dirs"] += includes
+    flags["library_dirs"] = list(libs)
+    flags["libraries"] = ["c10"]
+    flags["ccflags"] += [
+        # torch's headers make the translation unit ~7x bigger, and g++'s
+        # inlining budget is per unit: past a size threshold it stops inlining
+        # the tensor reader and PyFloat_AS_DOUBLE into the decode, costing a
+        # real call per argument.  Measured: ~5 ns per launch on a 3-tensor
+        # kernel.  Nothing here is about the torch code itself.
+        f"-D_GLIBCXX_USE_CXX11_ABI={context.cxx_abi}",
+        *(f"-Wl,-rpath,{d}" for d in libs),
+    ]
+    return flags
 
 
 def _install(content: bytes, path: Path) -> None:

@@ -144,6 +144,38 @@ test suite re-checks the row against the torch it runs on.
 load against the name the struct embeds. It is the independent oracle the test suite
 compares the other two against.
 
+## The kernel cache: `kernel_cache`
+
+Every launch turns the spec key into a compiled kernel through a hash map.
+`create_launcher(..., kernel_cache=...)` picks which, with `intj.KernelCache`:
+
+| | what it is | needs |
+|---|---|---|
+| `INTJ` (default) | intj's open-addressed table, 72 lines | nothing |
+| `TSL` | `tsl::robin_map`, handed the precomputed hash | `$INTJ_TSL_INCLUDE` |
+| `ABSL` | `absl::flat_hash_map` | `$INTJ_ABSL_INCLUDE`, `$INTJ_ABSL_LIB` |
+
+`TSL` and `ABSL` are C++ maps, so either one compiles the whole module as C++
+even under `SHIM` or `CPYTHON` access. Neither is vendored; both are found
+through those variables, and asking for one that is not there is an error rather
+than a silent fall back to `INTJ`.
+
+Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, 5-word key,
+ns per lookup, hit):
+
+| entries | `INTJ` | `TSL` | `ABSL` |
+|---|---|---|---|
+| 1 | 4.18 | 3.88 | 2.95 |
+| 8 | 3.24 | 3.93 | 10.40 |
+| 512 | 4.55 | 5.59 | 12.55 |
+
+`ABSL` wins at one entry because its small-object path skips hashing entirely;
+past that it re-computes the hash intj already has, and no abseil API takes one.
+That is the whole reason the default is the 72 lines.
+
+`pytest tests/test_kernel_cache.py` builds and runs that benchmark for whichever
+backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
+
 ## How a launch works
 
 1. Parse `device`, `stream` and `grid`; return early on a zero-volume grid.
