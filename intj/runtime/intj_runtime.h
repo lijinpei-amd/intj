@@ -16,8 +16,16 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
+/* Only for branches whose outcome is a property of the design, not a guess
+ * about the caller: a bad argument, a launch failure, a cold cache.  The
+ * argument *types* are deliberately not marked -- the render cannot know
+ * whether a parameter is usually a tensor or an int. */
+#define INTJ_LIKELY(x) __builtin_expect(!!(x), 1)
+#define INTJ_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
 #define INTJ_ALWAYS_INLINE inline
+#define INTJ_LIKELY(x) (x)
+#define INTJ_UNLIKELY(x) (x)
 #endif
 
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
@@ -30,13 +38,13 @@ static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 /* 0 = ok, -1 = does not fit, 1 = not an exact int */
 static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
-  if (PyUnstable_Long_IsCompact(v)) { /* |value| < 2**30 */
+  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
     *out = (int64_t)PyUnstable_Long_CompactValue(v);
     return 0;
   }
   uintptr_t tag = v->long_value.lv_tag;
   size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (nd > 3) /* > 90 bits */
+  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
     return -1;
   __uint128_t acc = 0;
   for (size_t i = nd; i-- > 0;)
@@ -63,13 +71,13 @@ static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
 
 static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
-  if (PyUnstable_Long_IsCompact(v)) { /* |value| < 2**30 */
+  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
     *out = (uint64_t)(int64_t)PyUnstable_Long_CompactValue(v);
     return INTJ_INT_I64;
   }
   uintptr_t tag = v->long_value.lv_tag;
   size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (nd > 3) /* > 90 bits */
+  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
     return INTJ_INT_TOO_BIG;
   __uint128_t acc = 0;
   for (size_t i = nd; i-- > 0;)
@@ -130,9 +138,9 @@ static inline intj_kernel *intj_map_get(const intj_map *m, const uint64_t *k,
   uint32_t i = (uint32_t)h & m->mask;
   for (;;) {
     const intj_slot *s = &m->slots[i];
-    if (!s->val)
+    if (INTJ_UNLIKELY(!s->val))
       return NULL;
-    if (s->hash == h && intj_key_eq(s->key, k))
+    if (INTJ_LIKELY(s->hash == h && intj_key_eq(s->key, k)))
       return s->val;
     i = (i + 1) & m->mask;
   }
@@ -250,7 +258,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
    * the kernel a null pointer instead would be a silent wrong launch.  Every
    * dense tensor has a storage, including a zero-element one.
    */
-  if (!si) {
+  if (INTJ_UNLIKELY(!si)) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: cannot access data pointer of a tensor with no "
                     "storage (a sparse tensor?)");
@@ -261,13 +269,13 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
    * slice at the end of a buffer).  Reproduce that: the pointer feeds the
    * alignment bit of the spec key, so a past-the-end pointer here would key
    * differently from the other two modes for the same arguments. */
-  if (numel == 0) {
+  if (INTJ_UNLIKELY(numel == 0)) {
     *p = NULL;
     if (want_size)
       *sz = *(const int64_t *)(si + abi->s_nbytes);
     return 0;
   }
-  if (code >= INTJ_NDTYPES || !abi->itemsize[code]) {
+  if (INTJ_UNLIKELY(code >= INTJ_NDTYPES || !abi->itemsize[code])) {
     /* A dtype intj has no element size for means the offsets are wrong, or
      * torch grew a dtype after the table was built.  Either way, refuse rather
      * than compute a pointer from a guess.
@@ -391,7 +399,7 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
   /* No storage means no dense data pointer -- sparse, mkldnn.  torch raises
    * here and so does intj, rather than handing the kernel a null. */
   const c10::Storage &storage = ti->*get(ti_storage());
-  if (!storage) {
+  if (INTJ_UNLIKELY(!storage)) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: cannot access data pointer of a tensor with no "
                     "storage (a sparse tensor?)");
@@ -400,7 +408,7 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
   c10::StorageImpl *si = storage.unsafeGetStorageImpl();
 
   const caffe2::TypeMeta meta = ti->*get(ti_data_type());
-  if (!meta.isScalarType()) { /* also makes toScalarType() unable to throw */
+  if (INTJ_UNLIKELY(!meta.isScalarType())) { /* also stops toScalarType() throwing */
     PyErr_SetString(PyExc_RuntimeError, "intj: tensor has no scalar dtype");
     return -1;
   }
@@ -536,7 +544,8 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
       int32_t _dt = -1;                                                        \
       int64_t _sz = 0;                                                         \
       int _want = (SPEC) && (SBIT);                                            \
-      if (intj_read_tensor(&(st)->abi, _o, &_p, &_dt, _want, &_sz) != 0) {     \
+      if (INTJ_UNLIKELY(intj_read_tensor(&(st)->abi, _o, &_p, &_dt, _want,      \
+                                         &_sz) != 0)) {                        \
         intj_note_param(pname);                                                \
         return NULL;                                                           \
       }                                                                        \
@@ -557,7 +566,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
     } else if (PyLong_CheckExact(_o)) {                                        \
       uint64_t _bits;                                                          \
       int _kind = intj_as_int(_o, &_bits);                                     \
-      if (_kind == INTJ_INT_TOO_BIG) {                                         \
+      if (INTJ_UNLIKELY(_kind == INTJ_INT_TOO_BIG)) {                          \
         PyErr_Format(PyExc_OverflowError,                                      \
                      "intj: integer argument '%s' is too large", pname);       \
         return NULL;                                                           \
@@ -606,7 +615,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
     } else if (PyLong_CheckExact(_o)) {                                        \
       uint64_t _bits;                                                          \
       int _kind = intj_as_int(_o, &_bits);                                     \
-      if (_kind == INTJ_INT_TOO_BIG) {                                         \
+      if (INTJ_UNLIKELY(_kind == INTJ_INT_TOO_BIG)) {                          \
         PyErr_Format(PyExc_OverflowError,                                      \
                      "intj: constexpr argument '%s' is too large", pname);     \
         return NULL;                                                           \
