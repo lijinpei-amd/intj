@@ -129,13 +129,19 @@ cache miss re-checks it against triton's own binder.
 
 Artifacts land at
 
-    $TRITON_CACHE_DIR/intj/loaded_modules/<digest>/<module>/<kernel><EXT_SUFFIX>
+    $TRITON_HOME/.triton/intj/loaded_modules/<digest>/<module>/<kernel><EXT_SUFFIX>
+    $TRITON_HOME/.triton/intj/loaded_modules/<digest>/<module>/<kernel>.c
 
-so the file says where the kernel came from and which build it is, and the symbol is
-the kernel's own name (`PyInit_<kernel>`) — what `perf` and `/proc/<pid>/maps` show.
-Two builds of one kernel are two directories and two independent modules.
+next to triton's own caches. The rendered source is kept beside the binary: it is what
+you read when a launch misbehaves. The symbol is the kernel's own name
+(`PyInit_<kernel>`) — what `perf` and `/proc/<pid>/maps` show. Two builds of one kernel
+are two directories and two independent modules.
+
+Within a process a `ModuleKey` maps to one loaded module, so repeating
+`create_launcher` for the same kernel and options hands back the same module — and
+therefore the same kernel cache — rather than loading a second copy.
 
 The digest covers the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,
 the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler,
-and `EXT_SUFFIX`. `rm -rf $TRITON_CACHE_DIR/intj` clears every intj artifact.
+and `EXT_SUFFIX`. `rm -rf $TRITON_HOME/.triton/intj` clears every intj artifact.

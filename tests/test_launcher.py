@@ -194,7 +194,7 @@ def test_zero_volume_grid_does_not_launch(scale_launcher):
 
 
 def test_options_are_baked_in():
-    launcher = create_launcher(scale, options={"num_warps": 8})
+    launcher = create_launcher(scale, options={"num_warps": 8})  # freshly loaded: see below
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
     kernel_cache = scale.device_caches[torch.cuda.current_device()][0]
@@ -210,21 +210,46 @@ def test_launchers_of_one_kernel_stay_independent():
     The symbol is the kernel's name, for legible `perf` output; the digest in
     the path and the spec name is what keeps the two builds apart.
     """
-    default = getattr(create_launcher(scale), "__self__")
-    wide = getattr(create_launcher(scale, options={"num_warps": 8}), "__self__")
-    assert default.__name__.rsplit(".", 1)[-1] == wide.__name__.rsplit(".", 1)[-1] == "scale"
-    assert default.__name__ != wide.__name__
-    assert default is not wide
-    assert default.__file__ != wide.__file__
+    # num_warps values no other test uses, so both modules are loaded here and
+    # their kernel caches are cold; a warm one would not compile anything.
+    narrow = getattr(create_launcher(scale, options={"num_warps": 2}), "__self__")
+    wide = getattr(create_launcher(scale, options={"num_warps": 16}), "__self__")
+    assert narrow.__name__.rsplit(".", 1)[-1] == wide.__name__.rsplit(".", 1)[-1] == "scale"
+    assert narrow.__name__ != wide.__name__
+    assert narrow is not wide
+    assert narrow.__file__ != wide.__file__
 
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
     kernel_cache = scale.device_caches[torch.cuda.current_device()][0]
-    for launcher, num_warps in ((default.entry, 4), (wide.entry, 8)):
+    for launcher, num_warps in ((narrow.entry, 2), (wide.entry, 16)):
         kernel_cache.clear()
         launch(launcher, (8,), x, o, 1024, 2.0, 128)
         torch.testing.assert_close(o, x * 2.0)
         assert {k.metadata.num_warps for k in kernel_cache.values()} == {num_warps}
+
+
+def test_one_module_per_key():
+    """A repeat `create_launcher` reuses the loaded module, callback included.
+
+    Installing a second callback would drop the first, freeing the
+    `CompiledKernel`s whose function handles the C kernel cache still holds.
+    """
+    first = create_launcher(scale, options={"num_stages": 3})
+    second = create_launcher(scale, options={"num_stages": 3})
+    assert getattr(first, "__self__") is getattr(second, "__self__")
+    assert first == second
+
+
+def test_source_and_binary_are_cached_on_disk():
+    launcher = create_launcher(scale, options={"num_stages": 4})
+    so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
+    source = so_path.with_name("scale.c")
+    assert so_path.exists() and source.exists()
+    assert "PyInit_scale" in source.read_text()
+    assert so_path.parent.parent.parent.name == "loaded_modules"
+    # no half-written artifacts left behind by the atomic install
+    assert not [p for p in so_path.parent.iterdir() if p.name.startswith(".")]
 
 
 def test_wrong_argument_count(scale_launcher):

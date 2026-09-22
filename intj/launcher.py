@@ -8,10 +8,10 @@ import importlib.util
 import inspect
 import json
 import os
-import shutil
 import struct
 import subprocess
 import sysconfig
+import threading
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -153,7 +153,7 @@ def create_launcher(
     # The rendered source is a pure function of the template, the runtime header
     # and the context, so hash those instead of the render -- otherwise naming the
     # module after the digest would need a throwaway render first.
-    digest = ModuleKey(
+    key = ModuleKey(
         template=_ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
         context=context,
@@ -168,17 +168,44 @@ def create_launcher(
         triton=_triton_identity(),
         compiler=_compiler_identity(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
-    ).digest()
-
-    module_name = _symbol_name(jit_func)
-    src = _render(dataclasses.replace(context, module_name=module_name))
-    module = _load(jit_func, module_name, digest, src)
-    module.set_compile_callback(_make_compile_callback(jit_func, params, options))
-    return module.entry
+    )
+    return _loaded_module(key, jit_func, context, params, options).entry
 
 
 def get_full_name(fn: Any) -> str:
     return f"{fn.__module__}.{fn.__qualname__}"
+
+
+_LOADED: dict[ModuleKey, types.ModuleType] = {}
+_LOAD_LOCK = threading.Lock()
+
+
+def _loaded_module(
+    key: ModuleKey,
+    jit_func: JitFunction,
+    context: RenderContext,
+    params: Sequence[Param],
+    options: Mapping[str, Any],
+) -> types.ModuleType:
+    """One module per `ModuleKey`, for the life of the process.
+
+    Reusing the module reuses its compile callback, which owns the
+    `CompiledKernel`s the C kernel cache points into -- installing a second
+    callback would drop the first, freeing kernels whose function handles are
+    still in that cache. So a hit returns the module untouched.
+
+    The lock matters: without it two threads both compile and both load, and the
+    loser's module (with its own kernel cache) is silently dropped.
+    """
+    with _LOAD_LOCK:
+        module = _LOADED.get(key)
+        if module is None:
+            name = _symbol_name(jit_func)
+            src = _render(dataclasses.replace(context, module_name=name))
+            module = _load(jit_func, name, key.digest(), src)
+            module.set_compile_callback(_make_compile_callback(jit_func, params, options))
+            _LOADED[key] = module
+        return module
 
 
 def _symbol_name(jit_func: JitFunction) -> str:
@@ -204,9 +231,10 @@ def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> typ
 
         built = compile_so_from_src(src=src, name=module_name, include_dirs=[str(_RUNTIME)], language="c")
         directory.mkdir(parents=True, exist_ok=True)
-        staged = directory / f".{module_name}.{os.getpid()}{suffix}"
-        shutil.copyfile(built, staged)
-        os.replace(staged, so_path)  # atomic, so a racing build cannot be half-read
+        # The source is kept next to the binary: it is what you read when a
+        # launch misbehaves, and what you recompile by hand to debug it.
+        _install(src.encode(), directory / f"{module_name}.c")
+        _install(Path(built).read_bytes(), so_path)
 
     # A distinct spec name per digest keeps two builds of one kernel apart.
     spec_name = f"intj.loaded_modules.{get_full_name(jit_func)}.{digest[:16]}.{module_name}"
@@ -218,11 +246,19 @@ def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> typ
     return module
 
 
+def _install(content: bytes, path: Path) -> None:
+    """Write `content` to `path` atomically, so a racing build cannot be half-read."""
+    staged = path.with_name(f".{path.name}.{os.getpid()}")
+    staged.write_bytes(content)
+    os.replace(staged, path)
+
+
 @functools.lru_cache(maxsize=1)
 def _cache_root() -> Path:
+    """`$TRITON_HOME/.triton/intj`, a sibling of triton's own cache."""
     from triton import knobs
 
-    return Path(knobs.cache.dir) / "intj" / "loaded_modules"
+    return Path(knobs.cache.get_triton_dir("intj")) / "loaded_modules"
 
 
 class Backend(abc.ABC):
