@@ -126,11 +126,12 @@ typedef struct {
   uint32_t used;
 } intj_map;
 
+/* memcmp, not a word loop: the loop has to exit early, so it compiles to one
+ * mov/cmp/jne per word, while memcmp of a compile-time size vectorizes -- three
+ * vpxor/vptest cover 88 bytes.  Measured on an 11-word key: 33 instructions and
+ * 11 dependent branches down to 12 and 3. */
 static inline int intj_key_eq(const uint64_t *a, const uint64_t *b) {
-  for (int i = 0; i < INTJ_NWORDS; i++)
-    if (a[i] != b[i])
-      return 0;
-  return 1;
+  return memcmp(a, b, INTJ_NWORDS * sizeof(uint64_t)) == 0;
 }
 
 static inline intj_kernel *intj_map_get(const intj_map *m, const uint64_t *k,
