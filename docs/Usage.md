@@ -149,21 +149,26 @@ compares the other two against.
 Every launch turns the spec key into a compiled kernel through a hash map.
 `create_launcher(..., kernel_cache=...)` picks which, with `intj.KernelCache`:
 
-| | what it is | provision with |
+| | what it is | first use costs |
 |---|---|---|
 | `INTJ` (default) | intj's open-addressed table, 72 lines | nothing |
-| `TSL` | `tsl::robin_map`, handed the precomputed hash | `python -m intj.kernel_cache tsl` |
-| `ABSL` | `absl::flat_hash_map` | `python -m intj.kernel_cache absl` |
+| `TSL` | `tsl::robin_map`, handed the precomputed hash | ~3 s, a download |
+| `ABSL` | `absl::flat_hash_map` | ~32 s, a download and a build |
 
 `TSL` and `ABSL` are C++ maps, so either one compiles the whole module as C++
 even under `SHIM` or `CPYTHON` access.
 
 Neither is vendored, and **nothing installed on the machine is searched for**:
-that command downloads a pinned version, checks its sha256, and (for abseil)
-builds it into `$TRITON_HOME/.triton/intj/deps/`. What a module was built
-against is then a property of intj's cache rather than of the host. Asking for a
-backend that is not provisioned is an error naming that command, never a silent
-fall back to `INTJ`.
+`create_launcher` downloads a pinned version, checks its sha256, and (for
+abseil) builds it into `$TRITON_HOME/.triton/intj/deps/`. What a module was
+built against is then a property of intj's cache rather than of the host. It
+happens once, on the path that was already going to invoke a compiler, and is
+announced on stderr — an implicit download is otherwise indistinguishable from
+a hang. To get it over with ahead of time, or before going offline:
+
+    python -m intj.kernel_cache all
+
+If the install fails, the error carries the reason and that command.
 
 Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, 5-word key,
 ns per lookup, hit):

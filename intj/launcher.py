@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .kernel_cache import KernelCache, toolchain_for, unavailable_message
+from .kernel_cache import KernelCache, install, toolchain_for, unavailable_message
 from .torch_abi import TensorLayout, TorchAccess, layout_for, supported_versions, torch_version
 
 # triton and torch ship no type information, so everything reaching into them is
@@ -144,7 +144,13 @@ def create_launcher(
     access = _resolve_access(torch_access)
     cache_toolchain = toolchain_for(kernel_cache)
     if cache_toolchain is None:
-        raise UnsupportedKernel(unavailable_message(kernel_cache))
+        # First use of a backend fetches it, and abseil also builds -- minutes,
+        # once, announced on stderr.  Only ever here, on the slow path that was
+        # already going to invoke a compiler.
+        try:
+            cache_toolchain = install(kernel_cache)
+        except Exception as error:
+            raise UnsupportedKernel(unavailable_message(kernel_cache, error)) from error
     target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)

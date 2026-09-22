@@ -18,7 +18,12 @@ measured, not because they are expected to win.
 `TSL` and `ABSL` are **downloaded and built into intj's own cache directory**,
 at a pinned version and checksum.  Nothing installed on the machine is searched
 for or used: what a module was built against is then a property of intj's cache,
-not of the host.  Provision with
+not of the host.
+
+`create_launcher` provisions on demand, so the first use of a backend fetches it
+(abseil also builds: ~2 minutes, once).  It says so on stderr first, because an
+implicit download is otherwise indistinguishable from a hang.  To get it over
+with ahead of time, or on a machine that will later be offline:
 
     python -m intj.kernel_cache tsl      # or absl, or all
 """
@@ -86,10 +91,8 @@ _SOURCES: dict[KernelCache, Dependency] = {
 def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
     """Include and library directories for `cache`, or None if not provisioned.
 
-    Only intj's own cache directory is consulted.  `install` is what puts
-    anything there, and it is never called implicitly: a `create_launcher` that
-    quietly reached for the network would be a surprise at an unpredictable
-    moment.
+    Only intj's own cache directory is consulted; `install` is what puts
+    anything there.
     """
     if cache is KernelCache.INTJ:
         return {"include_dirs": (), "library_dirs": (), "archives": ()}
@@ -116,7 +119,9 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
     """Download (and build, for abseil) `cache` into intj's cache directory.
 
     Returns the same toolchain `toolchain_for` does.  Idempotent: an existing
-    tree is reused unless `force`.
+    tree is reused unless `force`, so the common call does no work and says
+    nothing.  When there *is* work, it is announced -- a silent two-minute
+    build inside `create_launcher` is indistinguishable from a hang.
     """
     if cache is KernelCache.INTJ:
         return {"include_dirs": (), "library_dirs": (), "archives": ()}
@@ -126,8 +131,10 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
     if force:
         shutil.rmtree(root, ignore_errors=True)
     if not (root / source.marker).exists():
+        _announce(f"downloading {cache.value} {source.version} to {root}")
         _unpack(source, root)
     if source.builds and not _archives(root / "build"):
+        _announce(f"building {cache.value} {source.version} (a few minutes, once)")
         _cmake_build(root)
 
     toolchain = toolchain_for(cache)
@@ -136,13 +143,18 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
     return toolchain
 
 
-def unavailable_message(cache: KernelCache) -> str:
+def unavailable_message(cache: KernelCache, reason: object) -> str:
+    """Why an on-demand install failed, and how to do it by hand."""
     return (
-        f"intj: kernel_cache=KernelCache.{cache.name} is not provisioned; run "
-        f"`{Path(sys.executable).name} -m intj.kernel_cache {cache.value}` to download "
-        f"{'and build ' if _SOURCES[cache].builds else ''}"
-        f"{cache.value} {_SOURCES[cache].version} into {_deps_root()}"
+        f"intj: kernel_cache=KernelCache.{cache.name} needs {cache.value} "
+        f"{_SOURCES[cache].version} in {_deps_root()}, and installing it failed: {reason}. "
+        f"Run `{Path(sys.executable).name} -m intj.kernel_cache {cache.value}` to retry "
+        f"on its own, or use kernel_cache=KernelCache.INTJ, which needs nothing."
     )
+
+
+def _announce(message: str) -> None:
+    print(f"intj: {message}", file=sys.stderr, flush=True)
 
 
 @functools.lru_cache(maxsize=1)
@@ -222,9 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     for cache in wanted:
         if cache is KernelCache.INTJ:
             continue
-        source = _SOURCES[cache]
-        print(f"intj: installing {cache.value} {source.version} into {_source_root(cache)}")
         toolchain = install(cache)
+        print(f"intj: {cache.value} {_SOURCES[cache].version} in {_source_root(cache)}")
         print(f"  include {toolchain['include_dirs'][0]}")
         if toolchain["archives"]:
             print(f"  {len(toolchain['archives'])} libraries in {toolchain['library_dirs'][0]}")

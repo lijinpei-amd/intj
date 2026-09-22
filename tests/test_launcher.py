@@ -500,9 +500,22 @@ def test_kernel_cache_choice_reaches_the_digest():
     assert len(set(digests.values())) == len(CACHES)
 
 
-def test_unavailable_kernel_cache_is_refused(monkeypatch):
+def test_kernel_cache_is_installed_on_demand(monkeypatch):
+    """An unprovisioned backend installs itself, and says so if it cannot."""
+    calls: list[KernelCache] = []
     monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
-    with pytest.raises(UnsupportedKernel, match="python -m intj.kernel_cache tsl"):
+    monkeypatch.setattr(
+        "intj.launcher.install",
+        lambda cache: calls.append(cache) or {"include_dirs": (), "library_dirs": (), "archives": ()},
+    )
+    create_launcher(scale, kernel_cache=KernelCache.INTJ)  # the render does not care
+    assert calls == [KernelCache.INTJ]
+
+    def explode(cache):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr("intj.launcher.install", explode)
+    with pytest.raises(UnsupportedKernel, match="no network.*python -m intj.kernel_cache tsl"):
         create_launcher(scale, kernel_cache=KernelCache.TSL)
 
 

@@ -48,9 +48,9 @@ exception escape -- the C++ maps throw where intj returns -1. Numbers live in
 A backend's library is downloaded at a pinned version and checksum into
 `$TRITON_HOME/.triton/intj/deps/`, never taken from the host: what a module was
 built against has to be a property of intj's cache, or the same digest means
-different binaries on two machines. Never fetch implicitly from
-`create_launcher` -- `python -m intj.kernel_cache <name>` is the only thing that
-touches the network.
+different binaries on two machines. `create_launcher` provisions on demand, once, and announces it on stderr;
+`python -m intj.kernel_cache <name>` does the same thing ahead of time. Anything
+that reaches the network belongs on that slow path, never on a launch.
 
 ## Refusals are loud and early
 
