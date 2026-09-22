@@ -24,8 +24,9 @@ torch, and should pick a good default when they do not.
 ## Goals
 
 - Three explicit strategies, selectable per launcher, plus an automatic default.
-- The torch version is a render-time input, so the cache cannot serve a module
-  built against a different torch.
+- Every version-dependent input is a render-time input, so the cache cannot
+  serve a module built against a different torch -- and does not rebuild when
+  nothing relevant changed.
 - Avoid calling back into the Python interpreter on the launch path wherever the
   version makes that possible.
 - No measurable cost on the fast path, which is the whole point of intj: the
@@ -43,21 +44,46 @@ torch, and should pick a good default when they do not.
 
 ### Compile-time selection
 
-`RenderContext` gains two fields:
+The mode is resolved first -- `None` becomes one of the three concrete modes --
+and only then does `RenderContext` get filled in:
 
 ```python
-torch_access: str          # "direct" | "cpython" | "cxx"
-torch_version: tuple[int, int]
+torch_access: str                  # "direct" | "cpython" | "cxx"
+layout: TensorLayout | None        # "direct" only: the six offsets + itemsize
+torch_version: tuple[int, int] | None   # "cxx" only
 ```
 
-Both therefore land in `ModuleKey`, so the `.so` is keyed on
-`(mode, torch major.minor)` and the stale-cache bug is fixed by inclusion. Every
-layout constant is a render-time literal; the generated C has no mode branches,
-no offsets in module state, and no post-load setter.
+Every layout constant is a render-time literal, so the generated C has no mode
+branches, no offsets in module state, and no post-load setter.
 
-This costs a rebuild when torch's minor version changes. That is the honest
-price of baking layout knowledge into the binary, and it is what makes the
-binary correct.
+**What the key must contain is every version-dependent input, not the version.**
+`ModuleKey` already states this contract: "a missing field means a stale
+module." Applied per mode:
+
+| mode | version-dependent input | in the key as |
+|---|---|---|
+| `"direct"` | six struct offsets, itemsize table | `layout` |
+| `"cpython"` | none | - |
+| `"cxx"` | the headers and libraries it links | `torch_version` |
+
+So the version itself is keyed only in `"cxx"`, where nothing else describes
+what the binary was built against. This is strictly better than keying on the
+version everywhere:
+
+- `"direct"` rebuilds only when the layout actually differs. Torch versions that
+  share offsets share one `.so`, instead of one build per minor release.
+- `"cpython"` asserts nothing about torch's layout, so its `.so` is valid on
+  every torch version, forever. No rebuild, ever.
+- `"cxx"` rebuilds per minor version, which is unavoidable and correct.
+
+The stale-cache bug is fixed either way. The difference is how much unnecessary
+rebuilding comes with the fix.
+
+This does put weight on `TensorLayout` being complete. If a future torch changes
+something `"direct"` depends on that is *not* one of its fields, the digest will
+not move and a stale module will load. The `TypeMeta`/`ScalarType` coincidence
+is the one such dependency that is not currently a field, and it is why test 3
+exists.
 
 ### The modes
 
@@ -230,8 +256,12 @@ Extends `tests/test_launcher.py`, which is already differential against triton.
 4. **Layout and mode tables.** Pure-Python unit tests over the version ->
    constants mapping and the `None` -> mode resolution, including the
    unrecognised-version path and every raising case. No GPU needed.
-5. **Module key.** Assert `ModuleKey.digest()` changes when `torch_version` or
-   `torch_access` changes. This is the regression the design exists to prevent.
+5. **Module key granularity.** Assert the digest changes when `torch_access`
+   changes; when `layout` changes in `"direct"`; and when `torch_version`
+   changes in `"cxx"`. Assert it does *not* change when the torch version moves
+   in `"cpython"`, or in `"direct"` between two versions with identical layout.
+   The first three are the stale-cache regression; the last two are the
+   over-invalidation this keying exists to avoid.
 6. **Launch correctness per mode.** Launch the existing kernels under each mode
    and compare results against triton.
 
@@ -247,7 +277,8 @@ different build requirements and a slower first launch. Callers who want the old
 build characteristics pass `torch_access="direct"`.
 
 The `.so` cache invalidates once, because the template and runtime header are
-hashed into `ModuleKey`, and thereafter re-invalidates on each torch minor
-version.
+hashed into `ModuleKey`. After that, rebuild frequency depends on the mode:
+`"cxx"` on every torch minor version, `"direct"` only when the struct layout
+changes, `"cpython"` never.
 
 Bump `SCHEMA_VERSION`.
