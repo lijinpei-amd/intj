@@ -391,7 +391,7 @@ Implemented and measured on torch 2.14.0.dev+rocm7.2, gfx942, triton 3.8.0.
 | mode | decode + spec key (3 tensor args) | first build | `.so` rebuilt on torch upgrade |
 |---|---|---|---|
 | `SHIM` | 89 ns | 0.6 s | no |
-| `CXX` | 101 ns | 11.5 s | yes |
+| `CXX` | 90 ns | 11.5 s | yes |
 | `CPYTHON` | ~300 ns | 0.6 s | no |
 
 `SHIM` and `CXX` land in the same place, as predicted -- both inline the reads.
@@ -464,3 +464,37 @@ null pointer and the kernel faults on the GPU.
 than diverge. Documented in `docs/Usage.md` and pinned by a test, not fixed:
 neither a nested nor an mkldnn tensor is a usable triton kernel argument. `mkldnn`
 has no storage and *is* refused cleanly.
+
+## Postscript: closing the `CXX` gap, and what it was actually made of
+
+`CXX` started 14 ns behind `SHIM` and ended within ~1 ns of it (90 vs 89). None of
+the gap was where it looked. In order of what was actually measured:
+
+1. **Not the `TORCH_CHECK`s.** Removing them: no change. Predicted-not-taken
+   branches on flags already in cache.
+2. **Not the policy dispatch.** `numel_default()` vs `numel()`: no change.
+3. **Not the compiler.** The decisive control: compiling the *shim* source with
+   g++ instead of gcc gave byte-for-byte the same time (88.2 ns both).
+4. **Inlining, four separate times.** A `try` inside the reader stopped g++
+   inlining it. `sym_nbytes()` materialised a `SymInt` whose refcounting copy and
+   destructor cost ~129 instructions. `StorageImpl::nbytes()` went through the
+   PLT. And `PyFloat_AS_DOUBLE` -- CPython's own static inline, nothing to do
+   with torch -- was left out of line, worth ~4 ns on its own.
+
+The root cause behind most of those: g++'s inlining budget is per translation
+unit, and including `python_variable.h` makes `.text` **7.4x** bigger (23,794 ->
+176,492 bytes) for code that never uses it. Isolated with a one-flag experiment --
+identical source, identical flags, only `-include python_variable.h` added,
+unused: **92.64 -> 98.85 ns**, with `intj_read_tensor`, `PyFloat_AS_DOUBLE` and
+`intj_note_param` all going out of line.
+
+Raising the budget (`--param large-unit-insns`, `inline-unit-growth`) recovers it
+when the reader is not force-inlined, but once the reader carries
+`always_inline` and the float read is a field access the flags make no measurable
+difference, so they are not used. Two `always_inline` markers and one field read
+were enough.
+
+The final reader reaches torch's private fields through the explicit-instantiation
+trick, so it makes exactly the loads the shim makes. That is what removed the last
+throw site and let the try/catch go entirely -- the reason it is worth the
+unusual technique is correctness, not the ~1 ns.

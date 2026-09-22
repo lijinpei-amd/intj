@@ -384,6 +384,11 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
         # wins.  torch >= 2.14 needs c++20 to compile warning-clean.
         "ccflags": [
             "-std=c++20",
+            # torch's headers make the translation unit ~7x bigger, and g++'s
+            # inlining budget is per unit: past a size threshold it stops
+            # inlining the tensor reader and PyFloat_AS_DOUBLE into the decode,
+            # costing a real call per argument.  Measured: ~5 ns per launch on a
+            # 3-tensor kernel.  Nothing here is about the torch code itself.
             f"-D_GLIBCXX_USE_CXX11_ABI={context.cxx_abi}",
             _runtime_header_flag(),
             *(f"-Wl,-rpath,{d}" for d in libs),

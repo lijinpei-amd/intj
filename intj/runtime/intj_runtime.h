@@ -310,39 +310,64 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
 
 #elif defined(INTJ_ACCESS_CXX)
 
-/* The same reads as the shim mode, with the compiler resolving the field offsets
- * instead of a probe.
+/* Exactly the loads the shim mode makes, with the compiler supplying the field
+ * offsets instead of a probe.
  *
- * Deliberately the check-free accessors.  The convenient `t.data_ptr()` and
- * `t.storage().nbytes()` hide five TORCH_CHECKs between them and every one is a
- * throw; an exception escaping into CPython's C frames is not an error you catch
- * upstream, it is `std::terminate` -- measured, a core dump on a sparse tensor.
- * Each condition intj cares about is its own branch here instead.
+ * The fields are private, so they are reached through the explicit-instantiation
+ * trick: [temp.spec]/6 says access checking does not apply to names appearing in
+ * an explicit instantiation, so a pointer-to-private-member is legal there, and
+ * the friend injected by `Rob` hands it back.  (Johannes Schaub,
+ * bloglitb.blogspot.com/2010/07/access-to-private-members-thats-easy.html.)
  *
- * `numel_default()` and `storage_offset_default()` rather than `numel()` and
- * `storage_offset()`: those dispatch through a sizes/strides policy to a virtual
- * `*_custom()`, and impls whose stored fields disagree with their accessors -- a
- * nested tensor has `numel_ == 0` while `numel()` is 8 -- are *not* filtered by
- * the exact-type test, because `torch.nested.nested_tensor(...)` and
- * `.to_mkldnn()` are exact-type `torch.Tensor`.  Reading the raw field makes
- * this mode behave identically to the shim mode, which cannot see the policy bit
- * at all.  One documented limitation shared by both beats two modes that
- * disagree; see `docs/Usage.md`.
+ * This is deliberate, and it buys two things that the public accessors cannot:
  *
- * No try/catch here, on purpose.  The remaining throw sites are unreachable for
- * the tensors that get this far, and a `try` in this function inflates g++'s
- * inlining cost estimate enough that it leaves the whole reader out of line --
- * a real call per argument.  The template wraps the entire decode in one catch
- * instead, which costs nothing and still cannot let an exception reach CPython.
+ *  - No throw sites at all.  `t.data_ptr()`, `t.storage()`, `storage.nbytes()`
+ *    and even `numel()` each hide a TORCH_CHECK, and an exception crossing into
+ *    CPython's C frames is `std::terminate` -- measured, a core dump on a sparse
+ *    tensor.  Reading the fields means every failure intj can reach is an
+ *    explicit branch below, so this path needs no try/catch, which is worth
+ *    ~4 ns per decode in inlining and block layout alone.
+ *  - No accessor that torch declines to inline.  `StorageImpl::nbytes()` is
+ *    defined in-class but goes through the PLT in a module this size, and
+ *    `sym_nbytes()` materialises a `SymInt` whose refcounting copy and destroy
+ *    cost ~129 instructions for a value that is never heap-allocated here.
+ *
+ * The cost is that a torch release renaming any of these fields breaks the
+ * build.  That is the right failure: a compile error, not a wrong pointer --
+ * which is what the shim mode would get, since it cannot see names at all.
  */
+namespace intj_rob {
+template <typename Tag, typename Tag::type M>
+struct Rob {
+  friend typename Tag::type get(Tag) { return M; }
+};
+#define INTJ_ROB(NAME, CLASS, MEMBER, ...)                                     \
+  struct NAME {                                                               \
+    using type = __VA_ARGS__ CLASS::*;                                        \
+    friend type get(NAME);                                                    \
+  };                                                                          \
+  template struct Rob<NAME, &CLASS::MEMBER>;
+
+INTJ_ROB(ti_storage, c10::TensorImpl, storage_, c10::Storage)
+INTJ_ROB(ti_numel, c10::TensorImpl, numel_, int64_t)
+INTJ_ROB(ti_storage_offset, c10::TensorImpl, storage_offset_, int64_t)
+INTJ_ROB(ti_data_type, c10::TensorImpl, data_type_, caffe2::TypeMeta)
+INTJ_ROB(si_size_bytes, c10::StorageImpl, size_bytes_, c10::SymInt)
+INTJ_ROB(si_data_ptr, c10::StorageImpl, data_ptr_, c10::DataPtr)
+#undef INTJ_ROB
+}  // namespace intj_rob
+
 static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
                                                PyObject *o, void **p, int32_t *dt,
                                                int want_size, int64_t *sz) {
+  using namespace intj_rob;
   (void)abi;
   const at::Tensor &t = THPVariable_Unpack(o);
-  c10::TensorImpl *impl = t.unsafeGetTensorImpl();
+  c10::TensorImpl *ti = t.unsafeGetTensorImpl();
 
-  const c10::Storage &storage = impl->unsafe_storage();
+  /* No storage means no dense data pointer -- sparse, mkldnn.  torch raises
+   * here and so does intj, rather than handing the kernel a null. */
+  const c10::Storage &storage = ti->*get(ti_storage());
   if (!storage) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: cannot access data pointer of a tensor with no "
@@ -351,26 +376,24 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
   }
   c10::StorageImpl *si = storage.unsafeGetStorageImpl();
 
-  const caffe2::TypeMeta meta = impl->dtype();
-  if (!meta.isScalarType()) { /* makes toScalarType() unable to throw */
+  const caffe2::TypeMeta meta = ti->*get(ti_data_type());
+  if (!meta.isScalarType()) { /* also makes toScalarType() unable to throw */
     PyErr_SetString(PyExc_RuntimeError, "intj: tensor has no scalar dtype");
     return -1;
   }
   *dt = (int32_t)meta.toScalarType();
 
-  /* `nbytes()` rather than `sym_nbytes()`: the symbolic form returns a SymInt by
-   * value whose destructor does not inline, costing a real call per argument.
-   * This form is a bitfield test, and it throws only for a symbolic size, which
-   * the decode's outer catch covers. */
   if (want_size)
-    *sz = (int64_t)si->nbytes();
+    *sz = (si->*get(si_size_bytes())).as_int_unchecked();
 
   /* torch returns null for every zero-element tensor, even one whose storage is
-   * live and whose storage_offset is not zero; see the shim reader. */
-  *p = impl->numel_default() == 0
+   * live and whose storage_offset is not zero; see the shim reader.  Reading
+   * `numel_` rather than calling `numel()` also matches the shim mode on a
+   * tensor whose impl overrides it -- see docs/Usage.md. */
+  *p = (ti->*get(ti_numel())) == 0
            ? NULL
-           : (void *)((char *)si->_mutable_data_ptr_no_checks().get() +
-                      impl->storage_offset_default() * (int64_t)meta.itemsize());
+           : (void *)((char *)(si->*get(si_data_ptr())).get() +
+                      (ti->*get(ti_storage_offset())) * (int64_t)meta.itemsize());
   return 0;
 }
 
@@ -473,6 +496,11 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
  * (do_not_specialize, do_not_specialize_on_alignment, and whether the backend
  * specializes pointers on a 2 GiB range).
  *
+ * Reads `ob_fval` rather than calling `PyFloat_AS_DOUBLE`: that is a static
+ * inline in CPython's headers, and in the c++ mode's much larger translation
+ * unit g++ leaves it out of line -- a real call per float argument.  The two are
+ * the same field read.
+ *
  * `st` must expose tensor_type/param_type and the torch ABI block.
  * On failure it sets a python error and returns NULL from the enclosing
  * function -- which must therefore return PyObject *.  (A `goto` to a shared
@@ -535,7 +563,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         (np)++;                                                                \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      float _f = (float)PyFloat_AS_DOUBLE(_o);                                 \
+      float _f = (float)((PyFloatObject *)_o)->ob_fval;                                 \
       uint32_t _bits;                                                          \
       memcpy(&_bits, &_f, 4);                                                  \
       (word) = INTJ_WORD(INTJ_T_FP32, 0, 0);                                   \
@@ -578,7 +606,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         (w1) = _u;                                                             \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      double _d = PyFloat_AS_DOUBLE(_o);                                       \
+      double _d = ((PyFloatObject *)_o)->ob_fval;                                       \
       (w0) = INTJ_WORD(INTJ_T_CX_FLOAT, 0, 0);                                 \
       memcpy(&(w1), &_d, 8);                                                   \
     } else {                                                                   \
