@@ -190,14 +190,14 @@ def _symbol_name(jit_func: JitFunction) -> str:
 def _load(jit_func: JitFunction, module_name: str, digest: str, src: str) -> types.ModuleType:
     """Build (once) and load the extension for this kernel and this digest.
 
-    The `.so` lands in `<cache>/loaded_modules/<module>.<qualname>/<digest>/`, so
-    the artifact says which kernel it belongs to and which build it is. Its leaf
-    name is the kernel's own name, because CPython derives `PyInit_<leaf>` from
-    the last dotted component of the spec name -- that is also what `perf` and
+    The `.so` lands in `<cache>/loaded_modules/<module>/<digest>/<kernel>`, so the
+    artifact says where the kernel came from and which build it is. Its leaf name
+    is the kernel's own name, because CPython derives `PyInit_<leaf>` from the
+    last dotted component of the spec name -- that is also what `perf` and
     /proc/<pid>/maps show.
     """
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-    directory = _cache_root() / get_full_name(jit_func) / digest
+    directory = _cache_root() / jit_func.__module__ / digest
     so_path = directory / f"{module_name}{suffix}"
     if not so_path.exists():
         from triton.runtime.build import compile_so_from_src
