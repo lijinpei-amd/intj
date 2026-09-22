@@ -192,22 +192,50 @@ That is why `None` prefers it. Costs, all accepted:
   `torch/include/torch/csrc/api/include`, `-L <torch>/lib`, `-ltorch_cpu -lc10
   -ltorch_python`, and `-D_GLIBCXX_USE_CXX11_ABI=` matching how torch was built.
   Read that flag from `torch._C._GLIBCXX_USE_CXX11_ABI` rather than guessing.
-- **Build latency.** `python_variable.h` pulls in `ATen/Tensor.h` and thousands
-  of headers. First launch per kernel goes from well under a second to several.
+- **A language standard that depends on the torch version.** torch 2.14 requires
+  `-std=c++20`: `ATen/core/TensorBase.h` uses `requires` clauses, and C++17
+  fails with `'requires' does not name a type`. Older torch needed less. The
+  standard is therefore another version-dependent input, already covered by
+  `torch_version` in the key.
+- **Build latency, measured: 10.9 s** for one translation unit
+  (`g++ -std=c++20 -O2`, torch 2.14, warm page cache), against 0.011 s for an
+  empty C one. This is per kernel, on first launch, in the caller's foreground.
+  It is the strongest argument against `None` resolving here, and it should be
+  revisited once it is a benchmark row rather than a single measurement.
 - **A C++ compiler must exist.** `_compiler_identity()` covers only
   `_find_compiler("c")` today and must cover `"c++"` for this mode.
 
 triton's builder already supports it: `compile_so_from_src(..., language="c++")`
 and `_find_compiler` honours `CXX`.
 
-**Open feasibility risk.** The existing source must survive a C++ compile.
+#### Exceptions are mandatory here
+
+`-fno-exceptions` is not an option: torch's headers do not compile without
+exception support. `c10/util/Exception.h` throws from `TORCH_CHECK`, and
+`ATen/core/ivalue_inl.h` contains `try`/`catch`, both reached through the inline
+functions this mode calls -- `data_ptr()` itself throws on uninitialized
+storage. Verified: `-fno-exceptions` fails at `Exception.h:400`.
+
+Nor would disabling them pay. Itanium-ABI exception handling is table-driven, so
+the non-throwing path carries no runtime cost; `noexcept` and `-fno-exceptions`
+buy code size and a little optimizer freedom, not speed, and for a handful of
+inline loads that is not measurable. The C modes have nothing to disable.
+
+What this mode does need, for correctness rather than performance: an exception
+escaping `entry` into CPython's C frames is undefined behaviour, so the tensor
+reads sit inside a `try`/`catch` that converts `c10::Error` into a Python
+exception and takes the existing `goto error` path. Free when nothing throws.
+
+**Open feasibility risk.** Torch's side is now verified: a translation unit
+including `python_variable.h` and calling `THPVariable_Unpack`, `data_ptr()`,
+`scalar_type()` and `storage().nbytes()` compiles clean under `-std=c++20`. What
+is *not* yet verified is intj's own source surviving a C++ compile.
 `_Static_assert` in `intj_runtime.h` is C-only and needs a guard; every `void *`
 conversion must already be explicit; no `goto error` may cross a
-non-trivially-destructible local. Inspection suggests a handful of edits -- the
-casts look handled and every local on a `goto` path is a POD -- but that is an
-expectation, not a verified fact, and confirming it is the first step of the
-implementation plan. If one guarded template will not serve both languages, that
-is a scope increase to surface before proceeding.
+non-trivially-destructible local. Inspection suggests a handful of edits, but
+confirming it is the first step of the implementation plan. If one guarded
+template will not serve both languages, that is a scope increase to surface
+before proceeding.
 
 ### What leaves the design
 
