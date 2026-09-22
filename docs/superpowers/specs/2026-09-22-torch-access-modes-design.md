@@ -22,18 +22,17 @@ torch, and should pick a safe default when they do not.
 
 ## Goals
 
-- One compiled `.so` per kernel, usable across as many torch versions as
-  possible, with no rebuild when torch changes.
+- By default, one compiled `.so` per kernel, usable across as many torch
+  versions as possible, with no rebuild when torch changes.
 - Never crash on an unsupported torch. Degrade to a slower path or raise.
 - No measurable cost on the fast path, which is the whole point of intj: the
   5-argument benchmark decodes in 0.15 us.
 - Keep the version policy in Python, where it is testable.
+- Offer an opt-in mode that trades the version-independent `.so` for the
+  compiler's own knowledge of torch's layout, and for inlined reads.
 
 ## Non-goals
 
-- A mode that compiles the extension as C++ against torch's headers. Runtime
-  dispatch reaches the same versions without a C++ build, torch includes, or
-  link flags. Revisit only if a read appears that the shims cannot serve.
 - Tensor subclasses beyond `nn.Parameter`. Orthogonal, and a widened type test
   would accept `FakeTensor` and `DTensor`, which have no dense data pointer.
 
@@ -61,10 +60,13 @@ from 2.2 through 2.14. They are exported from `libtorch_cpu.so` only.
 
 ### Runtime dispatch, not compile-time selection
 
-The mode is chosen after the module loads, not when it is rendered. Nothing
-about torch enters `RenderContext` or `ModuleKey`, so the `.so` is
-torch-version-independent and a torch upgrade neither rebuilds it nor
-invalidates it.
+For the default and the two runtime modes, the mode is chosen after the module
+loads, not when it is rendered. Nothing about torch enters `RenderContext` or
+`ModuleKey`, so the `.so` is torch-version-independent and a torch upgrade
+neither rebuilds it nor invalidates it.
+
+`"cxx"` is the deliberate exception and is described in its own section below;
+it is chosen at build time and does put torch into the key.
 
 Module state gains one field and the three function pointers become
 mode-dependent:
@@ -96,18 +98,75 @@ always does `handle = o + st->tensor_offset` then
 Cost on the fast path: one load from a cache line already hot (the function
 pointers live beside it) plus an add. The indirect calls exist today.
 
-### The three modes
+### The modes
 
-`create_launcher(..., torch_access=None)`:
+`create_launcher(..., torch_access=None, torch_version=None)`:
 
-| Value | Behaviour |
-|---|---|
-| `"shim"` | Handle by offset, all three reads through the AOTI shims. Requires a torch version in the table. |
-| `"cpython"` | `tensor_offset = 0`, all three reads through intj's fallbacks. Works on any torch. |
-| `None` (default) | Consult the table; `"shim"` if the version is known, `"cpython"` otherwise. |
+| Value | Behaviour | Chosen at |
+|---|---|---|
+| `"shim"` | Handle by offset, all three reads through the AOTI shims. Requires a torch version in the table. | load |
+| `"cpython"` | `tensor_offset = 0`, all three reads through intj's fallbacks. Works on any torch. | load |
+| `"cxx"` | Compiled as C++ against torch's headers. Reads inline; no dlopen, no shims, no offset. | build |
+| `None` (default) | Consult the table; `"shim"` if the version is known, `"cpython"` otherwise. Never `"cxx"`. | load |
 
 Explicit `"shim"` on an unknown version raises `UnsupportedKernel`. The default
 never raises.
+
+`torch_version` is only meaningful with `"cxx"`, and only as an assertion: the
+headers come from the installed torch, so a version cannot be selected, only
+checked. `create_launcher` raises if it does not match `torch.__version__` to
+the stated precision. With any other mode, passing it raises.
+
+### The C++ mode
+
+The other three modes work around not knowing torch's layout. This one asks the
+compiler:
+
+```cpp
+const at::Tensor &t = THPVariable_Unpack(obj);
+void   *p  = t.data_ptr();
+int32_t dt = static_cast<int32_t>(t.scalar_type());
+int64_t n  = t.storage().nbytes();
+```
+
+Two things follow. A layout change becomes a compile error rather than a
+segfault, which is what the version table exists to approximate. And the reads
+**inline** -- no `dlopen`, no function pointers in module state, no indirect
+call per read -- so this is expected to be the fastest mode, not merely the
+safest. `intj_exec` still imports torch for the `Tensor`/`Parameter` type
+objects, but stops dlopening `libtorch_cpu.so` entirely.
+
+`tensor_offset`, the three function pointers and the fallback readers are all
+dead here. The tensor branch of `INTJ_DECODE` gets a jinja-guarded variant; the
+rest of the decode, the spec key and the launch path are unchanged.
+
+What it costs, all of it accepted deliberately:
+
+- **The `.so` is torch-specific again**, by construction. `torch.__version__`
+  and the torch lib directory re-enter `ModuleKey`, so every torch upgrade
+  rebuilds every cached kernel. This is why the mode is opt-in and never the
+  default.
+- **The build stops being self-contained.** It needs `torch/include`,
+  `torch/include/torch/csrc/api/include`, `-L <torch>/lib`, `-ltorch_cpu -lc10
+  -ltorch_python`, and `-D_GLIBCXX_USE_CXX11_ABI=` matching how torch was built.
+  A mismatch there is a link error at best and a runtime ABI mismatch at worst.
+  Read the ABI flag from `torch._C._GLIBCXX_USE_CXX11_ABI` rather than guessing.
+- **Build latency.** `python_variable.h` pulls in `ATen/Tensor.h` and thousands
+  of headers. First launch per kernel goes from well under a second to several.
+- **A C++ compiler must exist.** `_compiler_identity()` tracks only the C
+  compiler today and must cover `_find_compiler("c++")` for this mode.
+
+triton's builder already supports it: `compile_so_from_src(..., language="c++")`
+and `_find_compiler` honours `CXX`.
+
+**Open feasibility risk.** The existing source must survive a C++ compile.
+`_Static_assert` in `intj_runtime.h` is C-only and needs a guard; every `void *`
+conversion must already be explicit; and no `goto error` may cross a
+non-trivially-destructible local. Inspection suggests a handful of edits -- the
+casts look handled and every local on a `goto` path is a POD -- but this is an
+expectation, not a verified fact, and confirming it is the first step of the
+implementation plan. If it turns out to need two templates rather than one
+guarded template, that is a scope increase worth surfacing before proceeding.
 
 ### Version table
 
@@ -203,6 +262,11 @@ contract, so `INTJ_DECODE`'s error handling is untouched.
 
 - Unknown torch with `torch_access="shim"`: `UnsupportedKernel` at
   `create_launcher` time.
+- `torch_version` given with a mode other than `"cxx"`, or not matching
+  `torch.__version__`: `UnsupportedKernel` at `create_launcher` time.
+- `"cxx"` with no C++ compiler, or a failed build: the build error propagates
+  unwrapped. A link error naming a torch symbol is more useful than anything
+  intj would paraphrase.
 - Missing shim symbol when shims were requested: `RuntimeError` from the setter,
   naming the symbol.
 - Dtype layout self-check fails: raise `UnsupportedKernel` naming
@@ -216,27 +280,30 @@ contract, so `INTJ_DECODE`'s error handling is untouched.
 
 Extends `tests/test_launcher.py`, which is already differential against triton.
 
-1. **Both modes agree.** Run the existing
-   `test_spec_key_is_never_coarser_than_triton` corpus under `"shim"` and
-   `"cpython"` and assert each mode is internally consistent. The two modes
-   produce different key bytes (different code paths, same discriminating
-   power), so compare each against triton's specialization separately rather
-   than against each other.
+1. **Every mode agrees with triton.** Run the existing
+   `test_spec_key_is_never_coarser_than_triton` corpus under `"shim"`,
+   `"cpython"` and `"cxx"`, parametrized. Each mode is checked against triton's
+   specialization separately, not against the other modes: they produce
+   different key bytes by design (different dtype sources, same discriminating
+   power).
 2. **Dtype agreement.** For every `torch.dtype` singleton, assert the offset
    read equals `aoti_torch_get_dtype`. This is the test that catches a future
    `THPDtype` change.
 3. **Version table.** Pure-Python unit test over the `(major, minor)` ->
-   `(offset, use_shims)` mapping, including the unknown-version fallback and the
-   explicit-`"shim"`-raises case. No GPU needed.
+   `(use_shims, extra)` mapping, including the unknown-version fallback, the
+   explicit-`"shim"`-raises case, and `torch_version` validation. No GPU needed.
 4. **Module key stability.** Assert `ModuleKey.digest()` does not change when
-   the torch version changes, which is the regression this design exists to
-   prevent.
-5. **Fallback correctness.** Launch the existing kernels under
-   `torch_access="cpython"` and compare results against triton, covering
-   aligned/unaligned pointers and the >2 GiB storage case.
+   the torch version changes in the three runtime modes, and *does* change in
+   `"cxx"`. The first is the regression this design exists to prevent; the
+   second keeps `"cxx"` from inheriting the same bug.
+5. **Launch correctness per mode.** Launch the existing kernels under each mode
+   and compare results against triton, covering aligned/unaligned pointers and
+   the >2 GiB storage case.
 
-`benchmarks/bench_launch.py` gains a row per mode, so the cost of the fallback
-is a number rather than an estimate.
+`benchmarks/bench_launch.py` gains a row per mode. Two numbers this design
+asserts without evidence and the benchmark must settle: that the runtime
+`tensor_offset` load is free, and that `"cxx"` is faster than `"shim"` rather
+than merely equal.
 
 ## Migration
 
@@ -244,5 +311,11 @@ is a number rather than an estimate.
 `"shim"`, which is the current behaviour. No caller changes. The `.so` cache
 invalidates once, because the template and runtime header are hashed into
 `ModuleKey`.
+
+`ModuleKey` gains two fields that are populated only in `"cxx"` mode and left
+`None` otherwise: `torch_version` and the C++ compiler identity. Leaving them
+`None` is what preserves the version-independent digest for the other modes,
+and it is worth stating plainly because a future edit that populates them
+unconditionally would silently reintroduce a rebuild-per-torch-version.
 
 Bump `SCHEMA_VERSION`.
