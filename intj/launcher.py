@@ -63,6 +63,31 @@ class RenderContext:
     libtorch_path: str
 
 
+@dataclasses.dataclass(frozen=True)
+class ModuleKey:
+    """Everything the rendered `.so` depends on, hashed into its digest.
+
+    Anything that changes the generated code, the compiled binary, or which
+    kernel the module's callback compiles has to appear here: two launchers
+    whose keys match share one `.so`, so a missing field means a stale module.
+    """
+
+    template: str  # entry.c.jinja bytes, hex
+    runtime_header: str  # intj_runtime.h bytes, hex
+    context: dict[str, Any]  # the RenderContext, minus the module name
+    cache_key: str  # jit_func.cache_key: the kernel source and its callees
+    params: list[list[Any]]  # per-parameter decorator state, which cache_key misses
+    target: list[Any]  # backend, arch, warp size
+    options: str  # canonicalized compile options, hashed by triton
+    triton: list[Any]  # triton version and libtriton identity
+    compiler: list[str]  # the C compiler triton would invoke
+    ext_suffix: str | None
+    schema: int = SCHEMA_VERSION
+
+    def digest(self) -> str:
+        return hashlib.sha256(json.dumps(dataclasses.asdict(self), sort_keys=True).encode()).hexdigest()
+
+
 def create_launcher(
     jit_func: JitFunction,
     dynamic_grid: bool = False,
@@ -122,28 +147,22 @@ def create_launcher(
     # The rendered source is a pure function of the template, the runtime header
     # and the context, so hash those instead of the render -- otherwise naming the
     # module after the digest would need a throwaway render first.
-    digest = hashlib.sha256(
-        json.dumps(
-            {
-                "schema": SCHEMA_VERSION,
-                "template": _ENTRY_TEMPLATE.read_bytes().hex(),
-                "runtime_header": _RUNTIME_HEADER.read_bytes().hex(),
-                "context": dataclasses.asdict(context),
-                "cache_key": jit_func.cache_key,
-                "params": [
-                    [p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
-                     p.do_not_specialize_on_alignment, p.has_default, repr(p.default)]
-                    for p in jit_func.params
-                ],
-                "target": [target.backend, target.arch, target.warp_size],
-                "options": canonical_options.hash(),
-                "triton": _triton_identity(),
-                "compiler": _compiler_identity(),
-                "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
+    digest = ModuleKey(
+        template=_ENTRY_TEMPLATE.read_bytes().hex(),
+        runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
+        context=dataclasses.asdict(context),
+        cache_key=jit_func.cache_key,
+        params=[
+            [p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
+             p.do_not_specialize_on_alignment, p.has_default, repr(p.default)]
+            for p in jit_func.params
+        ],
+        target=[target.backend, target.arch, target.warp_size],
+        options=canonical_options.hash(),
+        triton=_triton_identity(),
+        compiler=_compiler_identity(),
+        ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
+    ).digest()
 
     # The symbol is the kernel's name, so `perf` and /proc/<pid>/maps stay
     # readable; the digest rides along in the source, which is what triton's
