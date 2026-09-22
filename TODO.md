@@ -20,10 +20,19 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   gap today (the extension is C, nothing can throw), and *not* a performance item:
   measured identical codegen with and without, because intj has no non-trivial
   destructors and so no landing pads to elide.
-
-- **`PyLong_AsNativeBytes` for the non-compact int path**, once 3.13 is the floor.
-  The compact case already goes through `PyUnstable_Long_*`; above 2**30 there is
-  no public reader on 3.12, so the digit walk uses CPython's own layout macros.
+- **Python versions other than 3.12.** The runtime is written against one
+  interpreter and refuses the rest at compile time (`#error` below `0x030C0000`),
+  which is honest but narrow. What is version-dependent today:
+  - the non-compact int decode walks `ob_digit` with CPython's layout macros. The
+    compact case already uses `PyUnstable_Long_*`; 3.13 adds `PyLong_AsNativeBytes`
+    and `PyLong_AsInt64`, which would retire the digit walk entirely.
+  - `PyFloat_CheckExact` + a direct `ob_fval` read, and the `PyLongObject` /
+    `PyFloatObject` layouts behind both.
+  - `PyErr_GetRaisedException` / `PyErr_SetRaisedException` (3.12+).
+  - 3.13+ also needs `Py_mod_gil` in the module slots, and free-threaded builds
+    need the kernel cache locked (see above).
+  A version's layout bets want the same treatment torch's got: a table per
+  supported version plus a self-check at load, not an `#if` thicket.
 
 ## Coverage (all currently refused loudly)
 
