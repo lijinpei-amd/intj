@@ -188,7 +188,17 @@ def get_full_name(fn: Any) -> str:
 
 
 def _module_name(jit_func: JitFunction) -> str:
-    """`get_full_name` as a C identifier -- it becomes `PyInit_<name>`."""
+    """`get_full_name` as a C identifier: it is rendered into `PyInit_<name>`.
+
+    The full name always carries dots from the module path, and `<locals>` when
+    the kernel is nested, neither of which is legal in a C identifier -- and
+    CPython derives the init symbol from the last dotted component, so leaving
+    the dots in would make it look for `PyInit_<last component>`.
+
+    Two kernels can sanitize to one name (`a.b` and `a_b`). That is harmless:
+    modules are keyed by name *and* path, and the digest in the source keeps
+    the paths apart.
+    """
     return "intj_" + re.sub(r"[^0-9a-zA-Z_]", "_", get_full_name(jit_func))
 
 

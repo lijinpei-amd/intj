@@ -13,7 +13,15 @@ import triton
 import triton.language as tl
 
 from intj import create_launcher
-from intj.launcher import ModuleKey, Param, RenderContext, UnsupportedKernel, to_json, triton_specialization
+from intj.launcher import (
+    ModuleKey,
+    Param,
+    RenderContext,
+    UnsupportedKernel,
+    _module_name,
+    to_json,
+    triton_specialization,
+)
 
 
 @triton.jit
@@ -318,6 +326,29 @@ def test_module_key_digest_tracks_every_field():
         if changed is None:
             continue
         assert dataclasses.replace(key, **{field.name: changed}).digest() != key.digest(), field.name
+
+
+def test_module_name_is_a_c_identifier():
+    """It is rendered into `PyInit_<name>`, so dots and `<locals>` cannot survive."""
+
+    def make():
+        @triton.jit
+        def inner(x, o, n, BLOCK: tl.constexpr):
+            off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            mask = off < n
+            tl.store(o + off, tl.load(x + off, mask=mask) * 2, mask=mask)
+
+        return inner
+
+    nested = make()
+    assert "<locals>" in f"{nested.__module__}.{nested.__qualname__}"
+    assert _module_name(nested).isidentifier()
+
+    launcher = create_launcher(nested)
+    x = torch.randn(1024, device="cuda")
+    o = torch.empty(1024, device="cuda")
+    launch(launcher, (8,), x, o, 1024, 128)
+    torch.testing.assert_close(o, x * 2.0)
 
 
 def test_refuses_non_jit_function():
