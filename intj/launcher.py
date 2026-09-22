@@ -230,11 +230,7 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
         _build(so_path, context)
 
     # Loading by hand, rather than through import_module, keeps the module out of
-    # sys.modules: intj's own dict owns it, so dropping a launcher can free it.
-    # The interpreter does not cache it either -- that only happens for
-    # single-phase extensions, and the template uses PyModuleDef_Init. So the
-    # name is a label rather than a key; what it must be is the kernel's own
-    # name, which the loader resolves as `PyInit_<name>`.
+    # sys.modules.
     spec = importlib.util.spec_from_file_location(context.module_name, so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so_path}")
