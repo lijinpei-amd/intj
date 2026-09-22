@@ -74,7 +74,7 @@ class ModuleKey:
 
     template: str  # entry.c.jinja bytes, hex
     runtime_header: str  # intj_runtime.h bytes, hex
-    context: dict[str, Any]  # the RenderContext, minus the module name
+    context: RenderContext  # with an empty module name: the digest is what names it
     cache_key: str  # jit_func.cache_key: the kernel source and its callees
     params: list[list[Any]]  # per-parameter decorator state, which cache_key misses
     target: list[Any]  # backend, arch, warp size
@@ -150,7 +150,7 @@ def create_launcher(
     digest = ModuleKey(
         template=_ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
-        context=dataclasses.asdict(context),
+        context=context,
         cache_key=jit_func.cache_key,
         params=[
             [p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
