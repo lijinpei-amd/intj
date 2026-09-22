@@ -101,7 +101,7 @@ def create_launcher(
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
     context = RenderContext(
-        module_name="intj_placeholder",  # replaced below, once the digest is known
+        module_name="",  # the digest below names the module, so it is filled in last
         kernel_repr=f"{jit_func.module}.{jit_func.__qualname__}",
         params=params,
         nwords=1 + sum(2 if p.is_constexpr else 1 for p in params),
@@ -118,13 +118,16 @@ def create_launcher(
         libtorch_path=os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
     )
 
-    src = _render(context)
+    # The rendered source is a pure function of the template, the runtime header
+    # and the context, so hash those instead of the render -- otherwise naming the
+    # module after the digest would need a throwaway render first.
     digest = hashlib.sha256(
         json.dumps(
             {
                 "schema": SCHEMA_VERSION,
-                "src": src,
+                "template": _ENTRY_TEMPLATE.read_bytes().hex(),
                 "runtime_header": _RUNTIME_HEADER.read_bytes().hex(),
+                "context": dataclasses.asdict(context),
                 "cache_key": jit_func.cache_key,
                 "params": [
                     [p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
