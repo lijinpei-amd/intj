@@ -37,6 +37,18 @@ launches the wrong binary and does not crash. Every change to argument decoding 
 key layout must keep `test_spec_key_is_never_coarser_than_triton` passing, and that
 test must be able to fail: mutate the change away and check the test catches it.
 
+## Types
+
+`intj/` is pyright-strict (settings in `pyproject.toml`); `tests/` and `benchmarks/`
+carry a `# pyright: standard` header. The `reportUnknown*` and `reportMissingTypeStubs`
+rules are off project-wide because triton, torch and jinja2 ship no type information —
+they say nothing about intj's own code. Values coming out of triton are annotated
+`Any` (`JitFunction`, `CompiledKernel`); reaching into a private triton name is fine
+where triton has no public equivalent, with a targeted
+`# pyright: ignore[reportPrivateUsage]` and a reason.
+
+    pyright   # 0 errors, keep it that way
+
 ## Testing
 
 No NVIDIA GPU on the development machine, so the CUDA path is compile-checked only.

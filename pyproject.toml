@@ -14,3 +14,17 @@ include = ["intj*"]
 
 [tool.setuptools.package-data]
 intj = ["runtime/*"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["intj", "tests", "benchmarks"]
+typeCheckingMode = "strict"
+# triton, torch and jinja2 ship no type information, so every value coming out of
+# them is Unknown or stub-less. Those reports say nothing about intj's own code.
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+# tests/ and benchmarks/ carry a `# pyright: standard` header: they are kernels and
+# timing scripts, not the shipped API surface.

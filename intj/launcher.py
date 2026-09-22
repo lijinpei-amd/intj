@@ -10,7 +10,14 @@ import os
 import struct
 import subprocess
 import sysconfig
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
+
+# triton and torch ship no type information, so everything reaching into them is
+# typed `Any` on purpose.
+JitFunction = Any
+CompiledKernel = Any
 
 SCHEMA_VERSION = 1
 
@@ -24,6 +31,17 @@ class UnsupportedKernel(NotImplementedError):
 
 
 @dataclasses.dataclass(frozen=True)
+class Param:
+    """One declared kernel parameter, as the template needs it."""
+
+    name: str
+    is_constexpr: bool
+    spec: int  # 0 when do_not_specialize
+    align: int  # 0 when do_not_specialize_on_alignment
+    word: int  # index of its first spec-key word
+
+
+@dataclasses.dataclass(frozen=True)
 class RenderContext:
     """Everything `entry.c.jinja` renders from, and nothing else.
 
@@ -33,7 +51,7 @@ class RenderContext:
 
     module_name: str
     kernel_repr: str
-    params: list  # _render_params() descriptors, one per declared parameter
+    params: list[Param]
     nwords: int  # spec-key length, in uint64 words
     max_slots: int  # kernel param slots, upper bound
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
@@ -44,7 +62,13 @@ class RenderContext:
     libtorch_path: str
 
 
-def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_annotation=None, options=None):
+def create_launcher(
+    jit_func: JitFunction,
+    dynamic_grid: bool = False,
+    dynamic_options: Sequence[str] = (),
+    extra_annotation: Mapping[str, str] | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> Callable[..., None]:
     """Build a fast launcher for `jit_func`.
 
     The returned callable is a C function:
@@ -72,17 +96,16 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
 
     import torch
     from triton.runtime.build import compile_module_from_src
-    from triton.runtime.driver import driver
 
-    target = driver.active.get_current_target()
+    target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
     context = RenderContext(
         module_name="intj_placeholder",  # replaced below, once the digest is known
         kernel_repr=f"{jit_func.module}.{jit_func.__qualname__}",
         params=params,
-        nwords=1 + sum(2 if p["is_constexpr"] else 1 for p in params),
-        max_slots=sum(0 if p["is_constexpr"] else 1 for p in params),
+        nwords=1 + sum(2 if p.is_constexpr else 1 for p in params),
+        max_slots=sum(0 if p.is_constexpr else 1 for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
@@ -162,10 +185,11 @@ class HipBackend(Backend):
     error_style = "return"
     pointer_range = True
 
-    def library_path(self):
-        from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+    def library_path(self) -> str:
+        # private, but it is the resolution order triton itself launches through
+        from triton.backends.amd import driver
 
-        return _get_path_to_hip_runtime_dylib()
+        return driver._get_path_to_hip_runtime_dylib()  # pyright: ignore[reportPrivateUsage]
 
 
 class CudaBackend(Backend):
@@ -175,14 +199,14 @@ class CudaBackend(Backend):
     error_style = "outparam"
     pointer_range = False
 
-    def library_path(self):
+    def library_path(self) -> str:
         return "libcuda.so.1"  # already mapped by torch, resolved through the normal search path
 
 
 BACKENDS: dict[str, Backend] = {}
 
 
-def register(backend: Backend):
+def register(backend: Backend) -> Backend:
     """Make `backend` usable by `create_launcher`, replacing any same-named one."""
     BACKENDS[backend.name] = backend
     return backend
@@ -195,7 +219,24 @@ register(CudaBackend())
 # --------------------------------------------------------------------- checks
 
 
-def _canonical_options(target, options):
+def _current_target() -> Any:
+    """The active triton target, which triton types as optional."""
+    from triton.runtime.driver import driver
+
+    target = driver.active.get_current_target()
+    if target is None:
+        raise UnsupportedKernel("intj: no active triton target; is a GPU visible?")
+    return target
+
+
+def _current_device() -> int:
+    from triton.runtime.driver import driver
+
+    # get_current_device() is on every concrete driver, just not on DriverBase
+    return driver.active.get_current_device()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
     """Run `options` through the triton compiler backend's `parse_options`.
 
     That fills in defaults and normalizes the odd fields (`extern_libs`,
@@ -208,16 +249,15 @@ def _canonical_options(target, options):
     """
     from triton.compiler import make_backend
 
-    parsed = make_backend(target).parse_options(dict(options))
+    parsed: Any = make_backend(target).parse_options(dict(options))
     unknown = set(options) - {f.name for f in dataclasses.fields(parsed)}
     if unknown:
         raise UnsupportedKernel(f"intj: unknown compile option(s) {sorted(unknown)}")
     return parsed
 
 
-def _check_kernel(jit_func, options):
+def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunction:
     from triton import knobs
-    from triton.runtime.driver import driver
     from triton.runtime.jit import JITFunction
 
     if knobs.runtime.interpret:
@@ -227,7 +267,7 @@ def _check_kernel(jit_func, options):
             f"intj: expected a @triton.jit function, got {type(jit_func).__name__}; "
             "autotuned and heuristic kernels are not supported"
         )
-    target = driver.active.get_current_target()
+    target = _current_target()
     if target.backend not in BACKENDS:
         raise UnsupportedKernel(
             f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
@@ -248,9 +288,10 @@ def _check_kernel(jit_func, options):
     return jit_func
 
 
-def _render_params(jit_func):
+def _render_params(jit_func: JitFunction) -> list[Param]:
     """One render-time descriptor per declared kernel parameter."""
-    params, word = [], 1
+    params: list[Param] = []
+    word = 1
     for p in jit_func.params:
         kind = p._param.kind
         if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
@@ -261,13 +302,13 @@ def _render_params(jit_func):
                 "are supported"
             )
         params.append(
-            {
-                "name": p.name,
-                "is_constexpr": p.is_constexpr,
-                "spec": 0 if p.do_not_specialize else 1,
-                "align": 0 if p.do_not_specialize_on_alignment else 1,
-                "word": word,
-            }
+            Param(
+                name=p.name,
+                is_constexpr=p.is_constexpr,
+                spec=0 if p.do_not_specialize else 1,
+                align=0 if p.do_not_specialize_on_alignment else 1,
+                word=word,
+            )
         )
         word += 2 if p.is_constexpr else 1
     return params
@@ -276,7 +317,7 @@ def _render_params(jit_func):
 # -------------------------------------------------------------------- render
 
 
-def _render(context: RenderContext):
+def _render(context: RenderContext) -> str:
     import jinja2
 
     template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
@@ -284,7 +325,7 @@ def _render(context: RenderContext):
 
 
 @functools.lru_cache(maxsize=1)
-def _triton_identity():
+def _triton_identity() -> list[Any]:
     import triton
 
     libtriton = Path(triton.__file__).parent / "_C" / "libtriton.so"
@@ -293,10 +334,10 @@ def _triton_identity():
 
 
 @functools.lru_cache(maxsize=1)
-def _compiler_identity():
+def _compiler_identity() -> list[str]:
     from triton.runtime import build
 
-    cc = build._find_compiler("c")
+    cc = build._find_compiler("c")  # pyright: ignore[reportPrivateUsage]  # the compiler triton itself picks
     cc = cc[0] if isinstance(cc, tuple) else cc
     try:
         version = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
@@ -308,15 +349,17 @@ def _compiler_identity():
 # ------------------------------------------------------------- compile hook
 
 
-def _make_compile_callback(jit_func, params, options):
+def _make_compile_callback(
+    jit_func: JitFunction, params: Sequence[Param], options: Mapping[str, Any]
+) -> Callable[..., tuple[int, int, int, int]]:
     """Called from C on a spec-key miss, with the key blob and the original args."""
-    kernels = []  # keeps every CompiledKernel (and therefore its hipModule) alive
-    seen = {}  # (param index, key word(s)) -> triton's specialization entry
+    kernels: list[CompiledKernel] = []  # keeps every CompiledKernel, and so its GPU module, alive
+    seen: dict[tuple[int, tuple[int, ...]], str] = {}  # key words -> triton's specialization entry
 
-    def compile_callback(keyblob, nparams, device, *args):
-        from triton.runtime.driver import driver
-
-        current = driver.active.get_current_device()
+    def compile_callback(
+        keyblob: bytes, nparams: int, device: int, *args: Any
+    ) -> tuple[int, int, int, int]:
+        current = _current_device()
         if device != current:
             # warmup() and _init_handles() both load the binary on the *current*
             # device; launching that function on another device's stream is a
@@ -354,20 +397,27 @@ def _make_compile_callback(jit_func, params, options):
     return compile_callback
 
 
-def triton_specialization(jit_func, args, options=None):
+def triton_specialization(
+    jit_func: JitFunction, args: Iterable[Any], options: Mapping[str, Any] | None = None
+) -> list[tuple[str, Any]]:
     """The `list[(type_str, key)]` triton would compute for these arguments."""
     from triton import knobs
-    from triton.runtime.driver import driver
 
-    device = driver.active.get_current_device()
-    binder = jit_func.device_caches[device][4]
+    binder = jit_func.device_caches[_current_device()][4]
     kwargs = dict(options or {})
     kwargs["debug"] = jit_func.debug or knobs.runtime.debug
     kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
     return binder(*args, **kwargs)[1]
 
 
-def _validate_spec_key(jit_func, params, options, keyblob, args, seen):
+def _validate_spec_key(
+    jit_func: JitFunction,
+    params: Sequence[Param],
+    options: Mapping[str, Any],
+    keyblob: bytes,
+    args: Sequence[Any],
+    seen: dict[tuple[int, tuple[int, ...]], str],
+) -> None:
     """Assert intj's key is no coarser than triton's specialization.
 
     Cheap (the miss path is milliseconds) and it turns a classifier drift from a
@@ -380,12 +430,12 @@ def _validate_spec_key(jit_func, params, options, keyblob, args, seen):
     specialization = triton_specialization(jit_func, args, options)
 
     for i, param in enumerate(params):
-        n = 2 if param["is_constexpr"] else 1
-        mine = words[param["word"]:param["word"] + n]
+        n = 2 if param.is_constexpr else 1
+        mine = words[param.word:param.word + n]
         theirs = repr(specialization[i])
         previous = seen.setdefault((i, mine), theirs)
         if previous != theirs:
             raise RuntimeError(
-                f"intj: spec key for parameter {param['name']!r} is too coarse: it maps both "
+                f"intj: spec key for parameter {param.name!r} is too coarse: it maps both "
                 f"{previous} and {theirs} to the same key; this is an intj bug"
             )

@@ -1,3 +1,4 @@
+# pyright: standard
 """Differential tests: every launch is compared against triton's own launcher.
 
 Run with `pytest tests` on a machine with an AMD GPU, torch and triton.

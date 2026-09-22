@@ -1,3 +1,4 @@
+# pyright: standard
 """Per-launch host overhead: intj vs triton's JITFunction.
 
 Usage: python benchmarks/bench_launch.py [iters]
@@ -52,11 +53,12 @@ def main(iters=20000):
     stream = torch.cuda.current_stream().cuda_stream
 
     for label, grid in (("grid=(1,)", (1,)), ("grid=(0,)", (0,))):
-        triton_us = bench(lambda: noop[grid](*args), iters)
+        # BLOCK is a tl.constexpr parameter; triton takes the plain int at runtime
+        triton_us = bench(lambda: noop[grid](*args), iters)  # pyright: ignore[reportArgumentType]
         intj_us = bench(lambda: launcher(device, stream, grid, *args), iters)
         print(f"{label:>10}: triton {triton_us:6.2f} us | intj {intj_us:6.2f} us | {triton_us / intj_us:5.1f}x")
 
-    spec_key = launcher.__self__.spec_key
+    spec_key = getattr(launcher, "__self__").spec_key
     print(f"{'spec_key':>10}: {bench(lambda: spec_key(*args), iters):6.2f} us (intj decode + key only)")
 
 
