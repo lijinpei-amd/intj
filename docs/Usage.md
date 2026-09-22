@@ -195,6 +195,5 @@ process takes ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build.
 
 The digest covers the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,
-the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler
-and the flags it is handed,
+the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler,
 and `EXT_SUFFIX`. `rm -rf $TRITON_HOME/.triton/intj` clears every intj artifact.
