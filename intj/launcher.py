@@ -12,13 +12,9 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-_TEMPLATES = Path(__file__).parent / "templates"
-_ENTRY_TEMPLATE = _TEMPLATES / "entry.c.jinja"
-_RUNTIME_HEADER = _TEMPLATES / "intj_runtime.h"
-
-# Spec-key tags, kept in sync with templates/intj_runtime.h.
-T_NONE, T_ONE, T_I32, T_I64, T_U64, T_FP32, T_U1, T_PTR = range(1, 9)
-T_CX_NONE, T_CX_BOOL, T_CX_INT, T_CX_UINT, T_CX_FLOAT = range(9, 14)
+_RUNTIME = Path(__file__).parent / "runtime"
+_ENTRY_TEMPLATE = _RUNTIME / "entry.c.jinja"
+_RUNTIME_HEADER = _RUNTIME / "intj_runtime.h"
 
 
 class UnsupportedKernel(NotImplementedError):
@@ -52,7 +48,6 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
     params = _render_params(jit_func)
 
     import torch
-    from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
     from triton.runtime.build import compile_module_from_src
     from triton.runtime.driver import driver
 
@@ -62,12 +57,14 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
         "params": params,
         "nwords": 1 + sum(2 if p["is_constexpr"] else 1 for p in params),
         "max_slots": sum(0 if p["is_constexpr"] else 1 for p in params),
-        # The pointer-range bit is always part of the key, even when buffer ops
-        # are off: the knob is read by triton per specialization, so a key that
-        # cannot tell a > 2 GiB buffer apart would launch a tt.pointer_range=32
-        # binary on it after the knob is flipped back on.
-        "spec_pointer_range": 1,
-        "libhip_path": _get_path_to_hip_runtime_dylib(),
+        "backend": target.backend,
+        # AMD only. The pointer-range bit is always part of the key, even when
+        # buffer ops are off: the knob is read by triton per specialization, so a
+        # key that cannot tell a > 2 GiB buffer apart would launch a
+        # tt.pointer_range=32 binary on it after the knob is flipped back on.
+        "spec_pointer_range": 1 if target.backend == "hip" else 0,
+        "driver_path": _driver_library(target.backend),
+        "launch_symbol": "hipModuleLaunchKernel" if target.backend == "hip" else "cuLaunchKernel",
         "libtorch_path": os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
     }
 
@@ -98,11 +95,23 @@ def create_launcher(jit_func, dynamic_grid=False, dynamic_options=(), extra_anno
     module = compile_module_from_src(
         src=_render(context, module_name=module_name),
         name=module_name,
-        include_dirs=[str(_TEMPLATES)],
+        include_dirs=[str(_RUNTIME)],
         language="c",
     )
     module.set_compile_callback(_make_compile_callback(jit_func, params, options))
     return module.entry
+
+
+SUPPORTED_BACKENDS = ("hip", "cuda")
+
+
+def _driver_library(backend):
+    """The GPU driver dylib to dlopen, the same one triton itself uses."""
+    if backend == "hip":
+        from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+
+        return _get_path_to_hip_runtime_dylib()
+    return "libcuda.so.1"  # already mapped by torch; resolved through the normal search path
 
 
 # --------------------------------------------------------------------- checks
@@ -121,8 +130,10 @@ def _check_kernel(jit_func, options):
             "autotuned and heuristic kernels are not supported"
         )
     target = driver.active.get_current_target()
-    if target.backend != "hip":
-        raise UnsupportedKernel(f"intj: only the AMD (hip) backend is supported, got {target.backend!r}")
+    if target.backend not in SUPPORTED_BACKENDS:
+        raise UnsupportedKernel(
+            f"intj: only the {'/'.join(SUPPORTED_BACKENDS)} backends are supported, got {target.backend!r}"
+        )
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")
     jit_func.cache_key  # populates used_global_vals
@@ -225,6 +236,8 @@ def _make_compile_callback(jit_func, params, options):
             raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
         if md.launch_cooperative_grid:
             raise UnsupportedKernel("intj: launch_cooperative_grid is not supported")
+        if getattr(md, "launch_pdl", False):  # nvidia only
+            raise UnsupportedKernel("intj: launch_pdl is not supported")
         if md.global_scratch_size or md.profile_scratch_size:
             raise UnsupportedKernel("intj: kernels requiring scratch memory are not supported")
 

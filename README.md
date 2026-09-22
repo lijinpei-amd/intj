@@ -8,7 +8,7 @@ INTJ (INcompatible Triton Jit) is a host side python launcher for triton kernel,
 
 INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunction` has a launch overhead of ~14us, while INTJ has a launch overhead of ~0.3us (overhead defined as the time excluding cuLaunchKernel/hipLaunchKernel).
 
-This is the initial version: AMD only, torch tensors only, static grid. Anything outside that is refused at `create_launcher` time, see `docs/Usage.md`.
+This is the initial version: torch tensors only, static grid. Anything outside that is refused, see `docs/Usage.md`. AMD is tested on gfx942; the NVIDIA path is implemented (`cuLaunchKernel`) but untested, no NVIDIA GPU here.
 
 ## Usage
 

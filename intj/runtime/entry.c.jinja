@@ -19,7 +19,9 @@ typedef struct {
   intj_get_storage_size_t get_storage_size;
   intj_get_dtype_t get_dtype;
   intj_launch_t launch;
-  intj_error_string_t error_string;
+{% if backend == 'hip' %}  intj_hip_error_string_t error_string;
+{% else %}  intj_cuda_error_string_t error_string;
+{% endif %}
   intj_map cache;
 } intj_state;
 
@@ -195,8 +197,16 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
       st->launch(kernel->function, gx, gy, gz, kernel->block_dim, 1, 1,
                  kernel->shared, (void *)(uintptr_t)stream, params, NULL);
   if (status != 0) {
-    PyErr_Format(PyExc_RuntimeError, "intj: hipModuleLaunchKernel failed: %s",
-                 st->error_string ? st->error_string(status) : "unknown error");
+    const char *message = NULL;
+{% if backend == 'hip' %}
+    if (st->error_string)
+      message = st->error_string(status);
+{% else %}
+    if (st->error_string)
+      st->error_string(status, &message);
+{% endif %}
+    PyErr_Format(PyExc_RuntimeError, "intj: {{ launch_symbol }} failed: %s",
+                 message ? message : "unknown error");
     return NULL;
   }
   Py_RETURN_NONE;
@@ -289,13 +299,17 @@ static int intj_exec(PyObject *m) {
   if (!st->get_data_ptr || !st->get_storage_size || !st->get_dtype)
     return -1;
 
-  void *hip = intj_dlopen("{{ libhip_path }}");
-  if (!hip)
+  void *gpu = intj_dlopen("{{ driver_path }}");
+  if (!gpu)
     return -1;
-  st->launch = (intj_launch_t)intj_dlsym(hip, "hipModuleLaunchKernel");
+  st->launch = (intj_launch_t)intj_dlsym(gpu, "{{ launch_symbol }}");
   if (!st->launch)
     return -1;
-  st->error_string = (intj_error_string_t)dlsym(hip, "hipGetErrorString");
+{% if backend == 'hip' %}
+  st->error_string = (intj_hip_error_string_t)dlsym(gpu, "hipGetErrorString");
+{% else %}
+  st->error_string = (intj_cuda_error_string_t)dlsym(gpu, "cuGetErrorString");
+{% endif %}
 
   if (intj_map_init(&st->cache, 16) != 0) {
     PyErr_NoMemory();

@@ -175,13 +175,16 @@ typedef int32_t (*intj_get_data_ptr_t)(intj_tensor_handle, void **);
 typedef int32_t (*intj_get_storage_size_t)(intj_tensor_handle, int64_t *);
 typedef int32_t (*intj_get_dtype_t)(intj_tensor_handle, int32_t *);
 
-/* ------------------------------------------------------------ hip runtime */
+/* ----------------------------------------------------------- gpu  runtime */
 
+/* hipModuleLaunchKernel and cuLaunchKernel take the same arguments in the same
+ * order.  Their error-string calls do not, hence the two typedefs. */
 typedef int32_t (*intj_launch_t)(void *f, uint32_t gx, uint32_t gy, uint32_t gz,
                                  uint32_t bx, uint32_t by, uint32_t bz,
                                  uint32_t shared, void *stream, void **params,
                                  void **extra);
-typedef const char *(*intj_error_string_t)(int32_t);
+typedef const char *(*intj_hip_error_string_t)(int32_t);
+typedef int32_t (*intj_cuda_error_string_t)(int32_t, const char **);
 
 /* ----------------------------------------------------------- spec-key tags */
 

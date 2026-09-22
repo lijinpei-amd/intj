@@ -58,7 +58,7 @@ not read the current device or stream for you — that is where the launch overh
 
 | passed value | triton type | key |
 |---|---|---|
-| `torch.Tensor` / `torch.nn.Parameter` (exact type) | `*<dtype>` | `D` when the data pointer is 16B-aligned, `S` when the storage is ≤ 2 GiB |
+| `torch.Tensor` / `torch.nn.Parameter` (exact type) | `*<dtype>` | `D` when the data pointer is 16B-aligned, `S` (AMD) when the storage is ≤ 2 GiB |
 | `int` | `constexpr` when the value is 1, else `i32`/`i64`/`u64` | `D` when divisible by 16 |
 | `float` | `fp32` | — |
 | `bool` | `u1` | — |
@@ -66,16 +66,18 @@ not read the current device or stream for you — that is where the launch overh
 | `tl.constexpr` parameter | `constexpr` | the value itself (`int`, `float`, `bool`, `None`) |
 
 `do_not_specialize` and `do_not_specialize_on_alignment` are honoured. The `S` bit is
-always part of the key, even when `knobs.amd.use_buffer_ops` is off, so that toggling
-the knob can only cost an extra compile, never launch a buffer-ops binary on a
-> 2 GiB tensor.
+AMD-only; there it is always part of the key, even when `knobs.amd.use_buffer_ops` is
+off, so that toggling the knob can only cost an extra compile, never launch a
+buffer-ops binary on a > 2 GiB tensor.
 
 ## Not supported
 
 Everything below is refused at `create_launcher` time, or on the first launch that
 hits it:
 
-- NVIDIA. INTJ launches through `hipModuleLaunchKernel` only.
+- Backends other than AMD (`hipModuleLaunchKernel`) and NVIDIA (`cuLaunchKernel`).
+  **NVIDIA is untested** -- it is written against triton's CUDA driver but there is
+  no NVIDIA GPU on the development machine.
 - `@triton.autotune` / `@triton.heuristics` wrappers, and `TRITON_INTERPRET=1`.
 - Callable grids (`dynamic_grid`), per-launch options (`dynamic_options`), and
   argument annotations (`extra_annotation`).
@@ -95,13 +97,13 @@ hits it:
    fields are read through libtorch's `aoti_torch_*` C shims, not `data_ptr()`.
 3. Hash the key and look it up in the module's open-addressed kernel cache.
 4. On a miss, call back into python: `JITFunction.warmup` compiles, `_init_handles`
-   loads the module, and the entry records the `hipFunction_t`, block dim and LDS
+   loads the module, and the entry records the function handle, block dim and LDS
    size. The callback also asserts that intj's key agrees with triton's
    specialization for these arguments.
 5. Pack the param array (plus the two mandatory trailing scratch slots) and call
-   `hipModuleLaunchKernel`.
+   `hipModuleLaunchKernel` / `cuLaunchKernel` (identical argument lists).
 
-Each cached `CompiledKernel` is kept alive by the launcher, so its `hipModule` stays
+Each cached `CompiledKernel` is kept alive by the launcher, so its GPU module stays
 loaded for the lifetime of the process.
 
 ## Correctness
@@ -120,6 +122,5 @@ cache miss re-checks it against triton's own binder.
 
 The rendered extension is keyed on the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,
-the options, intj's own template bytes, the triton build,
-the compiler, and `EXT_SUFFIX`. Artifacts live in triton's cache directory
+the options, intj's own `runtime/` bytes, the triton build, the compiler, and `EXT_SUFFIX`. Artifacts live in triton's cache directory
 (`TRITON_CACHE_DIR`), so `rm -rf ~/.triton/cache` clears them.
