@@ -135,8 +135,6 @@ def create_launcher(
     jit_func = _check_kernel(jit_func, options)
     params = _render_params(jit_func)
 
-    import torch
-
     access = _resolve_access(torch_access)
     target = _current_target()
     backend = BACKENDS[target.backend]
@@ -231,7 +229,7 @@ def _cxx_abi() -> int:
     """How torch was built.  A mismatch here links, then misbehaves at runtime."""
     import torch
 
-    return int(torch._C._GLIBCXX_USE_CXX11_ABI)  # pyright: ignore[reportAttributeAccessIssue]
+    return int(torch._C._GLIBCXX_USE_CXX11_ABI)  # pyright: ignore[reportPrivateUsage]
 
 
 @functools.lru_cache(maxsize=1)
@@ -336,12 +334,26 @@ def _build(so_path: Path, context: RenderContext) -> None:
         src=src, name=context.module_name, **_build_flags(context)
     )
 
+
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
     # misbehaves, and what you recompile by hand to debug it.
     suffix = ".cpp" if context.torch_access == TorchAccess.CXX.value else ".c"
     _install(src.encode(), so_path.with_name(f"{context.module_name}{suffix}"))
     _install(Path(built).read_bytes(), so_path)
+
+
+def _runtime_header_flag() -> str:
+    """Make the runtime header part of what triton's compile cache keys on.
+
+    `_compile_so` keys on the source bytes plus the *names* of the include
+    directories, not on the contents of the headers found there.  So an edit to
+    `intj_runtime.h` moves intj's own `ModuleKey` digest, intj re-renders, and
+    triton then serves the object it compiled from the previous header.  Feeding
+    the digest in as a define puts it in triton's key too.
+    """
+    digest = hashlib.sha256(_RUNTIME_HEADER.read_bytes()).hexdigest()[:16]
+    return f"-DINTJ_RUNTIME_HEADER=0x{digest}"
 
 
 def _build_flags(context: RenderContext) -> dict[str, Any]:
@@ -355,7 +367,11 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
     needed.
     """
     if context.torch_access != TorchAccess.CXX.value:
-        return {"language": "c", "include_dirs": [str(_RUNTIME)]}
+        return {
+            "language": "c",
+            "include_dirs": [str(_RUNTIME)],
+            "ccflags": [_runtime_header_flag()],
+        }
     toolchain = _cxx_toolchain()
     assert toolchain is not None, "create_launcher validated this"
     includes, libs = toolchain
@@ -369,6 +385,7 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
         "ccflags": [
             "-std=c++20",
             f"-D_GLIBCXX_USE_CXX11_ABI={context.cxx_abi}",
+            _runtime_header_flag(),
             *(f"-Wl,-rpath,{d}" for d in libs),
         ],
     }

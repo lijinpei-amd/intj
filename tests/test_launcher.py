@@ -599,6 +599,24 @@ def test_unconfigured_module_refuses_to_launch():
     assert hasattr(module, "set_torch_version")
     with pytest.raises(ValueError, match="needs a tensor layout"):
         module.set_torch_version((2, 14), None)
+    layout = cached_layout()
+    assert layout is not None
     cpython = getattr(create_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
     with pytest.raises(ValueError, match="takes no tensor layout"):
-        cpython.set_torch_version((2, 14), cached_layout().as_args())
+        cpython.set_torch_version((2, 14), layout.as_args())
+
+
+def test_modes_agree_on_rejecting_a_storageless_tensor():
+    """A sparse tensor has no data pointer at all, so every mode must raise.
+
+    The shim reads offsets rather than calling torch, so this is the one place it
+    could have handed the kernel a null pointer instead of failing.
+    """
+    sparse = torch.sparse_coo_tensor(
+        torch.tensor([[0, 1]]), torch.tensor([1.0, 2.0]), (4,)
+    ).cuda()
+    o = torch.empty(1024, device="cuda")
+    for m in ACCESS_MODES:
+        module = getattr(create_launcher(scale, torch_access=m), "__self__")
+        with pytest.raises(RuntimeError):
+            module.spec_key(sparse, o, 1024, 2.0, 128)

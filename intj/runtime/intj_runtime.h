@@ -217,15 +217,25 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   int64_t numel = *(const int64_t *)(ti + abi->numel);
   uint8_t code = *(const uint8_t *)(ti + abi->data_type);
   *dt = (int32_t)code;
+  /* A null storage means the tensor has none at all -- sparse, and anything else
+   * with a non-dense impl.  torch raises there, and so must this: handing the
+   * kernel a null pointer instead would be a silent wrong launch.  Every dense
+   * tensor has a storage, including a zero-element one. */
+  if (!si) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "intj: cannot access data pointer of a tensor with no "
+                    "storage (a sparse tensor?)");
+    return -1;
+  }
   /* torch's Tensor::data_ptr() returns null for every zero-element tensor, even
    * one whose storage is live and whose storage_offset is not zero (an empty
    * slice at the end of a buffer).  Reproduce that: the pointer feeds the
    * alignment bit of the spec key, so a past-the-end pointer here would key
    * differently from the other two modes for the same arguments. */
-  if (numel == 0 || !si) {
+  if (numel == 0) {
     *p = NULL;
     if (want_size)
-      *sz = si ? *(const int64_t *)(si + abi->s_nbytes) : 0;
+      *sz = *(const int64_t *)(si + abi->s_nbytes);
     return 0;
   }
   if (code >= INTJ_NDTYPES || !abi->itemsize[code]) {

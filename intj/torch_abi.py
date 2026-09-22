@@ -163,8 +163,6 @@ def probe_layout() -> TensorLayout | None:
     refuses the shim mode rather than reading a guessed offset, which is the one
     failure here that cannot raise.
     """
-    import torch
-
     head = _pyobject_size()
     cdata: set[int] | None = None
     ti_fields: dict[str, set[int]] = {}
@@ -234,8 +232,10 @@ def _read(layout: TensorLayout, t: Any) -> tuple[int, int, int]:
     simpl = ctypes.c_size_t.from_address(impl + layout.storage).value
     numel = ctypes.c_int64.from_address(impl + layout.numel).value
     code = ctypes.c_uint8.from_address(impl + layout.data_type).value
-    nbytes = ctypes.c_int64.from_address(simpl + layout.s_nbytes).value if simpl else 0
-    if numel == 0 or not simpl:
+    if not simpl:
+        raise RuntimeError("tensor has no storage")
+    nbytes = ctypes.c_int64.from_address(simpl + layout.s_nbytes).value
+    if numel == 0:
         return (0, code, nbytes)
     data = ctypes.c_size_t.from_address(simpl + layout.s_data).value
     off = ctypes.c_int64.from_address(impl + layout.storage_offset).value

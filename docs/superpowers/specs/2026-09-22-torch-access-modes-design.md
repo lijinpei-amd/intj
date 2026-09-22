@@ -406,6 +406,18 @@ Two things this spec claimed that turned out differently, both recorded above:
 the link set is `-lc10` alone rather than three libraries, and the layout is
 probed rather than looked up by version.
 
+Two bugs the work turned up, both fixed:
+
+* `SHIM` accepted a storage-less tensor (sparse) and would have handed the kernel
+  a null pointer where the other two modes raise.  `!storage` and `numel == 0`
+  are different conditions and torch treats them differently; so does intj now.
+* triton's compile cache is keyed on the source bytes and the include *directory
+  names*, not on the headers' contents.  So an edit to `intj_runtime.h` moved
+  intj's own digest, intj re-rendered, and triton then served the object it had
+  compiled from the previous header.  Pure-header edits silently did nothing.
+  Fixed by feeding the header's digest in as `-DINTJ_RUNTIME_HEADER=...`, which
+  puts it in triton's key too.  This predates this work.
+
 Still open, now with numbers behind it: whether `AUTO` should resolve to `CXX`.
 It costs 11.5 s on first build of each distinct kernel source for 0.02 us more
 decode time than `SHIM`, and it is the only mode that must be rebuilt when torch
