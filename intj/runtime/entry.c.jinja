@@ -257,22 +257,40 @@ static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
   Py_RETURN_NONE;
 }
 
-/* set_torch_version((major, minor), layout) -- install the torch ABI.
+/* set_torch_version((major, minor), layout, dtype_index) -- install the torch ABI.
  *
  * Deliberately not baked into the binary: the offsets come from the torch that
  * is running now, so there is no window in which a cached .so built against one
- * torch is loaded against another.  `layout` is None outside the shim mode.
+ * torch is loaded against another.  `layout` is None in the cpython mode.
  */
 static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                                    Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   PyObject *layout;
-  if (nargs != 2) {
-    PyErr_SetString(PyExc_TypeError,
-                    "intj: set_torch_version takes (version, layout)");
+  if (nargs != 3) {
+    PyErr_SetString(
+        PyExc_TypeError,
+        "intj: set_torch_version takes (version, layout, dtype_index)");
     return NULL;
   }
   layout = args[1];
+
+  /* Every mode reads this table, so it is installed before the per-mode branch
+   * rather than inside one: a module that skipped it would see all zeros and
+   * key every dtype to index 0 -- coarse in the same way in each mode, which is
+   * exactly the failure the cross-mode test cannot see. */
+  {
+    Py_ssize_t n = PyBytes_Size(args[2]);
+    if (n < 0)
+      return NULL;
+    if (n != INTJ_NDTYPES) {
+      PyErr_Format(PyExc_ValueError,
+                   "intj: dtype index table must be %d bytes, got %zd",
+                   INTJ_NDTYPES, n);
+      return NULL;
+    }
+    memcpy(st->abi.dtype_index, PyBytes_AS_STRING(args[2]), INTJ_NDTYPES);
+  }
 
 {% if torch_access == 'shim' %}
   unsigned int off[7];

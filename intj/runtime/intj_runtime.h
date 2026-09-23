@@ -326,6 +326,10 @@ typedef struct {
   uint16_t s_data;         /* StorageImpl* -> void*         */
   uint16_t s_nbytes;       /* StorageImpl* -> int64_t       */
   uint8_t itemsize[INTJ_NDTYPES]; /* dtype code -> element size */
+  /* dtype code -> the spec key's 5-bit index, 0xFF where triton takes no such
+   * dtype.  Unlike itemsize, every access mode reads this: it is what the key
+   * encodes, not how a pointer is computed. */
+  uint8_t dtype_index[INTJ_NDTYPES];
   int ready;               /* set_torch_version has run */
 } intj_torch_abi;
 

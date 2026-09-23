@@ -788,13 +788,32 @@ def test_unconfigured_module_refuses_to_launch():
     """`entry` is unreachable before set_torch_version; prove the guard exists."""
     module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
     assert hasattr(module, "set_torch_version")
+    index = dtype_index_table()
     with pytest.raises(ValueError, match="needs a tensor layout"):
-        module.set_torch_version((2, 14), None)
+        module.set_torch_version((2, 14), None, index)
     layout = layout_for()
     assert layout is not None
     cpython = getattr(make_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
     with pytest.raises(ValueError, match="takes no tensor layout"):
-        cpython.set_torch_version((2, 14), layout.as_args())
+        cpython.set_torch_version((2, 14), layout.as_args(), index)
+
+
+def test_set_torch_version_needs_the_dtype_index_in_every_mode():
+    """The dtype table is not a shim detail: all three readers key on it.
+
+    Installed in only some modes, the others would see an all-zero table and key
+    every dtype to index 0 -- coarse in the same way in each, so the cross-mode
+    equality test would not catch it.
+    """
+    layout = layout_for()
+    assert layout is not None
+    for mode in ACCESS_MODES:
+        module = getattr(make_launcher(scale, torch_access=mode), "__self__")
+        args = layout.as_args() if mode is not TorchAccess.CPYTHON else None
+        with pytest.raises(TypeError, match="dtype_index"):
+            module.set_torch_version((2, 14), args)
+        with pytest.raises(ValueError, match="dtype index table"):
+            module.set_torch_version((2, 14), args, b"\xff" * (NDTYPES - 1))
 
 
 def test_modes_agree_on_rejecting_a_storageless_tensor():

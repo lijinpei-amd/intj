@@ -24,7 +24,14 @@ from .kernel_cache import (
     toolchain_for,
     unavailable_message,
 )
-from .torch_abi import TensorLayout, TorchAccess, layout_for, supported_versions, torch_version
+from .torch_abi import (
+    TensorLayout,
+    TorchAccess,
+    dtype_index_table,
+    layout_for,
+    supported_versions,
+    torch_version,
+)
 
 # triton and torch ship no type information, so everything reaching into them is
 # typed `Any` on purpose.
@@ -339,7 +346,9 @@ def _loaded_module(
             module.set_compile_callback(_make_compile_callback(jit_func, params, options))
             # The tensor layout is installed, not compiled in, so it describes the
             # torch running now rather than the one this `.so` was built against.
-            module.set_torch_version(torch_version(), layout.as_args() if layout else None)
+            module.set_torch_version(
+                torch_version(), layout.as_args() if layout else None, dtype_index_table()
+            )
             _LOADED[key] = module
         return module
 
