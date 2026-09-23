@@ -4,16 +4,20 @@ The C++ half of the check `abi_detect` makes at runtime: here the compiler, not
 a search over field values, places each field.  The two share no code, so a
 table entry both agree on has been checked twice, independently.
 
-Needs a C++ compiler and torch's headers -- the toolchain the `CXX` mode uses.
+Needs a C++ compiler (`$CXX`, else `c++`) and torch's headers, but not triton:
+it runs in an environment with nothing but the torch whose entry it checks.
 
     python -m intj.torch_intf.cpp_detect
 """
 
 import ctypes
+import os
 import pathlib
 import subprocess
 import sysconfig
 import tempfile
+
+_RUNTIME = pathlib.Path(__file__).parent.parent / "runtime"
 
 #: Member pointers to private fields, taken the one legal way: access checking
 #: does not apply to the arguments of an explicit instantiation.  Not
@@ -24,11 +28,14 @@ _SOURCE = r"""
 #include <cstddef>
 #include <cstdio>
 #include <string>
+#include <type_traits>
 #include <c10/core/ScalarType.h>
 #include <c10/core/StorageImpl.h>
 #include <c10/core/TensorImpl.h>
 #include <c10/util/typeid.h>
 #include <torch/csrc/autograd/python_variable.h>
+
+#include "intj_thpvariable.h"
 
 template <class Tag> struct Member { static inline typename Tag::type ptr; };
 template <class Tag, typename Tag::type M> struct Steal {
@@ -40,6 +47,7 @@ template <class Tag, typename Tag::type M> struct Steal {
 
 using TensorPtr = c10::intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>;
 using StoragePtr = c10::intrusive_ptr<c10::StorageImpl>;
+STEAL(MO_own, c10::MaybeOwned<at::Tensor>, at::Tensor, own_)
 STEAL(TB_impl, at::TensorBase, TensorPtr, impl_)
 STEAL(TP_target, TensorPtr, c10::TensorImpl *, target_)
 STEAL(TI_storage, c10::TensorImpl, c10::Storage, storage_)
@@ -63,6 +71,17 @@ template <class C, class T> size_t off(T C::*m) {
 }
 #define OFF(tag) off(Member<tag>::ptr)
 
+// torch < 2.10 holds THPVariable::cdata as a MaybeOwned<Tensor>, whose borrowed
+// and owned Tensors share one union after an `isBorrowed_` flag.
+using Cdata = decltype(THPVariable::cdata);
+constexpr bool cdata_is_tensor = std::is_same_v<Cdata, at::Tensor>;
+size_t tensor_in_cdata() {
+  if constexpr (cdata_is_tensor)
+    return 0;
+  else
+    return OFF(MO_own);
+}
+
 // A shared object rather than a program: pybind11, which python_variable.h
 // pulls in, leaves references to libpython that only a live interpreter fills.
 extern "C" const char *intj_detect() {
@@ -74,10 +93,17 @@ extern "C" const char *intj_detect() {
   // the reader actually loads; `data_type` is TypeMeta's low byte, which is
   // the ScalarType on a little-endian machine.
   size_t thp_cdata = offsetof(THPVariable, cdata);
-  emit("pyobject=%zu thpvariable_cdata=%zu\n", sizeof(PyObject), thp_cdata);
+  // The CXX mode's own declaration, which it trusts without a load-time check.
+  bool intj_ok = std::is_same_v<Cdata, decltype(intj_THPVariable::cdata)> &&
+                 offsetof(intj_THPVariable, cdata) == thp_cdata;
+  (void)&intj_cdata;  // and its accessor still compiles against this torch
+  emit("pyobject=%zu thpvariable_cdata=%zu cdata_is_tensor=%d intj_thpvariable=%d "
+       "tensorimpl=%zu storageimpl=%zu\n",
+       sizeof(PyObject), thp_cdata, (int)cdata_is_tensor, (int)intj_ok,
+       sizeof(c10::TensorImpl), sizeof(c10::StorageImpl));
   emit("cdata=%zu storage=%zu storage_offset=%zu numel=%zu data_type=%zu "
        "s_data=%zu s_nbytes=%zu\n",
-       thp_cdata + OFF(TB_impl) + OFF(TP_target),
+       thp_cdata + tensor_in_cdata() + OFF(TB_impl) + OFF(TP_target),
        OFF(TI_storage) + OFF(S_impl) + OFF(SP_target),
        OFF(TI_storage_offset), OFF(TI_numel),
        OFF(TI_data_type) + OFF(TM_index),
@@ -91,47 +117,61 @@ extern "C" const char *intj_detect() {
 """
 
 
-def detect() -> tuple[dict[str, int], dict[int, int]]:
-    """(offsets, dtype code -> element size), as torch's headers declare them.
+def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
+    """(facts, offsets, dtype code -> element size), unchecked.
 
-    Raises if the toolchain is missing, the program does not build, or torch's
-    `THPVariable` no longer starts with the tensor -- the one layout the `CXX`
-    mode assumes rather than includes.
+    `facts` are what the layout rests on rather than the layout itself:
+    `sizeof(PyObject)`, where and what `THPVariable::cdata` is, whether the CXX
+    mode's `intj_THPVariable` matches it, and the sizes of TensorImpl and
+    StorageImpl.
     """
-    from ..launcher import _cxx_abi, _cxx_toolchain  # pyright: ignore[reportPrivateUsage]
+    import torch
+    from torch.utils import cpp_extension
 
-    toolchain = _cxx_toolchain()
-    if toolchain is None:
-        raise RuntimeError("intj: cpp_detect needs a C++ compiler and torch's headers")
-    includes, libs = toolchain
+    includes, libs = cpp_extension.include_paths(), cpp_extension.library_paths()
+    cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)  # pyright: ignore[reportPrivateUsage]
     with tempfile.TemporaryDirectory() as tmp:
         src, lib = pathlib.Path(tmp, "detect.cpp"), pathlib.Path(tmp, "detect.so")
         src.write_text(_SOURCE)
         subprocess.run(
             [
-                "c++", "-std=c++20", "-shared", "-fPIC", "-w", f"-D_GLIBCXX_USE_CXX11_ABI={_cxx_abi()}",
-                *(f"-I{d}" for d in [*includes, sysconfig.get_paths()["include"]]),
+                os.environ.get("CXX", "c++"), "-std=c++20", "-shared", "-fPIC", "-w",
+                f"-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}",
+                *(f"-I{d}" for d in [*includes, sysconfig.get_paths()["include"], _RUNTIME]),
                 str(src), "-o", str(lib),
                 *(f"-L{d}" for d in libs), *(f"-Wl,-rpath,{d}" for d in libs),
                 "-lc10", "-ltorch_cpu", "-ltorch_python",
             ],
             check=True,
         )
-        import torch  # pyright: ignore[reportUnusedImport] -- symbols the .so leaves undefined
-
+        # `import torch` above loaded the symbols the .so leaves undefined
         detect_fn = ctypes.CDLL(str(lib)).intj_detect
         detect_fn.restype = ctypes.c_char_p
         out = detect_fn().decode()
     head, layout, dtypes = (dict(p.split("=") for p in line.split()) for line in out.splitlines())
-    if head["thpvariable_cdata"] != head["pyobject"]:
-        raise RuntimeError(
-            f"intj: THPVariable::cdata is at {head['thpvariable_cdata']}, not right after "
-            f"PyObject_HEAD ({head['pyobject']}); intj_THPVariable is stale"
-        )
     return (
+        {k: int(v) for k, v in head.items()},
         {k: int(v) for k, v in layout.items()},
         {int(k): int(v) for k, v in dtypes.items()},
     )
+
+
+def detect() -> tuple[dict[str, int], dict[int, int]]:
+    """(offsets, dtype code -> element size), as torch's headers declare them.
+
+    Raises if the toolchain is missing, the program does not build, or the CXX
+    mode's `intj_THPVariable` (runtime/intj_thpvariable.h) no longer matches
+    torch's `THPVariable` -- the one layout that mode declares rather than
+    includes.
+    """
+    head, offsets, sizes = measure()
+    if not head["intj_thpvariable"]:
+        raise RuntimeError(
+            "intj: runtime/intj_thpvariable.h does not match this torch's THPVariable "
+            f"(cdata at {head['thpvariable_cdata']}, "
+            f"{'a Tensor' if head['cdata_is_tensor'] else 'a MaybeOwned<Tensor>'})"
+        )
+    return offsets, sizes
 
 
 if __name__ == "__main__":

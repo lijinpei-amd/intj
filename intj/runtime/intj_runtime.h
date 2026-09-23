@@ -418,25 +418,10 @@ typedef struct {
 } intj_torch_abi;
 
 #ifdef INTJ_ACCESS_CXX
-/* Deliberately NOT torch/csrc/autograd/python_variable.h.  That header declares
- * the four-line struct below and nothing else intj needs, but it also pulls in
- * pybind11 -- 79% of the resulting .text, none of it reachable, and 9.5 s of
- * the 11 s build.  These three give byte-identical code for the reader.
- */
-#include <ATen/core/Tensor.h>
 #include <c10/core/StorageImpl.h>
 #include <c10/core/TensorImpl.h>
 
-/* The head of THPVariable.  Declaring it here rather than including torch's
- * copy assumes one thing: that `cdata` is the first member after PyObject_HEAD.
- * Nothing checks it at load.  Both torch ABI detectors refuse a torch where it
- * does not hold (intj/torch_intf/abi_detect.py, cpp_detect.py), so it is
- * verified for every torch the table covers.
- */
-struct intj_THPVariable {
-  PyObject_HEAD
-  at::Tensor cdata;
-};
+#include "intj_thpvariable.h"
 #endif
 
 /* Interned method names, used only by the CPYTHON reader. Filled by
@@ -599,7 +584,7 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
                                                int64_t *sz) {
   using namespace intj_rob;
   (void)abi;
-  const at::Tensor &t = ((intj_THPVariable *)o)->cdata;
+  const at::Tensor &t = intj_cdata(o);
   c10::TensorImpl *ti = t.unsafeGetTensorImpl();
 
   /* No storage means no dense data pointer -- sparse, mkldnn.  torch raises

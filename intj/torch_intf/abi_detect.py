@@ -8,6 +8,7 @@ Needs no compiler; `cpp_detect` is the independent check that does.
 """
 
 import ctypes
+import functools
 from typing import Any
 
 from .torch_abi import (
@@ -20,13 +21,14 @@ from .torch_abi import (
     torch_version,
 )
 
-#: Bytes of TensorImpl / StorageImpl the probe is willing to read.  Both are far
-#: larger than this in every torch that has shipped -- TensorImpl's
-#: `sizes_and_strides_` alone is 88 bytes and sits in the middle -- but the
-#: windows are kept as small as the search allows, because reading past a live
+#: The most of TensorImpl / StorageImpl the probe reads.  Wide enough for every
+#: field it looks for in every torch since 2.2 (`data_type_` sits at 176 in 2.2),
+#: small enough that a wider search does not invite coincidences.  Each read is
+#: further capped at the object's own allocation -- TensorImpl is 176 bytes in
+#: torch 2.13, so this window alone would read past it, and reading past a live
 #: object is the one mistake here that cannot be caught.
-_TENSORIMPL_WINDOW = 176
-_STORAGEIMPL_WINDOW = 56
+_TENSORIMPL_WINDOW = 192
+_STORAGEIMPL_WINDOW = 72
 
 
 
@@ -61,6 +63,18 @@ def _probes() -> list[Any]:
         borrowed,
         borrowed[17:],
     ]
+
+
+@functools.lru_cache(maxsize=1)
+def _malloc_usable_size() -> Any:
+    fn = ctypes.CDLL(None).malloc_usable_size
+    fn.argtypes, fn.restype = [ctypes.c_void_p], ctypes.c_size_t
+    return fn
+
+
+def _heap_window(address: int, size: int) -> bytes:
+    """Up to `size` bytes of the `new`-allocated object at `address`, never past it."""
+    return _window(address, min(size, _malloc_usable_size()(address)))
 
 
 def _window(address: int, size: int) -> bytes:
@@ -103,8 +117,8 @@ def probe_layout() -> TensorABI | None:
             return None
 
         obj = _window(id(t), head + 8 * 4)
-        ti = _window(impl, _TENSORIMPL_WINDOW)
-        si = _window(simpl, _STORAGEIMPL_WINDOW)
+        ti = _heap_window(impl, _TENSORIMPL_WINDOW)
+        si = _heap_window(simpl, _STORAGEIMPL_WINDOW)
 
         found = {
             "storage": _find_u64(ti, simpl),
@@ -183,13 +197,6 @@ def _main() -> None:
     layout = probe_layout()
     if layout is None:
         raise SystemExit(f"intj: cannot pin torch {torch.__version__}'s layout")
-    # the CXX mode declares `intj_THPVariable { PyObject_HEAD; at::Tensor cdata; }`
-    # instead of including torch's header, and trusts it without a load-time check
-    if layout.cdata != pyobject_size():
-        raise SystemExit(
-            f"intj: torch {torch.__version__} has THPVariable::cdata at {layout.cdata}, "
-            f"not right after PyObject_HEAD ({pyobject_size()}); intj_THPVariable is stale"
-        )
 
     dtypes = live_dtypes()
     # `at::ScalarType` is a dense enum, so a gap means a code this torch uses is

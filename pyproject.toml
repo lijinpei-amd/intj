@@ -3,7 +3,7 @@ name = "intj"
 version = "0.1.0"
 description = "Incompatible Triton Jit: a low-overhead host launcher for triton kernels on AMD and NVIDIA GPUs"
 requires-python = ">=3.12"
-dependencies = ["jinja2", "triton>=3.8", "torch"]
+dependencies = ["jinja2", "triton>=3.8", "torch>=2.2"]
 
 [build-system]
 requires = ["setuptools"]

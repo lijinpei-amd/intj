@@ -41,7 +41,11 @@ SCHEMA_VERSION = 1
 
 _RUNTIME = Path(__file__).parent / "runtime"
 _ENTRY_TEMPLATE = _RUNTIME / "entry.c.jinja"
-_RUNTIME_HEADER = _RUNTIME / "intj_runtime.h"
+
+
+def _runtime_headers() -> bytes:
+    """Every header the rendered module can include from intj's runtime dir."""
+    return b"".join(p.read_bytes() for p in sorted(_RUNTIME.glob("*.h")))
 
 
 class UnsupportedKernel(NotImplementedError):
@@ -103,7 +107,7 @@ class ModuleKey:
     """
 
     template: str  # entry.c.jinja bytes, hex
-    runtime_header: str  # intj_runtime.h bytes, hex
+    runtime_header: str  # runtime/*.h bytes, hex
     context: RenderContext  # the render is a pure function of this and the template
     cache_key: str  # jit_func.cache_key: the kernel source and its callees
     params: tuple[tuple[Any, ...], ...]  # per-parameter decorator state, which cache_key misses
@@ -200,7 +204,7 @@ def make_launcher(
     # and the context, so hash those rather than the render itself.
     key = ModuleKey(
         template=_ENTRY_TEMPLATE.read_bytes().hex(),
-        runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
+        runtime_header=_runtime_headers().hex(),
         context=context,
         cache_key=jit_func.cache_key,
         params=tuple(
@@ -409,15 +413,15 @@ def _build(so_path: Path, context: RenderContext) -> None:
 
 
 def _runtime_header_flag() -> str:
-    """Make the runtime header part of what triton's compile cache keys on.
+    """Make the runtime headers part of what triton's compile cache keys on.
 
     `_compile_so` keys on the source bytes plus the *names* of the include
     directories, not on the contents of the headers found there.  So an edit to
-    `intj_runtime.h` moves intj's own `ModuleKey` digest, intj re-renders, and
-    triton then serves the object it compiled from the previous header.  Feeding
+    a runtime header moves intj's own `ModuleKey` digest, intj re-renders, and
+    triton then serves the object it compiled from the previous headers.  Feeding
     the digest in as a define puts it in triton's key too.
     """
-    digest = hashlib.sha256(_RUNTIME_HEADER.read_bytes()).hexdigest()[:16]
+    digest = hashlib.sha256(_runtime_headers()).hexdigest()[:16]
     return f"-DINTJ_RUNTIME_HEADER=0x{digest}"
 
 

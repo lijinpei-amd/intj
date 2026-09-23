@@ -137,8 +137,10 @@ torch whose dtype set has drifted from its entry — one renamed, dropped or ins
 unverified too, offsets and all: the same refusal, not a partial trust.
 
 `CXX` needs no entry: the compiler supplies every offset from torch's headers. The
-one thing it assumes without a header is that `THPVariable` starts with the tensor
-right after `PyObject_HEAD`; both detectors below refuse a torch where that fails.
+one thing it declares itself rather than includes is the head of `THPVariable`
+(`intj/runtime/intj_thpvariable.h`: a `MaybeOwned<Tensor>` before torch 2.10, a
+`Tensor` since); `cpp_detect` below refuses a torch where that declaration is wrong.
+On torch older than 2.10 the `CXX` mode is compile-checked only.
 
 To add a version, run `python -m intj.torch_intf.abi_detect` on it and paste the entry it
 prints. That derives each offset by matching field values against what torch's own

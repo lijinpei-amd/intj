@@ -14,6 +14,653 @@
 # through these offsets unless the running torch's dtypes are exactly the ones
 # that were there when the offsets were measured.
 
+# torch 2.2.2+cpu, x86-64
+["2.2"]
+cdata = 24
+storage = 24
+storage_offset = 160
+numel = 168
+data_type = 176
+s_data = 24
+s_nbytes = 56
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+]
+
+# torch 2.3.1+cpu, x86-64
+["2.3"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+]
+
+# torch 2.4.1+cpu, x86-64
+["2.4"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+]
+
+# torch 2.5.1+cpu, x86-64
+["2.5"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+]
+
+# torch 2.6.0+cpu, x86-64
+["2.6"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+]
+
+# torch 2.7.1+cpu, x86-64
+["2.7"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+]
+
+# torch 2.8.0+cpu, x86-64
+["2.8"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+  ["float4_e2m1fn_x2", 1],  # 45
+]
+
+# torch 2.9.1+cpu, x86-64
+["2.9"]
+cdata = 24
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+  ["float4_e2m1fn_x2", 1],  # 45
+]
+
+# torch 2.10.0+cpu, x86-64
+["2.10"]
+cdata = 16
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+  ["float4_e2m1fn_x2", 1],  # 45
+]
+
+# torch 2.11.0+cpu, x86-64
+["2.11"]
+cdata = 16
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+  ["float4_e2m1fn_x2", 1],  # 45
+]
+
+# torch 2.12.1+cpu, x86-64
+["2.12"]
+cdata = 16
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+  ["float4_e2m1fn_x2", 1],  # 45
+]
+
+# torch 2.13.0+cpu, x86-64
+["2.13"]
+cdata = 16
+storage = 16
+storage_offset = 144
+numel = 152
+data_type = 160
+s_data = 16
+s_nbytes = 48
+dtypes = [  # indexed by at::ScalarType code
+  ["uint8", 1],  # 0
+  ["int8", 1],  # 1
+  ["int16", 2],  # 2
+  ["int32", 4],  # 3
+  ["int64", 8],  # 4
+  ["float16", 2],  # 5
+  ["float32", 4],  # 6
+  ["float64", 8],  # 7
+  ["complex32", 4],  # 8
+  ["complex64", 8],  # 9
+  ["complex128", 16],  # 10
+  ["bool", 1],  # 11
+  ["qint8", 1],  # 12
+  ["quint8", 1],  # 13
+  ["qint32", 4],  # 14
+  ["bfloat16", 2],  # 15
+  ["quint4x2", 1],  # 16
+  ["quint2x4", 1],  # 17
+  ["bits1x8", 1],  # 18
+  ["bits2x4", 1],  # 19
+  ["bits4x2", 1],  # 20
+  ["bits8", 1],  # 21
+  ["bits16", 2],  # 22
+  ["float8_e5m2", 1],  # 23
+  ["float8_e4m3fn", 1],  # 24
+  ["float8_e5m2fnuz", 1],  # 25
+  ["float8_e4m3fnuz", 1],  # 26
+  ["uint16", 2],  # 27
+  ["uint32", 4],  # 28
+  ["uint64", 8],  # 29
+  ["uint1", 1],  # 30
+  ["uint2", 1],  # 31
+  ["uint3", 1],  # 32
+  ["uint4", 1],  # 33
+  ["uint5", 1],  # 34
+  ["uint6", 1],  # 35
+  ["uint7", 1],  # 36
+  ["int1", 1],  # 37
+  ["int2", 1],  # 38
+  ["int3", 1],  # 39
+  ["int4", 1],  # 40
+  ["int5", 1],  # 41
+  ["int6", 1],  # 42
+  ["int7", 1],  # 43
+  ["float8_e8m0fnu", 1],  # 44
+  ["float4_e2m1fn_x2", 1],  # 45
+]
+
 # torch 2.14.0.dev20260721+rocm7.2, x86-64
 ["2.14"]
 cdata = 16

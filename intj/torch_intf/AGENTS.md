@@ -18,11 +18,11 @@ kernel a pointer built from it. So:
 
 ## The generator checks what CXX assumes
 
-CXX mode needs no table, but it declares `intj_THPVariable` itself instead of
-including `python_variable.h` (which drags in pybind11), and does not check that at
-load. The generator refuses a torch where it no longer holds. Any new layout
-assumption in C++ code gets the same treatment: checked in the generator, not at
-load.
+CXX mode needs no table, but it declares `intj_THPVariable` itself
+(`intj/runtime/intj_thpvariable.h`) instead of including `python_variable.h`, which
+drags in pybind11, and does not check that at load. `cpp_detect` compiles it beside
+torch's own and refuses a torch where they differ. Any new layout assumption in C++
+code gets the same treatment: checked in `cpp_detect`, not at load.
 
 ## The ABI table is a trust boundary
 
