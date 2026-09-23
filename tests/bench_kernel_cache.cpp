@@ -26,6 +26,12 @@
  * line.  And the keys here are uniformly random words, where a real key is a
  * header of small byte codes plus a few value words -- fine for the table, but
  * not a test of the layout's own distribution.
+ *
+ * If you build this by hand at `-O1` with `-fsanitize=undefined` and
+ * `INTJ_NWORDS=1`, every `hit/*` reports "lookup returned the wrong kernel".
+ * That is a gcc 13.3.0 wrong-code bug, not a bug in the cache -- see the note
+ * above `intj_slot` in intj_runtime.h for what was ruled out.  `-O2` and `-O3`,
+ * which is what everything intj actually builds uses, are clean.
  */
 #include <benchmark/benchmark.h>
 

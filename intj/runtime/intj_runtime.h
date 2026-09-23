@@ -153,7 +153,26 @@ typedef struct {
 /* At one word `intj_hash` is a bijection, so `hash == h` IS key equality and the
  * slot has no reason to carry the key: 16 bytes, four to a cache line, against
  * 8 + 8 + INTJ_NWORDS * 8.  A probe is a cache miss, and the slot size is what
- * decides how many lines that miss costs. */
+ * decides how many lines that miss costs.
+ *
+ * gcc 13.3.0 miscompiles the lookup below at `-O1 -fsanitize=undefined` (or
+ * `=null`, or `=alignment`, each alone) when this branch is taken: the inlined
+ * `intj_map_get` returns NULL for a key that is present, while an immediately
+ * following identical call returns it.  Ruled out as a bug here rather than in
+ * intj: UBSan reports no diagnostic at all -- it silently changes behaviour,
+ * which is what a wrong-code bug looks like and a real null/alignment violation
+ * does not; the keyed slot at INTJ_NWORDS==1 with this same hash is clean under
+ * identical flags; -O0, -O2, -O3, every level without a sanitizer, and clang
+ * are all clean; and no rephrasing of the loop (hoisting the loads, dropping
+ * the INTJ_LIKELY hints) changes it.  It would not reduce to a standalone file,
+ * so there is no upstream report yet.
+ *
+ * Nothing intj builds is affected: triton compiles rendered modules at `-O3`
+ * with no sanitizer (`triton/runtime/build.py`), and so does
+ * `tests/test_kernel_cache.py`.  It is recorded because the benchmark is the
+ * only GPU-free coverage of this code, and someone will eventually build it by
+ * hand with sanitizers and go looking for the bug in here.
+ */
 #if INTJ_NWORDS == 1
 typedef struct {
   uint64_t hash;
