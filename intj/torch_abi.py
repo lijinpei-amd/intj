@@ -37,7 +37,7 @@ class TorchAccess(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class TensorLayout:
+class TensorABI:
     """Byte offsets the `SHIM` mode reads, plus the dtype-to-element-size table.
 
     The offsets come from `_LAYOUTS`, keyed on the torch version; `itemsize` is
@@ -205,7 +205,7 @@ def _find_u8(blob: bytes, want: int) -> set[int]:
     return {i for i in range(len(blob)) if blob[i] == want}
 
 
-def probe_layout() -> TensorLayout | None:
+def probe_layout() -> TensorABI | None:
     """Discover the offsets from the running torch, or return None.
 
     Not used when launching: `_LAYOUTS` is consulted instead, so a torch intj has
@@ -257,11 +257,11 @@ def probe_layout() -> TensorLayout | None:
             return None
         pinned[name] = hits.pop()
 
-    layout = TensorLayout(itemsize=itemsize_table(), **pinned)
+    layout = TensorABI(itemsize=itemsize_table(), **pinned)
     return layout if _selfcheck(layout) else None
 
 
-def _selfcheck(layout: TensorLayout) -> bool:
+def _selfcheck(layout: TensorABI) -> bool:
     """Reproduce torch's own `data_ptr()` through the discovered offsets.
 
     The probe pins each offset independently; this checks the arithmetic that
@@ -282,7 +282,7 @@ def _selfcheck(layout: TensorLayout) -> bool:
     return all(_read(layout, t) == _expected(t) for t in cases)
 
 
-def _read(layout: TensorLayout, t: Any) -> tuple[int, int, int]:
+def _read(layout: TensorABI, t: Any) -> tuple[int, int, int]:
     """What the C shim reader would compute, in python."""
     impl = ctypes.c_size_t.from_address(id(t) + layout.cdata).value
     simpl = ctypes.c_size_t.from_address(impl + layout.storage).value
@@ -328,7 +328,7 @@ def supported_versions() -> list[tuple[int, int]]:
 
 
 @functools.lru_cache(maxsize=4)
-def layout_for(version: tuple[int, int] | None = None) -> TensorLayout | None:
+def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
     """The layout for `version`, or None if intj has no verified row for it.
 
     None rather than a guess: a wrong offset cannot raise, it reads whatever
@@ -338,7 +338,7 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorLayout | None:
     offsets = _LAYOUTS.get(version)
     if offsets is None:
         return None
-    return TensorLayout(itemsize=itemsize_table(), **offsets)
+    return TensorABI(itemsize=itemsize_table(), **offsets)
 
 
 @functools.lru_cache(maxsize=1)

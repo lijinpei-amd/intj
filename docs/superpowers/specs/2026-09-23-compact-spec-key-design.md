@@ -151,7 +151,7 @@ already loads `abi.itemsize[code]`, so there the second table is free.
 It also makes the table mode-independent, where `itemsize` is installed only in
 the SHIM branch of `set_torch_version` and CPYTHON passes `layout=None`. So
 `set_torch_version` takes a third argument, `dtype_index`, always a 64-byte
-`bytes`, in every mode; `TensorLayout.as_args` keeps carrying `itemsize` for
+`bytes`, in every mode; `TensorABI.as_args` keeps carrying `itemsize` for
 SHIM alone.
 
 ### Layout

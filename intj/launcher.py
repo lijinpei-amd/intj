@@ -24,7 +24,7 @@ from .kernel_cache import (
     unavailable_message,
 )
 from .torch_abi import (
-    TensorLayout,
+    TensorABI,
     TorchAccess,
     dtype_index_table,
     layout_for,
@@ -331,7 +331,7 @@ def _loaded_module(
     context: RenderContext,
     params: Sequence[Param],
     options: Mapping[str, Any],
-    layout: TensorLayout | None,
+    layout: TensorABI | None,
 ) -> types.ModuleType:
     """One module per `ModuleKey`, for the life of the process.
 
