@@ -4,6 +4,10 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Correctness
 
+- **Support non-x86-64 hosts.** `torch_abi.toml` contains x86-64 tensor offsets,
+  but `layout_for()` selects them by torch version and `PyObject` size on every
+  host. Refuse SHIM on other host ABIs until their offsets are measured and
+  independently checked; add ARM64 layouts and run launcher tests there.
 - **Fork safety.** The C kernel cache keeps parent handles across `fork(2)`; a child
   that launches uses a dead context. Triton guards this by pid. Fix with a
   `pthread_atfork` child handler that repoints the cache at an empty sentinel.
