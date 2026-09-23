@@ -139,6 +139,7 @@ def make_launcher(
     options: Mapping[str, Any] | None = None,
     torch_access: TorchAccess = TorchAccess.AUTO,
     kernel_cache: KernelCache = KernelCache.INTJ,
+    no_gpu: bool = False,
 ) -> Callable[..., None]:
     """Build a fast launcher for `jit_func`.
 
@@ -154,14 +155,17 @@ def make_launcher(
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
     `TorchAccess`.  `kernel_cache` picks the hash map behind the kernel cache;
-    see `KernelCache`.  `dynamic_grid` and `dynamic_options` are reserved and
-    currently unsupported.
+    see `KernelCache`.  `no_gpu=True` decodes and caches on the host without
+    compiling or launching a GPU kernel. `dynamic_grid` and `dynamic_options`
+    are reserved and currently unsupported.
     """
     if dynamic_grid:
         raise UnsupportedKernel("intj: dynamic_grid is not implemented; pass an int or tuple grid")
     if dynamic_options:
         raise UnsupportedKernel("intj: dynamic_options is not implemented; pass options=... instead")
     options = dict(sorted((options or {}).items()))
+    if no_gpu and options:
+        raise UnsupportedKernel("intj: no_gpu=True supports only default compile options")
     jit_func = _check_kernel(jit_func, options)
     resolved = _resolve_annotations(jit_func, extra_annotation)
     for p in jit_func.params:
@@ -170,18 +174,23 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
-    target = _current_target()
-    if target.backend not in BACKENDS:
-        raise UnsupportedKernel(
-            f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
-            f"register() it (have: {', '.join(sorted(BACKENDS))})"
-        )
+    if no_gpu:
+        target = None
+        backend = None
+        canonical_options = None
+    else:
+        target = _current_target()
+        backend = BACKENDS.get(target.backend)
+        if backend is None:
+            raise UnsupportedKernel(
+                f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
+                f"register() it (have: {', '.join(sorted(BACKENDS))})"
+            )
+        canonical_options = _canonical_options(target, options)
     device_binding = DeviceBinding.NOT_FIXED
     params, device_offset, nwords = _render_params(resolved, device_binding)
 
     access = _resolve_access(torch_access)
-    backend = BACKENDS[target.backend]
-    canonical_options = _canonical_options(target, options)
     # last, after every refusal above it: a kernel that is going to be rejected
     # anyway must not pay for a download and an abseil build first
     cache_toolchain = _provision(kernel_cache)
@@ -197,17 +206,17 @@ def make_launcher(
         device_binding=device_binding,
         device_offset=device_offset,
         verify_annotation=False,
-        no_gpu=False,
+        no_gpu=no_gpu,
         max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
         # after the knob is flipped back on.
-        spec_pointer_range=1 if backend.pointer_range else 0,
-        driver_path=backend.library_path(),
-        launch_symbol=backend.launch_symbol,
-        error_symbol=backend.error_symbol,
-        error_style=backend.error_style,
+        spec_pointer_range=1 if backend is not None and backend.pointer_range else 0,
+        driver_path=backend.library_path() if backend is not None else "",
+        launch_symbol=backend.launch_symbol if backend is not None else "",
+        error_symbol=backend.error_symbol if backend is not None else "",
+        error_style=backend.error_style if backend is not None else "return",
         torch_access=access.value,
         kernel_cache=kernel_cache.value,
         cache_include_dirs=cache_toolchain["include_dirs"],
@@ -227,8 +236,8 @@ def make_launcher(
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
         context=context,
         cache_key=jit_func.cache_key,
-        target=(target.backend, target.arch, target.warp_size),
-        options=canonical_options.hash(),
+        target=(target.backend, target.arch, target.warp_size) if target is not None else ("host-only",),
+        options=canonical_options.hash() if canonical_options is not None else "host-defaults",
         triton=_triton_identity(),
         compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
@@ -368,7 +377,10 @@ def _loaded_module(
         module = _LOADED.get(key)
         if module is None:
             module = _load(key, jit_func, context)
-            module.set_compile_callback(_make_compile_callback(jit_func, params, options))
+            module.set_compile_callback(
+                _make_host_compile_callback() if context.no_gpu
+                else _make_compile_callback(jit_func, params, options)
+            )
             # The tensor layout is installed, not compiled in, so it describes the
             # torch running now rather than the one this `.so` was built against.
             module.set_torch_version(
@@ -719,6 +731,16 @@ def _make_compile_callback(
 
         kernels.append(kernel)
         return (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
+
+    return compile_callback
+
+
+def _make_host_compile_callback() -> Callable[..., tuple[int, int, int, int]]:
+    def compile_callback(
+        keyblob: bytes, nparams: int, device: int, *args: Any
+    ) -> tuple[int, int, int, int]:
+        del keyblob, device, args
+        return 0, 1, 0, nparams
 
     return compile_callback
 

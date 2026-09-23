@@ -6,6 +6,7 @@
 #include <Python.h>
 
 #define INTJ_NWORDS {{ [nwords, 1] | max }}
+#define INTJ_HAS_KEY {{ 1 if nwords else 0 }}
 #define INTJ_KEY_BYTES {{ nwords * 8 }}
 #define INTJ_ACCESS_{{ torch_access | upper }} 1
 #include "intj_runtime.h"
@@ -18,9 +19,10 @@ typedef struct {
   PyTypeObject *tensor_type;
   PyTypeObject *param_type;
   intj_torch_abi abi;
-  intj_launch_t launch;
+{% if not no_gpu %}  intj_launch_t launch;
 {% if error_style == 'return' %}  intj_error_string_ret_t error_string;
 {% else %}  intj_error_string_out_t error_string;
+{% endif %}
 {% endif %}
   intj_cache cache;
 } intj_state;
@@ -206,6 +208,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
     return NULL;
   }
 
+{% if not no_gpu %}
   /* Launch. Two trailing scratch slots are mandatory on AMD; intj refuses
    * kernels that need non-empty scratch, so they are always null. */
   void *params[INTJ_NSLOTS + 2];
@@ -231,6 +234,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
                  message ? message : "unknown error");
     return NULL;
   }
+{% endif %}
   Py_RETURN_NONE;
 }
 
@@ -407,6 +411,7 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
   Py_RETURN_NONE;
 }
 
+{% if not no_gpu %}
 static void *intj_dlopen(const char *path) {
   void *h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
   if (!h)
@@ -423,6 +428,7 @@ static void *intj_dlsym(void *handle, const char *name) {
     PyErr_Format(PyExc_RuntimeError, "intj: missing symbol %s", name);
   return sym;
 }
+{% endif %}
 
 static int intj_exec(PyObject *m) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
@@ -457,6 +463,7 @@ static int intj_exec(PyObject *m) {
   }
 {% endif %}
 
+{% if not no_gpu %}
   void *gpu = intj_dlopen("{{ driver_path }}");
   if (!gpu)
     return -1;
@@ -467,6 +474,7 @@ static int intj_exec(PyObject *m) {
   st->error_string = (intj_error_string_ret_t)dlsym(gpu, "{{ error_symbol }}");
 {% else %}
   st->error_string = (intj_error_string_out_t)dlsym(gpu, "{{ error_symbol }}");
+{% endif %}
 {% endif %}
 
   if (intj_cache_init(&st->cache) != 0) {

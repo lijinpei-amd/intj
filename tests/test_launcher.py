@@ -57,6 +57,35 @@ def scale(x, o, n, s, BLOCK: tl.constexpr):
     tl.store(o + off, tl.load(x + off, mask=mask) * s, mask=mask)
 
 
+def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
+    import intj.launcher as launcher
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("GPU path was reached")
+
+    monkeypatch.setattr(launcher, "_current_target", forbidden)
+    monkeypatch.setattr(launcher, "_current_device", forbidden)
+    monkeypatch.setattr(launcher, "_canonical_options", forbidden)
+    monkeypatch.setattr(launcher, "_make_compile_callback", forbidden)
+    host = make_launcher(scale, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    x = torch.ones(8)
+    out = torch.zeros(8)
+    assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
+    assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
+    assert torch.count_nonzero(out) == 0
+
+
+def test_no_gpu_rejects_real_backend_options(monkeypatch):
+    import intj.launcher as launcher
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("provisioning was reached")
+
+    monkeypatch.setattr(launcher, "_provision", forbidden)
+    with pytest.raises(UnsupportedKernel, match="no_gpu.*options"):
+        make_launcher(scale, no_gpu=True, options={"num_warps": 8})
+
+
 @triton.jit(do_not_specialize=["n"], do_not_specialize_on_alignment=["x"])
 def scale_nospec(x, o, n, s, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
