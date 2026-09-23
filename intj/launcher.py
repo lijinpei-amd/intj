@@ -104,8 +104,9 @@ class RenderContext:
     #: The interpreter the module is built for and loaded into.  Every mode reads
     #: CPython internals (see intj/python_intf), so a module is never shared
     #: across versions, patch releases included; the render refuses to compile
-    #: against any other `Python.h`.  ABI flags (`t`, `d`) are in `ext_suffix`.
+    #: against any other `Python.h`.  ABI flags (`t`, `d`) are also in `ext_suffix`.
     python_version: tuple[int, int, int]
+    free_threaded: bool
     python_abi: str  # the intj/python_intf header implementing that version
 
 
@@ -218,6 +219,7 @@ def make_launcher(
         torch_version=torch_version() if access is TorchAccess.CXX else None,
         cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
         python_version=cpython_abi.python_version(),
+        free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         python_abi=python_abi,
     )
 

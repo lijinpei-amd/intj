@@ -10,6 +10,8 @@ import ctypes
 import dataclasses
 import json
 import pathlib
+import subprocess
+import sysconfig
 import types
 
 import pytest
@@ -17,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from intj import make_launcher
+from intj import launcher, make_launcher
 from intj.launcher import (
     ModuleKey,
     Param,
@@ -26,6 +28,7 @@ from intj.launcher import (
     triton_specialization,
 )
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
+from intj.python_intf import cpython_abi
 from intj.torch_intf.abi_detect import probe_layout
 from intj.torch_intf.torch_abi import (
     NDTYPES,
@@ -442,7 +445,7 @@ def _render_context(**overrides):
         launch_symbol="launch", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
-        python_version=(3, 12, 3), python_abi="cpython_312.h",
+        python_version=(3, 12, 3), free_threaded=False, python_abi="cpython_312.h",
     )
     return RenderContext(**{**fields, **overrides})
 
@@ -489,11 +492,35 @@ def test_render_context_digest_tracks_every_field():
     base = _module_key()
     for field in dataclasses.fields(base.context):
         value = getattr(base.context, field.name)
-        changed = "zz" if isinstance(value, str) else (value + 1 if isinstance(value, int) else (1, 2))
+        if isinstance(value, bool):
+            changed = not value
+        elif isinstance(value, str):
+            changed = "zz"
+        elif isinstance(value, int):
+            changed = value + 1
+        else:
+            changed = (1, 2)
         if value == changed:
             continue
         other = dataclasses.replace(base, context=dataclasses.replace(base.context, **{field.name: changed}))
         assert other.digest() != base.digest(), field.name
+
+
+def test_free_threaded_build_changes_module_digest():
+    key = _module_key()
+    free_threaded = dataclasses.replace(key.context, free_threaded=True)
+    assert dataclasses.replace(key, context=free_threaded).digest() != key.digest()
+
+
+def test_render_rejects_mismatched_free_threaded_headers(tmp_path, capfd):
+    context = _render_context(
+        python_version=cpython_abi.python_version(),
+        python_abi=cpython_abi.header_for() or "",
+        free_threaded=not bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        launcher._build(tmp_path / "m.so", context)
+    assert "intj: compiling against headers of the wrong GIL build" in capfd.readouterr().err
 
 
 def test_artifact_layout_and_nested_kernels():

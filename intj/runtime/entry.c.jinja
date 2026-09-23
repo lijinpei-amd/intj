@@ -12,6 +12,9 @@
     PY_MICRO_VERSION != {{ python_version[2] }}
 #error "intj: compiling against the headers of a different CPython than the one running intj"
 #endif
+#if defined(Py_GIL_DISABLED) != {{ 1 if free_threaded else 0 }}
+#error "intj: compiling against headers of the wrong GIL build"
+#endif
 
 #define INTJ_PYTHON_ABI "{{ python_abi }}"
 #define INTJ_NWORDS {{ nwords }}

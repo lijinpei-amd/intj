@@ -106,7 +106,9 @@ def built(request, stub, tmp_path_factory):
         launch_symbol="stub_launch", error_symbol="stub_error", error_style="return",
         torch_access=mode.value, kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
         torch_version=None, cxx_abi=None,
-        python_version=cpython_abi.python_version(), python_abi=cpython_abi.header_for() or "",
+        python_version=cpython_abi.python_version(),
+        free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+        python_abi=cpython_abi.header_for() or "",
     )
     flags = launcher._build_flags(context)
     template = jinja2.Template(launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
