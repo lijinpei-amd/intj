@@ -57,10 +57,15 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
   }
 
   /* device / stream */
+  /* One byte of the key holds this, so the upper bound is load-bearing: device
+   * 256 would alias device 0 and launch on the wrong context.  It is checked
+   * here, with the parse, rather than beside the key build -- a zero-volume
+   * grid returns below, before any key exists. */
   int64_t device;
   if (INTJ_UNLIKELY(!PyLong_CheckExact(args[0]) ||
-                    intj_as_i64(args[0], &device) != 0 || device < 0)) {
-    PyErr_SetString(PyExc_TypeError, "intj: device must be a non-negative int");
+                    intj_as_i64(args[0], &device) != 0 || device < 0 ||
+                    device > 255)) {
+    PyErr_SetString(PyExc_TypeError, "intj: device must be an int in [0, 256)");
     return NULL;
   }
   uint64_t stream;
@@ -110,20 +115,30 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
   if (INTJ_UNLIKELY((uint64_t)gx * (uint64_t)gy * (uint64_t)gz == 0))
     Py_RETURN_NONE;
 
-  /* spec key + kernel arguments */
+  /* spec key + kernel arguments.  The header accumulates in 32-bit registers --
+   * the width the decode already works in -- and each key word gets exactly one
+   * store: two adjacent 32-bit stores feeding an 8-byte load would not forward.
+   * Every word is assigned rather than OR'd into, so the array needs no
+   * initializer; the header's padding bytes come from the zeroed accumulators. */
   uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
-  key[0] = (uint64_t)device;
+{% for a in range(header_words * 2) %}  uint32_t _a{{ a }} = 0;
+{% endfor %}
 {% for p in params %}
 {% if p.is_constexpr %}
-  INTJ_DECODE_CONSTEXPR(args[{{ 3 + loop.index0 }}], key[{{ p.word }}],
-                        key[{{ p.word + 1 }}], intj_param_names[{{ loop.index0 }}]);
+  INTJ_DECODE_CONSTEXPR(args[{{ 3 + loop.index0 }}], _a{{ loop.index0 // 4 }},
+                        {{ (loop.index0 % 4) * 8 }}, key[{{ p.cx_word }}],
+                        intj_param_names[{{ loop.index0 }}]);
 {% else %}
-  INTJ_DECODE(st, args[{{ 3 + loop.index0 }}], key[{{ p.word }}], vals, np,
+  INTJ_DECODE(st, args[{{ 3 + loop.index0 }}], _a{{ loop.index0 // 4 }},
+              {{ (loop.index0 % 4) * 8 }}, vals, np,
               {{ p.spec }}, {{ p.align }}, {{ spec_pointer_range }},
               intj_param_names[{{ loop.index0 }}]);
 {% endif %}
+{% endfor %}
+  _a{{ (params | length) // 4 }} |= (uint32_t)device << {{ ((params | length) % 4) * 8 }};
+{% for w in range(header_words) %}  key[{{ w }}] = (uint64_t)_a{{ 2 * w }} | ((uint64_t)_a{{ 2 * w + 1 }} << 32);
 {% endfor %}
 
   uint64_t hash = intj_hash(key);
@@ -236,16 +251,23 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
   uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
-  key[0] = 0;
+  uint32_t device = 0; /* no launch, so no device to key on */
+{% for a in range(header_words * 2) %}  uint32_t _a{{ a }} = 0;
+{% endfor %}
 {% for p in params %}
 {% if p.is_constexpr %}
-  INTJ_DECODE_CONSTEXPR(args[{{ loop.index0 }}], key[{{ p.word }}],
-                        key[{{ p.word + 1 }}], intj_param_names[{{ loop.index0 }}]);
+  INTJ_DECODE_CONSTEXPR(args[{{ loop.index0 }}], _a{{ loop.index0 // 4 }},
+                        {{ (loop.index0 % 4) * 8 }}, key[{{ p.cx_word }}],
+                        intj_param_names[{{ loop.index0 }}]);
 {% else %}
-  INTJ_DECODE(st, args[{{ loop.index0 }}], key[{{ p.word }}], vals, np,
+  INTJ_DECODE(st, args[{{ loop.index0 }}], _a{{ loop.index0 // 4 }},
+              {{ (loop.index0 % 4) * 8 }}, vals, np,
               {{ p.spec }}, {{ p.align }}, {{ spec_pointer_range }},
               intj_param_names[{{ loop.index0 }}]);
 {% endif %}
+{% endfor %}
+  _a{{ (params | length) // 4 }} |= device << {{ ((params | length) % 4) * 8 }};
+{% for w in range(header_words) %}  key[{{ w }}] = (uint64_t)_a{{ 2 * w }} | ((uint64_t)_a{{ 2 * w + 1 }} << 32);
 {% endfor %}
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)sizeof(key), np);
 }

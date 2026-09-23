@@ -390,11 +390,53 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
         assert nparams == sum(1 for ty, _ in spec if ty != "constexpr")
 
 
+@pytest.mark.parametrize(
+    "nparams,nconstexpr", [(1, 0), (1, 1), (6, 0), (7, 0), (8, 0), (7, 2), (8, 3)]
+)
+def test_render_params_byte_layout(tmp_path, nparams, nconstexpr):
+    """Byte i is parameter i; the device byte is last; constexpr words follow.
+
+    The 7-vs-8 cases straddle the header word boundary -- seven parameters plus
+    the device byte fill one word exactly, eight need a second.  Every kernel in
+    this suite has at most eight parameters, so nothing else here would catch a
+    device-byte off-by-one.
+    """
+    import importlib.util
+
+    from intj.launcher import _render_params
+
+    names = [f"p{i}" for i in range(nparams)]
+    cxnames = [f"C{i}" for i in range(nconstexpr)]
+    sig = ", ".join(names + [f"{c}: tl.constexpr" for c in cxnames])
+    # on disk, not exec'd: @triton.jit calls inspect.getsourcelines on it
+    path = tmp_path / f"k_{nparams}_{nconstexpr}.py"
+    path.write_text(
+        f"import triton\nimport triton.language as tl\n\n\n@triton.jit\ndef k({sig}):\n    pass\n"
+    )
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    params, nwords = _render_params(module.k)
+    header_words = -(-(nparams + nconstexpr + 1) // 8)
+
+    assert [p.name for p in params] == names + cxnames
+    assert [p.cx_word for p in params if not p.is_constexpr] == [None] * nparams
+    assert [p.cx_word for p in params if p.is_constexpr] == [
+        header_words + i for i in range(nconstexpr)
+    ]
+    assert nwords == header_words + nconstexpr
+
+
 def _render_context(**overrides):
     fields = dict(
         module_name="m", kernel_repr="a.b",
-        params=(Param("x", False, 1, 1, 1), Param("BLOCK", True, 1, 1, 2)),
-        nwords=4, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
+        params=(
+            Param(name="x", is_constexpr=False, spec=1, align=1, cx_word=None),
+            Param(name="BLOCK", is_constexpr=True, spec=1, align=1, cx_word=1),
+        ),
+        nwords=2, header_words=1, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
         launch_symbol="launch", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
@@ -668,6 +710,33 @@ def test_dtype_code_matches_torch(dtype_name):
     code = dtype_code(dtype)
     assert 0 <= code < NDTYPES
     assert itemsize_table()[code] == torch.empty(0, dtype=dtype).element_size()
+
+
+def test_unsupported_dtype_is_refused_in_every_mode():
+    """The path that skipped the dtype check: numel == 0 returns before it.
+
+    The shim reader bails at numel == 0 ahead of its own bound test, and the
+    cpython reader has no bound test at all.  Harmless while the dtype had 32
+    bits of the key to itself; under a byte code every unmapped dtype would
+    alias every other one.  So the check lives in the decode, which all three
+    readers pass through.
+    """
+    o = torch.empty(4096, device="cuda")
+    for mode in ACCESS_MODES:
+        module = getattr(make_launcher(scale, torch_access=mode), "__self__")
+        for x in (torch.zeros(4, device="cuda", dtype=torch.complex64),
+                  torch.zeros(0, device="cuda", dtype=torch.complex64)):
+            with pytest.raises(RuntimeError, match="triton does not take"):
+                module.spec_key(x, o, 1024, 2.0, 128)
+
+
+def test_device_above_255_is_refused(axpy_launcher):
+    """One byte holds the device, so 256 would alias 0 -- a wrong-context launch."""
+    x = torch.randn(64, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+    for device in (256, -1):
+        with pytest.raises(TypeError, match=r"\[0, 256\)"):
+            axpy_launcher(device, stream, (1,), x, x, x, 64, 1.5, True, None, 128)
 
 
 def test_dtype_index_table_matches_triton():

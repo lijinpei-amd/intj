@@ -8,7 +8,6 @@ import importlib.util
 import inspect
 import json
 import os
-import struct
 import subprocess
 import sysconfig
 import threading
@@ -57,7 +56,9 @@ class Param:
     is_constexpr: bool
     spec: int  # 0 when do_not_specialize
     align: int  # 0 when do_not_specialize_on_alignment
-    word: int  # index of its first spec-key word
+    # Its code byte is at its declaration position, which the template already
+    # has as `loop.index0`; only the value word needs carrying.
+    cx_word: int | None  # value-word index, None unless is_constexpr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +73,7 @@ class RenderContext:
     kernel_repr: str
     params: tuple[Param, ...]
     nwords: int  # spec-key length, in uint64 words
+    header_words: int  # words the code bytes and the device byte occupy
     max_slots: int  # kernel param slots, upper bound
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
     driver_path: str
@@ -152,7 +154,7 @@ def make_launcher(
 
     options = dict(sorted((options or {}).items()))
     jit_func = _check_kernel(jit_func, options)
-    params = _render_params(jit_func)
+    params, nwords = _render_params(jit_func)
 
     access = _resolve_access(torch_access)
     target = _current_target()
@@ -169,7 +171,8 @@ def make_launcher(
         module_name=module_name,
         kernel_repr=get_full_name(jit_func),
         params=params,
-        nwords=1 + sum(2 if p.is_constexpr else 1 for p in params),
+        nwords=nwords,
+        header_words=-(-(len(params) + 1) // 8),
         max_slots=sum(0 if p.is_constexpr else 1 for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
@@ -609,11 +612,19 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
     return jit_func
 
 
-def _render_params(jit_func: JitFunction) -> tuple[Param, ...]:
-    """One render-time descriptor per declared kernel parameter."""
+def _render_params(jit_func: JitFunction) -> tuple[tuple[Param, ...], int]:
+    """One render-time descriptor per declared kernel parameter, and the key length.
+
+    Byte `i` of the key is parameter `i`, the device byte follows them, and the
+    constexpr value words follow the padding.  `nwords` comes back alongside the
+    params because it is the same arithmetic: computing it somewhere else is how
+    the two drift.
+    """
+    declared = list(jit_func.params)
+    header_words = -(-(len(declared) + 1) // 8)
     params: list[Param] = []
-    word = 1
-    for p in jit_func.params:
+    word = header_words
+    for p in declared:
         kind = p._param.kind
         if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
             raise UnsupportedKernel(f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported")
@@ -628,11 +639,12 @@ def _render_params(jit_func: JitFunction) -> tuple[Param, ...]:
                 is_constexpr=p.is_constexpr,
                 spec=0 if p.do_not_specialize else 1,
                 align=0 if p.do_not_specialize_on_alignment else 1,
-                word=word,
+                cx_word=word if p.is_constexpr else None,
             )
         )
-        word += 2 if p.is_constexpr else 1
-    return tuple(params)
+        if p.is_constexpr:
+            word += 1
+    return tuple(params), word
 
 
 @functools.lru_cache(maxsize=1)
@@ -734,12 +746,14 @@ def _validate_spec_key(
     A key that is coarse in *both* directions never misses and so never reaches
     this check -- `tests/test_launcher.py` covers that case with `spec_key`.
     """
-    words = struct.unpack(f"<{len(keyblob) // 8}Q", keyblob)
     specialization = triton_specialization(jit_func, args, options)
 
     for i, param in enumerate(params):
-        n = 2 if param.is_constexpr else 1
-        mine = words[param.word:param.word + n]
+        # byte i is parameter i; a constexpr adds its value word
+        mine: tuple[int, ...] = (keyblob[i],)
+        if param.cx_word is not None:
+            at = param.cx_word * 8
+            mine += (int.from_bytes(keyblob[at:at + 8], "little"),)
         theirs = repr(specialization[i])
         previous = seen.setdefault((i, mine), theirs)
         if previous != theirs:

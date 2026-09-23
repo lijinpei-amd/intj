@@ -619,29 +619,34 @@ typedef int32_t (*intj_launch_t)(void *f, uint32_t gx, uint32_t gy, uint32_t gz,
 typedef const char *(*intj_error_string_ret_t)(int32_t);
 typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
 
-#define INTJ_T_NONE 1u     /* ("constexpr", None) */
-#define INTJ_T_ONE 2u      /* int 1 folded to ("constexpr", 1) */
-#define INTJ_T_I32 3u
-#define INTJ_T_I64 4u
-#define INTJ_T_U64 5u
-#define INTJ_T_FP32 6u
-#define INTJ_T_U1 7u
-#define INTJ_T_PTR 8u
-#define INTJ_T_CX_NONE 9u
-#define INTJ_T_CX_BOOL 10u
-#define INTJ_T_CX_INT 11u
-#define INTJ_T_CX_UINT 12u
-#define INTJ_T_CX_FLOAT 13u
+/* One byte per declared parameter.  The pointer range partitions the space, so
+ * "is a pointer" needs no flag of its own, and `S` -- the one bit that is only
+ * ever set for a pointer -- fits inside the byte rather than a section beside
+ * it.  That is what the 5-bit compact dtype index buys: at torch's raw 6-bit
+ * code the pointer codes alone would be all 256, leaving the scalars nowhere.
+ */
+#define INTJ_B_PTR(idx, d, s)                                                  \
+  (((uint32_t)(idx) << 2) | ((uint32_t)(d) << 1) | (uint32_t)(s))
+#define INTJ_B_I32 128u /* +1 when tt.divisibility = 16 */
+#define INTJ_B_I64 130u /* +1 likewise */
+#define INTJ_B_U64 132u /* +1 likewise */
+#define INTJ_B_FP32 134u
+#define INTJ_B_U1 135u
+#define INTJ_B_NONE 136u
+#define INTJ_B_ONE 137u /* int 1 folded to ("constexpr", 1) */
+#define INTJ_B_CX_NONE 138u
+#define INTJ_B_CX_BOOL 139u
+#define INTJ_B_CX_INT 140u
+#define INTJ_B_CX_UINT 141u
+#define INTJ_B_CX_FLOAT 142u
+/* 143..255 unused.  The constexpr codes are disjoint from the rest even though
+ * a byte position is always known at render time to be one or the other: it
+ * costs nothing out of the spare 113, and it turns a wrong render-time offset
+ * into a nonsense code rather than a silent alias. */
 
-#define INTJ_FLAG_D 1u /* tt.divisibility = 16 */
-#define INTJ_FLAG_S 2u /* tt.pointer_range = 32 */
-
-#define INTJ_WORD(tag, dtype, flags)                                           \
-  (((uint64_t)(tag) << 56) | ((uint64_t)(uint32_t)(dtype) << 8) |              \
-   (uint64_t)(flags))
-
-/* Decode one non-constexpr kernel argument: fills one key word, and appends at
- * most one value slot.  SPEC/ALIGN/SBIT are render-time constants
+/* Decode one non-constexpr kernel argument: ORs one code byte into a 32-bit
+ * header accumulator at a render-time shift, and appends at most one value
+ * slot.  SPEC/ALIGN/SBIT are render-time constants
  * (do_not_specialize, do_not_specialize_on_alignment, and whether the backend
  * specializes pointers on a 2 GiB range).
  *
@@ -656,32 +661,44 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
  * tidier, but C++ forbids jumping over the initializations that follow in
  * `entry`, and the CXX access mode compiles this as C++.) /
  */
-#define INTJ_DECODE(st, o, word, vals, np, SPEC, ALIGN, SBIT, pname)           \
+#define INTJ_DECODE(st, o, acc, shift, vals, np, SPEC, ALIGN, SBIT, pname)     \
   do {                                                                         \
     PyObject *_o = (o);                                                        \
     PyTypeObject *_t = Py_TYPE(_o);                                            \
+    uint32_t _code;                                                            \
     if (_t == (st)->tensor_type || _t == (st)->param_type) {                   \
       void *_p = NULL;                                                         \
       int32_t _dt = -1;                                                        \
       int64_t _sz = 0;                                                         \
       int _want = (SPEC) && (SBIT);                                            \
-      if (INTJ_UNLIKELY(intj_read_tensor(&(st)->abi, _o, &_p, &_dt, _want,      \
+      if (INTJ_UNLIKELY(intj_read_tensor(&(st)->abi, _o, &_p, &_dt, _want,     \
                                          &_sz) != 0)) {                        \
         intj_note_param(pname);                                                \
         return NULL;                                                           \
       }                                                                        \
-      uint32_t _flags = 0;                                                     \
-      if (SPEC) {                                                              \
-        if (ALIGN && (((uintptr_t)_p & 15u) == 0))                             \
-          _flags |= INTJ_FLAG_D;                                               \
-        if (_want && _sz <= 2147483647LL)                                      \
-          _flags |= INTJ_FLAG_S;                                               \
+      /* The three readers disagree about how much they check: the shim one     \
+       * skips its own bound test for a zero-element tensor, and the cpython    \
+       * one has none at all.  One lookup here covers every mode and every path \
+       * through them -- and with a byte code it has to, because an unmapped    \
+       * dtype would otherwise alias into the scalar range. */                  \
+      uint32_t _idx = (_dt >= 0 && _dt < INTJ_NDTYPES)                         \
+                          ? (st)->abi.dtype_index[_dt]                         \
+                          : 0xFFu;                                             \
+      if (INTJ_UNLIKELY(_idx == 0xFFu)) {                                      \
+        PyErr_Format(PyExc_RuntimeError,                                       \
+                     "intj: tensor argument '%s' has dtype code %d, which "    \
+                     "triton does not take",                                   \
+                     pname, (int)_dt);                                         \
+        return NULL;                                                           \
       }                                                                        \
-      (word) = INTJ_WORD(INTJ_T_PTR, _dt, _flags);                             \
+      uint32_t _d =                                                            \
+          ((SPEC) && (ALIGN) && (((uintptr_t)_p & 15u) == 0)) ? 1u : 0u;       \
+      uint32_t _s = (_want && _sz <= 2147483647LL) ? 1u : 0u;                  \
+      _code = INTJ_B_PTR(_idx, _d, _s);                                        \
       (vals)[(np)] = (uint64_t)(uintptr_t)_p;                                  \
       (np)++;                                                                  \
     } else if (_o == Py_True || _o == Py_False) {                              \
-      (word) = INTJ_WORD(INTJ_T_U1, 0, 0);                                     \
+      _code = INTJ_B_U1;                                                       \
       (vals)[(np)] = (uint64_t)(_o == Py_True);                                \
       (np)++;                                                                  \
     } else if (PyLong_CheckExact(_o)) {                                        \
@@ -693,27 +710,26 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         return NULL;                                                           \
       }                                                                        \
       int64_t _v = (int64_t)_bits;                                             \
-      if (_kind == INTJ_INT_I64 && SPEC && _v == 1) {                          \
-        (word) = INTJ_WORD(INTJ_T_ONE, 0, 0);                                  \
+      if (_kind == INTJ_INT_I64 && (SPEC) && _v == 1) {                        \
+        _code = INTJ_B_ONE;                                                    \
       } else {                                                                 \
-        uint32_t _flags =                                                      \
-            (SPEC && ALIGN && ((_bits & 15u) == 0)) ? INTJ_FLAG_D : 0;         \
-        uint32_t _tag = _kind == INTJ_INT_U64  ? INTJ_T_U64                    \
-                        : (_v >= INT32_MIN && _v <= INT32_MAX) ? INTJ_T_I32    \
-                                                               : INTJ_T_I64;   \
-        (word) = INTJ_WORD(_tag, 0, _flags);                                   \
+        uint32_t _d = ((SPEC) && (ALIGN) && ((_bits & 15u) == 0)) ? 1u : 0u;   \
+        _code = (_kind == INTJ_INT_U64 ? INTJ_B_U64                            \
+                 : (_v >= INT32_MIN && _v <= INT32_MAX) ? INTJ_B_I32           \
+                                                        : INTJ_B_I64) +        \
+                _d;                                                            \
         (vals)[(np)] = _bits;                                                  \
         (np)++;                                                                \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      float _f = (float)((PyFloatObject *)_o)->ob_fval;                     \
+      float _f = (float)((PyFloatObject *)_o)->ob_fval;                        \
       uint32_t _bits;                                                          \
       memcpy(&_bits, &_f, 4);                                                  \
-      (word) = INTJ_WORD(INTJ_T_FP32, 0, 0);                                   \
+      _code = INTJ_B_FP32;                                                     \
       (vals)[(np)] = (uint64_t)_bits;                                          \
       (np)++;                                                                  \
     } else if (_o == Py_None) {                                                \
-      (word) = INTJ_WORD(INTJ_T_NONE, 0, 0);                                   \
+      _code = INTJ_B_NONE;                                                     \
     } else {                                                                   \
       PyErr_Format(PyExc_TypeError,                                            \
                    "intj: unsupported argument '%s' of type %s; pass a "       \
@@ -721,18 +737,20 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
                    pname, Py_TYPE(_o)->tp_name);                               \
       return NULL;                                                             \
     }                                                                          \
+    (acc) |= _code << (shift);                                                 \
   } while (0)
 
-/* Decode a tl.constexpr argument into two key words.  No value slot. */
-#define INTJ_DECODE_CONSTEXPR(o, w0, w1, pname)                                \
+/* Decode a tl.constexpr argument into one code byte and one value word. */
+#define INTJ_DECODE_CONSTEXPR(o, acc, shift, valword, pname)                   \
   do {                                                                         \
     PyObject *_o = (o);                                                        \
+    uint32_t _code;                                                            \
     if (_o == Py_None) {                                                       \
-      (w0) = INTJ_WORD(INTJ_T_CX_NONE, 0, 0);                                  \
-      (w1) = 0;                                                                \
+      _code = INTJ_B_CX_NONE;                                                  \
+      (valword) = 0;                                                           \
     } else if (_o == Py_True || _o == Py_False) {                              \
-      (w0) = INTJ_WORD(INTJ_T_CX_BOOL, 0, 0);                                  \
-      (w1) = (uint64_t)(_o == Py_True);                                        \
+      _code = INTJ_B_CX_BOOL;                                                  \
+      (valword) = (uint64_t)(_o == Py_True);                                   \
     } else if (PyLong_CheckExact(_o)) {                                        \
       uint64_t _bits;                                                          \
       int _kind = intj_as_int(_o, &_bits);                                     \
@@ -741,13 +759,12 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
                      "intj: constexpr argument '%s' is too large", pname);     \
         return NULL;                                                           \
       }                                                                        \
-      (w0) = INTJ_WORD(                                                        \
-          _kind == INTJ_INT_U64 ? INTJ_T_CX_UINT : INTJ_T_CX_INT, 0, 0);       \
-      (w1) = _bits;                                                            \
+      _code = _kind == INTJ_INT_U64 ? INTJ_B_CX_UINT : INTJ_B_CX_INT;          \
+      (valword) = _bits;                                                       \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      double _d = ((PyFloatObject *)_o)->ob_fval;                           \
-      (w0) = INTJ_WORD(INTJ_T_CX_FLOAT, 0, 0);                                 \
-      memcpy(&(w1), &_d, 8);                                                   \
+      double _d = ((PyFloatObject *)_o)->ob_fval;                              \
+      _code = INTJ_B_CX_FLOAT;                                                 \
+      memcpy(&(valword), &_d, 8);                                              \
     } else {                                                                   \
       PyErr_Format(PyExc_TypeError,                                            \
                    "intj: unsupported constexpr argument '%s' of type %s; "    \
@@ -755,4 +772,5 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
                    pname, Py_TYPE(_o)->tp_name);                               \
       return NULL;                                                             \
     }                                                                          \
+    (acc) |= _code << (shift);                                                 \
   } while (0)
