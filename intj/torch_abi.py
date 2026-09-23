@@ -1,7 +1,8 @@
 """How the generated module reaches torch.
 
 Three strategies, and the discovery of what the shim one needs.  Everything here
-is pure python and testable without a GPU; nothing here imports triton.
+is pure python and testable without a GPU.  Only `dtype_index_table` consults
+triton, and lazily, the same way the rest consults torch.
 """
 
 import ctypes
@@ -104,6 +105,56 @@ def itemsize_table() -> bytes:
                 table[code] = torch.empty(0, dtype=value).element_size()
         except Exception:  # pragma: no cover - dtype the build cannot allocate
             continue
+    return bytes(table)
+
+
+@functools.lru_cache(maxsize=1)
+def dtype_index_table() -> bytes:
+    """torch dtype code -> a 5-bit index over the dtypes triton accepts.
+
+    The spec key encodes this rather than torch's raw `ScalarType` code so that
+    the dtype, the divisibility bit and the pointer-range bit fit in one byte: at
+    six bits the pointer codes alone fill all 256 and leave nowhere for the
+    scalar tags.  Torch is already at 45 of its 64 codes and adds them faster
+    than triton grows element types, so the compact space also has the headroom
+    the raw one no longer does.
+
+    Two torch dtypes share an index exactly when triton canonicalizes them to the
+    same type -- `bool`, `uint1` and `int1` are all `u1` -- which keeps the key
+    as fine as triton's specialization and no finer.  `0xFF` means "triton does
+    not take this dtype", and is the bound check the C side raises on.
+
+    Built from the live torch and the installed triton, never hardcoded: what a
+    module keys on has to describe the pair that is running now.
+    """
+    import torch
+    from triton._utils import type_canonicalisation_dict
+
+    by_code: dict[int, Any] = {}
+    for name in dir(torch):
+        value = getattr(torch, name, None)
+        if not isinstance(value, torch.dtype):
+            continue
+        code = dtype_code(value)
+        if 0 <= code < NDTYPES:
+            by_code[code] = value
+
+    table = bytearray(b"\xff" * NDTYPES)
+    indices: dict[str, int] = {}
+    for code in sorted(by_code):  # code order, so the assignment is stable
+        # `str(dtype)` is what triton's own canonicalize_dtype splits; the
+        # attribute name is not.  `torch.chalf` and `torch.complex32` are one
+        # dtype, and only the latter spelling is ever a key in that dict.
+        canon = type_canonicalisation_dict.get(str(by_code[code]).split(".")[-1])
+        if canon is None:
+            continue
+        table[code] = indices.setdefault(canon, len(indices))
+
+    if len(indices) > 32:  # pragma: no cover - triton would have to double
+        raise RuntimeError(
+            f"intj: triton now has {len(indices)} element types, which no longer "
+            "fit the spec key's 5-bit dtype index"
+        )
     return bytes(table)
 
 

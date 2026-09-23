@@ -28,6 +28,7 @@ from intj.torch_abi import (
     NDTYPES,
     TorchAccess,
     dtype_code,
+    dtype_index_table,
     itemsize_table,
     layout_for,
     probe_layout,
@@ -667,6 +668,49 @@ def test_dtype_code_matches_torch(dtype_name):
     code = dtype_code(dtype)
     assert 0 <= code < NDTYPES
     assert itemsize_table()[code] == torch.empty(0, dtype=dtype).element_size()
+
+
+def test_dtype_index_table_matches_triton():
+    """The compact index must be exactly as fine as triton's specialization.
+
+    Two torch dtypes share an index iff triton canonicalizes them to the same
+    type -- torch.bool, torch.uint1 and torch.int1 are all `u1`.  Finer would
+    cost redundant cache entries; coarser would launch the wrong kernel.
+    """
+    from triton._utils import type_canonicalisation_dict
+
+    table = dtype_index_table()
+    assert len(table) == NDTYPES
+
+    canonical: dict[int, str] = {}
+    for name in dir(torch):
+        value = getattr(torch, name, None)
+        if not isinstance(value, torch.dtype):
+            continue
+        canon = type_canonicalisation_dict.get(str(value).split(".")[-1])
+        index = table[dtype_code(value)]
+        if canon is None:
+            assert index == 0xFF, f"{value} is not a triton type but got index {index}"
+            continue
+        assert index < 32, f"{value} got index {index}, which does not fit 5 bits"
+        assert canonical.setdefault(index, canon) == canon, (
+            f"index {index} maps to both {canonical[index]} and {canon}"
+        )
+
+    assert canonical, "no torch dtype canonicalized; the table is empty"
+    # the three spellings triton folds into one type must share one index
+    assert table[dtype_code(torch.bool)] == table[dtype_code(torch.uint1)]
+    assert table[dtype_code(torch.int1)] == table[dtype_code(torch.bool)]
+    # and a dtype triton has never accepted must be refused
+    assert table[dtype_code(torch.complex64)] == 0xFF
+
+
+def test_dtype_index_table_is_deterministic():
+    """Same torch, same triton, same table -- a module keys on it."""
+    dtype_index_table.cache_clear()
+    first = dtype_index_table()
+    dtype_index_table.cache_clear()
+    assert dtype_index_table() == first
 
 
 def test_layout_probe_reproduces_torch():
