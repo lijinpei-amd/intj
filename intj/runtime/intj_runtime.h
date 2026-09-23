@@ -9,8 +9,13 @@
 #include <dlfcn.h>
 #include <float.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef __cplusplus
+#include <exception>
+#include <new>
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 #error "intj requires CPython 3.12 or newer (PyLongObject layout)"
@@ -602,13 +607,12 @@ INTJ_ROB(si_data_ptr, c10::StorageImpl, data_ptr_, c10::DataPtr)
 #undef INTJ_ROB
 }  // namespace intj_rob
 
-static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
-                                               PyObject *o, void **p,
-                                               int32_t *dt, int want_size,
-                                               int64_t *sz) {
+static INTJ_ALWAYS_INLINE int intj_read_cxx_tensor(const intj_torch_abi *abi,
+                                                   const at::Tensor &t, void **p,
+                                                   int32_t *dt, int want_size,
+                                                   int64_t *sz) {
   using namespace intj_rob;
   (void)abi;
-  const at::Tensor &t = ((intj_THPVariable *)o)->cdata;
   c10::TensorImpl *ti = t.unsafeGetTensorImpl();
 
   /* No storage means no dense data pointer -- sparse, mkldnn.  torch raises
@@ -642,6 +646,14 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
            : (void *)((char *)(si->*get(si_data_ptr())).get() +
                       (ti->*get(ti_storage_offset())) * itemsize);
   return 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
+                                               PyObject *o, void **p,
+                                               int32_t *dt, int want_size,
+                                               int64_t *sz) {
+  return intj_read_cxx_tensor(abi, ((intj_THPVariable *)o)->cdata,
+                              p, dt, want_size, sz);
 }
 
 #else
@@ -795,19 +807,8 @@ intj_decode_constexpr(PyObject *o, const char *pname, intj_decoded *out) {
 }
 
 static INTJ_ALWAYS_INLINE int
-intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                     PyTypeObject *param_type, PyObject *o, int want_size,
-                     const char *pname, intj_decoded *out) {
-  PyTypeObject *type = Py_TYPE(o);
-  if (type != tensor_type && type != param_type)
-    return intj_decode_constexpr(o, pname, out);
-  memset(out, 0, sizeof(*out));
-  int32_t dtype = -1;
-  if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype,
-                                    want_size, &out->storage_nbytes) != 0)) {
-    intj_note_param(pname);
-    return -1;
-  }
+intj_finish_tensor(const intj_torch_abi *abi, int32_t dtype,
+                    const char *pname, intj_decoded *out) {
   /* All three readers, including zero-element tensors, share this gate. */
   uint32_t index = (dtype >= 0 && dtype < INTJ_NDTYPES)
                        ? abi->dtype_index[dtype] : 0xFFu;
@@ -821,6 +822,116 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
   out->bits = (uint64_t)(uintptr_t)out->pointer;
   out->dtype_index = (uint8_t)index;
   return 0;
+}
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                     PyTypeObject *param_type, PyObject *o, int want_size,
+                     const char *pname, intj_decoded *out) {
+  PyTypeObject *type = Py_TYPE(o);
+  if (type != tensor_type && type != param_type)
+    return intj_decode_constexpr(o, pname, out);
+  memset(out, 0, sizeof(*out));
+  int32_t dtype = -1;
+  if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype,
+                                    want_size, &out->storage_nbytes) != 0)) {
+    intj_note_param(pname);
+    return -1;
+  }
+  return intj_finish_tensor(abi, dtype, pname, out);
+}
+
+#ifndef INTJ_NBOUND
+#define INTJ_NBOUND 0
+#endif
+#define INTJ_BOUND_SLOTS (INTJ_NBOUND ? INTJ_NBOUND : 1)
+
+typedef struct intj_bound_launcher {
+  PyObject_HEAD
+  vectorcallfunc vectorcall;
+  PyObject *module;
+  PyObject *signature;
+  PyObject *owners[INTJ_BOUND_SLOTS];
+  uint64_t pointer_bits[INTJ_BOUND_SLOTS];
+  intj_cache cache;
+  int cache_ready;
+  intj_kernel *fixed_kernel;
+  int fixed_device;
+  int64_t device_ordinal;
+  int32_t device_handle;
+#if defined(INTJ_ACCESS_CXX)
+  at::Tensor *tensors[INTJ_BOUND_SLOTS];
+#endif
+} intj_bound_launcher;
+
+static inline int
+intj_bind_tensor(intj_bound_launcher *bound, int index, PyObject *value,
+                 PyTypeObject *tensor_type, PyTypeObject *param_type,
+                 const char *pname) {
+  if (value != Py_None && Py_TYPE(value) != tensor_type && Py_TYPE(value) != param_type) {
+    PyErr_Format(PyExc_TypeError, "intj: bound tensor '%s' must be a tensor or None", pname);
+    return -1;
+  }
+#if defined(INTJ_ACCESS_CXX)
+  if (value != Py_None) {
+    bound->tensors[index] = new (std::nothrow) at::Tensor(((intj_THPVariable *)value)->cdata);
+    if (!bound->tensors[index]) {
+      PyErr_NoMemory();
+      return -1;
+    }
+  }
+#else
+  bound->owners[index] = Py_NewRef(value);
+#endif
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                         PyTypeObject *param_type, intj_bound_launcher *bound,
+                         int index, int want_size, const char *pname, intj_decoded *out) {
+#if defined(INTJ_ACCESS_CXX)
+  memset(out, 0, sizeof(*out));
+  if (!bound->tensors[index]) {
+    out->kind = INTJ_VALUE_NONE;
+    return 0;
+  }
+  int32_t dtype = -1;
+  if (INTJ_UNLIKELY(intj_read_cxx_tensor(abi, *bound->tensors[index], &out->pointer,
+                                        &dtype, want_size, &out->storage_nbytes) != 0)) {
+    intj_note_param(pname);
+    return -1;
+  }
+  return intj_finish_tensor(abi, dtype, pname, out);
+#else
+  return intj_decode_argument(abi, tensor_type, param_type, bound->owners[index],
+                              want_size, pname, out);
+#endif
+}
+
+/* A POINTER is decoded only during bind. Addresses carry no allocation range. */
+static inline int
+intj_decode_pointer(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                     PyTypeObject *param_type, PyObject *value,
+                     const char *pname, intj_decoded *out) {
+  if (Py_TYPE(value) == tensor_type || Py_TYPE(value) == param_type)
+    return intj_decode_argument(abi, tensor_type, param_type, value, 0, pname, out);
+  if (value == Py_None || PyLong_CheckExact(value))
+    return intj_decode_constexpr(value, pname, out);
+  PyObject *address = PyObject_CallMethodNoArgs(value, intj_str_data_ptr);
+  if (!address) {
+    if (PyErr_ExceptionMatches(PyExc_AttributeError))
+      PyErr_Format(PyExc_TypeError, "intj: bound pointer '%s' needs a tensor, int, data_ptr() or None", pname);
+    return -1;
+  }
+  if (!PyLong_CheckExact(address)) {
+    Py_DECREF(address);
+    PyErr_Format(PyExc_TypeError, "intj: bound pointer '%s' data_ptr() must return an exact int", pname);
+    return -1;
+  }
+  int rc = intj_decode_constexpr(address, pname, out);
+  Py_DECREF(address);
+  return rc;
 }
 
 static INTJ_ALWAYS_INLINE double intj_as_double(uint64_t bits) {

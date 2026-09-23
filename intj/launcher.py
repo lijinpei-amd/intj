@@ -12,9 +12,10 @@ import subprocess
 import sysconfig
 import threading
 import types
+import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ._version import __version__
 from .annotation import (
@@ -157,6 +158,73 @@ class ModuleKey:
         return hashlib.sha256(blob.encode()).hexdigest()
 
 
+@dataclasses.dataclass(frozen=True)
+class LauncherFactory:
+    jit_func: JitFunction
+    params: tuple[ResolvedParam, ...]
+    options: tuple[tuple[str, Any], ...]
+    torch_access: TorchAccess
+    kernel_cache: KernelCache
+    verify_annotation: bool
+    no_gpu: bool
+    bind_device_requested: bool
+
+    def bind(self, /, **values: object) -> Callable[..., None]:
+        if self.bind_device_requested:
+            raise TypeError("intj: use bind_device(device_ordinal, **values)")
+        return self._bind(None, values)
+
+    def bind_device(self, /, *args: object, **values: object) -> Callable[..., None]:
+        if not self.bind_device_requested:
+            raise TypeError("intj: bind_device was not requested")
+        if len(args) != 1:
+            raise TypeError("intj: bind_device requires exactly one positional device ordinal")
+        return self._bind(args[0], values)
+
+    def _bind(self, device: object, values: Mapping[str, object]) -> Callable[..., None]:
+        names = {p.name for p in self.params if p.annotation.bind_value is not None}
+        unknown = values.keys() - names
+        if unknown:
+            raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
+        missing = names - values.keys()
+        if missing:
+            raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
+        if device is not None:
+            raise UnsupportedKernel("intj: device binding is not implemented")
+
+        import torch
+        from triton._utils import type_canonicalisation_dict
+
+        resolved: list[ResolvedParam] = []
+        for p in self.params:
+            annotation = p.annotation
+            if annotation.bind_value == "tensor":
+                value = values[p.name]
+                if value is not None and type(value) not in (torch.Tensor, torch.nn.Parameter):
+                    raise TypeError(f"intj: bound tensor {p.name!r} must be a tensor or None")
+                if annotation.types is None:
+                    ty = None
+                    if value is not None:
+                        tensor = cast(torch.Tensor, value)
+                        dtype = type_canonicalisation_dict.get(str(tensor.dtype).split(".")[-1])
+                        if dtype is None:
+                            raise TypeError(f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}")
+                        ty = "*" + dtype
+                    annotation = dataclasses.replace(annotation, types=(ty,))
+            resolved.append(dataclasses.replace(p, annotation=annotation))
+        module = _materialize_module(
+            self.jit_func, tuple(resolved), dict(self.options), self.torch_access,
+            self.kernel_cache, self.no_gpu, self.verify_annotation,
+        )
+        signature = inspect.Signature(tuple(
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
+            for name in ("device", "stream", "grid", *(
+                p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
+            ))
+        ))
+        return module.make_bound(signature, *(values[p.name] for p in resolved if p.name in names))
+
+
 def make_launcher(
     jit_func: JitFunction,
     dynamic_grid: bool = False,
@@ -167,10 +235,10 @@ def make_launcher(
     kernel_cache: KernelCache = KernelCache.INTJ,
     no_gpu: bool = False,
     verify_annotation: bool = False,
-) -> Callable[..., None]:
+) -> Any:
     """Build a fast launcher for `jit_func`.
 
-    The returned callable is a C function:
+    Without bindings, the returned callable is a C function:
 
         launcher(device, stream, grid, arg0, arg1, ...)
 
@@ -178,7 +246,10 @@ def make_launcher(
     it -- `stream` a raw stream handle (both ints), `grid` an int or a
     tuple/list of up to 3 ints, and the remaining arguments are the kernel's
     public parameters, positionally, in declaration order. Baked Argument and
-    Constexpr values are omitted from the call.
+    Constexpr values are omitted from the call. With bound parameters this
+    returns a non-callable factory; `.bind(**values)` creates the native callable
+    and removes those parameters from its signature. The return shape depends
+    on the annotations stored on the (untyped) JITFunction.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
@@ -203,15 +274,39 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
+    if not no_gpu:
+        from triton import knobs
+
+        options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
+        options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+    access = _resolve_access(torch_access)
+    if any(p.annotation.bind_value is not None for p in resolved):
+        if not no_gpu:
+            _canonical_options(_current_target(), options)
+        if verify_annotation:
+            for p in resolved:
+                if p.annotation.bind_value == "pointer" and p.annotation.pointer_range_32 == "assume":
+                    warnings.warn(
+                        f"intj: pointer-range assumption for bound pointer {p.name!r} "
+                        "cannot be verified from an address and will be trusted",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        return LauncherFactory(jit_func, resolved, tuple(options.items()), access, kernel_cache,
+                               bool(verify_annotation), no_gpu, False)
+    return _materialize_module(jit_func, resolved, options, access, kernel_cache,
+                               no_gpu, bool(verify_annotation)).entry
+
+
+def _materialize_module(
+    jit_func: JitFunction, resolved: tuple[ResolvedParam, ...], options: Mapping[str, Any],
+    access: TorchAccess, kernel_cache: KernelCache, no_gpu: bool, verify_annotation: bool,
+) -> types.ModuleType:
     if no_gpu:
         target = None
         backend = None
         canonical_options = None
     else:
-        from triton import knobs
-
-        options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
-        options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
         target = _current_target()
         backend = BACKENDS.get(target.backend)
         if backend is None:
@@ -223,7 +318,6 @@ def make_launcher(
     device_binding = DeviceBinding.NOT_FIXED
     params, device_offset, nwords = _render_params(resolved, device_binding)
 
-    access = _resolve_access(torch_access)
     # last, after every refusal above it: a kernel that is going to be rejected
     # anyway must not pay for a download and an abseil build first
     cache_toolchain = _provision(kernel_cache)
@@ -281,7 +375,7 @@ def make_launcher(
     # compiled-in offset against
     layout = layout_for() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
     baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
-    return _loaded_module(key, jit_func, context, params, options, layout, baked_values).entry
+    return _loaded_module(key, jit_func, context, params, options, layout, baked_values)
 
 
 _INSTALL_FAILED: dict[KernelCache, Exception] = {}
@@ -756,7 +850,11 @@ def _compiler_input(
     values: list[tuple[tuple[int, ...], object]] = []
     for param in params:
         annotation = param.annotation
-        if param.call_index is None:
+        if annotation.bind_value is not None:
+            # Bound type/facts are fixed in this module. Only inferred None
+            # becomes a compiler constant; no callback owns a bound value.
+            value = None
+        elif param.call_index is None:
             assert baked_values is not None, "fixed values must accompany their canonical annotations"
             value = baked_values[param.index]
         else:
