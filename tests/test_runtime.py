@@ -276,3 +276,8 @@ def test_cpython_layer_matches_this_python():
     from intj.python_intf.check import check
 
     assert check() == []
+
+
+def test_verified_python_versions_share_one_header():
+    headers = {cpython_abi.header_for((3, minor)) for minor in range(8, 15)}
+    assert None not in headers and len(headers) == 1

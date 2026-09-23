@@ -1,24 +1,24 @@
 """Which CPython internals a module is built with, and the ones python reads.
 
-The C side is one header per CPython int layout, selected by interpreter version
-(`header_for`).  A version maps to a header only once `python -m
-intj.python_intf.check` has passed on it, default and free-threaded build alike.
+The C header selects its int layout at compile time.  A version maps to it only
+once `python -m intj.python_intf.check` has passed on both the default and
+free-threaded builds.
 """
 
 from __future__ import annotations
 
 import sys
 
-#: (major, minor) -> the header in this directory implementing that CPython.
+#: (major, minor) -> the verified C header implementing that CPython.
 #: Only verified versions: an unlisted one gets no guess from its neighbours.
 _HEADERS = {
-    (3, 8): "cpython_38.h",
-    (3, 9): "cpython_38.h",
-    (3, 10): "cpython_38.h",
-    (3, 11): "cpython_38.h",
-    (3, 12): "cpython_312.h",
-    (3, 13): "cpython_312.h",
-    (3, 14): "cpython_312.h",
+    (3, 8): "cpython_abi.h",
+    (3, 9): "cpython_abi.h",
+    (3, 10): "cpython_abi.h",
+    (3, 11): "cpython_abi.h",
+    (3, 12): "cpython_abi.h",
+    (3, 13): "cpython_abi.h",
+    (3, 14): "cpython_abi.h",
 }
 
 

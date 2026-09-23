@@ -6,7 +6,7 @@ correct.
 ## Every CPython internal lives here
 
 Any read past the public API -- a struct field, an `_Py` macro, a `PyUnstable_`
-call -- goes in a `cpython_*.h` header (C) or `cpython_abi.py` (python), never inline
+call -- goes in `cpython_abi.h` (C) or `cpython_abi.py` (python), never inline
 in `intj_runtime.h`, the entry template, or `torch_intf`. One place to audit when a
 new CPython changes a layout.
 
@@ -15,11 +15,10 @@ new CPython changes a layout.
 A version enters `cpython_abi._HEADERS` only after `python -m intj.python_intf.check
 <header>` passes on it, on both the default and the free-threaded build
 (`uv run --no-project --python cpython-3.Nt ...`). No entry is an error that names
-the version; never fall back to a neighbour's header. When a check fails, write a new
-`cpython_3NN.h` for the new layout rather than `#if`-ing the old one: it defines
-`intj_long_compact` and `intj_long_digits` and includes `cpython_common.h`, which keeps
-the decoders shared. Public calls a version predates get a shim in that version's
-header, guarded by the version that added the call.
+the version; never fall back to a neighbour's layout. When a check fails, add a
+`PY_VERSION_HEX` branch for the new layout in `cpython_abi.h`; keep the decoders
+shared. Public calls a version predates get a shim in that header, guarded by
+the version that added the call.
 
 ## No stable ABI
 

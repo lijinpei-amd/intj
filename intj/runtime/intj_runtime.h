@@ -24,7 +24,7 @@
 #define INTJ_UNLIKELY(x) (x)
 #endif
 
-/* The CPython layer, picked by version: see intj/python_intf. */
+/* The CPython layer selects its layout by PY_VERSION_HEX. */
 #ifndef INTJ_PYTHON_ABI
 #error "define INTJ_PYTHON_ABI to a header from intj/python_intf"
 #endif

@@ -445,7 +445,7 @@ def _render_context(**overrides):
         launch_symbol="launch", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
-        python_version=(3, 12, 3), free_threaded=False, python_abi="cpython_312.h",
+        python_version=(3, 12, 3), free_threaded=False, python_abi="cpython_abi.h",
     )
     return RenderContext(**{**fields, **overrides})
 

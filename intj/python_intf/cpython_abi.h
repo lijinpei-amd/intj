@@ -1,14 +1,56 @@
-/* What every CPython layer shares: the int and float decoders, over one int
- * layout's two primitives, and the free-threaded build's lock.
- *
- * Included by a cpython_*.h after it defines, always inline:
- *
- *   int intj_long_compact(PyLongObject *v, int64_t *out)
- *     1 and the value when |value| < 2**30, else 0.
- *   const digit *intj_long_digits(PyLongObject *v, size_t *nd, int *negative)
- *     the magnitude's 30-bit digits, least significant first.
+/* CPython internals for the verified 3.8 to 3.14 layouts.  PY_VERSION_HEX
+ * selects the int layout at compile time; Py_GIL_DISABLED selects the lock.
+ * Needs INTJ_ALWAYS_INLINE / INTJ_LIKELY / INTJ_UNLIKELY defined first.
  */
 #pragma once
+
+#include <Python.h>
+#include <stdint.h>
+
+#if PY_VERSION_HEX < 0x03080000
+#error "intj: unsupported CPython int layout"
+#endif
+#if PY_VERSION_HEX < 0x030B0000
+#include <longintrepr.h> /* Python.h includes it itself from 3.11 */
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+static INTJ_ALWAYS_INLINE int intj_long_compact(PyLongObject *v, int64_t *out) {
+  Py_ssize_t size = Py_SIZE(v);
+  if (size < -1 || size > 1)
+    return 0;
+  /* zero may have no digit allocated at all, so it is not read */
+  *out = size == 0 ? 0 : (int64_t)size * (int64_t)v->ob_digit[0];
+  return 1;
+}
+
+static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
+                                                         size_t *nd,
+                                                         int *negative) {
+  Py_ssize_t size = Py_SIZE(v);
+  *negative = size < 0;
+  *nd = (size_t)(size < 0 ? -size : size);
+  return v->ob_digit;
+}
+#else
+/* The compact case has a public reader.  Larger ints use CPython's own
+ * lv_tag and digit macros from cpython/longintrepr.h. */
+static INTJ_ALWAYS_INLINE int intj_long_compact(PyLongObject *v, int64_t *out) {
+  if (!PyUnstable_Long_IsCompact(v))
+    return 0;
+  *out = (int64_t)PyUnstable_Long_CompactValue(v);
+  return 1;
+}
+
+static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
+                                                         size_t *nd,
+                                                         int *negative) {
+  uintptr_t tag = v->long_value.lv_tag;
+  *nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
+  *negative = (tag & _PyLong_SIGN_MASK) == 2;
+  return v->long_value.ob_digit;
+}
+#endif
 
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
@@ -99,4 +141,39 @@ typedef PyMutex intj_mutex;
 typedef char intj_mutex;
 #define INTJ_LOCK(m) ((void)(m))
 #define INTJ_UNLOCK(m) ((void)(m))
+#endif
+
+/* Public calls the older interpreters predate. */
+#if PY_VERSION_HEX < 0x030C0000
+#if PY_VERSION_HEX < 0x03090000
+#define PyObject_Vectorcall _PyObject_Vectorcall
+static inline PyObject *PyObject_CallMethodNoArgs(PyObject *self,
+                                                  PyObject *name) {
+  return PyObject_CallMethodObjArgs(self, name, NULL);
+}
+#endif
+#if PY_VERSION_HEX < 0x030A0000
+static inline PyObject *Py_NewRef(PyObject *o) {
+  Py_INCREF(o);
+  return o;
+}
+#endif
+/* Before 3.12, the error indicator is a (type, value, traceback) triple that
+ * must be normalized before returning the raised exception. */
+static inline PyObject *PyErr_GetRaisedException(void) {
+  PyObject *type, *value, *tb;
+  PyErr_Fetch(&type, &value, &tb);
+  if (!type)
+    return NULL;
+  PyErr_NormalizeException(&type, &value, &tb);
+  if (tb)
+    PyException_SetTraceback(value, tb);
+  Py_DECREF(type);
+  Py_XDECREF(tb);
+  return value;
+}
+static inline void PyErr_SetRaisedException(PyObject *exc) { /* steals exc */
+  PyErr_Restore(Py_NewRef((PyObject *)Py_TYPE(exc)), exc,
+                PyException_GetTraceback(exc));
+}
 #endif
