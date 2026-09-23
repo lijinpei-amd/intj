@@ -145,16 +145,19 @@ straddles a word boundary, offsets are plain indices rather than shift
 constants, and `_validate_spec_key` reads `keyblob[i]`.
 
 ```
-byte 0                  device ordinal
-bytes 1 .. nparams      one byte per declared parameter, in declaration order
+bytes 0 .. nparams-1    one byte per declared parameter, in declaration order
+byte nparams            device ordinal
 pad to a word boundary, zeroed
 then                    one 64-bit value word per constexpr parameter
 ```
 
 ```python
-header_words = ceil((1 + nparams) / 8)
+header_words = ceil((nparams + 1) / 8)
 nwords       = header_words + n_cx
 ```
+
+Parameter `i` is at byte `i`, so `_validate_spec_key` indexes `keyblob[i]` with
+no offset to keep in step with the template.
 
 Sizes, all counting `spec_pointer_range` as irrelevant now that `S` lives in the
 byte -- HIP and CUDA are identical:
@@ -201,20 +204,37 @@ rather than a silent alias between a constexpr and a pointer.
 
 Byte stores into a `uint64_t[]` followed by a word-sized load for the hash is a
 narrow-store-to-wide-load forward, which stalls. So the header is accumulated in
-`uint64_t` locals and stored once per word:
+registers and stored to the stack a word at a time.
+
+The accumulators are `uint32_t`, one per four parameter bytes, which keeps the
+decode in the same width the macro already works in -- `intj_read_tensor` yields
+an `int32_t` dtype and `INTJ_DECODE` builds `uint32_t` flags -- so no operand is
+widened before it is placed:
 
 ```c
 uint64_t key[INTJ_NWORDS] = {0};
-uint64_t _h0 = (uint64_t)device;                             /* byte 0 */
-INTJ_DECODE(st, args[3], _h0, 8,  vals, np, 1, 1, 1, ...);   /* byte 1 */
-INTJ_DECODE(st, args[4], _h0, 16, vals, np, 1, 1, 1, ...);   /* byte 2 */
+uint32_t _a0 = 0, _a1 = 0;
+INTJ_DECODE(st, args[3], _a0, 0,  vals, np, 1, 1, 1, ...);   /* byte 0 */
+INTJ_DECODE(st, args[4], _a0, 8,  vals, np, 1, 1, 1, ...);   /* byte 1 */
+INTJ_DECODE(st, args[5], _a0, 16, vals, np, 1, 1, 1, ...);   /* byte 2 */
+INTJ_DECODE(st, args[6], _a0, 24, vals, np, 1, 1, 1, ...);   /* byte 3 */
+INTJ_DECODE(st, args[7], _a1, 0,  vals, np, 1, 1, 1, ...);   /* byte 4 */
 ...
-key[0] = _h0;
+key[0] = (uint64_t)_a0 | ((uint64_t)_a1 << 32);
 ```
 
-The shift is always a multiple of eight and always known at render time, so the
-macro's write is a single `|=` with no straddle case. `INTJ_DECODE` gains the
-accumulator and shift in place of the `(word)` lvalue it writes today.
+**Each 64-bit word gets exactly one store.** Two adjacent 32-bit stores would
+reintroduce the stall this section exists to avoid: x86 store-to-load forwarding
+requires the load to be contained in a single store, so an 8-byte load fed by
+two 4-byte stores falls back to the store buffer -- the same dozen-odd cycles as
+the byte-store version. The pair is folded in a register first.
+
+The shift is always a multiple of eight, under 32, and known at render time, so
+the macro's write is a single `|=` with no straddle case. `INTJ_DECODE` gains
+the accumulator and shift in place of the `(word)` lvalue it writes today.
+
+The device byte is placed the same way, at accumulator `nparams / 4` and shift
+`(nparams % 4) * 8`.
 
 The zero-init covers the header's padding bytes, which `memcmp` compares.
 Constexpr value words are written unconditionally and need none.
@@ -274,11 +294,11 @@ All three are `{% if %}` forks in `intj_runtime.h`, selected by `nwords`.
 
 `Param.word` is replaced by:
 
-- `byte` -- the parameter's header byte index, for every parameter.
+- `byte` -- the parameter's header byte index, which is just its position.
 - `cx_word` -- the value word index, constexpr parameters only.
 
 The accumulator and shift the template emits are derived from `byte`
-(`byte // 8`, `(byte % 8) * 8`), not stored.
+(`byte // 4`, `(byte % 4) * 8`), not stored.
 
 `_validate_spec_key` reads `keyblob[param.byte]` plus, for a constexpr, the
 value word at `cx_word`, and compares that against triton's specialization
