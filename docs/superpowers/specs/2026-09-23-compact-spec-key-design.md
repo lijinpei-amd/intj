@@ -86,17 +86,25 @@ nothing can reach intj's key regardless.
 The key encodes a 5-bit index over the dtypes triton can actually take, not
 torch's raw `ScalarType` code.
 
-Measured on torch 2.9.1 and triton 3.8: torch has **46 distinct ScalarType
-codes, 0..45**, of which triton accepts **19**. `canonicalize_dtype`
-(`_utils.py`) is a plain dict index, so everything else -- `chalf` `cfloat`
+Measured on torch 2.14.0+rocm7.2 and triton 3.8.0, the pair this was built
+against: torch has **47 distinct ScalarType codes, 0..46**, of which triton
+accepts **19**, canonicalizing to **17 distinct element types**.
+`canonicalize_dtype` (`_utils.py`) is a plain dict index, so everything else --
+`chalf` `cfloat`
 `cdouble`, the `qint*` family, `bits1x8`..`bits16`, `uint2`..`uint7`,
-`int2`..`int7`, `float8_e8m0fnu`, `float4_e2m1fn_x2` -- raises before intj is
-involved.
+`int2`..`int7`, `float8_e8m0fnu`, `float4_e2m1fn_x2`, `bcomplex32` -- raises
+before intj is involved.
 
-That is the argument for compacting. The raw code sits at 45 of a 64-code
-space, and the tail of that list is recent; 18 codes of headroom is a handful of
-torch releases. A 5-bit index over the triton-usable set is 19 of 32, and it
-grows only when *triton* adds support, which is far slower.
+That is the argument for compacting. The raw code sits at 46 of a 64-code
+space, and the tail of that list is recent; 17 codes of headroom is a handful of
+torch releases. A 5-bit index is 17 of 32, and it grows only when *triton* adds
+an element type, which is far slower.
+
+The index is over triton's *canonical type*, not over the accepted torch dtypes:
+`bool`, `uint1` and `int1` all canonicalize to `u1`, so they share one index.
+That is what makes the key exactly as fine as triton's specialization rather
+than needlessly finer -- indexing per torch dtype would give 19 and spend three
+cache entries where one does.
 
 It also collapses the layout. At 6 bits, `64 dtypes x D x S` is exactly 256
 codes -- the whole byte, with nowhere for the scalar tags -- which would force
@@ -109,12 +117,20 @@ with room to spare.
 uint8_t dtype_index[INTJ_NDTYPES];   /* torch ScalarType code -> 0..31, 0xFF = unsupported */
 ```
 
-`torch_abi.py` builds it exactly as `itemsize_table()` builds its neighbour --
-from the live torch, walking `torch`'s dtype singletons, assigning indices in
-`ScalarType` code order to those present in triton's
-`type_canonicalisation_dict`. Building it from the running torch and the
-installed triton, rather than baking it in, follows the rule the torch-access
-spec set: nothing version-specific in the binary unless it must be.
+`torch_abi.py` builds it much as `itemsize_table()` builds its neighbour: walk
+`torch`'s dtype singletons, visit them in `ScalarType` code order, map each
+through triton's `type_canonicalisation_dict`, and hand every *canonical type*
+the next free index the first time it appears. Code order, so the assignment is
+stable; canonical type, so `bool`, `uint1` and `int1` land together.
+
+`str(dtype)` is what is looked up, not the `dir(torch)` attribute name -- that
+is what triton's own `canonicalize_dtype` splits, and the two disagree
+(`torch.chalf` and `torch.complex32` are one dtype and only the latter spelling
+is a key).
+
+Building it from the running torch and the installed triton, rather than baking
+it in, follows the rule the torch-access spec set: nothing version-specific in
+the binary unless it must be.
 
 `0xFF` *is* the bound check. A dtype intj has no index for is refused with the
 same `RuntimeError` the SHIM reader already raises for an unknown code. That
@@ -177,7 +193,7 @@ One byte per parameter. The layout is uniform: `do_not_specialize` and
 never where its byte sits or how wide it is.
 
 ```
-0 .. 127      pointer:   (dtype_index << 2) | (D << 1) | S      /* 19 of 32 indices live */
+0 .. 127      pointer:   (dtype_index << 2) | (D << 1) | S      /* 17 of 32 indices live */
 128, 129      I32,  D = 0, 1
 130, 131      I64,  D = 0, 1
 132, 133      U64,  D = 0, 1
@@ -330,9 +346,11 @@ New:
 - A layout test on `_render_params`: byte offsets, `cx_word` and `nwords` for a
   parameter list spanning constexpr, `do_not_specialize` and
   `do_not_specialize_on_alignment`.
-- `tests/bench_kernel_cache.cpp` is parameterized on `INTJ_NWORDS` and currently
-  built at 5 and 11. Add 1 and 2 so the `nwords == 1` and `nwords == 2`
-  specializations are measured rather than assumed.
+- `tests/bench_kernel_cache.cpp` is parameterized on `INTJ_NWORDS` and was built
+  at 5 only -- `test_kernel_cache.py`'s `_NWORDS` was a scalar, and the 11 that
+  appears in `intj_key_eq`'s comment is from a measurement, not a build. It is
+  now built at 1, 2 and 5, so all three specializations are measured rather than
+  assumed.
 
 The `Param` fixture in `_render_context` constructs positionally and needs
 updating with the field list.

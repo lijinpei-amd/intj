@@ -135,9 +135,10 @@ def make_launcher(
 
         launcher(device, stream, grid, arg0, arg1, ...)
 
-    `device` is a device index, `stream` a raw stream handle (both ints), `grid`
-    an int or a tuple/list of up to 3 ints, and the remaining arguments are the
-    kernel's parameters, positionally, in declaration order.
+    `device` is a device index in `[0, 256)` -- one byte of the spec key holds
+    it -- `stream` a raw stream handle (both ints), `grid` an int or a
+    tuple/list of up to 3 ints, and the remaining arguments are the kernel's
+    parameters, positionally, in declaration order.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see

@@ -5,10 +5,20 @@ per launch.  Measured on this workload -- key of N uint64 words, insert-only,
 ~100% hit, hash already computed by the caller -- the three are within a few ns
 of each other, and `INTJ` wins at the sizes a kernel cache actually reaches:
 
+    ns/lookup, 8-byte key          1 entry   8 entries   512 entries
+    INTJ                              1.39        1.56          2.05
+    TSL   (precalculated_hash)        1.84        1.89          2.62
+    ABSL                              1.39        4.24          4.94
+
     ns/lookup, 40-byte key         1 entry   8 entries   512 entries
-    INTJ                              4.18        3.24          4.55
-    TSL   (precalculated_hash)        3.88        3.93          5.59
-    ABSL                              2.95       10.40         12.55
+    INTJ                              2.94        3.16          4.46
+    TSL   (precalculated_hash)        3.19        3.55          4.94
+    ABSL                              2.68        9.47         11.22
+
+The two sizes are the ends of the range a packed spec key reaches: 8 bytes is a
+kernel with no `tl.constexpr` parameter, where `INTJ`'s hash is a bijection and
+its slot carries no key at all, and 40 bytes is twelve parameters of which
+three are constexpr.
 
 `ABSL` is fast at one entry only because its small-object path skips hashing
 entirely; past that it re-computes the hash the caller already has, which no
