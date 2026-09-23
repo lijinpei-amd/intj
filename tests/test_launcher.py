@@ -11,6 +11,7 @@ import inspect
 import json
 import pathlib
 import struct
+import subprocess
 import sys
 import tomllib
 import types
@@ -102,6 +103,326 @@ def device_kernel(tmp_path):
 @pytest.fixture
 def pointer_kernel(tmp_path):
     return _kernel_from_source(tmp_path, "pointer_kernel", "x")
+
+
+def test_bind_device_requires_one_positional_ordinal(device_kernel):
+    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True)
+    assert not callable(factory)
+    with pytest.raises(TypeError, match="bind_device"):
+        factory.bind()
+    with pytest.raises(TypeError, match="exactly one positional"):
+        factory.bind_device()
+    with pytest.raises(TypeError, match="exactly one positional"):
+        factory.bind_device(0, 1)
+    with pytest.raises(TypeError, match="exactly one positional"):
+        factory.bind_device(device_ordinal=0)
+    launch = factory.bind_device(0)
+    assert tuple(inspect.signature(launch).parameters) == ("stream", "grid", "x")
+    assert type(launch).__flags__ & (1 << 11)  # Py_TPFLAGS_HAVE_VECTORCALL
+    assert launch(0, 1, 7) is None
+    with pytest.raises(TypeError, match="arguments"):
+        launch(0, 0, 1, 7)
+    with pytest.raises(TypeError, match="keyword"):
+        launch(0, 1, x=7)
+    with pytest.raises(TypeError, match="bound launcher"):
+        launch.__self__.entry(0, 1, 7)
+
+
+def test_bind_device_validates_exact_nonnegative_int32(device_kernel):
+    class IntSubclass(int):
+        pass
+
+    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
+                            torch_access=TorchAccess.CPYTHON)
+    launch = factory.bind_device(0)
+    for value in (None, True, False, 0.0, "0", IntSubclass(0), -1, 2**31, 2**65):
+        with pytest.raises(TypeError, match="device.*int"):
+            factory.bind_device(value)
+        with pytest.raises(TypeError, match="device.*int"):
+            launch.__self__.make_bound(inspect.signature(launch), value)
+
+
+def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(device_kernel, monkeypatch):
+    from intj.annotation import DeviceBinding
+    from intj.launcher import _LOADED
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("fixed host binding reached a GPU path")
+
+    for name in ("_current_target", "_current_device", "_canonical_options", "_make_compile_callback"):
+        monkeypatch.setattr(f"intj.launcher.{name}", forbidden)
+    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
+                            extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
+                            torch_access=TorchAccess.CPYTHON)
+    handles = [factory.bind_device(ordinal) for ordinal in (0, 255, 256, 2**31 - 1)]
+    module = handles[0].__self__
+    assert all(handle.__self__ is module for handle in handles)
+    context = next(key.context for key, loaded in _LOADED.items() if loaded is module)
+    assert context.device_binding is DeviceBinding.FIXED
+    assert context.device_offset is None and context.nwords == 0
+    calls = []
+
+    def compile_for_ordinal(key, nparams, device, *args):
+        calls.append((bytes(key), device))
+        return 0, 1, 0, nparams
+
+    module.set_compile_callback(compile_for_ordinal)
+    for handle in handles:
+        assert handle(0, 1, 7) is None
+    assert calls == [(b"", 0), (b"", 255), (b"", 256), (b"", 2**31 - 1)]
+
+
+def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
+    names = ("self", "args", "values", "device", "device_ordinal", "stream", "grid")
+    kernel = _kernel_from_source(tmp_path, "device_binding_names", ", ".join((*names, "n")))
+    factory = make_launcher(kernel, bind_device=True, extra_annotation={
+        name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
+                       bind_value=BindValue.POINTER) for name in names
+    }, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    values = dict.fromkeys(names, 0)
+    with pytest.raises(TypeError, match="missing"):
+        factory.bind_device(0)
+    with pytest.raises(TypeError, match="unknown.*other"):
+        factory.bind_device(0, **values, other=1)
+    launch = factory.bind_device(0, **values)
+    assert tuple(inspect.signature(launch).parameters) == ("stream", "grid", "n")
+    assert launch(0, 1, 7) is None
+
+
+def test_bind_device_signature_avoids_public_control_names(tmp_path):
+    names = ("device", "stream", "stream_", "grid", "grid_")
+    kernel = _kernel_from_source(tmp_path, "fixed_control_names", ", ".join(names))
+    launch = make_launcher(kernel, bind_device=True, no_gpu=True,
+                           torch_access=TorchAccess.CPYTHON).bind_device(0)
+    signature = inspect.signature(launch)
+    assert tuple(signature.parameters) == ("stream__", "grid__", *names)
+    assert all(p.kind is inspect.Parameter.POSITIONAL_ONLY for p in signature.parameters.values())
+    assert launch(0, 1, 4, 5, 6, 7, 8) is None
+
+
+def test_fixed_device_handles_own_independent_caches(device_kernel):
+    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True)
+    first = factory.bind_device(0)
+    second = factory.bind_device(0)
+    calls = []
+
+    def compile_once_per_handle(key, nparams, device, *args):
+        calls.append((bytes(key), device))
+        return 0, 1, 0, nparams
+
+    first.__self__.set_compile_callback(compile_once_per_handle)
+    first(0, 1, 7)
+    first(0, 1, 7)
+    second(0, 1, 7)
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
+def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
+    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
+                            extra_annotation={"x": Constexpr(type=tl.int32)},
+                            torch_access=TorchAccess.CPYTHON)
+    first, second = factory.bind_device(0), factory.bind_device(0)
+    calls = []
+
+    def compile_each_constant(key, nparams, device, value):
+        calls.append((bytes(key), nparams, device, value))
+        return 0, 1, 0, nparams
+
+    first.__self__.set_compile_callback(compile_each_constant)
+    for handle, value in ((first, 7), (first, 9), (first, 7), (second, 7), (second, 7)):
+        handle(0, 1, value)
+    assert calls == [(struct.pack("<Q", value), 0, 0, value) for value in (7, 9, 7)]
+    source = pathlib.Path(first.__self__.__file__).with_name("device_kernel.c").read_text()
+    assert "intj_cache_init(&bound->cache)" in source
+    assert "intj_cache_init(&st->cache)" not in source
+
+
+@pytest.mark.parametrize("mode,cache", [
+    (TorchAccess.CPYTHON, KernelCache.INTJ), (TorchAccess.CXX, KernelCache.INTJ),
+    (TorchAccess.CPYTHON, KernelCache.TSL), (TorchAccess.CPYTHON, KernelCache.ABSL),
+])
+def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(device_kernel, mode, cache):
+    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
+                            extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
+                            torch_access=mode, kernel_cache=cache)
+    launch = factory.bind_device(0)
+    calls = []
+
+    def compile_once(key, nparams, device, value):
+        calls.append((bytes(key), nparams, device, value))
+        return 0, 1, 0, nparams
+
+    launch.__self__.set_compile_callback(compile_once)
+    launch(0, 1, 7)
+    launch(0, 1, 9)
+    assert calls == [(b"", 1, 0, 7)]
+    other = factory.bind_device(0)
+    other(0, 1, 9)
+    assert calls == [(b"", 1, 0, 7), (b"", 1, 0, 9)]
+    source_path = pathlib.Path(launch.__self__.__file__)
+    cpp_path = source_path.with_name("device_kernel.cpp")
+    source = (cpp_path if cpp_path.exists() else source_path.with_name("device_kernel.c")).read_text()
+    call_body = source[source.index("static PyObject *intj_call"):source.index("static PyObject *entry")]
+    assert "#define INTJ_HAS_KEY 0" in source
+    assert "intj_hash(" not in call_body
+    assert "intj_cache_get(" not in call_body
+    assert "intj_cache_put(" not in call_body
+    assert "intj_cache_init(" not in source
+    assert "intj_cache_free(" not in source
+    assert call_body.count("INTJ_UNLIKELY(!bound->fixed_kernel)") == 1
+
+
+@pytest.mark.parametrize("has_key", [False, True])
+def test_bind_device_retry_and_reentrant_miss(device_kernel, has_key):
+    annotation = Constexpr(type=tl.int32) if has_key else Argument(type=tl.int32, specialize=NEVER)
+    launch = make_launcher(device_kernel, bind_device=True, no_gpu=True,
+                           extra_annotation={"x": annotation},
+                           torch_access=TorchAccess.CPYTHON).bind_device(0)
+    calls = []
+
+    def compile_reentrant(key, nparams, device, value):
+        calls.append(value)
+        if len(calls) == 1:
+            raise ValueError("compile failed")
+        if len(calls) == 2:
+            launch(0, 1, value)
+        return 0, 1, 0, nparams
+
+    launch.__self__.set_compile_callback(compile_reentrant)
+    assert launch(0, 0, 7) is None
+    assert calls == []
+    with pytest.raises(ValueError, match="compile failed"):
+        launch(0, 1, 7)
+    assert launch(0, 1, 7) is None
+    assert launch(0, 1, 7) is None
+    assert calls == [7, 7, 7]
+    with pytest.raises(TypeError, match="stream"):
+        launch(-1, 1, 7)
+
+
+def test_bind_device_keeps_dynamic_bound_handles_on_module_cache(pointer_kernel):
+    factory = make_launcher(pointer_kernel, no_gpu=True, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
+    }, torch_access=TorchAccess.CPYTHON)
+    first, second = factory.bind(x=4096), factory.bind(x=8192)
+    calls = []
+
+    def compile_for_device(key, nparams, device):
+        calls.append((bytes(key), device))
+        return 0, 1, 0, nparams
+
+    first.__self__.set_compile_callback(compile_for_device)
+    first(0, 0, 1)
+    second(0, 0, 1)
+    second(1, 0, 1)
+    assert calls == [(b"\0" * 8, 0), (b"\1" + b"\0" * 7, 1)]
+
+
+@pytest.mark.parametrize("has_key", [False, True])
+@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, mode):
+    from intj.launcher import _LOADED
+
+    factory = make_launcher(bound_kernel, bind_device=True, no_gpu=True, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
+        "p": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
+        "n": Constexpr(type=tl.int32) if has_key else Argument(type=tl.int32, specialize=NEVER),
+    }, torch_access=mode)
+    owner = _BoundPointer(4096)
+    bound = factory.bind_device(0, x=owner, p=0)
+    module = bound.__self__
+    owner_refs = sys.getrefcount(owner)
+    for _ in range(3):
+        with pytest.raises(OverflowError, match="p"):
+            factory.bind_device(0, x=owner, p=2**64)
+    assert sys.getrefcount(owner) == owner_refs
+    assert bound(0, 1, 7) is None
+    other = factory.bind_device(0, x=0, p=0)
+    assert other(0, 1, 7) is None
+    module_ref, owner_ref = weakref.ref(module), weakref.ref(owner)
+    key = next(key for key, loaded in _LOADED.items() if loaded is module)
+    _LOADED.pop(key)
+    owner.bound = bound
+    del owner, bound
+    gc.collect()
+    assert owner_ref() is None
+    assert other(0, 1, 7) is None
+    del other, module
+    gc.collect()
+    assert module_ref() is None
+
+
+@pytest.mark.parametrize("backend_name", ["hip", "cuda"])
+@pytest.mark.parametrize("no_gpu", [True, False])
+def test_bind_device_cuda_template_backend_branches_compile(tmp_path, device_kernel, backend_name, no_gpu):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import BACKENDS, _build, _render_params
+
+    backend = BACKENDS[backend_name]
+    assert backend.device_symbol == {"hip": "hipDeviceGet", "cuda": "cuDeviceGet"}[backend_name]
+    params, offset, nwords = _render_params(_resolve_annotations(device_kernel, {
+        "x": Argument(type=tl.int32, specialize=NEVER),
+    }), DeviceBinding.FIXED)
+    context = _render_context(
+        params=params, nwords=nwords, device_binding=DeviceBinding.FIXED, device_offset=offset,
+        torch_access="cpython", no_gpu=no_gpu, driver_path="/intj-test-no-driver.so",
+        launch_symbol=backend.launch_symbol, device_symbol=backend.device_symbol,
+        error_symbol=backend.error_symbol, error_style=backend.error_style,
+    )
+    binary = tmp_path / "m.so"
+    _build(binary, context)  # Build both real-driver branches, but load neither driver.
+    assert binary.is_file()
+    source = binary.with_suffix(".c").read_text()
+    if no_gpu:
+        assert "dlopen(" not in source and "dlsym(" not in source
+        assert backend.device_symbol not in source
+    else:
+        assert f'intj_dlsym(gpu, "{backend.device_symbol}")' in source
+        assert "st->device_get(&bound->device_handle," in source
+
+
+def test_bind_device_resolves_without_changing_current_and_checks_first_compile(device_kernel, monkeypatch):
+    current = torch.cuda.current_device()
+    ordinal = (current + 1) % torch.cuda.device_count()
+    factory = make_launcher(device_kernel, bind_device=True, torch_access=TorchAccess.CPYTHON)
+    launch = factory.bind_device(ordinal)
+    assert torch.cuda.current_device() == current
+    monkeypatch.setattr("intj.launcher._current_device", lambda: ordinal + 1)
+    with pytest.raises(UnsupportedKernel, match="make the target device current before the first launch"):
+        launch(0, 1, 7)
+
+
+def test_bind_device_reports_driver_lookup_failure(device_kernel):
+    # HIP leaves a failed lookup in its last-error slot; keep it out of later GPU tests.
+    result = subprocess.run([
+        sys.executable, "-c",
+        "import runpy, sys\n"
+        "from intj import make_launcher\n"
+        "from intj.torch_abi import TorchAccess\n"
+        "kernel = runpy.run_path(sys.argv[1])['device_kernel']\n"
+        "make_launcher(kernel, bind_device=True, torch_access=TorchAccess.CPYTHON).bind_device(2**31 - 1)\n",
+        inspect.getfile(device_kernel.fn),
+    ], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert any(f"RuntimeError: intj: {symbol} failed" in result.stderr
+               for symbol in ("hipDeviceGet", "cuDeviceGet")), result.stderr
+
+
+@pytest.mark.parametrize("has_key", [False, True])
+def test_bind_device_launches_annotated_ast_source_on_gpu(compiled_kernels, has_key):
+    output = torch.empty(1, dtype=torch.int32, device="cuda")
+    factory = make_launcher(annotated_store, bind_device=True, extra_annotation={
+        "o": Argument(type=tl.pointer_type(tl.int32), specialize=NEVER),
+        "x": Constexpr(type=tl.int32) if has_key else Argument(type=tl.int32, specialize=NEVER),
+    }, torch_access=TorchAccess.CPYTHON)
+    bound = factory.bind_device(torch.cuda.current_device())
+    stream = torch.cuda.current_stream().cuda_stream
+    for value in (1, 17, -31, 1):
+        bound(stream, 1, output, value)
+        torch.cuda.synchronize()
+        assert output.item() == value
+    assert len(compiled_kernels) == (3 if has_key else 1)
 
 
 def test_bind_requires_every_bound_name_once(bound_kernel):
@@ -1372,18 +1693,21 @@ def test_int_boundaries_match_triton(axpy_launcher):
         assert previous[0] == spec, f"{previous[1]} and {value} share a key, {previous[0]} != {spec}"
 
 
-def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
+@pytest.mark.parametrize("bind_device", [False, True], ids=["dynamic_device", "bind_device"])
+def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device):
     """The load-bearing invariant: same intj key => same triton specialization.
 
     A coarser key is the failure mode that does not crash -- it launches, say, a
     tt.divisibility=16 binary on an unaligned pointer.
     """
-    module = axpy_launcher.__self__
+    module = (make_launcher(axpy, bind_device=True).bind_device(torch.cuda.current_device()).__self__
+              if bind_device else axpy_launcher.__self__)
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input, _current_target, _render_params
     from triton.compiler import make_backend
 
-    params, _, _ = _render_params(_resolve_annotations(axpy, None), DeviceBinding.NOT_FIXED)
+    params, _, _ = _render_params(_resolve_annotations(axpy, None),
+                                  DeviceBinding.FIXED if bind_device else DeviceBinding.NOT_FIXED)
     backend = make_backend(_current_target())
     base = torch.randn(4096, device="cuda")
     tensors = [
@@ -1657,7 +1981,7 @@ def _render_context(**overrides):
         nwords=2, device_binding="not_fixed", device_offset=10,
         verify_annotation=False, no_gpu=False,
         max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
-        launch_symbol="launch", error_symbol="error", error_style="return",
+        launch_symbol="launch", device_symbol="device_get", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
     )

@@ -114,6 +114,7 @@ class RenderContext:
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
     driver_path: str
     launch_symbol: str
+    device_symbol: str
     error_symbol: str
     error_style: str  # "return" | "outparam"
     torch_access: str  # TorchAccess value; never "auto" by this point
@@ -189,9 +190,6 @@ class LauncherFactory:
         missing = names - values.keys()
         if missing:
             raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
-        if device is not None:
-            raise UnsupportedKernel("intj: device binding is not implemented")
-
         import torch
         from triton._utils import type_canonicalisation_dict
 
@@ -215,12 +213,13 @@ class LauncherFactory:
         module = _materialize_module(
             self.jit_func, tuple(resolved), dict(self.options), self.torch_access,
             self.kernel_cache, self.no_gpu, self.verify_annotation,
+            DeviceBinding.FIXED if self.bind_device_requested else DeviceBinding.NOT_FIXED,
         )
         public_names = tuple(
             p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
         )
         control_names: list[str] = []
-        for name in ("device", "stream", "grid"):
+        for name in (("stream", "grid") if self.bind_device_requested else ("device", "stream", "grid")):
             while name in public_names:
                 name += "_"
             control_names.append(name)
@@ -228,7 +227,8 @@ class LauncherFactory:
             inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
             for name in (*control_names, *public_names)
         ))
-        return module.make_bound(signature, *(values[p.name] for p in resolved if p.name in names))
+        return module.make_bound(signature, *((device,) if self.bind_device_requested else ()),
+                                 *(values[p.name] for p in resolved if p.name in names))
 
 
 def make_launcher(
@@ -241,6 +241,7 @@ def make_launcher(
     kernel_cache: KernelCache = KernelCache.INTJ,
     no_gpu: bool = False,
     verify_annotation: bool = False,
+    bind_device: bool = False,
 ) -> Any:
     """Build a fast launcher for `jit_func`.
 
@@ -254,8 +255,11 @@ def make_launcher(
     public parameters, positionally, in declaration order. Baked Argument and
     Constexpr values are omitted from the call. With bound parameters this
     returns a non-callable factory; `.bind(**values)` creates the native callable
-    and removes those parameters from its signature. The return shape depends
-    on the annotations stored on the (untyped) JITFunction.
+    and removes those parameters from its signature. `bind_device=True` also
+    returns a factory: `.bind_device(ordinal, **values)` fixes a non-negative
+    int32 device ordinal and returns `(stream, grid, ...)`. It owns a separate
+    kernel cache, or one kernel when no dynamic specialization key remains.
+    The return shape depends on this flag and annotations on the JITFunction.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
@@ -286,7 +290,7 @@ def make_launcher(
         options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
         options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
     access = _resolve_access(torch_access)
-    if any(p.annotation.bind_value is not None for p in resolved):
+    if bind_device or any(p.annotation.bind_value is not None for p in resolved):
         if not no_gpu:
             _canonical_options(_current_target(), options)
         if verify_annotation:
@@ -299,7 +303,7 @@ def make_launcher(
                         stacklevel=2,
                     )
         return LauncherFactory(jit_func, resolved, tuple(options.items()), access, kernel_cache,
-                               bool(verify_annotation), no_gpu, False)
+                               bool(verify_annotation), no_gpu, bool(bind_device))
     return _materialize_module(jit_func, resolved, options, access, kernel_cache,
                                no_gpu, bool(verify_annotation)).entry
 
@@ -307,6 +311,7 @@ def make_launcher(
 def _materialize_module(
     jit_func: JitFunction, resolved: tuple[ResolvedParam, ...], options: Mapping[str, Any],
     access: TorchAccess, kernel_cache: KernelCache, no_gpu: bool, verify_annotation: bool,
+    device_binding: DeviceBinding = DeviceBinding.NOT_FIXED,
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -321,7 +326,6 @@ def _materialize_module(
                 f"register() it (have: {', '.join(sorted(BACKENDS))})"
             )
         canonical_options = _canonical_options(target, options)
-    device_binding = DeviceBinding.NOT_FIXED
     params, device_offset, nwords = _render_params(resolved, device_binding)
 
     # last, after every refusal above it: a kernel that is going to be rejected
@@ -348,6 +352,7 @@ def _materialize_module(
         spec_pointer_range=1 if backend is not None and backend.pointer_range else 0,
         driver_path=backend.library_path() if backend is not None else "",
         launch_symbol=backend.launch_symbol if backend is not None else "",
+        device_symbol=backend.device_symbol if backend is not None else "",
         error_symbol=backend.error_symbol if backend is not None else "",
         error_style=backend.error_style if backend is not None else "return",
         torch_access=access.value,
@@ -662,6 +667,8 @@ class Backend(abc.ABC):
     name: str
     #: f(fn, gx,gy,gz, bx,by,bz, shared, stream, params, extra) -> error code
     launch_symbol: str
+    #: f(int32_t *device, int32_t ordinal) -> error code
+    device_symbol: str
     #: error-string lookup, called as `error_style` says
     error_symbol: str
     #: "return"   const char *f(int)
@@ -678,6 +685,7 @@ class Backend(abc.ABC):
 class HipBackend(Backend):
     name = "hip"
     launch_symbol = "hipModuleLaunchKernel"
+    device_symbol = "hipDeviceGet"
     error_symbol = "hipGetErrorString"
     error_style = "return"
     pointer_range = True
@@ -692,6 +700,7 @@ class HipBackend(Backend):
 class CudaBackend(Backend):
     name = "cuda"
     launch_symbol = "cuLaunchKernel"
+    device_symbol = "cuDeviceGet"
     error_symbol = "cuGetErrorString"
     error_style = "outparam"
     pointer_range = False
