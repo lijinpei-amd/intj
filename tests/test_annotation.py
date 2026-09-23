@@ -290,3 +290,61 @@ def test_make_launcher_resolves_before_target_discovery(tmp_path, monkeypatch):
     monkeypatch.setattr(launcher, "_current_target", lambda: pytest.fail("target discovered"))
     with pytest.raises(ValueError, match="unsupported"):
         intj.make_launcher(kernel)
+
+
+@pytest.mark.parametrize(
+    "widths,fixed_device,expected_offsets,device_offset,nwords",
+    [
+        ((8, 4, 2, 1), False, (0, 8, 12, 14), 15, 2),
+        ((1, 8, 1, 4, 2), False, (14, 0, 15, 8, 12), 16, 3),
+        ((2, 2, 1), True, (0, 2, 4), None, 1),
+        ((), True, (), None, 0),
+    ],
+)
+def test_layout_key_fields_are_grouped_by_descending_alignment(
+    widths, fixed_device, expected_offsets, device_offset, nwords
+):
+    from intj.annotation import DeviceBinding, KeyField, _layout_fields
+
+    layout = _layout_fields(
+        tuple((index, KeyField("payload", width)) for index, width in enumerate(widths)),
+        DeviceBinding.FIXED if fixed_device else DeviceBinding.NOT_FIXED,
+    )
+    assert tuple(field.offset for _, field in layout.fields) == expected_offsets
+    assert layout.device_offset == device_offset
+    assert layout.nwords == nwords
+
+
+def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _render_params
+
+    kernel = kernel_with_params(
+        tmp_path,
+        "raw: tl.constexpr, typed: tl.constexpr, power: tl.constexpr, "
+        "nothing: tl.constexpr, fixed: tl.int32, changing: tl.int32, bound, baked",
+    )
+    resolved = _resolve_annotations(kernel, {
+        "typed": intj.Constexpr(type=[tl.int16, tl.int32]),
+        "power": intj.Constexpr(type=tl.int64, power_of_two_or_zero=True),
+        "nothing": intj.Constexpr(type=None),
+        "fixed": intj.Argument(specialize=intj.NEVER),
+        "bound": intj.Argument(type=tl.pointer_type(tl.int32), specialize=intj.NEVER,
+                               bind_value=intj.BindValue.TENSOR),
+        "baked": intj.Argument(type=tl.int32, specialize=intj.NEVER, value=4),
+    })
+    params, device_offset, nwords = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    fields = [tuple((f.kind, f.width, f.offset) for f in p.annotation.key_fields) for p in params]
+    assert fields == [
+        (("payload", 8, 0), ("descriptor", 1, 12)),
+        (("payload", 4, 8), ("descriptor", 1, 13)),
+        (("payload", 1, 14),),
+        (),
+        (),
+        (("descriptor", 1, 15),),
+        (),
+        (),
+    ]
+    assert (device_offset, nwords) == (16, 3)
+    assert tuple(p.call_index for p in params) == (0, 1, 2, 3, 4, 5, None, None)
+    assert hash(params) and json.dumps(dataclasses.asdict(params[0]), sort_keys=True)

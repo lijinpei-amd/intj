@@ -5,7 +5,8 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#define INTJ_NWORDS {{ nwords }}
+#define INTJ_NWORDS {{ [nwords, 1] | max }}
+#define INTJ_KEY_BYTES {{ nwords * 8 }}
 #define INTJ_ACCESS_{{ torch_access | upper }} 1
 #include "intj_runtime.h"
 
@@ -115,31 +116,32 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
   if (INTJ_UNLIKELY((uint64_t)gx * (uint64_t)gy * (uint64_t)gz == 0))
     Py_RETURN_NONE;
 
-  /* spec key + kernel arguments.  The header accumulates in 32-bit registers --
-   * the width the decode already works in -- and each key word gets exactly one
-   * store: two adjacent 32-bit stores feeding an 8-byte load would not forward.
-   * Every word is assigned rather than OR'd into, so the array needs no
-   * initializer; the header's padding bytes come from the zeroed accumulators. */
-  uint64_t key[INTJ_NWORDS];
+  /* Key fields have render-time offsets; zero initialization also clears padding. */
+  uint64_t key[INTJ_NWORDS] = {0};
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
-{% for a in range(header_words * 2) %}  uint32_t _a{{ a }} = 0;
-{% endfor %}
 {% for p in params %}
-{% if p.is_constexpr %}
-  INTJ_DECODE_CONSTEXPR(args[{{ 3 + loop.index0 }}], _a{{ loop.index0 // 4 }},
-                        {{ (loop.index0 % 4) * 8 }}, key[{{ p.cx_word }}],
-                        intj_param_names[{{ loop.index0 }}]);
+{% set descriptor = p.annotation.key_fields | selectattr('kind', 'equalto', 'descriptor') | list %}
+{% set payload = p.annotation.key_fields | selectattr('kind', 'equalto', 'payload') | list %}
+  uint32_t _code{{ p.index }} = 0;
+{% if p.annotation.kind == 'constexpr' %}
+  uint64_t _value{{ p.index }} = 0;
+  INTJ_DECODE_CONSTEXPR(args[{{ 3 + loop.index0 }}], _code{{ p.index }},
+                        0, _value{{ p.index }}, intj_param_names[{{ loop.index0 }}]);
+{% if payload %}  memcpy((uint8_t *)key + {{ payload[0].offset }}, &_value{{ p.index }}, {{ payload[0].width }});
+{% endif %}
 {% else %}
-  INTJ_DECODE(st, args[{{ 3 + loop.index0 }}], _a{{ loop.index0 // 4 }},
-              {{ (loop.index0 % 4) * 8 }}, vals, np,
-              {{ p.spec }}, {{ p.align }}, {{ spec_pointer_range }},
+  INTJ_DECODE(st, args[{{ 3 + loop.index0 }}], _code{{ p.index }},
+              0, vals, np,
+              {{ 0 if p.annotation.equal_to_one == 'never' else 1 }},
+              {{ 0 if p.annotation.aligned_16 == 'never' else 1 }}, {{ spec_pointer_range }},
               intj_param_names[{{ loop.index0 }}]);
 {% endif %}
+{% if descriptor %}  ((uint8_t *)key)[{{ descriptor[0].offset }}] = (uint8_t)_code{{ p.index }};
+{% endif %}
 {% endfor %}
-  _a{{ (params | length) // 4 }} |= (uint32_t)device << {{ ((params | length) % 4) * 8 }};
-{% for w in range(header_words) %}  key[{{ w }}] = (uint64_t)_a{{ 2 * w }} | ((uint64_t)_a{{ 2 * w + 1 }} << 32);
-{% endfor %}
+{% if device_offset is not none %}  ((uint8_t *)key)[{{ device_offset }}] = (uint8_t)device;
+{% endif %}
 
   uint64_t hash = intj_hash(key);
   intj_kernel *kernel = intj_cache_get(&st->cache, key, hash);
@@ -150,7 +152,7 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
       PyErr_SetString(PyExc_RuntimeError, "intj: compile callback is not set");
       return NULL;
     }
-    PyObject *blob = PyBytes_FromStringAndSize((const char *)key, sizeof(key));
+    PyObject *blob = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
     if (!blob)
       return NULL;
     PyObject *nparams_obj = PyLong_FromLong(np);
@@ -248,28 +250,33 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
                  INTJ_NPARAMS, nargs);
     return NULL;
   }
-  uint64_t key[INTJ_NWORDS];
+  uint64_t key[INTJ_NWORDS] = {0};
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   uint32_t device = 0; /* no launch, so no device to key on */
-{% for a in range(header_words * 2) %}  uint32_t _a{{ a }} = 0;
-{% endfor %}
 {% for p in params %}
-{% if p.is_constexpr %}
-  INTJ_DECODE_CONSTEXPR(args[{{ loop.index0 }}], _a{{ loop.index0 // 4 }},
-                        {{ (loop.index0 % 4) * 8 }}, key[{{ p.cx_word }}],
-                        intj_param_names[{{ loop.index0 }}]);
+{% set descriptor = p.annotation.key_fields | selectattr('kind', 'equalto', 'descriptor') | list %}
+{% set payload = p.annotation.key_fields | selectattr('kind', 'equalto', 'payload') | list %}
+  uint32_t _code{{ p.index }} = 0;
+{% if p.annotation.kind == 'constexpr' %}
+  uint64_t _value{{ p.index }} = 0;
+  INTJ_DECODE_CONSTEXPR(args[{{ loop.index0 }}], _code{{ p.index }},
+                        0, _value{{ p.index }}, intj_param_names[{{ loop.index0 }}]);
+{% if payload %}  memcpy((uint8_t *)key + {{ payload[0].offset }}, &_value{{ p.index }}, {{ payload[0].width }});
+{% endif %}
 {% else %}
-  INTJ_DECODE(st, args[{{ loop.index0 }}], _a{{ loop.index0 // 4 }},
-              {{ (loop.index0 % 4) * 8 }}, vals, np,
-              {{ p.spec }}, {{ p.align }}, {{ spec_pointer_range }},
+  INTJ_DECODE(st, args[{{ loop.index0 }}], _code{{ p.index }},
+              0, vals, np,
+              {{ 0 if p.annotation.equal_to_one == 'never' else 1 }},
+              {{ 0 if p.annotation.aligned_16 == 'never' else 1 }}, {{ spec_pointer_range }},
               intj_param_names[{{ loop.index0 }}]);
 {% endif %}
+{% if descriptor %}  ((uint8_t *)key)[{{ descriptor[0].offset }}] = (uint8_t)_code{{ p.index }};
+{% endif %}
 {% endfor %}
-  _a{{ (params | length) // 4 }} |= device << {{ ((params | length) % 4) * 8 }};
-{% for w in range(header_words) %}  key[{{ w }}] = (uint64_t)_a{{ 2 * w }} | ((uint64_t)_a{{ 2 * w + 1 }} << 32);
-{% endfor %}
-  return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)sizeof(key), np);
+{% if device_offset is not none %}  ((uint8_t *)key)[{{ device_offset }}] = (uint8_t)device;
+{% endif %}
+  return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)INTJ_KEY_BYTES, np);
 }
 
 static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {

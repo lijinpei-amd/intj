@@ -145,6 +145,38 @@ class KeyField:
     offset: int = -1
 
 
+class DeviceBinding(enum.StrEnum):
+    FIXED = "fixed"
+    NOT_FIXED = "not_fixed"
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyLayout:
+    fields: tuple[tuple[int, KeyField], ...]
+    device_offset: int | None
+    nwords: int
+
+
+def _layout_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
+    fields: tuple[tuple[int, KeyField], ...], device_binding: DeviceBinding
+) -> KeyLayout:
+    ordered = sorted(enumerate(fields), key=lambda item: -item[1][1].width)
+    offsets: dict[int, int] = {}
+    offset = 0
+    for source_index, (_, field) in ordered:
+        offsets[source_index] = offset
+        offset += field.width
+    device_offset = None
+    if device_binding is DeviceBinding.NOT_FIXED:
+        device_offset = offset
+        offset += 1
+    placed = tuple(
+        (param_index, dataclasses.replace(field, offset=offsets[source_index]))
+        for source_index, (param_index, field) in enumerate(fields)
+    )
+    return KeyLayout(placed, device_offset, (offset + 7) // 8)
+
+
 @dataclasses.dataclass(frozen=True)
 class CanonicalAnnotation:
     kind: str
@@ -326,6 +358,34 @@ def _applicable(name: str | None, field: str) -> bool:
     if field == "equal_to_one":
         return name.startswith(("i", "u")) and name != "u1"
     return name.startswith("*") or (name.startswith(("i", "u")) and name != "u1")
+
+
+def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
+    annotation: CanonicalAnnotation,
+) -> tuple[KeyField, ...]:
+    if annotation.baked_value or annotation.bind_value is not None:
+        return ()
+    types = annotation.types
+    if annotation.kind == "constexpr":
+        if annotation.power_of_two_or_zero:
+            return (KeyField("payload", 1),)
+        if types == (None,):
+            return ()
+        descriptor = types is None or len(types) > 1
+        width = 8 if types is None else max(
+            0 if ty is None else 8 if ty == "fp64" else 1 if ty == "u1" else int(ty[1:]) // 8
+            for ty in types
+        )
+        return ((KeyField("descriptor", 1),) if descriptor else ()) + (
+            (KeyField("payload", width),) if width else ()
+        )
+    descriptor = types is None or len(types) > 1 or any(
+        mode == "auto" and any(_applicable(ty, field) for ty in types)
+        for field, mode in zip(_FACT_NAMES, (
+            annotation.equal_to_one, annotation.aligned_16, annotation.pointer_range_32
+        ))
+    )
+    return (KeyField("descriptor", 1),) if descriptor else ()
 
 
 def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher

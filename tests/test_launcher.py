@@ -18,6 +18,7 @@ import triton.language as tl
 
 import intj
 from intj import make_launcher
+from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
     ModuleKey,
     Param,
@@ -392,19 +393,11 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
         assert nparams == sum(1 for ty, _ in spec if ty != "constexpr")
 
 
-@pytest.mark.parametrize(
-    "nparams,nconstexpr", [(1, 0), (1, 1), (6, 0), (7, 0), (8, 0), (7, 2), (8, 3)]
-)
-def test_render_params_byte_layout(tmp_path, nparams, nconstexpr):
-    """Byte i is parameter i; the device byte is last; constexpr words follow.
-
-    The 7-vs-8 cases straddle the header word boundary -- seven parameters plus
-    the device byte fill one word exactly, eight need a second.  Every kernel in
-    this suite has at most eight parameters, so nothing else here would catch a
-    device-byte off-by-one.
-    """
+@pytest.mark.parametrize("nparams,nconstexpr", [(1, 0), (1, 1), (7, 2), (8, 3)])
+def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     import importlib.util
 
+    from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _render_params
 
     names = [f"p{i}" for i in range(nparams)]
@@ -420,25 +413,36 @@ def test_render_params_byte_layout(tmp_path, nparams, nconstexpr):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    params, nwords = _render_params(module.k)
-    header_words = -(-(nparams + nconstexpr + 1) // 8)
+    params, device_offset, nwords = _render_params(
+        _resolve_annotations(module.k, None), DeviceBinding.NOT_FIXED
+    )
 
     assert [p.name for p in params] == names + cxnames
-    assert [p.cx_word for p in params if not p.is_constexpr] == [None] * nparams
-    assert [p.cx_word for p in params if p.is_constexpr] == [
-        header_words + i for i in range(nconstexpr)
+    assert [p.index for p in params] == list(range(nparams + nconstexpr))
+    assert [p.call_index for p in params] == list(range(nparams + nconstexpr))
+    assert [p.annotation.key_fields[0].offset for p in params[:nparams]] == [
+        8 * nconstexpr + i for i in range(nparams)
     ]
-    assert nwords == header_words + nconstexpr
+    assert [p.annotation.key_fields[0].offset for p in params[nparams:]] == [
+        8 * i for i in range(nconstexpr)
+    ]
+    assert device_offset is not None
+    assert device_offset == 8 * nconstexpr + nparams + nconstexpr
+    assert nwords == (device_offset + 8) // 8
 
 
 def _render_context(**overrides):
+    ordinary = CanonicalAnnotation("argument", None, "auto", "auto", "auto", (), False, None, ())
+    constexpr = CanonicalAnnotation("constexpr", None, "auto", "auto", "auto", (), False, None, ())
     fields = dict(
         module_name="m", kernel_repr="a.b",
         params=(
-            Param(name="x", is_constexpr=False, spec=1, align=1, cx_word=None),
-            Param(name="BLOCK", is_constexpr=True, spec=1, align=1, cx_word=1),
+            Param(name="x", index=0, call_index=0, annotation=ordinary),
+            Param(name="BLOCK", index=1, call_index=1, annotation=constexpr),
         ),
-        nwords=2, header_words=1, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
+        nwords=2, device_binding="not_fixed", device_offset=10,
+        verify_annotation=False, no_gpu=False,
+        max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
         launch_symbol="launch", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
@@ -449,7 +453,6 @@ def _render_context(**overrides):
 def _module_key(**overrides):
     fields = dict(
         template="aa", runtime_header="bb", context=_render_context(module_name=""), cache_key="c",
-        params=(("x", "", False, False, False, False, False, "None"),),
         target=("hip", "gfx942", 64), options="o", triton=("3.8.0", 1, 2.0),
         compiler=("gcc", "13"), ext_suffix=".so", intj_version=(0, 1),
     )
@@ -810,54 +813,57 @@ def test_live_dtypes_have_no_holes():
 
 @pytest.mark.parametrize("nparams", [3, 7, 8, 15, 16])
 def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
-    """The template's accumulator/shift arithmetic, checked against a real key.
-
-    `test_render_params_byte_layout` pins the python half.  This pins the C
-    half: each parameter ORs its code into accumulator `i // 4` at shift
-    `(i % 4) * 8`, and the accumulators fold pairwise into one store per word.
-    The counts straddle both boundaries -- 4 bytes per accumulator and 8 per
-    word -- which is where an off-by-one would hide.
-    """
+    """The generated decoder writes each width at its globally placed offset."""
     import importlib.util
 
-    from intj.launcher import _render_params
+    from intj import launcher as launcher_module
 
     names = [f"p{i}" for i in range(nparams)]
     path = tmp_path / f"k{nparams}.py"
     path.write_text(
         "import triton\nimport triton.language as tl\n\n\n@triton.jit\n"
-        f"def k({', '.join(names)}, C: tl.constexpr):\n    pass\n"
+        f"def k({', '.join(names + [f'C{bits}: tl.constexpr' for bits in (64, 32, 16, 8)])}):\n"
+        "    pass\n"
     )
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     kernel = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(kernel)
 
-    params, nwords = _render_params(kernel.k)
-    header_words = -(-(nparams + 2) // 8)
-    module = getattr(make_launcher(kernel.k), "__self__")
+    annotation = {
+        f"C{bits}": intj.Constexpr(type=getattr(tl, f"int{bits}"))
+        for bits in (64, 32, 16, 8)
+    }
+    module = getattr(make_launcher(kernel.k, extra_annotation=annotation), "__self__")
+    context = next(key.context for key, loaded in launcher_module._LOADED.items() if loaded is module)
 
     b_i32 = 128  # INTJ_B_I32, +1 when the value is divisible by 16
-    # odd, above 1, not divisible by 16: every byte must be the plain i32 code
-    args = [3 + 2 * i for i in range(nparams)] + [256]
+    args = [3 + 2 * i for i in range(nparams)] + [
+        0x0102030405060708, 0x10203040, 0x1234, 0x42
+    ]
     blob, np_ = module.spec_key(*args)
 
-    assert (len(blob), nwords, np_) == (nwords * 8, header_words + 1, nparams)
-    assert list(blob[:nparams]) == [b_i32] * nparams
-    assert blob[nparams] == 140  # INTJ_B_CX_INT
-    assert blob[nparams + 1] == 0  # the device byte; spec_key keys on device 0
-    assert set(blob[nparams + 2:header_words * 8]) <= {0}  # padding memcmp reads
-    at = header_words * 8
-    assert int.from_bytes(blob[at:at + 8], "little") == 256
+    assert (len(blob), np_) == (context.nwords * 8, nparams)
+    for param in context.params[:nparams]:
+        field, = param.annotation.key_fields
+        assert (field.kind, field.width) == ("descriptor", 1)
+        assert blob[field.offset] == b_i32
+    for param, value, width in zip(context.params[nparams:], args[nparams:], (8, 4, 2, 1)):
+        field, = param.annotation.key_fields
+        assert (field.kind, field.width) == ("payload", width)
+        assert blob[field.offset:field.offset + width] == value.to_bytes(width, "little")
+    assert context.device_offset is not None
+    assert blob[context.device_offset] == 0
+    assert blob[context.device_offset + 1:] == bytes(len(blob) - context.device_offset - 1)
 
-    # flipping one parameter must move exactly its own byte and nothing else
     for i in range(nparams):
         alt = list(args)
-        alt[i] = 16  # divisible by 16 -> tt.divisibility, so +1
+        alt[i] = 16
         other, _ = module.spec_key(*alt)
-        assert other[i] == b_i32 + 1
-        assert [b for j, b in enumerate(other) if j != i] == [
-            b for j, b in enumerate(blob) if j != i
+        offset = context.params[i].annotation.key_fields[0].offset
+        assert other[offset] == b_i32 + 1
+        assert [b for j, b in enumerate(other) if j != offset] == [
+            b for j, b in enumerate(blob) if j != offset
         ]
 
 

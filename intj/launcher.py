@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from ._version import __version__
-from .annotation import _resolve_annotations  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
+from .annotation import (
+    CanonicalAnnotation,
+    DeviceBinding,
+    ResolvedParam,
+    _key_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
+    _layout_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
+    _resolve_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
+)
 from .kernel_cache import (
     INSTALL_ERRORS,
     KernelCache,
@@ -58,12 +65,9 @@ class Param:
     """One declared kernel parameter, as the template needs it."""
 
     name: str
-    is_constexpr: bool
-    spec: int  # 0 when do_not_specialize
-    align: int  # 0 when do_not_specialize_on_alignment
-    # Its code byte is at its declaration position, which the template already
-    # has as `loop.index0`; only the value word needs carrying.
-    cx_word: int | None  # value-word index, None unless is_constexpr
+    index: int
+    call_index: int | None
+    annotation: CanonicalAnnotation
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,7 +82,10 @@ class RenderContext:
     kernel_repr: str
     params: tuple[Param, ...]
     nwords: int  # spec-key length, in uint64 words
-    header_words: int  # words the code bytes and the device byte occupy
+    device_binding: DeviceBinding
+    device_offset: int | None
+    verify_annotation: bool
+    no_gpu: bool
     max_slots: int  # kernel param slots, upper bound
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
     driver_path: str
@@ -111,7 +118,6 @@ class ModuleKey:
     runtime_header: str  # intj_runtime.h bytes, hex
     context: RenderContext  # the render is a pure function of this and the template
     cache_key: str  # jit_func.cache_key: the kernel source and its callees
-    params: tuple[tuple[Any, ...], ...]  # per-parameter decorator state, which cache_key misses
     target: tuple[Any, ...]  # backend, arch, warp size
     options: str  # canonicalized compile options, hashed by triton
     triton: tuple[Any, ...]  # triton version and libtriton identity
@@ -157,14 +163,21 @@ def make_launcher(
         raise UnsupportedKernel("intj: dynamic_options is not implemented; pass options=... instead")
     options = dict(sorted((options or {}).items()))
     jit_func = _check_kernel(jit_func, options)
-    _resolve_annotations(jit_func, extra_annotation)
+    resolved = _resolve_annotations(jit_func, extra_annotation)
+    for p in jit_func.params:
+        kind = p._param.kind
+        if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            raise UnsupportedKernel(
+                f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
+            )
     target = _current_target()
     if target.backend not in BACKENDS:
         raise UnsupportedKernel(
             f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
             f"register() it (have: {', '.join(sorted(BACKENDS))})"
         )
-    params, nwords = _render_params(jit_func)
+    device_binding = DeviceBinding.NOT_FIXED
+    params, device_offset, nwords = _render_params(resolved, device_binding)
 
     access = _resolve_access(torch_access)
     backend = BACKENDS[target.backend]
@@ -181,8 +194,11 @@ def make_launcher(
         kernel_repr=get_full_name(jit_func),
         params=params,
         nwords=nwords,
-        header_words=-(-(len(params) + 1) // 8),
-        max_slots=sum(0 if p.is_constexpr else 1 for p in params),
+        device_binding=device_binding,
+        device_offset=device_offset,
+        verify_annotation=False,
+        no_gpu=False,
+        max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
@@ -211,11 +227,6 @@ def make_launcher(
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
         context=context,
         cache_key=jit_func.cache_key,
-        params=tuple(
-            (p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
-             p.do_not_specialize_on_alignment, p.has_default, repr(p.default))
-            for p in jit_func.params
-        ),
         target=(target.backend, target.arch, target.warp_size),
         options=canonical_options.hash(),
         triton=_triton_identity(),
@@ -617,34 +628,29 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
     return jit_func
 
 
-def _render_params(jit_func: JitFunction) -> tuple[tuple[Param, ...], int]:
-    """One render-time descriptor per declared kernel parameter, and the key length.
-
-    Byte `i` of the key is parameter `i`, the device byte follows them, and the
-    constexpr value words follow the padding.  `nwords` comes back alongside the
-    params because it is the same arithmetic: computing it somewhere else is how
-    the two drift.
-    """
-    declared = list(jit_func.params)
-    header_words = -(-(len(declared) + 1) // 8)
+def _render_params(
+    resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
+) -> tuple[tuple[Param, ...], int | None, int]:
+    """Place canonical key fields and number the arguments in the public call."""
+    fields = tuple(
+        (p.index, field) for p in resolved for field in _key_fields(p.annotation)
+    )
+    layout = _layout_fields(fields, device_binding)
     params: list[Param] = []
-    word = header_words
-    for p in declared:
-        kind = p._param.kind
-        if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            raise UnsupportedKernel(f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported")
-        params.append(
-            Param(
-                name=p.name,
-                is_constexpr=p.is_constexpr,
-                spec=0 if p.do_not_specialize else 1,
-                align=0 if p.do_not_specialize_on_alignment else 1,
-                cx_word=word if p.is_constexpr else None,
-            )
+    call_index = 0
+    for p in resolved:
+        annotation = dataclasses.replace(
+            p.annotation,
+            key_fields=tuple(sorted(
+                (field for index, field in layout.fields if index == p.index),
+                key=lambda field: field.offset,
+            )),
         )
-        if p.is_constexpr:
-            word += 1
-    return tuple(params), word
+        public = not annotation.baked_value and annotation.bind_value is None
+        params.append(Param(p.name, p.index, call_index if public else None, annotation))
+        if public:
+            call_index += 1
+    return tuple(params), layout.device_offset, layout.nwords
 
 
 @functools.lru_cache(maxsize=1)
@@ -749,11 +755,10 @@ def _validate_spec_key(
     specialization = triton_specialization(jit_func, args, options)
 
     for i, param in enumerate(params):
-        # byte i is parameter i; a constexpr adds its value word
-        mine: tuple[int, ...] = (keyblob[i],)
-        if param.cx_word is not None:
-            at = param.cx_word * 8
-            mine += (int.from_bytes(keyblob[at:at + 8], "little"),)
+        mine = tuple(
+            int.from_bytes(keyblob[field.offset:field.offset + field.width], "little")
+            for field in param.annotation.key_fields
+        )
         theirs = repr(specialization[i])
         previous = seen.setdefault((i, mine), theirs)
         if previous != theirs:
