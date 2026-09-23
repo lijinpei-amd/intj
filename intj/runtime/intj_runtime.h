@@ -99,13 +99,49 @@ static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
   return (uint64_t)(r >> 64) ^ (uint64_t)r;
 }
 
+/* The renderer knows INTJ_NWORDS, so the shape is chosen rather than looped.
+ * The signature is the same at every length: `tests/bench_kernel_cache.cpp` and
+ * the entry template both call this, and a per-length signature would fork both
+ * callers for nothing.
+ *
+ * At one word the mix is replaced by a bijection -- xorshift-right and an odd
+ * multiply both are -- which makes hash equality key equality and lets the slot
+ * drop the key altogether (see intj_slot).  At two, one multiply suffices, the
+ * way wyhash handles a short input.  Above that the chain is split across two
+ * lanes: a mix is a ~4-cycle multiply and the whole chain sits between the last
+ * argument decode and the first table probe, so five words is ~20 cycles of
+ * pure latency serially and ~12 in pairs.  Same reason wyhash runs three lanes
+ * over a 48-byte block.
+ */
+#if INTJ_NWORDS == 1
+static inline uint64_t intj_hash(const uint64_t *w) {
+  uint64_t x = w[0];
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ull;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebull;
+  x ^= x >> 31;
+  return x;
+}
+#elif INTJ_NWORDS == 2
 static inline uint64_t intj_hash(const uint64_t *w) {
   const uint64_t s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull;
-  uint64_t h = s0;
-  for (int i = 0; i < INTJ_NWORDS; i++)
-    h = intj_mix(h ^ s1, w[i] ^ s0);
-  return intj_mix(h, INTJ_NWORDS * 8 + s1);
+  return intj_mix(intj_mix(w[0] ^ s0, w[1] ^ s1), 2 * 8 + s1);
 }
+#else
+static inline uint64_t intj_hash(const uint64_t *w) {
+  const uint64_t s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull;
+  uint64_t h0 = s0, h1 = s1;
+  int i = 0;
+  for (; i + 1 < INTJ_NWORDS; i += 2) {
+    h0 = intj_mix(h0 ^ s1, w[i] ^ s0);
+    h1 = intj_mix(h1 ^ s0, w[i + 1] ^ s1);
+  }
+  if (i < INTJ_NWORDS)
+    h0 = intj_mix(h0 ^ s1, w[i] ^ s0);
+  return intj_mix(h0 ^ h1, INTJ_NWORDS * 8 + s1);
+}
+#endif
 
 typedef struct {
   void *function;     /* hipFunction_t / CUfunction */
