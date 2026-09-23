@@ -708,8 +708,81 @@ def test_dtype_code_matches_torch(dtype_name):
     """The THPDtype offset read, and the itemsize table built from it."""
     dtype = getattr(torch, dtype_name)
     code = dtype_code(dtype)
+    table = itemsize_table()
     assert 0 <= code < NDTYPES
-    assert itemsize_table()[code] == torch.empty(0, dtype=dtype).element_size()
+    assert table is not None, "no dtype row for the torch the suite is running against"
+    assert table[code] == torch.empty(0, dtype=dtype).element_size()
+
+
+def test_recorded_dtypes_match_this_torch():
+    """The `dtypes:` row is data, and data goes stale.  Check it against reality.
+
+    A drifted row is not cosmetic: the offsets in the same stanza were measured
+    against that set of dtypes, and `itemsize_table` refuses the whole stanza
+    when they no longer agree -- so this failing is what a silent fall back to
+    `CPYTHON` on a torch intj thinks it supports looks like before it happens.
+    """
+    from intj.torch_abi import _DTYPES, live_dtypes, torch_version
+
+    recorded = _DTYPES.get(torch_version())
+    assert recorded is not None, "no stanza for the torch the suite is running against"
+    assert recorded == live_dtypes(), (
+        "intj/torch_abi.txt is stale; regenerate with `python -m intj.torch_abi`"
+    )
+
+
+def test_abi_file_parses_wrapped_rows_and_refuses_broken_ones():
+    """`torch_abi.txt` is pasted by hand, so its parser is a trust boundary."""
+    from intj.torch_abi import _parse_abi, _parse_dtypes
+
+    stanzas = _parse_abi(
+        "# a comment\n"
+        "[2.9]\n"
+        "layout: cdata=16  # trailing comment\n"
+        "dtypes: 0=uint8:1\n"
+        "  1=int8:1\n"
+    )
+    assert stanzas == {(2, 9): {"layout": "cdata=16", "dtypes": "0=uint8:1 1=int8:1"}}
+    assert _parse_dtypes(stanzas[(2, 9)]["dtypes"]) == {0: ("uint8", 1), 1: ("int8", 1)}
+
+    for broken in ("layout: cdata=16\n", "[2.9\nlayout: cdata=16\n", "[2.9]\n  1=int8:1\n"):
+        with pytest.raises(ValueError, match="torch_abi.txt"):
+            _parse_abi(broken)
+
+
+def test_drifted_dtypes_refuse_the_whole_stanza(monkeypatch):
+    """A torch whose dtypes moved is an unverified torch, offsets and all."""
+    from intj import torch_abi as abi
+
+    drifted = dict(abi.live_dtypes())
+    drifted.pop(max(drifted))  # torch dropped a dtype since the stanza was taken
+    monkeypatch.setattr(abi, "live_dtypes", lambda: drifted)
+    abi.itemsize_table.cache_clear()
+    abi.layout_for.cache_clear()
+    try:
+        assert abi.itemsize_table() is None
+        assert abi.layout_for() is None
+    finally:  # the caches outlive the monkeypatch; every later test reads them
+        abi.itemsize_table.cache_clear()
+        abi.layout_for.cache_clear()
+
+
+def test_live_dtypes_have_no_holes():
+    """Every `ScalarType` below the highest one torch names has a size.
+
+    `live_dtypes` enumerates `dir(torch)`, so it only sees dtypes the torch
+    namespace names.  `ScalarType` is a plain dense enum, so a gap means some
+    code in the middle has no attribute to find it by -- and the C side would
+    then reject a perfectly ordinary tensor of that dtype as a layout mismatch.
+    Density is the check that `dir(torch)` is still an exhaustive enumeration.
+    """
+    from intj.torch_abi import live_dtypes
+
+    codes = sorted(live_dtypes())
+    assert codes, "no dtype was found at all"
+    assert codes == list(range(len(codes))), (
+        f"dtype codes {sorted(set(range(max(codes))) - set(codes))} are named nowhere"
+    )
 
 
 @pytest.mark.parametrize("nparams", [3, 7, 8, 15, 16])

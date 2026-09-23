@@ -1,0 +1,29 @@
+# Verified torch ABIs, one stanza per (major, minor).
+#
+# Never write a row by hand.  Run `python -m intj.torch_abi` on the target
+# build and paste the stanza it prints: every number in it is measured against
+# torch's own accessors, so a pasted stanza is verified by construction, while
+# an edited one is a guess -- and a wrong offset cannot raise, it reads
+# whatever lies at that address.
+#
+# Format: `[major.minor]` opens a stanza, `name: ...` is a row, an indented
+# line continues the row above it, and `#` starts a comment.
+#
+#   layout: byte offsets into PyObject / TensorImpl / StorageImpl
+#   dtypes: <at::ScalarType code>=<torch's spelling>:<element size>
+#
+# The dtypes row is what makes a version *known*: intj refuses to read tensors
+# through these offsets unless the running torch's dtypes are exactly the ones
+# that were there when the offsets were measured.
+
+# torch 2.14.0.dev20260721+rocm7.2, x86-64
+[2.14]
+layout: cdata=16 storage=16 storage_offset=144 numel=152 data_type=160 s_data=16 s_nbytes=48
+dtypes: 0=uint8:1 1=int8:1 2=int16:2 3=int32:4 4=int64:8 5=float16:2 6=float32:4
+  7=float64:8 8=complex32:4 9=complex64:8 10=complex128:16 11=bool:1 12=qint8:1
+  13=quint8:1 14=qint32:4 15=bfloat16:2 16=quint4x2:1 17=quint2x4:1 18=bits1x8:1
+  19=bits2x4:1 20=bits4x2:1 21=bits8:1 22=bits16:2 23=float8_e5m2:1 24=float8_e4m3fn:1
+  25=float8_e5m2fnuz:1 26=float8_e4m3fnuz:1 27=uint16:2 28=uint32:4 29=uint64:8
+  30=uint1:1 31=uint2:1 32=uint3:1 33=uint4:1 34=uint5:1 35=uint6:1 36=uint7:1 37=int1:1
+  38=int2:1 39=int3:1 40=int4:1 41=int5:1 42=int6:1 43=int7:1 44=float8_e8m0fnu:1
+  45=float4_e2m1fn_x2:1 46=bcomplex32:4

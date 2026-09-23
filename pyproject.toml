@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 include = ["intj*"]
 
 [tool.setuptools.package-data]
-intj = ["runtime/*"]
+intj = ["runtime/*", "torch_abi.txt"]
 
 [tool.pyright]
 pythonVersion = "3.12"

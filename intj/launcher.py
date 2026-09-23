@@ -277,8 +277,9 @@ def _resolve_access(requested: TorchAccess) -> TorchAccess:
 def _unverified_torch_message() -> str:
     return (
         f"intj: no verified tensor layout for torch {_torch_version_string()} "
-        f"(have {', '.join('%d.%d' % v for v in supported_versions())}); pass "
-        "torch_access=TorchAccess.CPYTHON, or add a row to intj.torch_abi._LAYOUTS "
+        f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
+        "dtypes are no longer the ones the stanza was measured against; pass "
+        "torch_access=TorchAccess.CPYTHON, or add a stanza to intj/torch_abi.txt "
         "with `python -m intj.torch_abi` on this torch"
     )
 

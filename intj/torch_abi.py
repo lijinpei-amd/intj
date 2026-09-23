@@ -9,6 +9,7 @@ import ctypes
 import dataclasses
 import enum
 import functools
+import pathlib
 from typing import Any
 
 #: How many dtype codes the C side reserves room for; mirrors INTJ_NDTYPES.
@@ -40,9 +41,9 @@ class TorchAccess(enum.Enum):
 class TensorABI:
     """Byte offsets the `SHIM` mode reads, plus the dtype-to-element-size table.
 
-    The offsets come from `_LAYOUTS`, keyed on the torch version; `itemsize` is
-    built from the running torch, since which dtypes exist is not a question
-    about where fields sit.
+    Both halves come from one stanza of `torch_abi.txt`, keyed on the torch
+    version: the offsets were measured on a torch with exactly those dtypes, so
+    they are verified together or not at all.
     """
 
     cdata: int  # PyObject*    -> TensorImpl*
@@ -80,32 +81,57 @@ def _pyobject_size() -> int:
 
 
 @functools.lru_cache(maxsize=1)
-def itemsize_table() -> bytes:
-    """dtype code -> element size, for every dtype this torch can allocate.
+def live_dtypes() -> dict[int, tuple[str, int]]:
+    """dtype code -> (torch's own spelling, element size), from the running torch.
 
-    Built from the live torch rather than hardcoded, so a torch that adds a dtype
-    needs no change here.  A zero entry means "no such dtype", which the C side
-    treats as a layout mismatch rather than computing a pointer from a guess.
+    `str(dtype)` rather than the attribute name: `torch.half` and `torch.float16`
+    are one dtype with one canonical spelling, and only that spelling is stable
+    enough to compare a recorded row against.
+
+    `dtype.itemsize` reads the `TypeMeta` directly, so it answers for dtypes this
+    build cannot actually allocate and, unlike a zero-element `torch.empty`,
+    warns for none of the experimental ones.
     """
-    import warnings
-
     import torch
 
-    table = bytearray(NDTYPES)
+    found: dict[int, tuple[str, int]] = {}
     for name in dir(torch):
         value = getattr(torch, name, None)
         if not isinstance(value, torch.dtype):
             continue
         code = dtype_code(value)
-        if not 0 <= code < NDTYPES:
-            continue
-        try:
-            with warnings.catch_warnings():  # experimental/deprecated dtypes warn
-                warnings.simplefilter("ignore")
-                table[code] = torch.empty(0, dtype=value).element_size()
-        except Exception:  # pragma: no cover - dtype the build cannot allocate
-            continue
+        if 0 <= code < NDTYPES:
+            found[code] = (str(value).split(".")[-1], value.itemsize)
+    return found
+
+
+def _itemsize_bytes(dtypes: dict[int, tuple[str, int]]) -> bytes:
+    """The `NDTYPES`-long table the C side indexes by dtype code.
+
+    A zero entry means "no such dtype", which the C side treats as a layout
+    mismatch rather than computing a pointer from a guess.
+    """
+    table = bytearray(NDTYPES)
+    for code, (_, size) in dtypes.items():
+        table[code] = size
     return bytes(table)
+
+
+@functools.lru_cache(maxsize=4)
+def itemsize_table(version: tuple[int, int] | None = None) -> bytes | None:
+    """The recorded dtype -> element size table for `version`, or None.
+
+    None both when intj has no row for this torch and when it has one the running
+    torch disagrees with.  The disagreement matters as much as the absence: the
+    offsets in the same stanza were measured against *that* set of dtypes, and a
+    torch that has since renamed, dropped or inserted one is a torch those
+    offsets were never verified on.  Refusing sends the caller to `CPYTHON`,
+    which assumes no layout at all.
+    """
+    recorded = _DTYPES.get(version or torch_version())
+    if recorded is None or recorded != live_dtypes():
+        return None
+    return _itemsize_bytes(recorded)
 
 
 @functools.lru_cache(maxsize=1)
@@ -257,7 +283,9 @@ def probe_layout() -> TensorABI | None:
             return None
         pinned[name] = hits.pop()
 
-    layout = TensorABI(itemsize=itemsize_table(), **pinned)
+    # the live dtypes, not the recorded ones: this is what *generates* a stanza,
+    # so it has to run on a torch that has none yet
+    layout = TensorABI(itemsize=_itemsize_bytes(live_dtypes()), **pinned)
     return layout if _selfcheck(layout) else None
 
 
@@ -302,46 +330,83 @@ def _expected(t: Any) -> tuple[int, int, int]:
     return (t.data_ptr(), dtype_code(t.dtype), t.untyped_storage().nbytes())
 
 
-#: Verified tensor layouts, by torch (major, minor).
+#: The verified torch ABIs, as a data file beside this module.
 #:
-#: Offsets only -- `itemsize` is filled from the running torch, since it is a
-#: property of which dtypes exist rather than of where fields sit, and a torch
-#: that adds one should not need a new row.
+#: Text rather than a dict literal, and a separate file rather than a string in
+#: here, so that a stanza is pasted exactly as `_main` printed it -- with no
+#: chance of it being re-indented, re-ordered or "tidied" on the way in.
 #:
-#: Each row must be *measured*, never reasoned about: run
+#: Every number in it must be *measured*, never reasoned about: run
 #: `python -m intj.torch_abi` on the target torch and paste what it prints.
 #: `probe_layout()` finds each offset by matching field values against what
-#: torch's own accessors report, so a row generated that way is verified by
-#: construction.  `test_hardcoded_layout_matches_this_torch` re-checks the row
-#: for whatever torch the suite runs against.
-#: It is text rather than a dict literal so that a row is pasted exactly as
-#: `_main` printed it, with no chance of it being edited on the way in.
-_LAYOUTS_TEXT = """
-# torch 2.14.0.dev+rocm7.2, x86-64
-2.14: cdata=16 storage=16 storage_offset=144 numel=152 data_type=160 s_data=16 s_nbytes=48
-"""
+#: torch's own accessors report, so a stanza generated that way is verified by
+#: construction.  `test_hardcoded_layout_matches_this_torch` re-checks the
+#: stanza for whatever torch the suite runs against.
+_ABI_PATH = pathlib.Path(__file__).with_name("torch_abi.txt")
 
-#: Field names of `TensorABI` that `_LAYOUTS_TEXT` carries, in `_main`'s order.
+#: Field names of `TensorABI` that the `layout:` row carries, in `_main`'s order.
 _OFFSETS = tuple(f.name for f in dataclasses.fields(TensorABI) if f.name != "itemsize")
 
 
-def _parse_layouts(text: str) -> dict[tuple[int, int], dict[str, int]]:
-    """Rows of `<major>.<minor>: name=offset ...`; blanks and `#` comments ignored."""
-    table = {}
-    for line in text.splitlines():
-        line = line.split("#")[0].strip()
+def _parse_abi(text: str) -> dict[tuple[int, int], dict[str, str]]:
+    """Stanzas of `[major.minor]` followed by `name: value` rows.
+
+    A line that starts with whitespace continues the row above it, so a row too
+    long for one line can be wrapped anywhere without the parser caring where.
+    `#` starts a comment; blank lines are ignored.
+    """
+    stanzas: dict[tuple[int, int], dict[str, str]] = {}
+    rows: dict[str, str] | None = None
+    key: str | None = None
+    for raw in text.splitlines():
+        line = raw.split("#")[0].strip()
         if not line:
             continue
-        version, _, fields = line.partition(":")
-        major, minor = version.split(".")
-        offsets = dict(pair.split("=") for pair in fields.split())
-        if tuple(offsets) != _OFFSETS:
-            raise ValueError(f"intj: layout row for {version} has the wrong fields")
-        table[(int(major), int(minor))] = {k: int(v) for k, v in offsets.items()}
-    return table
+        if line.startswith("["):
+            if not line.endswith("]"):
+                raise ValueError(f"intj: torch_abi.txt has an unclosed header {line!r}")
+            major, minor = line[1:-1].split(".")
+            rows, key = {}, None
+            stanzas[(int(major), int(minor))] = rows
+        elif rows is None:
+            raise ValueError(f"intj: torch_abi.txt has {line!r} before any [version]")
+        elif raw[:1].isspace():
+            if key is None:
+                raise ValueError(f"intj: torch_abi.txt continues nothing at {line!r}")
+            rows[key] = f"{rows[key]} {line}"
+        else:
+            key, _, value = line.partition(":")
+            rows[key] = value.strip()
+    return stanzas
 
 
-_LAYOUTS = _parse_layouts(_LAYOUTS_TEXT)
+def _row(rows: dict[str, str], name: str, version: tuple[int, int]) -> str:
+    if name not in rows:
+        raise ValueError("intj: the torch %d.%d stanza has no %s row" % (*version, name))
+    return rows[name]
+
+
+def _parse_offsets(row: str, version: tuple[int, int]) -> dict[str, int]:
+    """A `layout:` row: `name=offset ...`, every field of `_OFFSETS` once."""
+    offsets = dict(pair.split("=") for pair in row.split())
+    if tuple(offsets) != _OFFSETS:
+        raise ValueError("intj: the torch %d.%d layout row has the wrong fields" % version)
+    return {k: int(v) for k, v in offsets.items()}
+
+
+def _parse_dtypes(row: str) -> dict[int, tuple[str, int]]:
+    """A `dtypes:` row: `code=name:size ...`, in the shape `live_dtypes` returns."""
+    dtypes: dict[int, tuple[str, int]] = {}
+    for entry in row.split():
+        code, _, spelling = entry.partition("=")
+        name, _, size = spelling.partition(":")
+        dtypes[int(code)] = (name, int(size))
+    return dtypes
+
+
+_ABI = _parse_abi(_ABI_PATH.read_text())
+_LAYOUTS = {v: _parse_offsets(_row(r, "layout", v), v) for v, r in _ABI.items()}
+_DTYPES = {v: _parse_dtypes(_row(r, "dtypes", v)) for v, r in _ABI.items()}
 
 
 def supported_versions() -> list[tuple[int, int]]:
@@ -350,16 +415,19 @@ def supported_versions() -> list[tuple[int, int]]:
 
 @functools.lru_cache(maxsize=4)
 def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
-    """The layout for `version`, or None if intj has no verified row for it.
+    """The layout for `version`, or None if intj has no verified stanza for it.
 
     None rather than a guess: a wrong offset cannot raise, it reads whatever
     happens to be at that address and hands the kernel a pointer built from it.
+    A stanza whose `dtypes:` row no longer describes the running torch counts as
+    no stanza at all -- see `itemsize_table`.
     """
     version = version or torch_version()
     offsets = _LAYOUTS.get(version)
-    if offsets is None:
+    items = itemsize_table(version)
+    if offsets is None or items is None:
         return None
-    return TensorABI(itemsize=itemsize_table(), **offsets)
+    return TensorABI(itemsize=items, **offsets)
 
 
 @functools.lru_cache(maxsize=1)
@@ -372,15 +440,29 @@ def torch_version() -> tuple[int, int]:
 
 
 def _main() -> None:
-    """Print the `_LAYOUTS` row for the running torch, to paste into the table."""
+    """Print the stanza for the running torch, to paste into `torch_abi.txt`."""
+    import textwrap
+
     import torch
 
     layout = probe_layout()
     if layout is None:
         raise SystemExit(f"intj: cannot pin torch {torch.__version__}'s layout")
-    body = " ".join(f"{f}={getattr(layout, f)}" for f in _OFFSETS)
+
+    dtypes = live_dtypes()
+    # `at::ScalarType` is a dense enum, so a gap means a code this torch uses is
+    # named nowhere in its namespace -- and a tensor of that dtype would be
+    # refused at launch as a layout mismatch.  Say so here rather than print a
+    # stanza with a hole in it.
+    holes = sorted(set(range(max(dtypes, default=0))) - set(dtypes))
+    if holes:
+        raise SystemExit(f"intj: torch {torch.__version__} names no dtype for codes {holes}")
+
+    entries = " ".join(f"{code}={name}:{size}" for code, (name, size) in sorted(dtypes.items()))
     print(f"# torch {torch.__version__}, x86-64")
-    print("%d.%d: %s" % (*torch_version(), body))
+    print("[%d.%d]" % torch_version())
+    print("layout: " + " ".join(f"{f}={getattr(layout, f)}" for f in _OFFSETS))
+    print(textwrap.fill(entries, width=88, initial_indent="dtypes: ", subsequent_indent="  "))
 
 
 if __name__ == "__main__":
