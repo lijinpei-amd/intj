@@ -7,17 +7,20 @@ Needs no compiler; `cpp_detect` is the independent check that does.
     python -m intj.torch_intf.abi_detect   # prints a torch_abi.toml entry
 """
 
+from __future__ import annotations
+
 import ctypes
 import functools
 from typing import Any
 
+from ..python_intf.cpython_abi import pyobject_size
 from .torch_abi import (
+    MEASURED_PYOBJECT_SIZE,
     OFFSETS,
     TensorABI,
     dtype_code,
     itemsize_bytes,
     live_dtypes,
-    pyobject_size,
     torch_version,
 )
 
@@ -194,6 +197,12 @@ def _main() -> None:
     """Print the entry for the running torch, to paste into `torch_abi.toml`."""
     import torch
 
+    if pyobject_size() != MEASURED_PYOBJECT_SIZE:
+        raise SystemExit(
+            f"intj: sizeof(PyObject) is {pyobject_size()} here, but every torch_abi.toml "
+            f"entry is measured on a build where it is {MEASURED_PYOBJECT_SIZE}; "
+            "run this on a default (GIL) build"
+        )
     layout = probe_layout()
     if layout is None:
         raise SystemExit(f"intj: cannot pin torch {torch.__version__}'s layout")

@@ -6,13 +6,22 @@ here is pure python and testable without a GPU.  Only `dtype_index_table` consul
 triton, and lazily, the same way the rest consults torch.
 """
 
+from __future__ import annotations
+
 import ctypes
 import dataclasses
 import enum
 import functools
 import pathlib
-import tomllib
+import sys
 from typing import Any
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # the same parser, before it joined the stdlib
+    import tomli as tomllib  # pyright: ignore[reportMissingImports]
+
+from ..python_intf.cpython_abi import pyobject_size
 
 #: How many dtype codes the C side reserves room for; mirrors INTJ_NDTYPES.
 NDTYPES = 64
@@ -66,12 +75,6 @@ def dtype_code(dtype: Any) -> int:
     against the embedded `name[]`; this is its python twin.
     """
     return ctypes.c_int8.from_address(id(dtype) + pyobject_size()).value
-
-
-@functools.lru_cache(maxsize=1)
-def pyobject_size() -> int:
-    """`sizeof(PyObject)`: refcount plus type pointer, whatever the build."""
-    return ctypes.sizeof(ctypes.c_void_p) * 2
 
 
 @functools.lru_cache(maxsize=1)
@@ -186,6 +189,14 @@ def dtype_index_table() -> bytes:
 #: whatever torch the suite runs against, with both detectors.
 _ABI_PATH = pathlib.Path(__file__).with_name("torch_abi.toml")
 
+#: `sizeof(PyObject)` on the builds every entry was measured on: default, GIL
+#: builds.  `cdata` sits right past that header, so on a free-threaded build,
+#: whose header is 32 bytes, the same offset reads the wrong field.  Such a build
+#: gets no layout, and AUTO moves on to CXX or CPYTHON.
+#: ponytail: free-threaded builds get no SHIM; key entries on the header size
+#: too if that mode is wanted there.
+MEASURED_PYOBJECT_SIZE = 16
+
 #: Field names of `TensorABI` that an entry carries as offsets, in its order.
 OFFSETS = tuple(f.name for f in dataclasses.fields(TensorABI) if f.name != "itemsize")
 
@@ -252,8 +263,11 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
     None rather than a guess: a wrong offset cannot raise, it reads whatever
     happens to be at that address and hands the kernel a pointer built from it.
     An entry whose `dtypes` no longer describe the running torch counts as no
-    entry at all -- see `itemsize_table`.
+    entry at all -- see `itemsize_table` -- and so does every entry on a build
+    whose `PyObject` header is not the one they were measured under.
     """
+    if pyobject_size() != MEASURED_PYOBJECT_SIZE:
+        return None
     version = version or torch_version()
     offsets = _LAYOUTS.get(version)
     items = itemsize_table(version)

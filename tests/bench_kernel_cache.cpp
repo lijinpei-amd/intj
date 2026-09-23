@@ -5,7 +5,8 @@
  * does the building and runs whichever backends are available.
  *
  *   g++ -O3 -DNDEBUG -DINTJ_CACHE_INTJ -DINTJ_ACCESS_SHIM -DINTJ_NWORDS=5 \
- *       -I intj/runtime -I $(python3-config --includes) tests/bench_kernel_cache.cpp \
+ *       -DINTJ_PYTHON_ABI='"cpython_312.h"' -I intj/python_intf \
+ *       -I intj/runtime $(python3-config --includes) tests/bench_kernel_cache.cpp \
  *       -lbenchmark -lpython3.12 -o bench
  *
  * The workload is intj's: a key of INTJ_NWORDS uint64 words, insert-only,

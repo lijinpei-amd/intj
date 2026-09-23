@@ -14,6 +14,8 @@ Reports wall-clock per launch for a trivial kernel:
   changes how a tensor argument is read -- everything else is identical.
 """
 
+from __future__ import annotations
+
 import sys
 import time
 

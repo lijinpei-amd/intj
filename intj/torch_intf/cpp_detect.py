@@ -10,6 +10,8 @@ it runs in an environment with nothing but the torch whose entry it checks.
     python -m intj.torch_intf.cpp_detect
 """
 
+from __future__ import annotations
+
 import ctypes
 import os
 import pathlib

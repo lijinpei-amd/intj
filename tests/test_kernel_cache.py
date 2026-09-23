@@ -12,6 +12,8 @@ one thing still taken from the environment: `$INTJ_BENCHMARK_ROOT` pointing at a
 build tree, or an installed copy. Everything is skipped without it.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import pathlib
@@ -21,8 +23,10 @@ import sysconfig
 import pytest
 
 from intj.kernel_cache import KernelCache, toolchain_for
+from intj.python_intf import cpython_abi
 
 _RUNTIME = pathlib.Path(__import__("intj").__file__).parent / "runtime"
+_PYTHON_INTF = _RUNTIME.parent / "python_intf"
 _SOURCE = pathlib.Path(__file__).parent / "bench_kernel_cache.cpp"
 #: The three key lengths the packed layout actually produces, which are also the
 #: three hash and slot specializations: 1 = no constexpr and at most 7 params,
@@ -58,6 +62,7 @@ def _build(cache: KernelCache, nwords: int, include: str, libraries: list[str], 
         f"-DINTJ_CACHE_{cache.value.upper()}",
         f'-DINTJ_CACHE_NAME="{cache.value}"',
         str(_SOURCE), "-o", str(out),
+        f'-DINTJ_PYTHON_ABI="{cpython_abi.header_for()}"', f"-I{_PYTHON_INTF}",
         f"-I{_RUNTIME}", f"-I{include}", f"-I{sysconfig.get_paths()['include']}",
         *(f"-I{d}" for d in toolchain["include_dirs"]),
     ]

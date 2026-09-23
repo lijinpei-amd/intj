@@ -7,8 +7,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - **Fork safety.** The C kernel cache keeps parent handles across `fork(2)`; a child
   that launches uses a dead context. Triton guards this by pid. Fix with a
   `pthread_atfork` child handler that repoints the cache at an empty sentinel.
-- **Free-threaded builds.** The kernel cache and the borrow-on-hit discipline assume
-  the GIL. Refuse on `Py_GIL_DISABLED`, or lock it.
 - **`knobs.runtime.debug` / `knobs.compilation.instrumentation_mode`** are in triton's
   cache key but neither in intj's module digest nor its spec key: flipping one after
   `make_launcher` keeps launching the old binary. Same for `use_buffer_ops`, which
@@ -20,19 +18,9 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   gap today (the extension is C, nothing can throw), and *not* a performance item:
   measured identical codegen with and without, because intj has no non-trivial
   destructors and so no landing pads to elide.
-- **Python versions other than 3.12.** The runtime is written against one
-  interpreter and refuses the rest at compile time (`#error` below `0x030C0000`),
-  which is honest but narrow. What is version-dependent today:
-  - the non-compact int decode walks `ob_digit` with CPython's layout macros. The
-    compact case already uses `PyUnstable_Long_*`; 3.13 adds `PyLong_AsNativeBytes`
-    and `PyLong_AsInt64`, which would retire the digit walk entirely.
-  - `PyFloat_CheckExact` + a direct `ob_fval` read, and the `PyLongObject` /
-    `PyFloatObject` layouts behind both.
-  - `PyErr_GetRaisedException` / `PyErr_SetRaisedException` (3.12+).
-  - 3.13+ also needs `Py_mod_gil` in the module slots, and free-threaded builds
-    need the kernel cache locked (see above).
-  A version's layout bets want the same treatment torch's got: a table per
-  supported version plus a self-check at load, not an `#if` thicket.
+- **The triton half below 3.10.** `tests/run_python_matrix.sh` runs the rendered
+  module on 3.8 through 3.14t, but `triton>=3.8` ships no wheel below 3.10, so
+  `make_launcher` and the compile callback are only exercised from 3.10 up.
 
 ## Coverage (all currently refused loudly)
 

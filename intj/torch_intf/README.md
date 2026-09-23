@@ -18,4 +18,4 @@ For the abi table used by shim, a toml file mapping torch version to abi details
 
 Our provided table is checked using both method in our CI for supported pytorch version.
 
-Supported: python >= 3.12, pytorch >= 2.2.
+Supported: pytorch >= 2.2; for python, see `../python_intf`.

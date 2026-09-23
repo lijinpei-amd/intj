@@ -5,6 +5,15 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+/* The module reads CPython internals, so it is built for exactly one interpreter:
+ * the one that rendered it.  A different Python.h on the include path would
+ * compile cleanly and read the wrong layout. */
+#if PY_MAJOR_VERSION != {{ python_version[0] }} || PY_MINOR_VERSION != {{ python_version[1] }} || \
+    PY_MICRO_VERSION != {{ python_version[2] }}
+#error "intj: compiling against the headers of a different CPython than the one running intj"
+#endif
+
+#define INTJ_PYTHON_ABI "{{ python_abi }}"
 #define INTJ_NWORDS {{ nwords }}
 #define INTJ_ACCESS_{{ torch_access | upper }} 1
 #include "intj_runtime.h"
@@ -22,6 +31,7 @@ typedef struct {
 {% else %}  intj_error_string_out_t error_string;
 {% endif %}
   intj_cache cache;
+  intj_mutex mutex; /* the cache and compile_cb, on a free-threaded build */
 } intj_state;
 
 static const char *const intj_param_names[INTJ_NPARAMS + 1] = {
@@ -142,20 +152,26 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
 {% endfor %}
 
   uint64_t hash = intj_hash(key);
+  INTJ_LOCK(&st->mutex);
   intj_kernel *kernel = intj_cache_get(&st->cache, key, hash);
+  INTJ_UNLOCK(&st->mutex);
   if (INTJ_UNLIKELY(!kernel)) {
     /* Cold path: hand the original arguments back to python, which compiles
-     * through JITFunction.warmup and validates our spec key against triton's. */
-    if (!st->compile_cb) {
+     * through JITFunction.warmup and validates our spec key against triton's.
+     * The lock is never held across it: the callback runs python. */
+    INTJ_LOCK(&st->mutex);
+    PyObject *cb = st->compile_cb;
+    Py_XINCREF(cb);
+    INTJ_UNLOCK(&st->mutex);
+    if (!cb) {
       PyErr_SetString(PyExc_RuntimeError, "intj: compile callback is not set");
       return NULL;
     }
     PyObject *blob = PyBytes_FromStringAndSize((const char *)key, sizeof(key));
-    if (!blob)
-      return NULL;
-    PyObject *nparams_obj = PyLong_FromLong(np);
+    PyObject *nparams_obj = blob ? PyLong_FromLong(np) : NULL;
     if (!nparams_obj) {
-      Py_DECREF(blob);
+      Py_XDECREF(blob);
+      Py_DECREF(cb);
       return NULL;
     }
     PyObject *cb_args[3 + INTJ_NPARAMS];
@@ -164,7 +180,6 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
     cb_args[2] = args[0]; /* device */
     for (int i = 0; i < INTJ_NPARAMS; i++)
       cb_args[3 + i] = args[3 + i];
-    PyObject *cb = Py_NewRef(st->compile_cb);
     PyObject *res = PyObject_Vectorcall(cb, cb_args, 3 + INTJ_NPARAMS, NULL);
     Py_DECREF(cb);
     Py_DECREF(blob);
@@ -180,20 +195,25 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
     }
     Py_DECREF(res);
     /* The callback ran python, so another thread may have filled this key. */
+    intj_kernel *fresh = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
+    if (!fresh)
+      return PyErr_NoMemory();
+    fresh->function = (void *)(uintptr_t)function;
+    fresh->block_dim = block_dim;
+    fresh->shared = shared;
+    fresh->nparams = nparams;
+    INTJ_LOCK(&st->mutex);
     kernel = intj_cache_get(&st->cache, key, hash);
+    int failed = 0;
     if (!kernel) {
-      kernel = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
-      if (!kernel)
-        return PyErr_NoMemory();
-      kernel->function = (void *)(uintptr_t)function;
-      kernel->block_dim = block_dim;
-      kernel->shared = shared;
-      kernel->nparams = nparams;
-      if (intj_cache_put(&st->cache, key, hash, kernel) != 0) {
-        PyMem_RawFree(kernel);
-        return PyErr_NoMemory();
-      }
+      failed = intj_cache_put(&st->cache, key, hash, fresh);
+      kernel = fresh;
     }
+    INTJ_UNLOCK(&st->mutex);
+    if (kernel != fresh || failed)
+      PyMem_RawFree(fresh);
+    if (failed)
+      return PyErr_NoMemory();
   }
 
   if (INTJ_UNLIKELY((uint32_t)np != kernel->nparams)) {
@@ -275,7 +295,11 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
 static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   Py_INCREF(cb);
-  Py_XSETREF(st->compile_cb, cb);
+  INTJ_LOCK(&st->mutex);
+  PyObject *old = st->compile_cb;
+  st->compile_cb = cb;
+  INTJ_UNLOCK(&st->mutex);
+  Py_XDECREF(old); /* outside the lock: a finalizer runs python */
   Py_RETURN_NONE;
 }
 
@@ -290,6 +314,10 @@ static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
  * whose kernel cache already holds entries, so a call that failed halfway used
  * to leave it live with a half-installed table -- one key byte for every dtype,
  * which is a silently wrong kernel rather than an error.
+ *
+ * Launches read `st->abi` unlocked, so on a free-threaded build this must not
+ * race one.  The launcher calls it once, under its load lock, before the module
+ * is reachable.
  */
 static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                                    Py_ssize_t nargs) {
@@ -477,7 +505,12 @@ static PyMethodDef intj_methods[] = {
 
 static PyModuleDef_Slot intj_slots[] = {
     {Py_mod_exec, (void *)intj_exec},
+#ifdef Py_mod_multiple_interpreters /* 3.12+; older CPython has no such slot */
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
+#ifdef Py_mod_gil /* 3.13+: a free-threaded build keeps the GIL off for it */
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
     {0, NULL}};
 
 static struct PyModuleDef intj_module = {

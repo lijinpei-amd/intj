@@ -1,5 +1,7 @@
 """Render, build and load the C launcher for a `@triton.jit` kernel."""
 
+from __future__ import annotations
+
 import abc
 import dataclasses
 import functools
@@ -23,6 +25,7 @@ from .kernel_cache import (
     toolchain_for,
     unavailable_message,
 )
+from .python_intf import cpython_abi
 from .torch_intf.torch_abi import (
     TensorABI,
     TorchAccess,
@@ -41,11 +44,14 @@ SCHEMA_VERSION = 1
 
 _RUNTIME = Path(__file__).parent / "runtime"
 _ENTRY_TEMPLATE = _RUNTIME / "entry.c.jinja"
+_PYTHON_INTF = Path(__file__).parent / "python_intf"
 
 
 def _runtime_headers() -> bytes:
-    """Every header the rendered module can include from intj's runtime dir."""
-    return b"".join(p.read_bytes() for p in sorted(_RUNTIME.glob("*.h")))
+    """Every header the rendered module can include: the runtime's own, and the
+    CPython layer `intj_runtime.h` includes from `python_intf/`."""
+    headers = [*sorted(_RUNTIME.glob("*.h")), *sorted(_PYTHON_INTF.glob("*.h"))]
+    return b"".join(p.read_bytes() for p in headers)
 
 
 class UnsupportedKernel(NotImplementedError):
@@ -95,6 +101,12 @@ class RenderContext:
     #: and these stay None -- which is what keeps them out of the digest.
     torch_version: tuple[int, int] | None
     cxx_abi: int | None
+    #: The interpreter the module is built for and loaded into.  Every mode reads
+    #: CPython internals (see intj/python_intf), so a module is never shared
+    #: across versions, patch releases included; the render refuses to compile
+    #: against any other `Python.h`.  ABI flags (`t`, `d`) are in `ext_suffix`.
+    python_version: tuple[int, int, int]
+    python_abi: str  # the intj/python_intf header implementing that version
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,6 +173,13 @@ def make_launcher(
     jit_func = _check_kernel(jit_func, options)
     params, nwords = _render_params(jit_func)
 
+    python_abi = cpython_abi.header_for()
+    if python_abi is None:
+        raise UnsupportedKernel(
+            f"intj: no verified CPython layer for python {'%d.%d.%d' % cpython_abi.python_version()} "
+            f"(have {', '.join('%d.%d' % v for v in cpython_abi.supported_versions())}); "
+            "run `python -m intj.python_intf.check` on it and add it to intj/python_intf/cpython_abi.py"
+        )
     access = _resolve_access(torch_access)
     target = _current_target()
     backend = BACKENDS[target.backend]
@@ -198,6 +217,8 @@ def make_launcher(
         # across torch versions.
         torch_version=torch_version() if access is TorchAccess.CXX else None,
         cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
+        python_version=cpython_abi.python_version(),
+        python_abi=python_abi,
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -280,7 +301,8 @@ def _unverified_torch_message() -> str:
     return (
         f"intj: no verified tensor layout for torch {_torch_version_string()} "
         f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
-        "dtypes are no longer the ones the entry was measured against; pass "
+        "dtypes are no longer the ones the entry was measured against, or this "
+        "is a free-threaded build, which no entry covers; pass "
         "torch_access=TorchAccess.CPYTHON, or add an entry to intj/torch_intf/torch_abi.toml "
         "with `python -m intj.torch_intf.abi_detect` on this torch"
     )
@@ -387,7 +409,7 @@ def _load(key: ModuleKey, jit_func: JitFunction, context: RenderContext) -> type
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
     return module
 
 
@@ -441,7 +463,7 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
     cxx_access = context.torch_access == TorchAccess.CXX.value
     cxx_cache = context.kernel_cache != KernelCache.INTJ.value
     flags: dict[str, Any] = {
-        "include_dirs": [str(_RUNTIME), *context.cache_include_dirs],
+        "include_dirs": [str(_RUNTIME), str(_PYTHON_INTF), *context.cache_include_dirs],
         "ccflags": [_runtime_header_flag(), f"-DINTJ_CACHE_{context.kernel_cache.upper()}"],
     }
     if context.cache_archives:

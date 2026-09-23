@@ -10,10 +10,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#if PY_VERSION_HEX < 0x030C0000
-#error "intj requires CPython 3.12 or newer (PyLongObject layout)"
-#endif
-
 #if defined(__GNUC__) || defined(__clang__)
 #define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
 /* Only for branches whose outcome is a property of the design, not a guess
@@ -28,71 +24,11 @@
 #define INTJ_UNLIKELY(x) (x)
 #endif
 
-static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
-
-/* The compact case has a public reader (`PyUnstable_Long_*`, 3.12+).  Above it
- * the digits have none before `PyLong_AsNativeBytes` in 3.13, so the rest walks
- * `ob_digit` with CPython's own layout macros from cpython/longintrepr.h.
- */
-
-/* 0 = ok, -1 = does not fit, 1 = not an exact int */
-static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
-  PyLongObject *v = (PyLongObject *)o;
-  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
-    *out = (int64_t)PyUnstable_Long_CompactValue(v);
-    return 0;
-  }
-  uintptr_t tag = v->long_value.lv_tag;
-  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
-    return -1;
-  __uint128_t acc = 0;
-  for (size_t i = nd; i-- > 0;)
-    acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & _PyLong_SIGN_MASK) == 2) {
-    if (acc > ((__uint128_t)1 << 63))
-      return -1;
-    *out = (int64_t)(-(__int128_t)acc);
-  } else {
-    if (acc > (__uint128_t)INT64_MAX)
-      return -1;
-    *out = (int64_t)acc;
-  }
-  return 0;
-}
-
-/* Which of the two integer widths a python int lands in, if either.  Triton
- * buckets an int by what it fits (i32/i64, else u64), so a caller wants both
- * answers from one decode -- asking `intj_as_i64` and then `intj_as_u64` walks
- * the digits twice for every value above INT64_MAX. */
-#define INTJ_INT_TOO_BIG 0 /* fits neither: |value| is over 64 bits */
-#define INTJ_INT_I64 1     /* *out is the int64, cast back from the bits */
-#define INTJ_INT_U64 2     /* *out is the uint64: above INT64_MAX */
-
-static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
-  PyLongObject *v = (PyLongObject *)o;
-  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
-    *out = (uint64_t)(int64_t)PyUnstable_Long_CompactValue(v);
-    return INTJ_INT_I64;
-  }
-  uintptr_t tag = v->long_value.lv_tag;
-  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
-    return INTJ_INT_TOO_BIG;
-  __uint128_t acc = 0;
-  for (size_t i = nd; i-- > 0;)
-    acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & _PyLong_SIGN_MASK) == 2) { /* negative: int64 or nothing */
-    if (acc > ((__uint128_t)1 << 63))
-      return INTJ_INT_TOO_BIG;
-    *out = (uint64_t)(int64_t)(-(__int128_t)acc);
-    return INTJ_INT_I64;
-  }
-  if (acc > (__uint128_t)UINT64_MAX)
-    return INTJ_INT_TOO_BIG;
-  *out = (uint64_t)acc;
-  return acc > (__uint128_t)INT64_MAX ? INTJ_INT_U64 : INTJ_INT_I64;
-}
+/* The CPython layer, picked by version: see intj/python_intf. */
+#ifndef INTJ_PYTHON_ABI
+#error "define INTJ_PYTHON_ABI to a header from intj/python_intf"
+#endif
+#include INTJ_PYTHON_ABI
 
 static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
   __uint128_t r = (__uint128_t)a * b;
@@ -720,11 +656,6 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
  * (do_not_specialize, do_not_specialize_on_alignment, and whether the backend
  * specializes pointers on a 2 GiB range).
  *
- * Reads `ob_fval` rather than calling `PyFloat_AS_DOUBLE`: that is a static
- * inline in CPython's headers, and in the c++ mode's much larger translation
- * unit g++ leaves it out of line -- a real call per float argument.  The two
- * are the same field read.
- *
  * `st` must expose tensor_type/param_type and the torch ABI block. On failure
  * it sets a python error and returns NULL from the enclosing function -- which
  * must therefore return PyObject *.  (A `goto` to a shared label would be
@@ -792,7 +723,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         (np)++;                                                                \
       }                                                                        \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      float _f = (float)((PyFloatObject *)_o)->ob_fval;                        \
+      float _f = (float)INTJ_FLOAT_VALUE(_o);                                  \
       uint32_t _bits;                                                          \
       memcpy(&_bits, &_f, 4);                                                  \
       _code = INTJ_B_FP32;                                                     \
@@ -832,7 +763,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
       _code = _kind == INTJ_INT_U64 ? INTJ_B_CX_UINT : INTJ_B_CX_INT;          \
       (valword) = _bits;                                                       \
     } else if (PyFloat_CheckExact(_o)) {                                       \
-      double _d = ((PyFloatObject *)_o)->ob_fval;                              \
+      double _d = INTJ_FLOAT_VALUE(_o);                                        \
       _code = INTJ_B_CX_FLOAT;                                                 \
       memcpy(&(valword), &_d, 8);                                              \
     } else {                                                                   \

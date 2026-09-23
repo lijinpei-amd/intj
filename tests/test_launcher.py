@@ -4,6 +4,8 @@
 Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 """
 
+from __future__ import annotations
+
 import ctypes
 import dataclasses
 import json
@@ -416,7 +418,7 @@ def test_render_params_byte_layout(tmp_path, nparams, nconstexpr):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
     params, nwords = _render_params(module.k)
     header_words = -(-(nparams + nconstexpr + 1) // 8)
@@ -440,6 +442,7 @@ def _render_context(**overrides):
         launch_symbol="launch", error_symbol="error", error_style="return",
         torch_access="shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
+        python_version=(3, 12, 3), python_abi="cpython_312.h",
     )
     return RenderContext(**{**fields, **overrides})
 
@@ -813,7 +816,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     kernel = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(kernel)
+    spec.loader.exec_module(kernel)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
     params, nwords = _render_params(kernel.k)
     header_words = -(-(nparams + 2) // 8)
@@ -1157,3 +1160,4 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
         module = getattr(make_launcher(scale, torch_access=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(mkl, o, 16, 2.0, 128)
+
