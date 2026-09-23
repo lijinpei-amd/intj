@@ -191,12 +191,16 @@ def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
     raise ValueError(f"intj: parameter {name!r} has unsupported annotation {value!r}")
 
 
-def _merge_field(name: str, field: str, left: object, right: object) -> object:
+def _merge_field(
+    name: str, field: str, left: object, right: object, *, kind: str = "argument"
+) -> object:
     if left is UNSET:
         return right
     if right is UNSET:
         return left
-    if field == "value" and left is not UNSET and right is not UNSET:
+    if field == "type":
+        equal = _canonical_types(left, kind) == _canonical_types(right, kind)
+    elif field == "value" and left is not UNSET and right is not UNSET:
         equal = type(left) is type(right) and (
             struct.pack(">d", left) == struct.pack(">d", right)
             if type(left) is float else left == right
@@ -343,7 +347,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             left = inline if inline is not None else Constexpr()
             right = other if other is not None else Constexpr()
             assert isinstance(left, Constexpr) and isinstance(right, Constexpr)
-            raw_type = _merge_field(name, "type", left.type, right.type)
+            raw_type = _merge_field(name, "type", left.type, right.type, kind=kind)
             baked = _merge_field(name, "value", left.value, right.value)
             power = left.power_of_two_or_zero or right.power_of_two_or_zero
             modes = ("auto", "auto", "auto")
@@ -352,7 +356,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             left = inline if inline is not None else Argument()
             right = other if other is not None else Argument()
             assert isinstance(left, Argument) and isinstance(right, Argument)
-            raw_type = _merge_field(name, "type", left.type, right.type)
+            raw_type = _merge_field(name, "type", left.type, right.type, kind=kind)
             baked = _merge_field(name, "value", left.value, right.value)
             bind_value = _merge_field(name, "bind_value",
                                       left.bind_value if left.bind_value is not None else UNSET,

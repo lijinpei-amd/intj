@@ -100,6 +100,18 @@ def test_annotation_sources_merge_field_by_field(tmp_path):
     )
 
 
+def test_annotation_sources_merge_equivalent_type_sets(tmp_path):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(
+        tmp_path, "x: intj.Argument(type=[tl.int64, tl.int32, tl.int64])"
+    )
+    resolved = _resolve_annotations(
+        kernel, {"x": intj.Argument(type=[tl.int32, tl.int64])}
+    )
+    assert resolved[0].annotation.types == ("i32", "i64")
+
+
 def test_none_and_unset_remain_distinct_after_merge(tmp_path):
     from intj.annotation import _resolve_annotations
 
