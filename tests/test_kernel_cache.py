@@ -24,7 +24,13 @@ from intj.kernel_cache import KernelCache, toolchain_for
 
 _RUNTIME = pathlib.Path(__import__("intj").__file__).parent / "runtime"
 _SOURCE = pathlib.Path(__file__).parent / "bench_kernel_cache.cpp"
-_NWORDS = 5  # a 3-tensor, 1-int kernel
+#: The three key lengths the packed layout actually produces, which are also the
+#: three hash and slot specializations: 1 = no constexpr and at most 7 params,
+#: where the hash is a bijection and the slot stores no key; 2 =
+#: add_kernel(x, y, out, n, BLOCK_SIZE); 5 = six tensors, three ints, three
+#: constexpr.  All three have to compile and self-check, not just the one a
+#: given kernel happens to hit.
+_NWORDS = (1, 2, 5)
 
 
 def _benchmark_toolchain():
@@ -43,12 +49,12 @@ def _benchmark_toolchain():
     return None
 
 
-def _build(cache: KernelCache, include: str, libraries: list[str], out: pathlib.Path):
+def _build(cache: KernelCache, nwords: int, include: str, libraries: list[str], out: pathlib.Path):
     toolchain = toolchain_for(cache)
     assert toolchain is not None
     command = [
         os.environ.get("CXX", "g++"), "-O3", "-DNDEBUG", "-std=c++20",
-        f"-DINTJ_NWORDS={_NWORDS}",
+        f"-DINTJ_NWORDS={nwords}",
         f"-DINTJ_CACHE_{cache.value.upper()}",
         f'-DINTJ_CACHE_NAME="{cache.value}"',
         str(_SOURCE), "-o", str(out),
@@ -69,32 +75,46 @@ def test_kernel_cache_benchmark(capsys):
     include, libraries = toolchain
 
     available = [c for c in KernelCache if toolchain_for(c) is not None]
-    results: dict[str, dict[str, float]] = {}
+    # keyed on (nwords, name): every binary emits the same benchmark names, so a
+    # narrower key would let the last key length overwrite the others in silence
+    results: dict[tuple[int, str], dict[str, float]] = {}
     tmp = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "intj-cache-bench"
     tmp.mkdir(parents=True, exist_ok=True)
 
-    for cache in available:
-        binary = tmp / f"bench_{cache.value}"
-        built = _build(cache, include, libraries, binary)
-        assert built.returncode == 0, f"{cache.value} failed to build:\n{built.stderr[-2000:]}"
-        run = subprocess.run(
-            [str(binary), "--benchmark_format=json", "--benchmark_min_time=0.05s"],
-            capture_output=True, text=True,
-        )
-        assert run.returncode == 0, f"{cache.value} failed to run:\n{run.stderr[-2000:]}"
-        for entry in json.loads(run.stdout)["benchmarks"]:
-            assert "error_message" not in entry, entry
-            results.setdefault(entry["name"], {})[cache.value] = entry["real_time"]
+    for nwords in _NWORDS:
+        for cache in available:
+            binary = tmp / f"bench_{cache.value}_{nwords}"
+            built = _build(cache, nwords, include, libraries, binary)
+            assert built.returncode == 0, (
+                f"{cache.value} at {nwords} words failed to build:\n{built.stderr[-2000:]}"
+            )
+            run = subprocess.run(
+                [str(binary), "--benchmark_format=json", "--benchmark_min_time=0.05s"],
+                capture_output=True, text=True,
+            )
+            assert run.returncode == 0, (
+                f"{cache.value} at {nwords} words failed to run:\n{run.stderr[-2000:]}"
+            )
+            for entry in json.loads(run.stdout)["benchmarks"]:
+                assert "error_message" not in entry, entry
+                results.setdefault((nwords, entry["name"]), {})[cache.value] = entry["real_time"]
 
-    names = sorted(results, key=lambda n: (n.split("/")[0], int(n.split("/")[-1]) if "/" in n else 0))
     with capsys.disabled():
-        print(f"\nkernel cache, {_NWORDS}-word key, ns per operation\n")
-        print(f"{'':<16}" + "".join(f"{c.value:>10}" for c in available))
-        for name in names:
-            row = "".join(f"{results[name].get(c.value, float('nan')):>10.2f}" for c in available)
-            print(f"{name:<16}{row}")
+        for nwords in _NWORDS:
+            names = sorted(
+                (n for w, n in results if w == nwords),
+                key=lambda n: (n.split("/")[0], int(n.split("/")[-1]) if "/" in n else 0),
+            )
+            print(f"\nkernel cache, {nwords}-word key, ns per operation\n")
+            print(f"{'':<16}" + "".join(f"{c.value:>10}" for c in available))
+            for name in names:
+                row = "".join(
+                    f"{results[nwords, name].get(c.value, float('nan')):>10.2f}"
+                    for c in available
+                )
+                print(f"{name:<16}{row}")
 
     # every backend must find what it stored, at a sane speed
-    for name, row in results.items():
+    for (nwords, name), row in results.items():
         for backend, ns in row.items():
-            assert 0.0 < ns < 1000.0, f"{backend} {name} = {ns} ns"
+            assert 0.0 < ns < 1000.0, f"{backend} {name} at {nwords} words = {ns} ns"

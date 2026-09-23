@@ -13,6 +13,19 @@
  * lookup takes it as an argument.  `entries` is how many specializations of one
  * kernel are live; real ones sit at 1-8, 512 is there to show the cache
  * behaviour.
+ *
+ * It is built at three key lengths, which are the three the packed layout
+ * produces and so also the three specializations in the header: 1, where the
+ * hash is a bijection and the slot carries no key at all; 2, one multiply; and
+ * 5, the loop.  Nothing here forks on INTJ_NWORDS -- `intj_hash` and
+ * `intj_cache_*` keep one signature at every length, which is what lets this
+ * file measure what the launcher actually runs.
+ *
+ * Two things to keep in mind reading the output.  `hit/1` and `miss/1` index
+ * with `& 0`, so they always touch element 0 and measure a permanently hot
+ * line.  And the keys here are uniformly random words, where a real key is a
+ * header of small byte codes plus a few value words -- fine for the table, but
+ * not a test of the layout's own distribution.
  */
 #include <benchmark/benchmark.h>
 
