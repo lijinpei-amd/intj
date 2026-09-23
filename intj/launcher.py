@@ -23,7 +23,7 @@ from .kernel_cache import (
     toolchain_for,
     unavailable_message,
 )
-from .torch_abi import (
+from .torch_intf.torch_abi import (
     TensorABI,
     TorchAccess,
     dtype_index_table,
@@ -216,7 +216,7 @@ def make_launcher(
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
-    layout = layout_for() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
+    layout = layout_for() if access is TorchAccess.SHIM else None
     return _loaded_module(key, jit_func, context, params, options, layout).entry
 
 
@@ -263,11 +263,9 @@ def _resolve_access(requested: TorchAccess) -> TorchAccess:
             "intj: the c++ access mode needs a c++ compiler and torch's headers; "
             "set $CXX or pass torch_access=TorchAccess.SHIM"
         )
-    if requested is TorchAccess.CXX and layout_for() is None:
-        raise UnsupportedKernel(_unverified_torch_message())
     if requested is not TorchAccess.AUTO:
         return requested
-    if _cxx_toolchain() and layout_for() is not None:
+    if _cxx_toolchain():
         return TorchAccess.CXX
     if layout_for() is not None:
         return TorchAccess.SHIM
@@ -278,9 +276,9 @@ def _unverified_torch_message() -> str:
     return (
         f"intj: no verified tensor layout for torch {_torch_version_string()} "
         f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
-        "dtypes are no longer the ones the stanza was measured against; pass "
-        "torch_access=TorchAccess.CPYTHON, or add a stanza to intj/torch_abi.txt "
-        "with `python -m intj.torch_abi` on this torch"
+        "dtypes are no longer the ones the entry was measured against; pass "
+        "torch_access=TorchAccess.CPYTHON, or add an entry to intj/torch_intf/torch_abi.toml "
+        "with `python -m intj.torch_intf.abi_detect` on this torch"
     )
 
 

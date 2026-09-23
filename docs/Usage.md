@@ -126,24 +126,26 @@ AMD) the storage size. `make_launcher(..., torch_access=...)` picks how, with
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
 `SHIM` reads offsets from a table of torch versions intj has been verified against
-(`intj/torch_abi.txt`), installed at load by `set_torch_version`. A torch with no
-stanza is **refused, never guessed at** — a wrong offset cannot raise, it reads whatever
+(`intj/torch_intf/torch_abi.toml`), installed at load by `set_torch_version`. A torch with no
+entry is **refused, never guessed at** — a wrong offset cannot raise, it reads whatever
 lies at that address and hands the kernel a pointer built from it. On an unverified
 torch, `torch_access=TorchAccess.SHIM` raises and `AUTO` falls through to `CPYTHON`.
 
-Each stanza records the dtypes the running torch had when the offsets were measured
-(`<code>=<name>:<element size>`) alongside the offsets themselves. A torch whose dtype
-set has drifted from its stanza — one renamed, dropped or inserted — is treated as
+Each entry records the dtypes the running torch had when the offsets were measured
+(`[name, element size]`, indexed by dtype code) alongside the offsets themselves. A
+torch whose dtype set has drifted from its entry — one renamed, dropped or inserted — is treated as
 unverified too, offsets and all: the same refusal, not a partial trust.
 
-`CXX` needs a row too, but only to check itself: it compares its compiled-in
-`offsetof(THPVariable, cdata)` against the table's, and refuses the module if they
-disagree.
+`CXX` needs no entry: the compiler supplies every offset from torch's headers. The
+one thing it assumes without a header is that `THPVariable` starts with the tensor
+right after `PyObject_HEAD`; both detectors below refuse a torch where that fails.
 
-To add a version, run `python -m intj.torch_abi` on it and paste the stanza it prints.
-That derives each offset by matching field values against what torch's own accessors
-report, so a row produced that way is verified rather than reasoned about — and the
-test suite re-checks the row against the torch it runs on.
+To add a version, run `python -m intj.torch_intf.abi_detect` on it and paste the entry it
+prints. That derives each offset by matching field values against what torch's own
+accessors report, so an entry produced that way is verified rather than reasoned about.
+`python -m intj.torch_intf.cpp_detect` derives the same offsets independently, by
+compiling against torch's C++ headers. The test suite checks the entry for the torch
+it runs on against both.
 
 `CPYTHON` assumes nothing about torch's layout except `THPDtype`, which checks itself at
 load against the name the struct embeds. It is the independent oracle the test suite

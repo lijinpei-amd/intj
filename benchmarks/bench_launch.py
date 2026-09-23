@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 
 from intj import make_launcher
-from intj.torch_abi import TorchAccess
+from intj.torch_intf.torch_abi import TorchAccess
 
 
 @triton.jit

@@ -24,14 +24,14 @@ from intj.launcher import (
     triton_specialization,
 )
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
-from intj.torch_abi import (
+from intj.torch_intf.abi_detect import probe_layout
+from intj.torch_intf.torch_abi import (
     NDTYPES,
     TorchAccess,
     dtype_code,
     dtype_index_table,
     itemsize_table,
     layout_for,
-    probe_layout,
 )
 
 
@@ -722,37 +722,42 @@ def test_recorded_dtypes_match_this_torch():
     when they no longer agree -- so this failing is what a silent fall back to
     `CPYTHON` on a torch intj thinks it supports looks like before it happens.
     """
-    from intj.torch_abi import _DTYPES, live_dtypes, torch_version
+    from intj.torch_intf.torch_abi import _DTYPES, live_dtypes, torch_version
 
     recorded = _DTYPES.get(torch_version())
     assert recorded is not None, "no stanza for the torch the suite is running against"
     assert recorded == live_dtypes(), (
-        "intj/torch_abi.txt is stale; regenerate with `python -m intj.torch_abi`"
+        "intj/torch_intf/torch_abi.toml is stale; regenerate with `python -m intj.torch_intf.abi_detect`"
     )
 
 
-def test_abi_file_parses_wrapped_rows_and_refuses_broken_ones():
-    """`torch_abi.txt` is pasted by hand, so its parser is a trust boundary."""
-    from intj.torch_abi import _parse_abi, _parse_dtypes
+def test_abi_file_parses_and_refuses_broken_entries():
+    """`torch_abi.toml` is pasted by hand, so its parser is a trust boundary."""
+    from intj.torch_intf.torch_abi import OFFSETS, _parse_abi
 
-    stanzas = _parse_abi(
-        "# a comment\n"
-        "[2.9]\n"
-        "layout: cdata=16  # trailing comment\n"
-        "dtypes: 0=uint8:1\n"
-        "  1=int8:1\n"
-    )
-    assert stanzas == {(2, 9): {"layout": "cdata=16", "dtypes": "0=uint8:1 1=int8:1"}}
-    assert _parse_dtypes(stanzas[(2, 9)]["dtypes"]) == {0: ("uint8", 1), 1: ("int8", 1)}
+    offsets = "".join(f"{f} = {i}\n" for i, f in enumerate(OFFSETS))
+    good = '["2.9"]\n' + offsets + 'dtypes = [["uint8", 1], ["int8", 1]]\n'
+    assert _parse_abi(good) == {
+        (2, 9): ({f: i for i, f in enumerate(OFFSETS)}, {0: ("uint8", 1), 1: ("int8", 1)})
+    }
 
-    for broken in ("layout: cdata=16\n", "[2.9\nlayout: cdata=16\n", "[2.9]\n  1=int8:1\n"):
-        with pytest.raises(ValueError, match="torch_abi.txt"):
+    for broken in (
+        good.replace('["2.9"]', "[2.9"),  # not TOML
+        good.replace('"2.9"', '"two.nine"'),  # not a version
+        good.replace("cdata = 0\n", ""),  # a missing offset
+        good + "extra = 1\n",  # an unknown field
+        good.replace("cdata = 0", "cdata = 65536"),  # wraps in the C side's uint16_t
+        good.replace("cdata = 0", 'cdata = "0"'),
+        good.replace('["int8", 1]', '["int8", "1"]'),
+        good.replace('["int8", 1]', '["int8", 1, 2]'),
+    ):
+        with pytest.raises(ValueError, match="torch_abi.toml"):
             _parse_abi(broken)
 
 
 def test_drifted_dtypes_refuse_the_whole_stanza(monkeypatch):
     """A torch whose dtypes moved is an unverified torch, offsets and all."""
-    from intj import torch_abi as abi
+    from intj.torch_intf import torch_abi as abi
 
     drifted = dict(abi.live_dtypes())
     drifted.pop(max(drifted))  # torch dropped a dtype since the stanza was taken
@@ -776,7 +781,7 @@ def test_live_dtypes_have_no_holes():
     then reject a perfectly ordinary tensor of that dtype as a layout mismatch.
     Density is the check that `dir(torch)` is still an exhaustive enumeration.
     """
-    from intj.torch_abi import live_dtypes
+    from intj.torch_intf.torch_abi import live_dtypes
 
     codes = sorted(live_dtypes())
     assert codes, "no dtype was found at all"
@@ -938,16 +943,36 @@ def test_auto_resolves_and_explicit_modes_validate():
 
 
 def test_hardcoded_layout_matches_this_torch():
-    """The table is data, and data goes stale.  Check the row against reality.
+    """The table is data, and data goes stale.  Check the entry against reality.
 
     `probe_layout` finds each offset by matching field values against torch's own
     accessors, so it is an independent oracle for the hardcoded row -- and the
-    thing that generates rows in the first place (`python -m intj.torch_abi`).
+    thing that generates entries in the first place (`python -m intj.torch_intf.abi_detect`).
     """
     table, probed = layout_for(), probe_layout()
-    assert table is not None, "no row for the torch the suite is running against"
+    assert table is not None, "no entry for the torch the suite is running against"
     assert probed is not None, "probe could not pin this torch's layout"
     assert table == probed
+
+
+def test_hardcoded_layout_matches_torch_headers():
+    """The same entry, checked by the other detector: the compiler places each field.
+
+    Element sizes are compared by code only; the spellings are python's, and the
+    headers know none of them.  Codes the headers declare past the recorded ones
+    must be sizeless placeholders, or the table is missing a dtype.
+    """
+    from intj.launcher import _cxx_toolchain
+    from intj.torch_intf.cpp_detect import detect
+    from intj.torch_intf.torch_abi import OFFSETS
+
+    if _cxx_toolchain() is None:
+        pytest.skip("no C++ compiler and torch headers")
+    table = layout_for()
+    assert table is not None, "no entry for the torch the suite is running against"
+    offsets, sizes = detect()
+    assert offsets == {f: getattr(table, f) for f in OFFSETS}
+    assert {c: s for c, s in sizes.items() if s} == {c: table.itemsize[c] for c in range(NDTYPES) if table.itemsize[c]}
 
 
 def test_shim_is_refused_rather_than_guessed(monkeypatch):
@@ -957,6 +982,16 @@ def test_shim_is_refused_rather_than_guessed(monkeypatch):
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
         make_launcher(scale, torch_access=TorchAccess.SHIM)
+
+
+def test_cxx_needs_no_table(monkeypatch):
+    """The compiler supplies CXX's offsets, so an unverified torch still gets it."""
+    from intj import launcher as launcher_mod
+
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
+    x = torch.arange(128, device="cuda", dtype=torch.float32)
+    o = torch.empty_like(x)
+    check_matches_triton(scale, make_launcher(scale, torch_access=TorchAccess.CXX), (1,), (x, o, 128, 2.0, 128), 1)
 
 
 def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
@@ -1042,7 +1077,7 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
     assert layout is not None
     for mode in ACCESS_MODES:
         module = getattr(make_launcher(scale, torch_access=mode), "__self__")
-        args = layout.as_args() if mode is not TorchAccess.CPYTHON else None
+        args = layout.as_args() if mode is TorchAccess.SHIM else None
         with pytest.raises(TypeError, match="dtype_index"):
             module.set_torch_version((2, 14), args)
         with pytest.raises(ValueError, match="dtype index table"):
@@ -1105,7 +1140,7 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
     This pins the behaviour so that a torch change, or a decision to start
     detecting these, shows up here instead of silently.
     """
-    from intj.torch_abi import _read
+    from intj.torch_intf.abi_detect import _read
 
     layout = layout_for()
     assert layout is not None

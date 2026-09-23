@@ -428,9 +428,10 @@ typedef struct {
 #include <c10/core/TensorImpl.h>
 
 /* The head of THPVariable.  Declaring it here rather than including torch's
- * copy asserts one thing: that `cdata` is the first member after PyObject_HEAD.
- * That assertion is checked at load against the verified layout for this torch
- * -- see set_torch_version.
+ * copy assumes one thing: that `cdata` is the first member after PyObject_HEAD.
+ * Nothing checks it at load.  Both torch ABI detectors refuse a torch where it
+ * does not hold (intj/torch_intf/abi_detect.py, cpp_detect.py), so it is
+ * verified for every torch the table covers.
  */
 struct intj_THPVariable {
   PyObject_HEAD
