@@ -214,7 +214,7 @@ def test_fixed_device_handles_own_independent_caches(device_kernel):
     first(0, 1, 7)
     first(0, 1, 7)
     second(0, 1, 7)
-    assert len(calls) == 2
+    assert len(calls) == 2, "different fixed-device handles must compile independently"
     assert calls[0] == calls[1]
 
 
@@ -232,7 +232,8 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
     first.__self__.set_compile_callback(compile_each_constant)
     for handle, value in ((first, 7), (first, 9), (first, 7), (second, 7), (second, 7)):
         handle(0, 1, value)
-    assert calls == [(struct.pack("<Q", value), 0, 0, value) for value in (7, 9, 7)]
+    assert calls == [(struct.pack("<Q", value), 0, 0, value) for value in (7, 9, 7)], \
+        "each fixed-device handle must own its specialization map"
     source = pathlib.Path(first.__self__.__file__).with_name("device_kernel.c").read_text()
     assert "intj_cache_init(&bound->cache)" in source
     assert "intj_cache_init(&st->cache)" not in source
@@ -259,7 +260,8 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(device_kernel, 
     assert calls == [(b"", 1, 0, 7)]
     other = factory.bind_device(0)
     other(0, 1, 9)
-    assert calls == [(b"", 1, 0, 7), (b"", 1, 0, 9)]
+    assert calls == [(b"", 1, 0, 7), (b"", 1, 0, 9)], \
+        "each no-map handle must own its fixed kernel"
     source_path = pathlib.Path(launch.__self__.__file__)
     cpp_path = source_path.with_name("device_kernel.cpp")
     source = (cpp_path if cpp_path.exists() else source_path.with_name("device_kernel.c")).read_text()
@@ -766,21 +768,28 @@ def test_binding_unchecked_assumptions_keep_structural_safety(pointer_kernel, mo
 
 
 @pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
-def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mode):
+@pytest.mark.parametrize("cache_owner", ["module", "handle-map", "no-map"])
+def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mode, cache_owner):
     for verify in (True, False):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            bound = make_launcher(bound_kernel, extra_annotation={
+            factory = make_launcher(bound_kernel, extra_annotation={
                 "x": Argument(type=tl.pointer_type(tl.float32),
                               specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.TENSOR),
                 "p": Argument(type=tl.pointer_type(tl.float32),
                               specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.POINTER),
-                "n": Argument(type=tl.int32, specialize=Assume(Aligned(16))),
-            }, no_gpu=True, verify_annotation=verify, torch_access=mode).bind(x=None, p=0)
+                "n": Argument(type=tl.int32, specialize=NEVER if cache_owner == "no-map" else Assume(Aligned(16))),
+            }, no_gpu=True, verify_annotation=verify, torch_access=mode, bind_device=cache_owner != "module")
+            bound = (factory.bind(x=None, p=0) if cache_owner == "module"
+                     else factory.bind_device(0, x=None, p=0))
         suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
         source = pathlib.Path(bound.__self__.__file__).with_name(f"bound_kernel{suffix}").read_text()
         pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
         bind = source[source.index("static PyObject *make_bound"):source.index("/* Debug/test entry")]
+        call = source[source.index("static PyObject *intj_call"):source.index("static PyObject *entry")]
+        lookup = "kernel = bound->fixed_kernel" if cache_owner == "no-map" else "intj_cache_get("
+        assert call.index("intj_pack(") < call.index(lookup), \
+            "argument validation must precede cache lookup"
         for i, body in ((0, pack), (1, bind), (2, pack)):
             branch, assume = f"INTJ_UNLIKELY(!valid_{i})", f"INTJ_ASSUME(valid_{i})"
             assert source.count(branch) == source.count(assume) == int(verify)
