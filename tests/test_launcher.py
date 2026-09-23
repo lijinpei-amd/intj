@@ -8,6 +8,7 @@ import ctypes
 import dataclasses
 import json
 import pathlib
+import struct
 import tomllib
 import types
 
@@ -17,7 +18,7 @@ import triton
 import triton.language as tl
 
 import intj
-from intj import AUTO, NEVER, Aligned, Argument, Assume, EqualTo, PointerRange, make_launcher
+from intj import AUTO, NEVER, Aligned, Argument, Assume, Constexpr, EqualTo, PointerRange, make_launcher
 from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
     ModuleKey,
@@ -96,6 +97,239 @@ def device_kernel(tmp_path):
 @pytest.fixture
 def pointer_kernel(tmp_path):
     return _kernel_from_source(tmp_path, "pointer_kernel", "x")
+
+
+@pytest.mark.parametrize(
+    "value,encoded",
+    [(0, 0x00), (1, 0x01), (2, 0x02), (2**63, 0x40),
+     (-1, 0x81), (-2, 0x82), (-2**63, 0xC0)],
+)
+def test_power_of_two_or_zero_encoding(power_kernel, value, encoded):
+    module = getattr(make_launcher(
+        power_kernel, extra_annotation={"N": Constexpr(
+            type=(tl.int64, tl.uint64), power_of_two_or_zero=True)},
+        verify_annotation=True, no_gpu=True,
+    ), "__self__")
+    key, slots = module.spec_key(value)
+    assert key == bytes((encoded,)) + bytes(7)
+    assert slots == 0
+
+
+@pytest.mark.parametrize("annotation", [
+    Constexpr(power_of_two_or_zero=True),
+    Constexpr(type=(tl.int64, tl.uint64), power_of_two_or_zero=True),
+])
+def test_power_of_two_full_signed_domain(power_kernel, annotation):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": annotation},
+        verify_annotation=True, no_gpu=True), "__self__")
+    values = [0] + [sign * 2**exponent for sign in (1, -1) for exponent in range(64)]
+    assert len({module.spec_key(value) for value in values}) == 129
+    for bad in (3, -3, True, 1.0, None):
+        with pytest.raises(ValueError, match="N"):
+            module.spec_key(bad)
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("width", [8, 16, 32, 64])
+def test_typed_constexpr_integer_widths(power_kernel, signed, width):
+    dtype = getattr(tl, f"{'int' if signed else 'uint'}{width}")
+    low = -(1 << (width - 1)) if signed else 0
+    high = (1 << (width - int(signed))) - 1
+    launch = make_launcher(power_kernel, extra_annotation={"N": Constexpr(type=dtype)},
+                           verify_annotation=True, no_gpu=True)
+    module = getattr(launch, "__self__")
+    for value in (low, high):
+        key, slots = module.spec_key(value)
+        payload = value.to_bytes(width // 8, "little", signed=signed)
+        assert key == payload + bytes(len(key) - len(payload))
+        assert slots == 0
+        assert launch(0, 0, 1, value) is None
+    for value in (low - 1, high + 1, True, 1.0, None):
+        with pytest.raises((TypeError, OverflowError), match="N"):
+            module.spec_key(value)
+        with pytest.raises((TypeError, OverflowError), match="N"):
+            launch(0, 0, 1, value)
+
+
+@pytest.mark.parametrize("annotation", [tl.constexpr, Constexpr()])
+def test_bare_constexpr_preserves_descriptor_and_binary64(power_kernel, annotation):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": annotation},
+                                  no_gpu=True), "__self__")
+    values = [(None, 138, bytes(8)), (False, 139, bytes(8)),
+              (True, 139, (1).to_bytes(8, "little")),
+              (-2**63, 140, (-2**63).to_bytes(8, "little", signed=True)),
+              (2**64 - 1, 141, (2**64 - 1).to_bytes(8, "little")),
+              (-0.0, 142, struct.pack("<d", -0.0)),
+              (0.0, 142, struct.pack("<d", 0.0)),
+              (1.0 + 2**-52, 142, struct.pack("<d", 1.0 + 2**-52))]
+    for value, descriptor, payload in values:
+        assert module.spec_key(value) == (payload + bytes((descriptor,)) + bytes(7), 0)
+    assert len({module.spec_key(value)[0] for value, _, _ in values}) == len(values)
+
+
+@pytest.mark.parametrize("choices", [
+    (tl.uint64, tl.int16, tl.uint8, tl.int8),
+    (tl.int8, tl.uint8, tl.int16, tl.uint64),
+])
+def test_constexpr_type_list_selects_smallest_then_name(power_kernel, choices):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(type=choices)},
+                                  verify_annotation=True, no_gpu=True), "__self__")
+    # i8 wins the equal-width tie; u8 wins over i16 where i8 no longer fits.
+    for value, code in [(-1, 144), (127, 144), (128, 146), (256, 148), (2**63, 132)]:
+        payload = (value % 2**64).to_bytes(8, "little")
+        assert module.spec_key(value) == (payload + bytes((code,)) + bytes(7), 0)
+    for bad in (True, 1.0, None, -32769):
+        with pytest.raises(TypeError, match="N.*type"):
+            module.spec_key(bad)
+
+
+def test_constexpr_type_list_distinguishes_python_kinds(power_kernel):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(
+        type=(None, tl.int1, tl.int8, tl.float64))},
+        verify_annotation=True, no_gpu=True), "__self__")
+    for value, code, payload in [(None, 136, bytes(8)), (False, 135, bytes(8)),
+                                 (0, 144, bytes(8)), (0.0, 143, bytes(8))]:
+        assert module.spec_key(value) == (payload + bytes((code,)) + bytes(7), 0)
+
+
+def test_constexpr_byte_list_uses_placed_descriptor_and_payload(power_kernel):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(
+        type=(None, tl.int1, tl.int8, tl.uint8))},
+        verify_annotation=True, no_gpu=True), "__self__")
+    for value, code, payload in [(None, 136, 0), (False, 135, 0),
+                                 (-1, 144, 255), (128, 146, 128)]:
+        assert module.spec_key(value) == (bytes((code, payload)) + bytes(6), 0)
+
+
+def test_constexpr_exact_none_stays_public(power_kernel):
+    launch = make_launcher(power_kernel, extra_annotation={"N": Constexpr(type=None)},
+                           verify_annotation=True, no_gpu=True)
+    module = getattr(launch, "__self__")
+    assert module.spec_key(None) == (bytes(8), 0)
+    assert launch(0, 0, 1, None) is None
+    with pytest.raises(TypeError, match="arguments"):
+        launch(0, 0, 1)
+    for bad in (0, False):
+        with pytest.raises(TypeError, match="N.*type"):
+            launch(0, 0, 1, bad)
+
+
+@pytest.mark.parametrize("value", [None, True, 17, 2**64 - 1, -0.0])
+def test_baked_constexpr_removes_public_value_and_key(bound_kernel, value):
+    launch = make_launcher(bound_kernel, extra_annotation={"p": Constexpr(value=value)},
+                           verify_annotation=True, no_gpu=True)
+    assert launch(0, 0, 1, 7, 17) is None
+    assert getattr(launch, "__self__").spec_key(7, 17) == (bytes((128, 128)) + bytes(6), 2)
+    with pytest.raises(TypeError, match="arguments"):
+        launch(0, 0, 1, 7, value, 17)
+
+
+@pytest.mark.parametrize("annotation,values", [
+    (Constexpr(type=tl.int1), (False, True)),
+    (Constexpr(type=tl.float64), (-0.0, 0.0, 1.0, 1.0 + 2**-52)),
+])
+def test_typed_constexpr_bool_and_float_bits(power_kernel, annotation, values):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": annotation},
+                                  verify_annotation=True, no_gpu=True), "__self__")
+    keys = []
+    for value in values:
+        key, slots = module.spec_key(value)
+        payload = bytes((int(value),)) if type(value) is bool else struct.pack("<d", value)
+        assert key == payload + bytes(len(key) - len(payload))
+        assert slots == 0
+        keys.append(key)
+    assert len(set(keys)) == len(keys)
+    with pytest.raises(TypeError, match="N.*type"):
+        module.spec_key(1)
+
+
+def test_constexpr_binary64_preserves_nonfinite_bits(power_kernel):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(type=tl.float64)},
+                                  verify_annotation=True, no_gpu=True), "__self__")
+    for bits in (0x7FF0000000000000, 0xFFF0000000000000,
+                 0x7FF8000000000000, 0x7FF8000000000001):
+        payload = bits.to_bytes(8, "little")
+        value, = struct.unpack("<d", payload)
+        assert module.spec_key(value) == (payload + bytes(8), 0)
+
+
+@pytest.mark.parametrize("name", [name for name in tl.dtype.FP_TYPES if name != "fp64"])
+def test_constexpr_rejects_lower_precision_float_types(power_kernel, name):
+    with pytest.raises(ValueError, match="unsupported constexpr type"):
+        make_launcher(power_kernel, extra_annotation={"N": Constexpr(type=tl.dtype(name))},
+                      no_gpu=True)
+
+
+@pytest.mark.parametrize("dtype,bad", [
+    (tl.int8, (3, -3, 128, -256, True, 1.0, None)),
+    (tl.uint8, (3, -1, 256, True, 1.0, None)),
+    (tl.int64, (3, 2**63, True)),
+    (tl.uint64, (3, -2**63, True)),
+])
+def test_power_of_two_checked_before_cache_lookup(power_kernel, dtype, bad):
+    launch = make_launcher(power_kernel, extra_annotation={"N": Constexpr(
+        type=dtype, power_of_two_or_zero=True)}, verify_annotation=True, no_gpu=True)
+    assert launch(0, 0, 1, 1) is None  # 3 and True would alias this cached key.
+    for value in bad:
+        with pytest.raises(ValueError, match="N"):
+            launch(0, 0, 1, value)
+        with pytest.raises(ValueError, match="N"):
+            getattr(launch, "__self__").spec_key(value)
+
+
+def test_power_of_two_unchecked_can_alias_but_keeps_structural_checks(power_kernel):
+    launch = make_launcher(power_kernel, extra_annotation={"N": Constexpr(
+        type=tl.int8, power_of_two_or_zero=True)}, no_gpu=True)
+    module = getattr(launch, "__self__")
+    assert module.spec_key(1) == module.spec_key(3)
+    for value in (3, -3, 128, True, 1.0, None):
+        assert launch(0, 0, 1, value) is None
+    for bad in (object(), torch.empty(1), 2**64, -2**63 - 1):
+        with pytest.raises((TypeError, OverflowError), match="N"):
+            module.spec_key(bad)
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("annotation", [
+    Constexpr(value=2**64), Constexpr(value=-2**63 - 1),
+    Constexpr(type=tl.int8, value=128),
+    Constexpr(type=tl.uint8, value=-1),
+    Constexpr(type=tl.int8, power_of_two_or_zero=True, value=3),
+    Constexpr(power_of_two_or_zero=True, value=True),
+    Constexpr(power_of_two_or_zero=True, value=2**64),
+])
+def test_baked_constexpr_invalid_at_creation(power_kernel, annotation, verify):
+    with pytest.raises((ValueError, OverflowError), match="range|fit|power of two"):
+        make_launcher(power_kernel, extra_annotation={"N": annotation},
+                      verify_annotation=verify, no_gpu=True)
+
+
+@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+def test_constexpr_checked_source_has_one_predicted_branch(power_kernel, mode):
+    for verify in (True, False):
+        module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(
+            type=(tl.int8, tl.uint64), power_of_two_or_zero=True)},
+            verify_annotation=verify, no_gpu=True, torch_access=mode), "__self__")
+        suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+        source = pathlib.Path(module.__file__).with_name(f"power_kernel{suffix}").read_text()
+        assert source.count("INTJ_UNLIKELY(!valid_0)") == int(verify)
+        assert source.count("INTJ_ASSUME(valid_0)") == int(verify)
+        assert source.count("intj_decode_constexpr(") == 1
+
+
+def test_constexpr_callback_receives_original_objects(power_kernel):
+    module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(
+        type=(tl.int8, tl.int64, tl.float64))}, no_gpu=True), "__self__")
+    seen = []
+
+    def capture(key, slots, device, value):
+        seen.append(value)
+        return 0, 1, 0, slots
+
+    module.set_compile_callback(capture)
+    for value in (int("10000000000"), float("1.0000000000000002"), -0.0):
+        assert module.entry(0, 0, 1, value) is None
+        assert seen[-1] is value
 
 
 @pytest.mark.parametrize(

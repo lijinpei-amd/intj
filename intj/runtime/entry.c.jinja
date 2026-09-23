@@ -68,19 +68,10 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% for p in params %}
 {% set a = p.annotation %}
 {% set i = p.index %}
+{% if a.kind != 'constexpr' or not a.baked_value %}
 {% set descriptor = a.key_fields | selectattr('kind', 'equalto', 'descriptor') | list %}
 {% set payload = a.key_fields | selectattr('kind', 'equalto', 'payload') | list %}
   uint32_t code_{{ i }} = 0;
-{% if a.kind == 'constexpr' %}
-  uint64_t value_{{ i }} = 0;
-  INTJ_DECODE_CONSTEXPR(args[{{ p.call_index }}], code_{{ i }}, 0, value_{{ i }},
-                        intj_param_names[{{ i }}]);
-{% if payload %}
-{% if payload[0].width == 1 %}  ((uint8_t *)key)[{{ payload[0].offset }}] = (uint8_t)value_{{ i }};
-{% else %}  intj_key_store{{ payload[0].width * 8 }}((uint8_t *)key + {{ payload[0].offset }}, value_{{ i }});
-{% endif %}
-{% endif %}
-{% else %}
 {% set d = 'decoded_' ~ i %}
 {% if a.baked_value %}
   intj_decoded {{ d }} = {INTJ_VALUE_NONE, 0, NULL, 0, 0};
@@ -95,27 +86,54 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% endif %}
 {% else %}
   intj_decoded {{ d }};
+{% if a.kind == 'constexpr' %}
+  if (intj_decode_constexpr(args[{{ p.call_index }}], intj_param_names[{{ i }}], &{{ d }}) != 0)
+    return -1;
+{% else %}
   if (intj_decode_argument(&st->abi, st->tensor_type, st->param_type,
                            args[{{ p.call_index }}],
                            {{ 1 if (a.pointer_range_32 == 'auto' and spec_pointer_range) or (a.pointer_range_32 == 'assume' and verify_annotation) else 0 }},
                            intj_param_names[{{ i }}], &{{ d }}) != 0)
     return -1;
 {% endif %}
+{% endif %}
+{% if a.kind == 'constexpr' and a.types is none %}
+  uint32_t type_{{ i }} = intj_constexpr_type(&{{ d }});
+{% elif a.kind == 'constexpr' and a.types | length > 1 %}
+{% set choices = [] %}
+{% for ty in a.types %}
+{% set width = 0 if ty is none else 1 if ty == 'u1' else 64 if ty == 'fp64' else ty[1:] | int %}
+{% set _ = choices.append((width, ty or '', ty)) %}
+{% endfor %}
+  uint32_t type_{{ i }} = 0;
+{% for width, name, ty in choices | sort %}
+  {{ 'else ' if not loop.first }}if ({{ type_valid(ty, d) }}) type_{{ i }} = {{ type_code(ty) }};
+{% endfor %}
+{% else %}
   uint32_t type_{{ i }} = {{ type_code(a.types[0]) if a.types is not none and a.types | length == 1 else 'intj_infer_type(&' ~ d ~ ')' }};
+{% endif %}
+{% if a.power_of_two_or_zero %}
+  int negative_{{ i }} = {{ d }}.kind == INTJ_VALUE_I64 && (int64_t){{ d }}.bits < 0;
+  uint64_t magnitude_{{ i }} = negative_{{ i }} ? -{{ d }}.bits : {{ d }}.bits;
+{% endif %}
 {% set checks = [] %}
 {% if verify_annotation and not a.baked_value %}
+{% set type_error = 'ValueError' if a.power_of_two_or_zero else 'TypeError' %}
+{% set range_error = 'ValueError' if a.power_of_two_or_zero else 'OverflowError' %}
 {% if a.types is not none %}
 {% if a.types | length == 1 %}
 {% set ty = a.types[0] %}
 {% if ty is not none and ty.startswith(('i', 'u')) and ty != 'u1' %}
-{% set _ = checks.append(('(' ~ d ~ '.kind == INTJ_VALUE_I64 || ' ~ d ~ '.kind == INTJ_VALUE_U64)', 'type', 'TypeError')) %}
-{% set _ = checks.append((type_valid(ty, d), 'range', 'OverflowError')) %}
+{% set _ = checks.append(('(' ~ d ~ '.kind == INTJ_VALUE_I64 || ' ~ d ~ '.kind == INTJ_VALUE_U64)', 'type', type_error)) %}
+{% set _ = checks.append((type_valid(ty, d), 'range', range_error)) %}
 {% elif ty == 'fp32' %}
 {% set _ = checks.append((d ~ '.kind == INTJ_VALUE_FP64', 'type', 'TypeError')) %}
 {% set _ = checks.append((type_valid(ty, d), 'range', 'OverflowError')) %}
 {% else %}
 {% set _ = checks.append((type_valid(ty, d), 'type', 'TypeError')) %}
 {% endif %}
+{% elif a.kind == 'constexpr' %}
+{% set _ = checks.append(('type_' ~ i ~ ' != 0', 'type allowlist', type_error)) %}
 {% else %}
 {% set allowed = [] %}
 {% for ty in a.types %}
@@ -126,6 +144,13 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% set _ = checks.append(('(' ~ (allowed | join(' || ') or '0') ~ ')', 'type allowlist', 'TypeError')) %}
 {% endif %}
 {% endif %}
+{% if a.power_of_two_or_zero %}
+{% if a.types is none %}
+{% set _ = checks.append(('(' ~ d ~ '.kind == INTJ_VALUE_I64 || ' ~ d ~ '.kind == INTJ_VALUE_U64)', 'integer type', 'ValueError')) %}
+{% endif %}
+{% set _ = checks.append(('(magnitude_' ~ i ~ ' & (magnitude_' ~ i ~ ' - 1)) == 0', 'power_of_two_or_zero', 'ValueError')) %}
+{% endif %}
+{% if a.kind == 'argument' %}
 {% if a.equal_to_one == 'assume' %}
 {% set _ = checks.append(('(!intj_integer_type(type_' ~ i ~ ') || ' ~ d ~ '.bits == 1)', 'equal_to_one', 'ValueError')) %}
 {% endif %}
@@ -134,6 +159,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% endif %}
 {% if a.pointer_range_32 == 'assume' %}
 {% set _ = checks.append(('(type_' ~ i ~ ' >= INTJ_B_I32 || ' ~ d ~ '.storage_nbytes <= 2147483647LL)', 'pointer_range_32', 'ValueError')) %}
+{% endif %}
 {% endif %}
 {% endif %}
 {% if checks %}
@@ -150,6 +176,16 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
   INTJ_ASSUME(valid_{{ i }});
 {% endif %}
   code_{{ i }} = type_{{ i }};
+{% if a.kind == 'constexpr' %}
+{% if payload %}
+{% set value = 'intj_power_of_two_or_zero(magnitude_' ~ i ~ ', negative_' ~ i ~ ')' if a.power_of_two_or_zero else d ~ '.bits' %}
+{% if payload[0].width == 1 %}
+  ((uint8_t *)key)[{{ payload[0].offset }}] = (uint8_t){{ value }};
+{% else %}
+  intj_key_store{{ payload[0].width * 8 }}((uint8_t *)key + {{ payload[0].offset }}, {{ value }});
+{% endif %}
+{% endif %}
+{% else %}
 {% if a.equal_to_one != 'never' %}
   if (intj_integer_type(type_{{ i }}){{ ' && ' ~ d ~ '.bits == 1' if a.equal_to_one == 'auto' else '' }}) {
     code_{{ i }} = INTJ_B_ONE;
@@ -172,6 +208,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% endif %}
 {% if descriptor %}
   ((uint8_t *)key)[{{ descriptor[0].offset }}] = (uint8_t)code_{{ i }};
+{% endif %}
 {% endif %}
 {% endfor %}
   *nparams = np;

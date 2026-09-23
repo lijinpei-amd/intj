@@ -443,6 +443,8 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             raise ValueError(f"intj: parameter {name!r} power_of_two_or_zero needs an integer type")
         tag = () if baked is UNSET else _canonical_value(baked)
         if baked is not UNSET:
+            if kind == "constexpr" and types is None:
+                _inferred_scalar_type(baked)  # Enforce Triton's scalar integer domain.
             if kind == "argument":
                 inferred = _inferred_scalar_type(baked)
                 if types is None:

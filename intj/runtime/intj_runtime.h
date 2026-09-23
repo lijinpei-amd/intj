@@ -765,31 +765,9 @@ typedef struct {
 } intj_decoded;
 
 static INTJ_ALWAYS_INLINE int
-intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                     PyTypeObject *param_type, PyObject *o, int want_size,
-                     const char *pname, intj_decoded *out) {
+intj_decode_constexpr(PyObject *o, const char *pname, intj_decoded *out) {
   memset(out, 0, sizeof(*out));
-  PyTypeObject *type = Py_TYPE(o);
-  if (type == tensor_type || type == param_type) {
-    int32_t dtype = -1;
-    if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype,
-                                      want_size, &out->storage_nbytes) != 0)) {
-      intj_note_param(pname);
-      return -1;
-    }
-    /* All three readers, including zero-element tensors, share this gate. */
-    uint32_t index = (dtype >= 0 && dtype < INTJ_NDTYPES)
-                         ? abi->dtype_index[dtype] : 0xFFu;
-    if (INTJ_UNLIKELY(index == 0xFFu)) {
-      PyErr_Format(PyExc_RuntimeError,
-                   "intj: tensor argument '%s' has dtype code %d, which "
-                   "triton does not take", pname, (int)dtype);
-      return -1;
-    }
-    out->kind = INTJ_VALUE_TENSOR;
-    out->bits = (uint64_t)(uintptr_t)out->pointer;
-    out->dtype_index = (uint8_t)index;
-  } else if (o == Py_True || o == Py_False) {
+  if (o == Py_True || o == Py_False) {
     out->kind = INTJ_VALUE_BOOL;
     out->bits = (uint64_t)(o == Py_True);
   } else if (PyLong_CheckExact(o)) {
@@ -810,9 +788,38 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
   } else {
     PyErr_Format(PyExc_TypeError,
                  "intj: unsupported argument '%s' of type %s; pass a "
-                 "torch.Tensor, int, float, bool or None", pname, type->tp_name);
+                 "scalar int, float, bool or None", pname, Py_TYPE(o)->tp_name);
     return -1;
   }
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                     PyTypeObject *param_type, PyObject *o, int want_size,
+                     const char *pname, intj_decoded *out) {
+  PyTypeObject *type = Py_TYPE(o);
+  if (type != tensor_type && type != param_type)
+    return intj_decode_constexpr(o, pname, out);
+  memset(out, 0, sizeof(*out));
+  int32_t dtype = -1;
+  if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype,
+                                    want_size, &out->storage_nbytes) != 0)) {
+    intj_note_param(pname);
+    return -1;
+  }
+  /* All three readers, including zero-element tensors, share this gate. */
+  uint32_t index = (dtype >= 0 && dtype < INTJ_NDTYPES)
+                       ? abi->dtype_index[dtype] : 0xFFu;
+  if (INTJ_UNLIKELY(index == 0xFFu)) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "intj: tensor argument '%s' has dtype code %d, which "
+                 "triton does not take", pname, (int)dtype);
+    return -1;
+  }
+  out->kind = INTJ_VALUE_TENSOR;
+  out->bits = (uint64_t)(uintptr_t)out->pointer;
+  out->dtype_index = (uint8_t)index;
   return 0;
 }
 
@@ -834,6 +841,25 @@ static INTJ_ALWAYS_INLINE uint32_t intj_infer_type(const intj_decoded *value) {
   case INTJ_VALUE_NONE: return INTJ_B_NONE;
   }
   return INTJ_B_NONE;
+}
+
+static INTJ_ALWAYS_INLINE uint32_t intj_constexpr_type(const intj_decoded *value) {
+  switch (value->kind) {
+  case INTJ_VALUE_BOOL: return INTJ_B_CX_BOOL;
+  case INTJ_VALUE_I64: return INTJ_B_CX_INT;
+  case INTJ_VALUE_U64: return INTJ_B_CX_UINT;
+  case INTJ_VALUE_FP64: return INTJ_B_CX_FLOAT;
+  default: return INTJ_B_CX_NONE;
+  }
+}
+
+/* Magnitude and sign are separate so both +2**63 and -2**63 are representable. */
+static INTJ_ALWAYS_INLINE uint8_t
+intj_power_of_two_or_zero(uint64_t magnitude, int negative) {
+  if (magnitude == 0)
+    return 0;
+  uint8_t code = (uint8_t)(__builtin_ctzll(magnitude) + 1);
+  return negative ? (uint8_t)(0x80u | code) : code;
 }
 
 static INTJ_ALWAYS_INLINE int intj_integer_type(uint32_t type) {
@@ -863,39 +889,3 @@ INTJ_KEY_STORE(16)
 INTJ_KEY_STORE(32)
 INTJ_KEY_STORE(64)
 #undef INTJ_KEY_STORE
-
-/* Decode a tl.constexpr into a code and value word; return -1 from intj_pack
- * on failure. Typed constexpr packing is separate from ordinary decoding. */
-#define INTJ_DECODE_CONSTEXPR(o, acc, shift, valword, pname)                   \
-  do {                                                                         \
-    PyObject *_o = (o);                                                        \
-    uint32_t _code;                                                            \
-    if (_o == Py_None) {                                                       \
-      _code = INTJ_B_CX_NONE;                                                  \
-      (valword) = 0;                                                           \
-    } else if (_o == Py_True || _o == Py_False) {                              \
-      _code = INTJ_B_CX_BOOL;                                                  \
-      (valword) = (uint64_t)(_o == Py_True);                                   \
-    } else if (PyLong_CheckExact(_o)) {                                        \
-      uint64_t _bits;                                                          \
-      int _kind = intj_as_int(_o, &_bits);                                     \
-      if (INTJ_UNLIKELY(_kind == INTJ_INT_TOO_BIG)) {                          \
-        PyErr_Format(PyExc_OverflowError,                                      \
-                     "intj: constexpr argument '%s' is too large", pname);     \
-        return -1;                                                             \
-      }                                                                        \
-      _code = _kind == INTJ_INT_U64 ? INTJ_B_CX_UINT : INTJ_B_CX_INT;          \
-      (valword) = _bits;                                                       \
-    } else if (PyFloat_CheckExact(_o)) {                                       \
-      double _d = ((PyFloatObject *)_o)->ob_fval;                              \
-      _code = INTJ_B_CX_FLOAT;                                                 \
-      memcpy(&(valword), &_d, 8);                                              \
-    } else {                                                                   \
-      PyErr_Format(PyExc_TypeError,                                            \
-                   "intj: unsupported constexpr argument '%s' of type %s; "    \
-                   "pass an int, float, bool or None",                         \
-                   pname, Py_TYPE(_o)->tp_name);                               \
-      return -1;                                                               \
-    }                                                                          \
-    (acc) |= _code << (shift);                                                 \
-  } while (0)
