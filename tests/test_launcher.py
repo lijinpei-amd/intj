@@ -577,6 +577,19 @@ def test_no_gpu_rejects_real_backend_options(monkeypatch):
         make_launcher(scale, no_gpu=True, options={"num_warps": 8})
 
 
+def test_no_gpu_does_not_read_gpu_compilation_knobs(scalar_kernel, monkeypatch):
+    from triton import knobs
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("host mode read a GPU compilation knob")
+
+    monkeypatch.setattr(type(knobs.runtime), "debug", property(forbidden))
+    monkeypatch.setattr(type(knobs.compilation), "instrumentation_mode", property(forbidden))
+    monkeypatch.setattr("intj.launcher._canonical_options", forbidden)
+    host = make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    host(0, 0, (1,), 7)
+
+
 @triton.jit(do_not_specialize=["n"], do_not_specialize_on_alignment=["x"])
 def scale_nospec(x, o, n, s, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -749,6 +762,59 @@ def test_options_are_baked_in(compiled_kernels):
     launch(launcher, (8,), x, o, 1024, 2.0, 128)
     torch.testing.assert_close(o, x * 2.0)
     assert {k.metadata.num_warps for k in compiled_kernels} == {8}
+
+
+@pytest.mark.parametrize("jit_debug,runtime_debug,instrumentation,options,expected_debug", [
+    (True, False, "", {}, True),
+    (False, True, "", {}, True),
+    (False, False, "fpsan", {}, False),
+    (True, False, "", {"debug": False}, False),
+    (False, True, "", {"debug": False}, True),
+    (False, False, "", {"debug": True}, True),
+    (True, False, "", {"debug": None}, False),
+    (False, False, "", {"instrumentation_mode": "fpsan"}, False),
+])
+def test_annotated_effective_compile_options_and_identity(
+    scalar_kernel, monkeypatch, jit_debug, runtime_debug, instrumentation, options, expected_debug
+):
+    import intj.launcher as launcher
+    import triton.compiler
+    from triton import knobs
+
+    monkeypatch.setattr(scalar_kernel, "debug", False)
+    monkeypatch.setattr(knobs.runtime, "debug", False)
+    monkeypatch.setattr(knobs.compilation, "instrumentation_mode", "")
+    baseline = make_launcher(scalar_kernel, torch_access=TorchAccess.CPYTHON)
+    baseline_key = next(key for key, module in launcher._LOADED.items()
+                        if module is getattr(baseline, "__self__"))
+    monkeypatch.setattr(scalar_kernel, "debug", jit_debug)
+    monkeypatch.setattr(knobs.runtime, "debug", runtime_debug)
+    monkeypatch.setattr(knobs.compilation, "instrumentation_mode", instrumentation)
+    captured = {}
+
+    class CompilationCaptured(Exception):
+        pass
+
+    def capture_compile(source, *, target, options):
+        captured.update(options)
+        raise CompilationCaptured
+
+    def capture_module(key, fn, context, params, options, layout, baked_values):
+        callback = launcher._make_compile_callback(fn, params, options, baked_values)
+        with pytest.raises(CompilationCaptured):
+            callback(b"\x00" * 8, 1, torch.cuda.current_device(), 7)
+        assert captured["debug"] is expected_debug
+        assert captured["instrumentation_mode"] == instrumentation
+        expected_options = triton.compiler.make_backend(launcher._current_target()).parse_options({
+            "debug": expected_debug, "instrumentation_mode": instrumentation,
+        })
+        assert key.options == getattr(expected_options, "hash")()
+        assert (key.options != baseline_key.options) == (expected_debug or bool(instrumentation))
+        return types.SimpleNamespace(entry=None)
+
+    monkeypatch.setattr(triton.compiler, "compile", capture_compile)
+    monkeypatch.setattr(launcher, "_loaded_module", capture_module)
+    make_launcher(scalar_kernel, options=options, torch_access=TorchAccess.CPYTHON)
 
 
 def test_launchers_of_one_kernel_stay_independent(compiled_kernels):

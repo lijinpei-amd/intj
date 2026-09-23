@@ -208,6 +208,10 @@ def make_launcher(
         backend = None
         canonical_options = None
     else:
+        from triton import knobs
+
+        options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
+        options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
         target = _current_target()
         backend = BACKENDS.get(target.backend)
         if backend is None:
