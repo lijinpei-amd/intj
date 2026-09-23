@@ -920,6 +920,44 @@ def test_unconfigured_module_refuses_to_launch():
         cpython.set_torch_version((2, 14), layout.as_args(), index)
 
 
+def test_a_failed_set_torch_version_changes_nothing():
+    """A rejected call must not leave a half-installed table behind.
+
+    The method is reachable from python on a module that is already configured
+    and whose kernel cache already holds entries.  Installing the dtype table
+    before validating the rest meant a call that raised still committed it --
+    and an all-zero table keys every dtype to index 0, so a float16 binary runs
+    on float32 memory with no error at all.  Silent, and the worst failure this
+    design has.
+    """
+    module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    o = torch.empty(64, device="cuda")
+
+    def keys():
+        return {
+            d: module.spec_key(torch.zeros(64, device="cuda", dtype=d), o, 64, 2.0, 128)
+            for d in (torch.float32, torch.float16)
+        }
+
+    before = keys()
+    assert len(set(before.values())) == 2, "two dtypes must key apart to begin with"
+
+    good = layout_for()
+    assert good is not None
+    index = dtype_index_table()
+    for layout, table in (
+        (None, bytes(NDTYPES)),  # shim rejects a None layout...
+        (None, index),  # ...whichever table comes with it
+        (good.as_args(), b"\xff" * (NDTYPES - 1)),  # wrong length
+        (good.as_args(), bytes([32]) + index[1:]),  # an index past five bits
+    ):
+        with pytest.raises(ValueError):
+            module.set_torch_version((2, 14), layout, table)
+        # per case, not once at the end: each rejection has its own way of
+        # committing early, and one masks the next
+        assert keys() == before
+
+
 def test_set_torch_version_needs_the_dtype_index_in_every_mode():
     """The dtype table is not a shim detail: all three readers key on it.
 

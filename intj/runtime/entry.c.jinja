@@ -284,6 +284,12 @@ static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
  * Deliberately not baked into the binary: the offsets come from the torch that
  * is running now, so there is no window in which a cached .so built against one
  * torch is loaded against another.  `layout` is None in the cpython mode.
+ *
+ * Nothing is written into `st->abi` until every argument has been checked.  The
+ * method is reachable from python on a module that is already configured and
+ * whose kernel cache already holds entries, so a call that failed halfway used
+ * to leave it live with a half-installed table -- one key byte for every dtype,
+ * which is a silently wrong kernel rather than an error.
  */
 static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                                    Py_ssize_t nargs) {
@@ -297,10 +303,9 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
   }
   layout = args[1];
 
-  /* Every mode reads this table, so it is installed before the per-mode branch
-   * rather than inside one: a module that skipped it would see all zeros and
-   * key every dtype to index 0 -- coarse in the same way in each mode, which is
-   * exactly the failure the cross-mode test cannot see. */
+  /* Every mode reads this table -- it is what the key encodes, not how a
+   * pointer is computed -- so it is validated here rather than in a branch. */
+  const uint8_t *index;
   {
     Py_ssize_t n = PyBytes_Size(args[2]);
     if (n < 0)
@@ -311,7 +316,19 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                    INTJ_NDTYPES, n);
       return NULL;
     }
-    memcpy(st->abi.dtype_index, PyBytes_AS_STRING(args[2]), INTJ_NDTYPES);
+    index = (const uint8_t *)PyBytes_AS_STRING(args[2]);
+    /* The key gives the index five bits.  A larger one would not overflow into
+     * the next parameter's byte -- it would shift the pointer code past 127 and
+     * alias a scalar tag, so a float32 pointer could key as a 16-divisible
+     * int64.  0xFF is the "triton does not take this dtype" sentinel. */
+    for (int i = 0; i < INTJ_NDTYPES; i++)
+      if (index[i] >= 32u && index[i] != 0xFFu) {
+        PyErr_Format(PyExc_ValueError,
+                     "intj: dtype index table[%d] is %u; the spec key has five "
+                     "bits for it",
+                     i, (unsigned)index[i]);
+        return NULL;
+      }
   }
 
 {% if torch_access == 'shim' %}
@@ -327,14 +344,6 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
   if (!PyArg_ParseTuple(layout, "IIIIIIIO", &off[0], &off[1], &off[2], &off[3],
                         &off[4], &off[5], &off[6], &sizes))
     return NULL;
-  st->abi.cdata = (uint16_t)off[0];
-  st->abi.storage = (uint16_t)off[1];
-  st->abi.storage_offset = (uint16_t)off[2];
-  st->abi.numel = (uint16_t)off[3];
-  st->abi.data_type = (uint16_t)off[4];
-  st->abi.s_data = (uint16_t)off[5];
-  st->abi.s_nbytes = (uint16_t)off[6];
-
   Py_ssize_t n = PyBytes_Size(sizes);
   if (n < 0)
     return NULL;
@@ -343,6 +352,14 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                  INTJ_NDTYPES, n);
     return NULL;
   }
+  /* checks done; commit */
+  st->abi.cdata = (uint16_t)off[0];
+  st->abi.storage = (uint16_t)off[1];
+  st->abi.storage_offset = (uint16_t)off[2];
+  st->abi.numel = (uint16_t)off[3];
+  st->abi.data_type = (uint16_t)off[4];
+  st->abi.s_data = (uint16_t)off[5];
+  st->abi.s_nbytes = (uint16_t)off[6];
   memcpy(st->abi.itemsize, PyBytes_AS_STRING(sizes), INTJ_NDTYPES);
 {% elif torch_access == 'cxx' %}
   /* The compiler placed `cdata` for us; the probe found where it actually is.
@@ -378,6 +395,7 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
   }
 {% endif %}
 
+  memcpy(st->abi.dtype_index, index, INTJ_NDTYPES);
   st->abi.ready = 1;
   Py_RETURN_NONE;
 }

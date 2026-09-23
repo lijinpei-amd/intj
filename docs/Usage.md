@@ -41,7 +41,7 @@ launcher(device, stream, grid, arg0, arg1, ...)
 
 | argument | type |
 |---|---|
-| `device` | device index, `int` (e.g. `torch.cuda.current_device()`) |
+| `device` | device index, `int` in `[0, 256)` (e.g. `torch.cuda.current_device()`) |
 | `stream` | raw stream handle, `int` (e.g. `torch.cuda.current_stream().cuda_stream`) |
 | `grid` | `int`, or a `tuple`/`list` of 1-3 ints |
 | `arg0...` | the kernel parameters, **positionally, all of them, in declaration order** |
@@ -174,14 +174,17 @@ miss together do not build into one tree. If the install fails, the error
 carries that command and the reason, and the failure is remembered rather than
 re-attempted on every later `make_launcher`.
 
-Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, 5-word key,
-ns per lookup, hit):
+Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, ns per lookup,
+hit), at the two ends of the range a packed key reaches — 8 bytes is a kernel with
+no `tl.constexpr` parameter, where the hash is a bijection and the slot carries no
+key at all; 40 bytes is twelve parameters of which three are constexpr:
 
-| entries | `INTJ` | `TSL` | `ABSL` |
-|---|---|---|---|
-| 1 | 4.18 | 3.88 | 2.95 |
-| 8 | 3.24 | 3.93 | 10.40 |
-| 512 | 4.55 | 5.59 | 12.55 |
+| entries | `INTJ` | `TSL` | `ABSL` | | `INTJ` | `TSL` | `ABSL` |
+|---|---|---|---|---|---|---|---|
+| | *8-byte key* | | | | *40-byte key* | | |
+| 1 | 1.39 | 1.84 | 1.39 | | 2.94 | 3.19 | 2.68 |
+| 8 | 1.56 | 1.89 | 4.24 | | 3.16 | 3.55 | 9.47 |
+| 512 | 2.05 | 2.62 | 4.94 | | 4.46 | 4.94 | 11.22 |
 
 `ABSL` wins at one entry because its small-object path skips hashing entirely;
 past that it re-computes the hash intj already has, and no abseil API takes one.
@@ -193,8 +196,9 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 ## How a launch works
 
 1. Parse `device`, `stream` and `grid`; return early on a zero-volume grid.
-2. Decode every argument into one spec-key word and at most one param slot. Tensor
-   fields are read through libtorch's `aoti_torch_*` C shims, not `data_ptr()`.
+2. Decode every argument into one spec-key *byte* and at most one param slot,
+   accumulating the key's header in 32-bit registers. How the tensor fields are read
+   is `torch_access`'s choice; no mode calls an `aoti_torch_*` shim.
 3. Hash the key and look it up in the module's open-addressed kernel cache.
 4. On a miss, call back into python: `JITFunction.warmup` compiles, `_init_handles`
    loads the module, and the entry records the function handle, block dim and LDS
@@ -207,6 +211,22 @@ Each cached `CompiledKernel` is kept alive by the launcher, so its GPU module st
 loaded for the lifetime of the process.
 
 ## Correctness
+
+The spec key is a flat byte array:
+
+```
+bytes 0 .. nparams-1    one code byte per declared parameter, in declaration order
+byte nparams            the device ordinal, hence its [0, 256) bound
+pad to a word boundary, zeroed
+then                    one 64-bit value word per tl.constexpr parameter
+```
+
+A parameter's byte is `(dtype << 2) | divisibility << 1 | pointer_range` for a
+pointer, which leaves `128..142` for the scalar and constexpr tags. `dtype` is a
+5-bit index over triton's *element types*, not torch's `ScalarType` codes: `bool`,
+`uint1` and `int1` all canonicalize to `u1`, so they share an index, and the key
+ends up exactly as fine as triton's specialization. The table is built from the
+running torch and triton and installed at load, never compiled in.
 
 The invariant intj must not break is:
 
