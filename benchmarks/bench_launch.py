@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from intj import create_launcher
+from intj import make_launcher
 from intj.torch_abi import TorchAccess
 
 
@@ -50,7 +50,7 @@ def main(iters=20000):
     o = torch.empty(n, device="cuda")
     args = (x, y, o, n, 1.5, 128)
 
-    launcher = create_launcher(noop)
+    launcher = make_launcher(noop)
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream
 
@@ -63,7 +63,7 @@ def main(iters=20000):
     print()
     for mode in (TorchAccess.SHIM, TorchAccess.CXX, TorchAccess.CPYTHON):
         built = time.perf_counter()
-        module = getattr(create_launcher(noop, torch_access=mode), "__self__")
+        module = getattr(make_launcher(noop, torch_access=mode), "__self__")
         built = time.perf_counter() - built
         spec_key = module.spec_key
         decode = bench(lambda: spec_key(*args), iters)

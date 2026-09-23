@@ -20,7 +20,7 @@ at a pinned version and checksum.  Nothing installed on the machine is searched
 for or used: what a module was built against is then a property of intj's cache,
 not of the host.
 
-`create_launcher` provisions on demand, so the first use of a backend fetches it
+`make_launcher` provisions on demand, so the first use of a backend fetches it
 (abseil also builds its 90 libraries: 28 s on 224 cores, minutes on a few).  It
 says so on stderr first, because an implicit download is otherwise
 indistinguishable from a hang.  To get it over with ahead of time, or on a
@@ -52,7 +52,7 @@ from pathlib import Path
 #: come back to the user as "the download failed, try again".
 INSTALL_ERRORS = (OSError, RuntimeError, tarfile.TarError, subprocess.SubprocessError)
 
-#: seconds; a stalled connection must not hang `create_launcher` forever
+#: seconds; a stalled connection must not hang `make_launcher` forever
 _DOWNLOAD_TIMEOUT = 60
 
 #: written last, so a half-finished build tree never looks provisioned
@@ -147,7 +147,7 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
     Returns the same toolchain `toolchain_for` does.  Idempotent: an existing
     tree is reused unless `force`, so the common call does no work and says
     nothing.  When there *is* work, it is announced -- a silent minutes-long
-    build inside `create_launcher` is indistinguishable from a hang.
+    build inside `make_launcher` is indistinguishable from a hang.
 
     One installer at a time, machine-wide: the 8 ranks of a torchrun job all
     miss together, and without the lock they would cmake into one build tree.
@@ -240,7 +240,7 @@ def _unpack(source: Dependency, root: Path) -> None:
     with tempfile.TemporaryDirectory(dir=root.parent) as scratch:
         archive = Path(scratch) / "source.tar.gz"
         # timeout, because with none urlopen inherits socket's default of None:
-        # a blackholed port 443 would hang create_launcher forever
+        # a blackholed port 443 would hang make_launcher forever
         with urllib.request.urlopen(source.url, timeout=_DOWNLOAD_TIMEOUT) as response:  # noqa: S310 - pinned https URL
             blob = response.read()
         digest = hashlib.sha256(blob).hexdigest()
@@ -294,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     for cache in wanted:
         if cache is KernelCache.INTJ:
             continue
-        # the same one line create_launcher would print, not a traceback: this
+        # the same one line make_launcher would print, not a traceback: this
         # command is what that error tells the reader to run
         try:
             toolchain = install(cache, force=force)

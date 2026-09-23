@@ -18,7 +18,7 @@ Worse, the torch version appears nowhere in `ModuleKey`, and `libtorch_path` is
 the same string across versions. A `.so` built under 2.14 is reused verbatim
 after a downgrade to 2.9.
 
-`create_launcher` should let the caller choose how the generated module reaches
+`make_launcher` should let the caller choose how the generated module reaches
 torch, and should pick a good default when they do not.
 
 ## Goals
@@ -121,7 +121,7 @@ it is the point where the `THPDtype` self-check runs.
 
 ### The modes
 
-`create_launcher(..., torch_access=TorchAccess.AUTO, torch_version=None)`:
+`make_launcher(..., torch_access=TorchAccess.AUTO, torch_version=None)`:
 
 | Value | How it reads a tensor | Needs |
 |---|---|---|
@@ -144,7 +144,7 @@ maintain and no "unrecognised version" cliff.
 
 One asymmetry worth stating plainly: in `CXX` mode it cannot select, because
 the headers come from the loaded torch. There it is validated instead, and
-`create_launcher` raises if it disagrees with `torch.__version__`.
+`make_launcher` raises if it disagrees with `torch.__version__`.
 
 ### `SHIM`: reading the structs
 
@@ -327,7 +327,7 @@ same number by another route does not need reconciling.
 ## Error handling
 
 - `torch_access=TorchAccess.SHIM` with a version absent from the layout table:
-  `UnsupportedKernel` at `create_launcher` time, naming the version.
+  `UnsupportedKernel` at `make_launcher` time, naming the version.
 - `torch_access=TorchAccess.CXX` with `torch_version` disagreeing with the loaded
   torch: `UnsupportedKernel`, since the headers cannot be selected.
 - `CXX` with no C++ compiler, or a failed build: the build error propagates

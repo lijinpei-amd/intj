@@ -11,7 +11,7 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   the GIL. Refuse on `Py_GIL_DISABLED`, or lock it.
 - **`knobs.runtime.debug` / `knobs.compilation.instrumentation_mode`** are in triton's
   cache key but neither in intj's module digest nor its spec key: flipping one after
-  `create_launcher` keeps launching the old binary. Same for `use_buffer_ops`, which
+  `make_launcher` keeps launching the old binary. Same for `use_buffer_ops`, which
   is only stale-but-valid since the `S` bit is unconditionally keyed.
 - **Run the NVIDIA path on an NVIDIA GPU.** It is compile-checked only.
 - **`noexcept` at the CPython boundary**, once the C++ access mode lands. An

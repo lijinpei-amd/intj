@@ -111,7 +111,7 @@ class ModuleKey:
         return hashlib.sha256(blob.encode()).hexdigest()
 
 
-def create_launcher(
+def make_launcher(
     jit_func: JitFunction,
     dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
@@ -215,7 +215,7 @@ _INSTALL_FAILED: dict[KernelCache, Exception] = {}
 def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
     """The toolchain for `cache`, fetching and building it the first time.
 
-    Only ever reached from `create_launcher`, on the slow path that was already
+    Only ever reached from `make_launcher`, on the slow path that was already
     going to invoke a compiler.  A failure is remembered: a script that builds
     twenty launchers offline should wait out one connect timeout, not twenty.
     """
@@ -443,7 +443,7 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
         return flags
 
     toolchain = _cxx_toolchain()
-    assert toolchain is not None, "create_launcher validated this"
+    assert toolchain is not None, "make_launcher validated this"
     includes, libs = toolchain
     flags["include_dirs"] += includes
     flags["library_dirs"] = list(libs)
@@ -522,7 +522,7 @@ BACKENDS: dict[str, Backend] = {}
 
 
 def register(backend: Backend) -> Backend:
-    """Make `backend` usable by `create_launcher`, replacing any same-named one."""
+    """Make `backend` usable by `make_launcher`, replacing any same-named one."""
     BACKENDS[backend.name] = backend
     return backend
 
@@ -554,7 +554,7 @@ def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
     That fills in defaults and normalizes the odd fields (`extern_libs`,
     `llvm_fn_attrs`, `warp_size`), so `{}` and `{"num_warps": 4}` reach the same
     rendered module instead of building it twice.  It also rejects what the
-    backend rejects, at `create_launcher` time rather than on the first launch.
+    backend rejects, at `make_launcher` time rather than on the first launch.
 
     `parse_options` ignores keys it does not know, so unknown ones are caught
     here -- otherwise a typo would silently compile with the default.

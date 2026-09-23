@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from intj import create_launcher
+from intj import make_launcher
 from intj.launcher import (
     ModuleKey,
     Param,
@@ -86,12 +86,12 @@ def check_matches_triton(jit_func, launcher, grid, args, out_index):
 
 @pytest.fixture(scope="module")
 def axpy_launcher():
-    return create_launcher(axpy)
+    return make_launcher(axpy)
 
 
 @pytest.fixture(scope="module")
 def scale_launcher():
-    return create_launcher(scale)
+    return make_launcher(scale)
 
 
 @pytest.mark.parametrize("n", [1, 17, 4096])
@@ -139,7 +139,7 @@ def test_int_specialization(scale_launcher, value):
 
 
 def test_do_not_specialize():
-    launcher = create_launcher(scale_nospec)
+    launcher = make_launcher(scale_nospec)
     base = torch.randn(1025, device="cuda")
     o = torch.empty(1024, device="cuda")
     for x in (base[:1024], base[1:]):
@@ -165,7 +165,7 @@ def write_program_ids(o, sy, sz, BLOCK: tl.constexpr):
 
 def test_grid_y_and_z_dimensions():
     """gy and gz must reach the kernel in the right order."""
-    launcher = create_launcher(write_program_ids)
+    launcher = make_launcher(write_program_ids)
     o = torch.zeros(2 * 3 * 64, device="cuda", dtype=torch.int32)
     check_matches_triton(write_program_ids, launcher, (1, 3, 2), (o, 64, 3 * 64, 64), 0)
 
@@ -186,7 +186,7 @@ def matmul(a, b, c, M, N, K, BLOCK: tl.constexpr):
 
 def test_dynamic_shared_memory():
     """A kernel with non-zero LDS: `shared` must be plumbed into the launch."""
-    launcher = create_launcher(matmul)
+    launcher = make_launcher(matmul)
     m = n = k = 256
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
     b = torch.randn(k, n, device="cuda", dtype=torch.float16)
@@ -203,7 +203,7 @@ def test_zero_volume_grid_does_not_launch(scale_launcher):
 
 
 def test_options_are_baked_in():
-    launcher = create_launcher(scale, options={"num_warps": 8})  # freshly loaded: see below
+    launcher = make_launcher(scale, options={"num_warps": 8})  # freshly loaded: see below
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
     kernel_cache = scale.device_caches[torch.cuda.current_device()][0]
@@ -221,8 +221,8 @@ def test_launchers_of_one_kernel_stay_independent():
     """
     # num_warps values no other test uses, so both modules are loaded here and
     # their kernel caches are cold; a warm one would not compile anything.
-    narrow = getattr(create_launcher(scale, options={"num_warps": 2}), "__self__")
-    wide = getattr(create_launcher(scale, options={"num_warps": 16}), "__self__")
+    narrow = getattr(make_launcher(scale, options={"num_warps": 2}), "__self__")
+    wide = getattr(make_launcher(scale, options={"num_warps": 16}), "__self__")
     assert narrow.__name__ == wide.__name__ == "scale"  # one name ...
     assert narrow is not wide  # ... two modules, told apart by their file
     assert narrow.__file__ != wide.__file__
@@ -238,13 +238,13 @@ def test_launchers_of_one_kernel_stay_independent():
 
 
 def test_one_module_per_key():
-    """A repeat `create_launcher` reuses the loaded module, callback included.
+    """A repeat `make_launcher` reuses the loaded module, callback included.
 
     Installing a second callback would drop the first, freeing the
     `CompiledKernel`s whose function handles the C kernel cache still holds.
     """
-    first = create_launcher(scale, options={"num_stages": 3})
-    second = create_launcher(scale, options={"num_stages": 3})
+    first = make_launcher(scale, options={"num_stages": 3})
+    second = make_launcher(scale, options={"num_stages": 3})
     assert getattr(first, "__self__") is getattr(second, "__self__")
     assert first == second
 
@@ -253,7 +253,7 @@ def test_cached_build_is_reused_without_rendering():
     """A dict miss with the .so already on disk must not render or compile again."""
     import intj.launcher as launcher_module
 
-    create_launcher(scale, options={"num_stages": 5})
+    make_launcher(scale, options={"num_stages": 5})
     launcher_module._LOADED.clear()
 
     def fail(*args, **kwargs):
@@ -261,7 +261,7 @@ def test_cached_build_is_reused_without_rendering():
 
     original, launcher_module._build = launcher_module._build, fail
     try:
-        create_launcher(scale, options={"num_stages": 5})
+        make_launcher(scale, options={"num_stages": 5})
     finally:
         launcher_module._build = original
 
@@ -279,11 +279,11 @@ def test_modules_stay_out_of_the_import_system():
     import intj.launcher as launcher_module
 
     before = set(sys.modules)
-    first = getattr(create_launcher(scale, options={"num_stages": 6}), "__self__")
+    first = getattr(make_launcher(scale, options={"num_stages": 6}), "__self__")
     assert first.__spec__.name not in sys.modules
 
     launcher_module._LOADED.clear()
-    second = getattr(create_launcher(scale, options={"num_stages": 6}), "__self__")
+    second = getattr(make_launcher(scale, options={"num_stages": 6}), "__self__")
     assert second.__file__ == first.__file__  # same .so ...
     assert second is not first  # ... but a module of its own
 
@@ -295,7 +295,7 @@ def test_modules_stay_out_of_the_import_system():
 
 
 def test_source_and_binary_are_cached_on_disk():
-    launcher = create_launcher(scale, options={"num_stages": 4}, torch_access=TorchAccess.SHIM)
+    launcher = make_launcher(scale, options={"num_stages": 4}, torch_access=TorchAccess.SHIM)
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
     source = so_path.with_name("scale.c")
     assert so_path.exists() and source.exists()
@@ -463,7 +463,7 @@ def test_artifact_layout_and_nested_kernels():
         return inner
 
     nested = make()  # qualname carries `<locals>`, which a C symbol cannot
-    module = getattr(create_launcher(nested), "__self__")
+    module = getattr(make_launcher(nested), "__self__")
     path = pathlib.Path(module.__file__)
     assert path.name.startswith("inner.")
     assert path.parent.name == nested.__module__
@@ -475,7 +475,7 @@ def test_artifact_layout_and_nested_kernels():
     torch.testing.assert_close(o, x * 2.0)
 
 
-CACHES = list(KernelCache)  # create_launcher provisions whichever is missing
+CACHES = list(KernelCache)  # make_launcher provisions whichever is missing
 
 
 def _provisioned(cache):
@@ -499,7 +499,7 @@ def test_kernel_cache_backends_launch_the_same(cache):
     build -- which is the part most likely to break.
     """
     _provisioned(cache)
-    launcher = create_launcher(scale, torch_access=TorchAccess.SHIM, kernel_cache=cache)
+    launcher = make_launcher(scale, torch_access=TorchAccess.SHIM, kernel_cache=cache)
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
     for block in (64, 128):  # two specializations, so the cache is used
@@ -508,7 +508,7 @@ def test_kernel_cache_backends_launch_the_same(cache):
 
 def test_kernel_cache_choice_reaches_the_digest():
     modules = {
-        c: pathlib.Path(getattr(create_launcher(scale, kernel_cache=_provisioned(c)), "__self__").__file__)
+        c: pathlib.Path(getattr(make_launcher(scale, kernel_cache=_provisioned(c)), "__self__").__file__)
         for c in CACHES
     }
     digests = {c: path.parent.parent.name for c, path in modules.items()}
@@ -529,7 +529,7 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
         "intj.launcher._loaded_module",
         lambda key, fn, context, *rest: contexts.append(context) or types.SimpleNamespace(entry=None),
     )
-    create_launcher(scale, kernel_cache=KernelCache.TSL)
+    make_launcher(scale, kernel_cache=KernelCache.TSL)
     # the requested backend, and what install returned actually reaches the build
     assert calls == [KernelCache.TSL]
     assert contexts[-1].cache_include_dirs == toolchain["include_dirs"]
@@ -548,7 +548,7 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
     monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
     for _ in range(3):
         with pytest.raises(UnsupportedKernel, match="python -m intj.kernel_cache tsl.*no network"):
-            create_launcher(scale, kernel_cache=KernelCache.TSL)
+            make_launcher(scale, kernel_cache=KernelCache.TSL)
     assert attempts == [KernelCache.TSL]  # remembered, not re-attempted
 
 
@@ -557,7 +557,7 @@ def test_kernel_cache_install_bug_is_not_dressed_up_as_a_download_failure(monkey
     monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
     monkeypatch.setattr("intj.launcher.install", lambda cache: cache.no_such_attribute)
     with pytest.raises(AttributeError):
-        create_launcher(scale, kernel_cache=KernelCache.TSL)
+        make_launcher(scale, kernel_cache=KernelCache.TSL)
 
 
 def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
@@ -569,17 +569,17 @@ def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
 
     monkeypatch.setattr("intj.launcher.install", explode)
     with pytest.raises(UnsupportedKernel, match="unknown compile option"):
-        create_launcher(scale, options={"nonsense": 1}, kernel_cache=KernelCache.ABSL)
+        make_launcher(scale, options={"nonsense": 1}, kernel_cache=KernelCache.ABSL)
 
 
 def test_refuses_non_jit_function():
     with pytest.raises(UnsupportedKernel):
-        create_launcher(lambda: None)
+        make_launcher(lambda: None)
 
 
 def test_refuses_kernel_reading_globals():
     with pytest.raises(UnsupportedKernel, match="global variable"):
-        create_launcher(uses_global)
+        make_launcher(uses_global)
 
 
 GLOBAL_SCALE = 2.0
@@ -604,7 +604,7 @@ def mode(request):
 
 @pytest.fixture(scope="module")
 def scale_by_mode(mode):
-    return mode, create_launcher(scale, torch_access=mode)
+    return mode, make_launcher(scale, torch_access=mode)
 
 
 def _read_corpus():
@@ -651,7 +651,7 @@ def test_modes_agree_on_every_read():
     is what notices.
     """
     modules = {
-        m: getattr(create_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES
+        m: getattr(make_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES
     }
     o = torch.empty(4096, device="cuda")
     for x in _read_corpus():
@@ -717,7 +717,7 @@ def test_shim_is_refused_rather_than_guessed(monkeypatch):
 
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
-        create_launcher(scale, torch_access=TorchAccess.SHIM)
+        make_launcher(scale, torch_access=TorchAccess.SHIM)
 
 
 def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
@@ -729,7 +729,7 @@ def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
     from intj import launcher as launcher_mod
 
     def digest_dir(m):
-        return pathlib.Path(getattr(create_launcher(scale, torch_access=m), "__self__").__file__).parent.parent.name
+        return pathlib.Path(getattr(make_launcher(scale, torch_access=m), "__self__").__file__).parent.parent.name
 
     before = {m: digest_dir(m) for m in ACCESS_MODES}
     monkeypatch.setattr(launcher_mod, "torch_version", lambda: (99, 99))
@@ -742,13 +742,13 @@ def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
 
 def test_unconfigured_module_refuses_to_launch():
     """`entry` is unreachable before set_torch_version; prove the guard exists."""
-    module = getattr(create_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
     assert hasattr(module, "set_torch_version")
     with pytest.raises(ValueError, match="needs a tensor layout"):
         module.set_torch_version((2, 14), None)
     layout = layout_for()
     assert layout is not None
-    cpython = getattr(create_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
+    cpython = getattr(make_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
     with pytest.raises(ValueError, match="takes no tensor layout"):
         cpython.set_torch_version((2, 14), layout.as_args())
 
@@ -764,7 +764,7 @@ def test_modes_agree_on_rejecting_a_storageless_tensor():
     ).cuda()
     o = torch.empty(1024, device="cuda")
     for m in ACCESS_MODES:
-        module = getattr(create_launcher(scale, torch_access=m), "__self__")
+        module = getattr(make_launcher(scale, torch_access=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(sparse, o, 1024, 2.0, 128)
 
@@ -778,7 +778,7 @@ def test_modes_agree_on_tensors_with_unusual_impls():
     the impls carrying them belong to `Tensor` *subclasses*, which INTJ_DECODE's
     exact-type test already refuses -- this pins that reasoning.
     """
-    modules = {m: getattr(create_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES}
+    modules = {m: getattr(make_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES}
     o = torch.empty(1024, device="cuda")
 
     with torch.inference_mode():
@@ -823,6 +823,6 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
         _read(layout, mkl)
     o = torch.empty(16, device="cuda")
     for m in ACCESS_MODES:
-        module = getattr(create_launcher(scale, torch_access=m), "__self__")
+        module = getattr(make_launcher(scale, torch_access=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(mkl, o, 16, 2.0, 128)

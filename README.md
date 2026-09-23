@@ -14,7 +14,7 @@ This is the initial version: torch tensors only, static grid. Anything outside t
 
 ```python
 import torch, triton, triton.language as tl
-from intj import create_launcher
+from intj import make_launcher
 
 @triton.jit
 def my_kernel(x, y, o, n, BLOCK: tl.constexpr):
@@ -22,7 +22,7 @@ def my_kernel(x, y, o, n, BLOCK: tl.constexpr):
 
 # line #1: create jit launcher.
 # Speed doesn't matter much here.
-launcher = create_launcher(my_kernel, options={"num_warps": 4})
+launcher = make_launcher(my_kernel, options={"num_warps": 4})
 
 # line #2: call the jit launcher.
 # Calling the launcher should be fast.

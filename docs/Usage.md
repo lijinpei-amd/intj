@@ -1,11 +1,11 @@
 # INTJ usage
 
-## `create_launcher`
+## `make_launcher`
 
 ```python
-from intj import create_launcher
+from intj import make_launcher
 
-launcher = create_launcher(
+launcher = make_launcher(
     jit_func,              # a @triton.jit function
     dynamic_grid=False,    # reserved, must be False
     dynamic_options=(),    # reserved, must be empty
@@ -14,7 +14,7 @@ launcher = create_launcher(
 )
 ```
 
-`create_launcher` renders a C python extension for `jit_func`, compiles it (through
+`make_launcher` renders a C python extension for `jit_func`, compiles it (through
 triton's build + on-disk cache, so it is free after the first time), loads it, and
 returns its `entry` function. It is slow; call it once, outside any hot loop.
 
@@ -76,7 +76,7 @@ buffer-ops binary on a > 2 GiB tensor.
 
 ## Not supported
 
-Everything below is refused at `create_launcher` time, or on the first launch that
+Everything below is refused at `make_launcher` time, or on the first launch that
 hits it:
 
 - Backends with no registered `intj.launcher.Backend`. `HipBackend` and
@@ -113,7 +113,7 @@ kind of tensor is a usable triton kernel argument in the first place.
 ## Reaching torch: `torch_access`
 
 Every launch reads three things off each tensor: the data pointer, the dtype, and (on
-AMD) the storage size. `create_launcher(..., torch_access=...)` picks how, with
+AMD) the storage size. `make_launcher(..., torch_access=...)` picks how, with
 `intj.TorchAccess`:
 
 | | how it reads | decode + key, 3 tensors | first build | rebuilt when torch changes |
@@ -147,7 +147,7 @@ compares the other two against.
 ## The kernel cache: `kernel_cache`
 
 Every launch turns the spec key into a compiled kernel through a hash map.
-`create_launcher(..., kernel_cache=...)` picks which, with `intj.KernelCache`:
+`make_launcher(..., kernel_cache=...)` picks which, with `intj.KernelCache`:
 
 | | what it is | first use costs |
 |---|---|---|
@@ -159,7 +159,7 @@ Every launch turns the spec key into a compiled kernel through a hash map.
 even under `SHIM` or `CPYTHON` access.
 
 Neither is vendored, and **nothing installed on the machine is searched for**:
-`create_launcher` downloads a pinned version, checks its sha256, and (for
+`make_launcher` downloads a pinned version, checks its sha256, and (for
 abseil) builds it into `$TRITON_HOME/.triton/intj/deps/`. What a module was
 built against is then a property of intj's cache rather than of the host. It
 happens once, on the path that was already going to invoke a compiler, and is
@@ -172,7 +172,7 @@ a hang. To get it over with ahead of time, or before going offline:
 One installer at a time, machine-wide, so the ranks of a torchrun job that all
 miss together do not build into one tree. If the install fails, the error
 carries that command and the reason, and the failure is remembered rather than
-re-attempted on every later `create_launcher`.
+re-attempted on every later `make_launcher`.
 
 Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, 5-word key,
 ns per lookup, hit):
@@ -234,7 +234,7 @@ Modules are loaded by hand, so none of this reaches `sys.modules`: the module's 
 is just the kernel's, a label rather than a lookup key — two builds of one kernel share
 it and are told apart by `__file__`.
 
-`create_launcher` looks for its module in three places, in order: the process-level
+`make_launcher` looks for its module in three places, in order: the process-level
 `ModuleKey` dict (same module, so the same kernel cache), the `.so` on disk (loaded
 as-is, nothing rendered or compiled), and only then renders and builds. A warm
 process takes ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build.
