@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ._version import __version__
 from .kernel_cache import (
     INSTALL_ERRORS,
     KernelCache,
@@ -37,8 +38,6 @@ from .torch_abi import (
 JitFunction = Any
 CompiledKernel = Any
 
-SCHEMA_VERSION = 1
-
 _RUNTIME = Path(__file__).parent / "runtime"
 _ENTRY_TEMPLATE = _RUNTIME / "entry.c.jinja"
 _RUNTIME_HEADER = _RUNTIME / "intj_runtime.h"
@@ -46,6 +45,11 @@ _RUNTIME_HEADER = _RUNTIME / "intj_runtime.h"
 
 class UnsupportedKernel(NotImplementedError):
     """Raised for kernels or options outside intj's (deliberately small) scope."""
+
+
+def _cache_version() -> tuple[int, int]:
+    major, minor, *_ = __version__.split(".")
+    return int(major), int(minor)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,7 +116,7 @@ class ModuleKey:
     triton: tuple[Any, ...]  # triton version and libtriton identity
     compiler: tuple[str, ...]  # the C compiler triton would invoke
     ext_suffix: str | None
-    schema: int = SCHEMA_VERSION
+    intj_version: tuple[int, int]
 
     def digest(self) -> str:
         # sort_keys so the digest does not depend on field order
@@ -213,6 +217,7 @@ def make_launcher(
         triton=_triton_identity(),
         compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
+        intj_version=_cache_version(),
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against

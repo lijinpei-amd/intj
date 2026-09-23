@@ -8,6 +8,7 @@ import ctypes
 import dataclasses
 import json
 import pathlib
+import tomllib
 import types
 
 import pytest
@@ -15,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+import intj
 from intj import make_launcher
 from intj.launcher import (
     ModuleKey,
@@ -449,9 +451,30 @@ def _module_key(**overrides):
         template="aa", runtime_header="bb", context=_render_context(module_name=""), cache_key="c",
         params=(("x", "", False, False, False, False, False, "None"),),
         target=("hip", "gfx942", 64), options="o", triton=("3.8.0", 1, 2.0),
-        compiler=("gcc", "13"), ext_suffix=".so",
+        compiler=("gcc", "13"), ext_suffix=".so", intj_version=(0, 1),
     )
     return ModuleKey(**{**fields, **overrides})
+
+
+def test_package_version_has_one_source():
+    data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+    assert "version" not in data["project"]
+    assert data["project"]["dynamic"] == ["version"]
+    assert data["tool"]["setuptools"]["dynamic"]["version"] == {
+        "attr": "intj._version.__version__"
+    }
+    assert intj.__version__ == "0.1.0"
+
+
+def test_module_key_uses_major_minor_version_only(monkeypatch):
+    import intj.launcher as launcher
+
+    monkeypatch.setattr(launcher, "__version__", "7.8.9")
+    assert launcher._cache_version() == (7, 8)
+    monkeypatch.setattr(launcher, "__version__", "7.8.10")
+    assert launcher._cache_version() == (7, 8)
+    monkeypatch.setattr(launcher, "__version__", "7.9.0")
+    assert launcher._cache_version() == (7, 9)
 
 
 @pytest.mark.parametrize(
@@ -894,8 +917,8 @@ def test_dtype_index_table_matches_triton():
 
     assert canonical, "no torch dtype canonicalized; the table is empty"
     # the three spellings triton folds into one type must share one index
-    assert table[dtype_code(torch.bool)] == table[dtype_code(torch.uint1)]
-    assert table[dtype_code(torch.int1)] == table[dtype_code(torch.bool)]
+    assert table[dtype_code(torch.bool)] == table[dtype_code(getattr(torch, "uint1"))]
+    assert table[dtype_code(getattr(torch, "int1"))] == table[dtype_code(torch.bool)]
     # and a dtype triton has never accepted must be refused
     assert table[dtype_code(torch.complex64)] == 0xFF
 

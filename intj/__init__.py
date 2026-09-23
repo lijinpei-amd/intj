@@ -1,5 +1,6 @@
+from ._version import __version__
 from .kernel_cache import KernelCache
 from .launcher import make_launcher
 from .torch_abi import TorchAccess
 
-__all__ = ["KernelCache", "TorchAccess", "make_launcher"]
+__all__ = ["KernelCache", "TorchAccess", "make_launcher", "__version__"]
