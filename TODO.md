@@ -25,6 +25,9 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - **The triton half below 3.10.** `tests/run_python_matrix.sh` runs the rendered
   module on 3.8 through 3.14t, but `triton>=3.8` ships no wheel below 3.10, so
   `make_launcher` and the compile callback are only exercised from 3.10 up.
+- **Develop a Torch and CPython interface spec.** Define the binary data each
+  interface reads, supported versions and build variants, how those facts are
+  verified, and when intj refuses an unsupported combination.
 
 ## Coverage (all currently refused loudly)
 
