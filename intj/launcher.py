@@ -17,7 +17,13 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .kernel_cache import KernelCache, install, toolchain_for, unavailable_message
+from .kernel_cache import (
+    INSTALL_ERRORS,
+    KernelCache,
+    install,
+    toolchain_for,
+    unavailable_message,
+)
 from .torch_abi import TensorLayout, TorchAccess, layout_for, supported_versions, torch_version
 
 # triton and torch ship no type information, so everything reaching into them is
@@ -142,18 +148,12 @@ def create_launcher(
     params = _render_params(jit_func)
 
     access = _resolve_access(torch_access)
-    cache_toolchain = toolchain_for(kernel_cache)
-    if cache_toolchain is None:
-        # First use of a backend fetches it, and abseil also builds -- minutes,
-        # once, announced on stderr.  Only ever here, on the slow path that was
-        # already going to invoke a compiler.
-        try:
-            cache_toolchain = install(kernel_cache)
-        except Exception as error:
-            raise UnsupportedKernel(unavailable_message(kernel_cache, error)) from error
     target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
+    # last, after every refusal above it: a kernel that is going to be rejected
+    # anyway must not pay for a download and an abseil build first
+    cache_toolchain = _provision(kernel_cache)
     # the kernel's own name, unless python allows something C does not
     module_name = jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
@@ -207,6 +207,31 @@ def create_launcher(
     # compiled-in offset against
     layout = layout_for() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
     return _loaded_module(key, jit_func, context, params, options, layout).entry
+
+
+_INSTALL_FAILED: dict[KernelCache, Exception] = {}
+
+
+def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
+    """The toolchain for `cache`, fetching and building it the first time.
+
+    Only ever reached from `create_launcher`, on the slow path that was already
+    going to invoke a compiler.  A failure is remembered: a script that builds
+    twenty launchers offline should wait out one connect timeout, not twenty.
+    """
+    toolchain = toolchain_for(cache)
+    if toolchain is not None:
+        return toolchain
+    if cache not in _INSTALL_FAILED:
+        try:
+            return install(cache)
+        # INSTALL_ERRORS, not Exception: a TypeError from a bug in here is not a
+        # provisioning failure, and must not send the reader off to re-run a
+        # command that will fail identically.
+        except INSTALL_ERRORS as error:
+            _INSTALL_FAILED[cache] = error
+    failure = _INSTALL_FAILED[cache]
+    raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
 
 
 def get_full_name(fn: Any) -> str:

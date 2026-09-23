@@ -21,15 +21,19 @@ for or used: what a module was built against is then a property of intj's cache,
 not of the host.
 
 `create_launcher` provisions on demand, so the first use of a backend fetches it
-(abseil also builds: ~2 minutes, once).  It says so on stderr first, because an
-implicit download is otherwise indistinguishable from a hang.  To get it over
-with ahead of time, or on a machine that will later be offline:
+(abseil also builds its 90 libraries: 28 s on 224 cores, minutes on a few).  It
+says so on stderr first, because an implicit download is otherwise
+indistinguishable from a hang.  To get it over with ahead of time, or on a
+machine that will later be offline:
 
-    python -m intj.kernel_cache tsl      # or absl, or all
+    python -m intj.kernel_cache tsl            # or absl, or all
+    python -m intj.kernel_cache --force absl   # discard a half-written tree
 """
 
+import contextlib
 import dataclasses
 import enum
+import fcntl
 import functools
 import hashlib
 import os
@@ -39,7 +43,25 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from collections.abc import Generator
 from pathlib import Path
+
+#: What a failed `install` raises: network and disk (OSError, which
+#: urllib.error.URLError subclasses), a bad tarball, a failed compiler, and the
+#: RuntimeErrors raised here.  Narrow on purpose -- an internal bug should not
+#: come back to the user as "the download failed, try again".
+INSTALL_ERRORS = (OSError, RuntimeError, tarfile.TarError, subprocess.SubprocessError)
+
+#: seconds; a stalled connection must not hang `create_launcher` forever
+_DOWNLOAD_TIMEOUT = 60
+
+#: written last, so a half-finished build tree never looks provisioned
+_BUILT_MARKER = ".intj-built"
+
+#: what the one-off abseil build costs, as the announce and the docs say it.
+#: Measured: 28 s wall for all 90 libraries on 224 cores, and it scales with
+#: them, so quote both ends rather than one machine's number.
+_BUILD_COST = "~30 s on a big machine, minutes on a few cores"
 
 
 class KernelCache(enum.Enum):
@@ -105,6 +127,10 @@ def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
     if not source.builds:
         return {"include_dirs": (include,), "library_dirs": (), "archives": ()}
 
+    # the marker, not the archives: a build in flight has emitted some of its 90
+    # libraries, and linking against that set fails with undefined absl symbols
+    if not (root / "build" / _BUILT_MARKER).exists():
+        return None
     archives = _archives(root / "build")
     if not archives:
         return None
@@ -120,22 +146,26 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
 
     Returns the same toolchain `toolchain_for` does.  Idempotent: an existing
     tree is reused unless `force`, so the common call does no work and says
-    nothing.  When there *is* work, it is announced -- a silent two-minute
+    nothing.  When there *is* work, it is announced -- a silent minutes-long
     build inside `create_launcher` is indistinguishable from a hang.
+
+    One installer at a time, machine-wide: the 8 ranks of a torchrun job all
+    miss together, and without the lock they would cmake into one build tree.
     """
     if cache is KernelCache.INTJ:
         return {"include_dirs": (), "library_dirs": (), "archives": ()}
 
     source = _SOURCES[cache]
     root = _source_root(cache)
-    if force:
-        shutil.rmtree(root, ignore_errors=True)
-    if not (root / source.marker).exists():
-        _announce(f"downloading {cache.value} {source.version} to {root}")
-        _unpack(source, root)
-    if source.builds and not _archives(root / "build"):
-        _announce(f"building {cache.value} {source.version} (a few minutes, once)")
-        _cmake_build(root)
+    with _install_lock(cache):
+        if force:
+            shutil.rmtree(root, ignore_errors=True)
+        if not (root / source.marker).exists():
+            _announce(f"downloading {cache.value} {source.version} to {root}")
+            _unpack(source, root)
+        if source.builds and not (root / "build" / _BUILT_MARKER).exists():
+            _announce(f"building {cache.value} {source.version} ({_BUILD_COST}, once)")
+            _cmake_build(root)
 
     toolchain = toolchain_for(cache)
     if toolchain is None:  # pragma: no cover - a build that produced nothing
@@ -144,17 +174,40 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
 
 
 def unavailable_message(cache: KernelCache, reason: object) -> str:
-    """Why an on-demand install failed, and how to do it by hand."""
+    """Why an on-demand install failed, and how to do it by hand.
+
+    The reason goes last: a cmake failure brings a screenful of compiler
+    diagnostics with it, and what the reader has to act on must not be buried
+    above them.
+    """
+    source = _SOURCES[cache]
+    what = "downloading and building" if source.builds else "downloading"
+    python = Path(sys.executable).name
     return (
-        f"intj: kernel_cache=KernelCache.{cache.name} needs {cache.value} "
-        f"{_SOURCES[cache].version} in {_deps_root()}, and installing it failed: {reason}. "
-        f"Run `{Path(sys.executable).name} -m intj.kernel_cache {cache.value}` to retry "
-        f"on its own, or use kernel_cache=KernelCache.INTJ, which needs nothing."
+        f"intj: kernel_cache=KernelCache.{cache.name} needs {cache.value} {source.version} "
+        f"in {_deps_root()}, and {what} it failed. Run "
+        f"`{python} -m intj.kernel_cache {cache.value}` to retry on its own, add --force "
+        f"to discard a half-written tree first, or use kernel_cache=KernelCache.INTJ, "
+        f"which needs nothing. The failure was: {reason}"
     )
 
 
 def _announce(message: str) -> None:
     print(f"intj: {message}", file=sys.stderr, flush=True)
+
+
+@contextlib.contextmanager
+def _install_lock(cache: KernelCache) -> Generator[None]:
+    """One installer per machine for `cache`, across processes.
+
+    flock rather than a lock file we create and delete: the kernel drops it when
+    the process dies, so a killed install does not wedge every later one.
+    """
+    deps = _deps_root()
+    deps.mkdir(parents=True, exist_ok=True)
+    with open(deps / f".{cache.value}.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 @functools.lru_cache(maxsize=1)
@@ -186,19 +239,23 @@ def _unpack(source: Dependency, root: Path) -> None:
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root.parent) as scratch:
         archive = Path(scratch) / "source.tar.gz"
-        with urllib.request.urlopen(source.url) as response:  # noqa: S310 - pinned https URL
-            archive.write_bytes(response.read())
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        # timeout, because with none urlopen inherits socket's default of None:
+        # a blackholed port 443 would hang create_launcher forever
+        with urllib.request.urlopen(source.url, timeout=_DOWNLOAD_TIMEOUT) as response:  # noqa: S310 - pinned https URL
+            blob = response.read()
+        digest = hashlib.sha256(blob).hexdigest()
         if digest != source.sha256:
             raise RuntimeError(
                 f"intj: {source.url} hashed to {digest}, expected {source.sha256}"
             )
+        archive.write_bytes(blob)
         with tarfile.open(archive) as tar:
             tar.extractall(Path(scratch) / "tree", filter="data")
         # one directory in, the way github archives are laid out
         (inner,) = (Path(scratch) / "tree").iterdir()
-        if (root / source.marker).exists():  # a racing install won
-            return
+        # rename(2) onto a non-empty directory is ENOTEMPTY, so clear whatever an
+        # interrupted install left: the caller already found no marker there.
+        shutil.rmtree(root, ignore_errors=True)
         os.replace(inner, root)
 
 
@@ -220,21 +277,30 @@ def _cmake_build(root: Path) -> None:
             raise RuntimeError(
                 f"intj: {' '.join(command[:2])} failed for {root.name}:\n{done.stderr[-2000:]}"
             )
+    (build / _BUILT_MARKER).write_text("")  # last, and only on success
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    force = "--force" in argv
+    argv = [arg for arg in argv if arg != "--force"]
     wanted = [c for c in KernelCache if c is not KernelCache.INTJ]
     if argv and argv != ["all"]:
         try:
             wanted = [KernelCache(name) for name in argv]
         except ValueError:
-            print(f"usage: python -m intj.kernel_cache [tsl|absl|all]", file=sys.stderr)
+            print("usage: python -m intj.kernel_cache [--force] [tsl|absl|all]", file=sys.stderr)
             return 2
     for cache in wanted:
         if cache is KernelCache.INTJ:
             continue
-        toolchain = install(cache)
+        # the same one line create_launcher would print, not a traceback: this
+        # command is what that error tells the reader to run
+        try:
+            toolchain = install(cache, force=force)
+        except INSTALL_ERRORS as error:
+            print(unavailable_message(cache, error), file=sys.stderr)
+            return 1
         print(f"intj: {cache.value} {_SOURCES[cache].version} in {_source_root(cache)}")
         print(f"  include {toolchain['include_dirs'][0]}")
         if toolchain["archives"]:

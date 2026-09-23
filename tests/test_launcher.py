@@ -8,6 +8,7 @@ import ctypes
 import dataclasses
 import json
 import pathlib
+import types
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ from intj.launcher import (
     UnsupportedKernel,
     triton_specialization,
 )
-from intj.kernel_cache import KernelCache, toolchain_for
+from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
 from intj.torch_abi import (
     NDTYPES,
     TorchAccess,
@@ -474,7 +475,20 @@ def test_artifact_layout_and_nested_kernels():
     torch.testing.assert_close(o, x * 2.0)
 
 
-CACHES = [c for c in KernelCache if toolchain_for(c) is not None]
+CACHES = list(KernelCache)  # create_launcher provisions whichever is missing
+
+
+def _provisioned(cache):
+    """Install `cache` up front, so an offline run skips rather than fails.
+
+    Narrow on purpose: only a failed *install* skips.  Routing every
+    UnsupportedKernel here would hide the refusals these tests exist to check.
+    """
+    try:
+        install(cache)
+    except INSTALL_ERRORS as error:
+        pytest.skip(f"{cache.value} could not be installed: {error}")
+    return cache
 
 
 @pytest.mark.parametrize("cache", CACHES, ids=[c.value for c in CACHES])
@@ -484,6 +498,7 @@ def test_kernel_cache_backends_launch_the_same(cache):
     tsl and absl are C++ maps, so they also drag a shim-mode module into a C++
     build -- which is the part most likely to break.
     """
+    _provisioned(cache)
     launcher = create_launcher(scale, torch_access=TorchAccess.SHIM, kernel_cache=cache)
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
@@ -493,7 +508,7 @@ def test_kernel_cache_backends_launch_the_same(cache):
 
 def test_kernel_cache_choice_reaches_the_digest():
     modules = {
-        c: pathlib.Path(getattr(create_launcher(scale, kernel_cache=c), "__self__").__file__)
+        c: pathlib.Path(getattr(create_launcher(scale, kernel_cache=_provisioned(c)), "__self__").__file__)
         for c in CACHES
     }
     digests = {c: path.parent.parent.name for c, path in modules.items()}
@@ -501,22 +516,60 @@ def test_kernel_cache_choice_reaches_the_digest():
 
 
 def test_kernel_cache_is_installed_on_demand(monkeypatch):
-    """An unprovisioned backend installs itself, and says so if it cannot."""
+    """An unprovisioned backend installs itself, and its toolchain is what builds."""
     calls: list[KernelCache] = []
+    toolchain = {"include_dirs": ("/nowhere/include",), "library_dirs": (), "archives": ()}
     monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.launcher.install", lambda c: calls.append(c) or toolchain)
+
+    # stop before the real build: the point is what reaches it, not that a
+    # fabricated include directory compiles
+    contexts: list[RenderContext] = []
     monkeypatch.setattr(
-        "intj.launcher.install",
-        lambda cache: calls.append(cache) or {"include_dirs": (), "library_dirs": (), "archives": ()},
+        "intj.launcher._loaded_module",
+        lambda key, fn, context, *rest: contexts.append(context) or types.SimpleNamespace(entry=None),
     )
-    create_launcher(scale, kernel_cache=KernelCache.INTJ)  # the render does not care
-    assert calls == [KernelCache.INTJ]
+    create_launcher(scale, kernel_cache=KernelCache.TSL)
+    # the requested backend, and what install returned actually reaches the build
+    assert calls == [KernelCache.TSL]
+    assert contexts[-1].cache_include_dirs == toolchain["include_dirs"]
+
+
+def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
+    """A failed install refuses with the reason and the retry command, and is not re-tried."""
+    attempts = []
 
     def explode(cache):
-        raise RuntimeError("no network")
+        attempts.append(cache)
+        raise OSError("no network")
+
+    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.launcher.install", explode)
+    monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
+    for _ in range(3):
+        with pytest.raises(UnsupportedKernel, match="python -m intj.kernel_cache tsl.*no network"):
+            create_launcher(scale, kernel_cache=KernelCache.TSL)
+    assert attempts == [KernelCache.TSL]  # remembered, not re-attempted
+
+
+def test_kernel_cache_install_bug_is_not_dressed_up_as_a_download_failure(monkeypatch):
+    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
+    monkeypatch.setattr("intj.launcher.install", lambda cache: cache.no_such_attribute)
+    with pytest.raises(AttributeError):
+        create_launcher(scale, kernel_cache=KernelCache.TSL)
+
+
+def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
+    """A kernel that will be rejected anyway must not pay for a download first."""
+    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
+
+    def explode(cache):
+        raise AssertionError("installed before refusing an unknown option")
 
     monkeypatch.setattr("intj.launcher.install", explode)
-    with pytest.raises(UnsupportedKernel, match="no network.*python -m intj.kernel_cache tsl"):
-        create_launcher(scale, kernel_cache=KernelCache.TSL)
+    with pytest.raises(UnsupportedKernel, match="unknown compile option"):
+        create_launcher(scale, options={"nonsense": 1}, kernel_cache=KernelCache.ABSL)
 
 
 def test_refuses_non_jit_function():

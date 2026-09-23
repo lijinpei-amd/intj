@@ -153,7 +153,7 @@ Every launch turns the spec key into a compiled kernel through a hash map.
 |---|---|---|
 | `INTJ` (default) | intj's open-addressed table, 72 lines | nothing |
 | `TSL` | `tsl::robin_map`, handed the precomputed hash | ~3 s, a download |
-| `ABSL` | `absl::flat_hash_map` | ~32 s, a download and a build |
+| `ABSL` | `absl::flat_hash_map` | a download, then a build of 90 libraries: 28 s on 224 cores, minutes on a few |
 
 `TSL` and `ABSL` are C++ maps, so either one compiles the whole module as C++
 even under `SHIM` or `CPYTHON` access.
@@ -167,8 +167,12 @@ announced on stderr — an implicit download is otherwise indistinguishable from
 a hang. To get it over with ahead of time, or before going offline:
 
     python -m intj.kernel_cache all
+    python -m intj.kernel_cache --force absl   # discard a half-written tree
 
-If the install fails, the error carries the reason and that command.
+One installer at a time, machine-wide, so the ranks of a torchrun job that all
+miss together do not build into one tree. If the install fails, the error
+carries that command and the reason, and the failure is remembered rather than
+re-attempted on every later `create_launcher`.
 
 Measured through `tests/bench_kernel_cache.cpp` (google/benchmark, 5-word key,
 ns per lookup, hit):
