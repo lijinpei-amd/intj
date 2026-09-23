@@ -457,7 +457,7 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
         context = dataclasses.replace(key.context, spec_pointer_range=1)
         ranged = _loaded_module(
             dataclasses.replace(key, context=context), pointer_kernel,
-            context, context.params, {}, None,
+            context, context.params, {}, None, {},
         )
         small_key = ranged.spec_key(small)
         large_key = ranged.spec_key(large)
@@ -726,18 +726,32 @@ def test_zero_volume_grid_does_not_launch(scale_launcher):
     torch.testing.assert_close(o, torch.zeros_like(o))
 
 
-def test_options_are_baked_in():
+@pytest.fixture
+def compiled_kernels(monkeypatch):
+    import triton.compiler
+
+    compile = triton.compiler.compile
+    kernels = []
+
+    def capture(*args, **kwargs):
+        kernel = compile(*args, **kwargs)
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(triton.compiler, "compile", capture)
+    return kernels
+
+
+def test_options_are_baked_in(compiled_kernels):
     launcher = make_launcher(scale, options={"num_warps": 8})  # freshly loaded: see below
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
-    kernel_cache = scale.device_caches[torch.cuda.current_device()][0]
-    kernel_cache.clear()
     launch(launcher, (8,), x, o, 1024, 2.0, 128)
     torch.testing.assert_close(o, x * 2.0)
-    assert {k.metadata.num_warps for k in kernel_cache.values()} == {8}
+    assert {k.metadata.num_warps for k in compiled_kernels} == {8}
 
 
-def test_launchers_of_one_kernel_stay_independent():
+def test_launchers_of_one_kernel_stay_independent(compiled_kernels):
     """Two launchers share a C symbol and a module name, so they must not share a module.
 
     The symbol is the kernel's name, for legible `perf` output; the digest in
@@ -753,12 +767,11 @@ def test_launchers_of_one_kernel_stay_independent():
 
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
-    kernel_cache = scale.device_caches[torch.cuda.current_device()][0]
     for launcher, num_warps in ((narrow.entry, 2), (wide.entry, 16)):
-        kernel_cache.clear()
+        compiled_kernels.clear()
         launch(launcher, (8,), x, o, 1024, 2.0, 128)
         torch.testing.assert_close(o, x * 2.0)
-        assert {k.metadata.num_warps for k in kernel_cache.values()} == {num_warps}
+        assert {k.metadata.num_warps for k in compiled_kernels} == {num_warps}
 
 
 def test_one_module_per_key():
@@ -876,6 +889,12 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
     tt.divisibility=16 binary on an unaligned pointer.
     """
     module = axpy_launcher.__self__
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+    from triton.compiler import make_backend
+
+    params, _, _ = _render_params(_resolve_annotations(axpy, None), DeviceBinding.NOT_FIXED)
+    backend = make_backend(_current_target())
     base = torch.randn(4096, device="cuda")
     tensors = [
         base,  # 16B aligned
@@ -904,13 +923,198 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher):
     seen = {}
     for args in cases:
         key, nparams = module.spec_key(*args)
-        spec = triton_specialization(axpy, args)
-        previous = seen.setdefault((key, nparams), (repr(spec), args))
-        assert previous[0] == repr(spec), (
-            f"intj key collides for two different triton specializations:\n"
-            f"  {previous[1]} -> {previous[0]}\n  {args} -> {spec}"
-        )
-        assert nparams == sum(1 for ty, _ in spec if ty != "constexpr")
+        source = _compiler_input(axpy, params, args, backend)
+        assert seen.setdefault(key, source) == source, "intj key collides for annotated ASTSource inputs"
+        assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
+
+
+@triton.jit
+def annotated_store(o, x):
+    tl.store(o, x)
+
+
+@triton.jit
+def annotated_null(o, x):
+    tl.store(o, x.to(tl.uint64) == 0)
+
+
+@triton.jit
+def annotated_baked(x, BLOCK, o, bias):
+    tl.store(o, x + BLOCK + bias)
+
+
+def test_annotated_cuda_compile_only():
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _render_params
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import compile as triton_compile, make_backend
+
+    target = GPUTarget("cuda", 80, 32)
+    resolved = _resolve_annotations(annotated_baked, {
+        "x": Argument(type=tl.float64, value=2.5, specialize=NEVER),
+        "BLOCK": Constexpr(type=tl.int16, value=128),
+        "o": Argument(type=tl.pointer_type(tl.float64), specialize=Assume(Aligned(16))),
+        "bias": Argument(type=tl.int32, specialize=NEVER),
+    })
+    params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    source = _compiler_input(annotated_baked, params, (None, 7), make_backend(target),
+                             baked_values={p.index: p.baked for p in resolved
+                                           if p.annotation.baked_value})
+    compiled = triton_compile(source.ast_source(annotated_baked), target=target)
+    assert compiled.asm["ptx"]
+
+
+@pytest.mark.parametrize("annotation,values,signature,output_dtype", [
+    (Argument(type=tl.int32, specialize=NEVER), (1, 17, -31), "i32", torch.int64),
+    (Argument(type=tl.float64), (1.0 + 2**-40, -0.5), "fp64", torch.float64),
+    (Argument(specialize=NEVER), (1, 17), "i32", torch.int64),
+    (Argument(), (1,), "constexpr", torch.int64),
+    (Argument(type=tl.int32, specialize=Assume(EqualTo(1))), (1,), "constexpr", torch.int64),
+    (Argument(type=tl.int32, specialize=Assume(Aligned(16))), (16, 32), "i32", torch.int64),
+    (Constexpr(type=tl.int8), (-128, 127), "constexpr", torch.int64),
+    (Constexpr(type=tl.uint16), (0, 2**16 - 1), "constexpr", torch.int64),
+    (Constexpr(type=tl.int32), (-2**31, 2**31 - 1), "constexpr", torch.int64),
+    (Constexpr(type=tl.int64), (-2**63, 2**63 - 1), "constexpr", torch.int64),
+    (Constexpr(type=tl.float64), (1.0 + 2**-40, -1.5), "constexpr", torch.float64),
+    (Constexpr(type=tl.int64, power_of_two_or_zero=True),
+     (0, 1, -1, 2**32, -2**32, -2**63), "constexpr", torch.int64),
+])
+def test_annotated_scalar_matches_triton(annotation, values, signature, output_dtype):
+    from triton.compiler import ASTSource, compile as triton_compile
+
+    reference = torch.empty(1, device="cuda", dtype=output_dtype)
+    actual = torch.empty_like(reference)
+    pointer = "*fp64" if output_dtype == torch.float64 else "*i64"
+    launcher = make_launcher(annotated_store, extra_annotation={"x": annotation},
+                             torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    for value in values:
+        expected = triton_compile(ASTSource(
+            annotated_store, {"o": pointer, "x": signature},
+            {(1,): value} if signature == "constexpr" else {},
+        ))
+        expected[(1, 1, 1)](reference, value)
+        launch(launcher, (1,), actual, value)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("null", [None, 0])
+def test_annotated_null_pointer_matches_triton(null):
+    from triton.compiler import ASTSource, compile as triton_compile
+
+    reference = torch.empty(1, device="cuda", dtype=torch.int32)
+    actual = torch.empty_like(reference)
+    expected = triton_compile(ASTSource(annotated_null, {"o": "*i32", "x": "*fp32"}))
+    expected[(1, 1, 1)](reference, None)
+    launcher = make_launcher(annotated_null, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER),
+    }, torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    launch(launcher, (1,), actual, null)
+    torch.testing.assert_close(actual, reference)
+    assert actual.item() == 1
+
+
+@pytest.mark.parametrize("specialize", [AUTO, NEVER, Assume(Aligned(16), PointerRange(32))])
+def test_annotated_tensor_matches_triton(specialize):
+    x = torch.randn(128, device="cuda", dtype=torch.float64)
+    out = torch.empty_like(x)
+    launcher = make_launcher(scale, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float64), specialize=specialize),
+        "o": Argument(type=tl.pointer_type(tl.float64), specialize=specialize),
+        "s": Argument(type=tl.float64),
+    }, torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    check_matches_triton(scale, launcher, (1,), (x, out, 128, 2.0, 128), 1)
+
+
+def test_annotated_baked_arguments_compile_without_jit_state(monkeypatch):
+    from triton.compiler import ASTSource, compile as triton_compile
+
+    expected_out = torch.empty(1, device="cuda", dtype=torch.float64)
+    actual = torch.empty_like(expected_out)
+    expected = triton_compile(ASTSource(annotated_baked,
+        {"x": "fp64", "BLOCK": "constexpr", "o": "*fp64", "bias": "i32"}, {(1,): 128}))
+    expected[(1, 1, 1)](2.5, 128, expected_out, 7)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("intj entered mutable JITFunction compilation")
+
+    monkeypatch.setattr(annotated_baked, "warmup", forbidden)
+    monkeypatch.setattr(annotated_baked, "_do_compile", forbidden)
+    caches = dict(annotated_baked.device_caches)
+    launcher = make_launcher(annotated_baked, extra_annotation={
+        "x": Argument(type=tl.float64, value=2.5, specialize=NEVER),
+        "BLOCK": Constexpr(type=tl.int16, value=128),
+        "bias": Argument(type=tl.int32, specialize=NEVER),
+    }, torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    launch(launcher, (1,), actual, 7)
+    torch.testing.assert_close(actual, expected_out)
+    assert dict(annotated_baked.device_caches) == caches
+
+
+@pytest.mark.parametrize("annotation,values", [
+    (Argument(), (None, False, True, 0, 1, 16, 17, 2**31, 2**63, 1.0)),
+    (Argument(type=(tl.int32, tl.int64, tl.uint64), specialize=NEVER), (1, 2**31, 2**63)),
+    (Argument(type=tl.int32), (1, 16, 17)),
+    (Argument(type=tl.int32, specialize=NEVER), (1, 16, 17)),
+    (Argument(type=tl.int32, specialize=Assume(Aligned(16))), (16, 32)),
+    (Argument(type=tl.int32, specialize=Assume(EqualTo(1))), (1,)),
+    (Constexpr(), (None, False, True, 0, 1, 0.0, -0.0, 1.0, 2**31, 2**63)),
+    (Constexpr(type=(tl.int8, tl.int64)), (-128, 127, 128, 2**32)),
+    (Constexpr(type=(tl.int8, tl.uint8)), (-128, 0, 127, 128, 255)),
+    (Constexpr(type=(tl.int1, tl.int32, tl.float64)), (False, 0, 0.0, True, 1, 1.0)),
+    (Constexpr(type=tl.int64, power_of_two_or_zero=True), (0, 1, -1, 2, -2, 2**32, -2**32)),
+])
+def test_annotated_spec_key_is_never_coarser_than_triton(scalar_kernel, annotation, values):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+    from triton.compiler import make_backend
+
+    extra = {"x": annotation}
+    params, _, _ = _render_params(_resolve_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED)
+    backend = make_backend(_current_target())
+    module = getattr(make_launcher(scalar_kernel, extra_annotation=extra,
+                                   torch_access=TorchAccess.CPYTHON, verify_annotation=True), "__self__")
+    seen = {}
+    for value in values:
+        key, nparams = module.spec_key(value)
+        source = _compiler_input(scalar_kernel, params, (value,), backend)
+        assert seen.setdefault(key, source) == source, "intj key collides for annotated ASTSource inputs"
+        assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
+
+
+@pytest.mark.parametrize("specialize", [AUTO, NEVER, Assume(Aligned(16), PointerRange(32))])
+def test_annotated_pointer_spec_key_is_never_coarser_than_triton(pointer_kernel, specialize):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+    from triton.compiler import make_backend
+
+    base = torch.empty(16, device="cuda")
+    large = torch.empty(2**29 + 8, device="cuda")
+    extra = {"x": Argument(type=tl.pointer_type(tl.float32), specialize=specialize)}
+    params, _, _ = _render_params(_resolve_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED)
+    backend = make_backend(_current_target())
+    module = getattr(make_launcher(pointer_kernel, extra_annotation=extra,
+                                   torch_access=TorchAccess.CPYTHON), "__self__")
+    seen = {}
+    for value in (None, 0, base, base[1:], large, large[1:]):
+        key, nparams = module.spec_key(value)
+        source = _compiler_input(pointer_kernel, params, (value,), backend)
+        assert seen.setdefault(key, source) == source, "intj key collides for annotated ASTSource inputs"
+        assert nparams == 1
+
+
+@pytest.mark.parametrize("key", [b"", b"\x00" * 8])
+def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _make_compile_callback, _render_params
+
+    params, _, _ = _render_params(_resolve_annotations(power_kernel, {"N": Constexpr()}),
+                                  DeviceBinding.FIXED)
+    callback = _make_compile_callback(power_kernel, params, {})
+    device = torch.cuda.current_device()
+    callback(key, 0, device, 1)
+    callback(key, 0, device, 1)
+    with pytest.raises(RuntimeError, match="two annotated ASTSource inputs"):
+        callback(key, 0, device, True)
 
 
 @pytest.mark.parametrize("nparams,nconstexpr", [(1, 0), (1, 1), (7, 2), (8, 3)])

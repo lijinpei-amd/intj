@@ -21,6 +21,8 @@ from .annotation import (
     CanonicalAnnotation,
     DeviceBinding,
     ResolvedParam,
+    _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
+    _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
     _key_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
     _layout_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
     _resolve_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
@@ -69,6 +71,26 @@ class Param:
     index: int
     call_index: int | None
     annotation: CanonicalAnnotation
+
+
+@dataclasses.dataclass(frozen=True)
+class CompilerInput:
+    """The final annotated ASTSource identity, with its original Python constants."""
+
+    signature: tuple[tuple[str, str], ...]
+    constants: tuple[tuple[tuple[int, ...], tuple[object, ...]], ...]
+    attrs: tuple[tuple[tuple[int, ...], tuple[tuple[str, int], ...]], ...]
+    values: tuple[tuple[tuple[int, ...], object], ...] = dataclasses.field(
+        compare=False, hash=False, repr=False
+    )
+
+    def ast_source(self, jit_func: JitFunction) -> Any:
+        from triton.compiler import ASTSource
+
+        return ASTSource(
+            jit_func, dict(self.signature), dict(self.values),
+            {path: [list(attr) for attr in attrs] for path, attrs in self.attrs},
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -254,7 +276,8 @@ def make_launcher(
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
     layout = layout_for() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
-    return _loaded_module(key, jit_func, context, params, options, layout).entry
+    baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
+    return _loaded_module(key, jit_func, context, params, options, layout, baked_values).entry
 
 
 _INSTALL_FAILED: dict[KernelCache, Exception] = {}
@@ -370,6 +393,7 @@ def _loaded_module(
     params: Sequence[Param],
     options: Mapping[str, Any],
     layout: TensorABI | None,
+    baked_values: Mapping[int, object],
 ) -> types.ModuleType:
     """One module per `ModuleKey`, for the life of the process.
 
@@ -387,7 +411,7 @@ def _loaded_module(
             module = _load(key, jit_func, context)
             module.set_compile_callback(
                 _make_host_compile_callback() if context.no_gpu
-                else _make_compile_callback(jit_func, params, options)
+                else _make_compile_callback(jit_func, params, options, baked_values)
             )
             # The tensor layout is installed, not compiled in, so it describes the
             # torch running now rather than the one this `.so` was built against.
@@ -710,28 +734,126 @@ def _compiler_identity(language: str = "c") -> tuple[str, ...]:
     return (str(cc), version)
 
 
+def _triton_specialize(
+    value: object, *, backend: Any, is_const: bool, specialize: bool, align: bool
+) -> tuple[str, Any]:
+    from triton._C.libtriton import native_specialize_impl
+
+    return native_specialize_impl(backend, value, is_const, specialize, align)
+
+
+def _compiler_input(
+    jit_func: JitFunction, params: Sequence[Param], public_args: Sequence[object], backend: Any,
+    *, baked_values: Mapping[int, object] | None = None,
+) -> CompilerInput:
+    signature: list[tuple[str, str]] = []
+    constants: list[tuple[tuple[int, ...], tuple[object, ...]]] = []
+    attrs: list[tuple[tuple[int, ...], tuple[tuple[str, int], ...]]] = []
+    values: list[tuple[tuple[int, ...], object]] = []
+    for param in params:
+        annotation = param.annotation
+        if param.call_index is None:
+            assert baked_values is not None, "fixed values must accompany their canonical annotations"
+            value = baked_values[param.index]
+        else:
+            value = public_args[param.call_index]
+        ty = "constexpr"
+        desc = ""
+        if annotation.kind == "argument":
+            fixed_type = annotation.types is not None and len(annotation.types) == 1
+            effective = annotation.types[0] if fixed_type and annotation.types else None
+            modes = (("equal_to_one", annotation.equal_to_one),
+                     ("aligned_16", annotation.aligned_16),
+                     ("pointer_range_32", annotation.pointer_range_32))
+            assumed_one = annotation.equal_to_one == "assume" and _applicable(effective, "equal_to_one")
+            inferred_desc = None
+            if not assumed_one and (not fixed_type or any(
+                mode == "auto" and _applicable(effective, field) for field, mode in modes
+            )):
+                inference_value = value
+                if effective is not None and effective.startswith("*") and (
+                    value is None or type(value) is int and value == 0
+                ):
+                    from triton.runtime.jit import MockTensor
+
+                    # Both public null spellings have pointer 0 and storage range 0.
+                    inference_value = MockTensor(effective[1:])
+                inferred, inferred_desc = _triton_specialize(
+                    inference_value, backend=backend, is_const=jit_func.params[param.index].is_const,
+                    specialize=any(mode == "auto" for _, mode in modes),
+                    align=annotation.aligned_16 == "auto",
+                )
+                if not fixed_type:
+                    # The native primitive folds only None and integer 1.
+                    effective = (None if value is None else "i32") if inferred == "constexpr" else inferred
+            ty = effective or "constexpr"
+            if _applicable(effective, "equal_to_one") and (
+                annotation.equal_to_one == "assume" or
+                annotation.equal_to_one == "auto" and value == 1
+            ):
+                ty = "constexpr"
+                if annotation.equal_to_one == "assume":
+                    value = 1
+            if ty != "constexpr":
+                desc = "".join(char for field, mode, char in (
+                    ("aligned_16", annotation.aligned_16, "D"),
+                    ("pointer_range_32", annotation.pointer_range_32, "S"),
+                ) if _applicable(effective, field) and (
+                    mode == "assume" or mode == "auto" and
+                    isinstance(inferred_desc, str) and char in inferred_desc
+                ))
+        path = (param.index,)
+        signature.append((param.name, ty))
+        if ty == "constexpr":
+            constants.append((path, _canonical_value(value)))
+            values.append((path, value))
+        if desc:
+            parsed = tuple((name, amount) for name, amount in backend.parse_attr(desc))
+            if parsed:
+                attrs.append((path, parsed))
+    return CompilerInput(tuple(signature), tuple(constants), tuple(attrs), tuple(values))
+
+
 def _make_compile_callback(
-    jit_func: JitFunction, params: Sequence[Param], options: Mapping[str, Any]
+    jit_func: JitFunction, params: Sequence[Param], options: Mapping[str, Any],
+    baked_values: Mapping[int, object] | None = None,
 ) -> Callable[..., tuple[int, int, int, int]]:
     """Called from C on a spec-key miss, with the key blob and the original args."""
+    from triton.compiler import compile as triton_compile, make_backend
+
+    target = _current_target()
+    backend = make_backend(target)
+    canonical_options = _canonical_options(target, options)
     kernels: list[CompiledKernel] = []  # keeps every CompiledKernel, and so its GPU module, alive
-    seen: dict[tuple[int, tuple[int, ...]], str] = {}  # key words -> triton's specialization entry
+    seen: dict[bytes, CompilerInput] = {}
+    no_key_input: CompilerInput | None = None
 
     def compile_callback(
         keyblob: bytes, nparams: int, device: int, *args: Any
     ) -> tuple[int, int, int, int]:
+        nonlocal no_key_input
         current = _current_device()
         if device != current:
-            # warmup() and _init_handles() both load the binary on the *current*
+            # _init_handles() loads the binary on the *current*
             # device; launching that function on another device's stream is a
             # wrong-context launch, so refuse instead.
             raise UnsupportedKernel(
                 f"intj: launching on device {device} while device {current} is current; "
                 "make the target device current before the first launch"
             )
-        kernel = jit_func.warmup(*args, grid=None, **options)
-        if kernel is None:
-            raise RuntimeError("intj: triton returned no kernel (a jit_cache_hook is installed?)")
+        compiler_input = _compiler_input(jit_func, params, args, backend, baked_values=baked_values)
+        if keyblob:
+            previous = seen.setdefault(keyblob, compiler_input)
+        else:
+            if no_key_input is None:
+                no_key_input = compiler_input
+            previous = no_key_input
+        if previous != compiler_input:
+            raise RuntimeError(
+                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
+            )
+        kernel = triton_compile(compiler_input.ast_source(jit_func), target=target,
+                                options=canonical_options.__dict__)
         kernel._init_handles()
 
         md = kernel.metadata
@@ -750,8 +872,6 @@ def _make_compile_callback(
                 f"intj: packed {nparams} kernel arguments but triton compiled {expected}; "
                 "this is an intj bug"
             )
-        _validate_spec_key(jit_func, params, options, keyblob, args, seen)
-
         kernels.append(kernel)
         return (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
 
@@ -779,35 +899,3 @@ def triton_specialization(
     kwargs["debug"] = jit_func.debug or knobs.runtime.debug
     kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
     return binder(*args, **kwargs)[1]
-
-
-def _validate_spec_key(
-    jit_func: JitFunction,
-    params: Sequence[Param],
-    options: Mapping[str, Any],
-    keyblob: bytes,
-    args: Sequence[Any],
-    seen: dict[tuple[int, tuple[int, ...]], str],
-) -> None:
-    """Assert intj's key is no coarser than triton's specialization.
-
-    Cheap (the miss path is milliseconds) and it turns a classifier drift from a
-    silently wrong kernel launch into a loud failure: if the same intj key word
-    ever maps to two different triton specializations, the key is too coarse.
-    A key that is coarse in *both* directions never misses and so never reaches
-    this check -- `tests/test_launcher.py` covers that case with `spec_key`.
-    """
-    specialization = triton_specialization(jit_func, args, options)
-
-    for i, param in enumerate(params):
-        mine = tuple(
-            int.from_bytes(keyblob[field.offset:field.offset + field.width], "little")
-            for field in param.annotation.key_fields
-        )
-        theirs = repr(specialization[i])
-        previous = seen.setdefault((i, mine), theirs)
-        if previous != theirs:
-            raise RuntimeError(
-                f"intj: spec key for parameter {param.name!r} is too coarse: it maps both "
-                f"{previous} and {theirs} to the same key; this is an intj bug"
-            )

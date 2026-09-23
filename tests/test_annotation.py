@@ -348,3 +348,122 @@ def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path
     assert (device_offset, nwords) == (16, 3)
     assert tuple(p.call_index for p in params) == (0, 1, 2, 3, 4, 5, None, None)
     assert hash(params) and json.dumps(dataclasses.asdict(params[0]), sort_keys=True)
+
+
+class CompilerBackendStub:
+    @staticmethod
+    def parse_attr(desc):
+        attrs = []
+        if "D" in desc:
+            attrs.append(["tt.divisibility", 16])
+        if "S" in desc:
+            attrs.append(["tt.pointer_range", 32])
+        return attrs
+
+
+def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _render_params
+
+    kernel = kernel_with_params(tmp_path, "x, n, BLOCK")
+    resolved = _resolve_annotations(kernel, {
+        "x": intj.Argument(type=tl.pointer_type(tl.float32),
+                           specialize=intj.Assume(intj.Aligned(16), intj.PointerRange(32))),
+        "n": intj.Argument(type=tl.int32, specialize=intj.NEVER),
+        "BLOCK": intj.Constexpr(type=tl.int32),
+    })
+    params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    monkeypatch.setattr("intj.launcher._triton_specialize",
+                        lambda *args, **kwargs: pytest.fail("fixed input was specialized"))
+    source = _compiler_input(kernel, params, (object(), 7, 128), CompilerBackendStub())
+    assert source.signature == (("x", "*fp32"), ("n", "i32"), ("BLOCK", "constexpr"))
+    assert source.constants == (((2,), ("int", "128")),)
+    assert source.attrs == (((0,), (("tt.divisibility", 16), ("tt.pointer_range", 32))),)
+
+
+@pytest.mark.parametrize("annotation,value,inferred,signature,constant,attrs", [
+    (intj.Argument(), 1, ("constexpr", 1), "constexpr", ("int", "1"), ()),
+    (intj.Argument(specialize=intj.NEVER), 1, ("i32", None), "i32", (), ()),
+    (intj.Argument(type=tl.int32, specialize=intj.NEVER), 1, None, "i32", (), ()),
+    (intj.Argument(type=tl.pointer_type(tl.float32), specialize=intj.NEVER),
+     None, None, "*fp32", (), ()),
+    (intj.Argument(type=tl.pointer_type(tl.float32), specialize=intj.NEVER),
+     0, None, "*fp32", (), ()),
+    (intj.Argument(type=tl.float64), 1.25, None, "fp64", (), ()),
+    (intj.Argument(type=(tl.int32, tl.int64), specialize=intj.NEVER),
+     2**31, ("i64", None), "i64", (), ()),
+    (intj.Argument(type=(tl.int32, tl.int64)),
+     1, ("constexpr", 1), "constexpr", ("int", "1"), ()),
+    (intj.Argument(type=tl.int32, specialize=intj.Assume(intj.EqualTo(1))),
+     7, None, "constexpr", ("int", "1"), ()),
+    (intj.Argument(type=tl.int32, specialize=intj.Assume(intj.Aligned(16))),
+     16, ("i32", "D"), "i32", (), (("tt.divisibility", 16),)),
+    (intj.Argument(type=tl.int32),
+     16, ("i32", "D"), "i32", (), (("tt.divisibility", 16),)),
+    (intj.Argument(type=None), None, None, "constexpr", ("none",), ()),
+    (intj.Constexpr(type=tl.int8), -128, None, "constexpr", ("int", "-128"), ()),
+    (intj.Constexpr(type=tl.int64, power_of_two_or_zero=True),
+     -2**32, None, "constexpr", ("int", "-4294967296"), ()),
+    (intj.Constexpr(), -0.0, None, "constexpr", ("float64", "8000000000000000"), ()),
+])
+def test_compiler_input_canonical_overrides(
+    monkeypatch, tmp_path, annotation, value, inferred, signature, constant, attrs
+):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _render_params
+
+    kernel = kernel_with_params(tmp_path, "x")
+    params, _, _ = _render_params(_resolve_annotations(kernel, {"x": annotation}),
+                                  DeviceBinding.NOT_FIXED)
+
+    def specialize(value, **kwargs):
+        assert inferred is not None, "fixed input was specialized"
+        return inferred
+
+    monkeypatch.setattr("intj.launcher._triton_specialize", specialize)
+    source = _compiler_input(kernel, params, (value,), CompilerBackendStub())
+    assert source.signature == (("x", signature),)
+    assert source.constants == ((((0,), constant),) if constant else ())
+    assert source.attrs == ((((0,), attrs),) if attrs else ())
+    if annotation != intj.Argument(type=tl.int32, specialize=intj.Assume(intj.EqualTo(1))) and constant:
+        assert source.ast_source(kernel).constants[(0,)] is value
+
+
+def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_path):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _render_params
+
+    kernel = kernel_with_params(tmp_path, "a, b, c, d")
+    original = float("-0.0")
+    resolved = _resolve_annotations(kernel, {
+        "a": intj.Argument(type=tl.int32, specialize=intj.NEVER),
+        "b": intj.Constexpr(value=original),
+        "c": intj.Argument(type=tl.float64, value=2.5, specialize=intj.NEVER),
+        "d": intj.Constexpr(type=tl.int16),
+    })
+    params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    monkeypatch.setattr("intj.launcher._triton_specialize",
+                        lambda *args, **kwargs: pytest.fail("fixed input was specialized"))
+    source = _compiler_input(kernel, params, (3, 1024), CompilerBackendStub(),
+                             baked_values={p.index: p.baked for p in resolved
+                                           if p.annotation.baked_value})
+    assert source.signature == (("a", "i32"), ("b", "constexpr"), ("c", "fp64"), ("d", "constexpr"))
+    assert source.constants == (((1,), ("float64", "8000000000000000")),
+                                ((3,), ("int", "1024")))
+    assert source.ast_source(kernel).constants[(1,)] is original
+
+
+def test_compiler_input_compares_tagged_constants_not_python_equality(tmp_path):
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _render_params
+
+    kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
+    params, _, _ = _render_params(_resolve_annotations(kernel, None), DeviceBinding.NOT_FIXED)
+    values = (None, False, 0, 0.0, -0.0, float("nan"), float("nan"))
+    sources = [_compiler_input(kernel, params, (value,), CompilerBackendStub()) for value in values]
+    assert len(set(sources)) == 6
+    assert sources[-1] == sources[-2]
+    assert sources[-1].ast_source(kernel).constants[(0,)] is values[-1]
+    assert "values=" not in repr(sources[-1])
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(sources[0], "signature", ())
