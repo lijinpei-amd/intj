@@ -216,11 +216,17 @@ class LauncherFactory:
             self.jit_func, tuple(resolved), dict(self.options), self.torch_access,
             self.kernel_cache, self.no_gpu, self.verify_annotation,
         )
+        public_names = tuple(
+            p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
+        )
+        control_names: list[str] = []
+        for name in ("device", "stream", "grid"):
+            while name in public_names:
+                name += "_"
+            control_names.append(name)
         signature = inspect.Signature(tuple(
             inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
-            for name in ("device", "stream", "grid", *(
-                p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
-            ))
+            for name in (*control_names, *public_names)
         ))
         return module.make_bound(signature, *(values[p.name] for p in resolved if p.name in names))
 

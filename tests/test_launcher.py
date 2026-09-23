@@ -197,6 +197,27 @@ def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path
     assert gc.is_tracked(bound)
 
 
+@pytest.mark.parametrize("public_names,control_names", [
+    (("device",), ("device_", "stream", "grid")),
+    (("stream",), ("device", "stream_", "grid")),
+    (("grid",), ("device", "stream", "grid_")),
+    (("grid", "device", "stream"), ("device_", "stream_", "grid_")),
+    (("device", "device_", "stream", "stream_", "grid", "grid_"),
+     ("device__", "stream__", "grid__")),
+])
+def test_bind_signature_control_names_avoid_kernel_names(tmp_path, public_names, control_names):
+    kernel = _kernel_from_source(tmp_path, "binding_control_names", ", ".join(("x", *public_names)))
+    factory = make_launcher(kernel, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
+    }, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    bound = factory.bind(x=0)
+    signature = inspect.signature(bound)
+    assert tuple(signature.parameters) == (*control_names, *public_names)
+    assert all(p.kind is inspect.Parameter.POSITIONAL_ONLY for p in signature.parameters.values())
+    assert inspect.signature(factory.bind(x=4096)) == signature
+    assert bound(0, 0, 1, *range(4, 4 + len(public_names))) is None
+
+
 @pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
 def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mode):
     from intj.launcher import _LOADED
