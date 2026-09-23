@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 import intj
-from intj import NEVER, Aligned, Argument, Assume, EqualTo, PointerRange, make_launcher
+from intj import AUTO, NEVER, Aligned, Argument, Assume, EqualTo, PointerRange, make_launcher
 from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
     ModuleKey,
@@ -204,6 +204,34 @@ def test_ordinary_unannotated_none_and_never(scalar_kernel):
     assert len({never.spec_key(value) for value in (1, 16, 17)}) == 1
     tensor = torch.empty(8)
     assert never.spec_key(tensor) == never.spec_key(tensor[1:])
+
+
+def test_ordinary_never_omits_pointer_range(pointer_kernel):
+    from intj.launcher import _LOADED, _loaded_module
+
+    # CPU storage is virtual: exercise both sides of the threshold without
+    # touching the bytes or requiring a GPU/backend initialization.
+    small = torch.empty(2**31 - 1, dtype=torch.uint8)
+    large = torch.empty(2**31, dtype=torch.uint8)
+    for specialization in (AUTO, NEVER):
+        baseline = getattr(make_launcher(
+            pointer_kernel, extra_annotation={"x": Argument(specialize=specialization)},
+            no_gpu=True, torch_access=TorchAccess.CPYTHON,
+        ), "__self__")
+        assert baseline.spec_key(small) == baseline.spec_key(large)
+        key = next(key for key, module in _LOADED.items() if module is baseline)
+        context = dataclasses.replace(key.context, spec_pointer_range=1)
+        ranged = _loaded_module(
+            dataclasses.replace(key, context=context), pointer_kernel,
+            context, context.params, {}, None,
+        )
+        small_key = ranged.spec_key(small)
+        large_key = ranged.spec_key(large)
+        if specialization is AUTO:
+            assert small_key != large_key
+            assert large_key == baseline.spec_key(large)
+        else:
+            assert small_key == large_key == baseline.spec_key(small)
 
 
 def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
