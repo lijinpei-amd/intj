@@ -314,13 +314,34 @@ def _expected(t: Any) -> tuple[int, int, int]:
 #: torch's own accessors report, so a row generated that way is verified by
 #: construction.  `test_hardcoded_layout_matches_this_torch` re-checks the row
 #: for whatever torch the suite runs against.
-_LAYOUTS: dict[tuple[int, int], dict[str, int]] = {
-    # torch 2.14.0.dev+rocm7.2, x86-64
-    (2, 14): {
-        "cdata": 16, "storage": 16, "storage_offset": 144, "numel": 152,
-        "data_type": 160, "s_data": 16, "s_nbytes": 48,
-    },
-}
+#: It is text rather than a dict literal so that a row is pasted exactly as
+#: `_main` printed it, with no chance of it being edited on the way in.
+_LAYOUTS_TEXT = """
+# torch 2.14.0.dev+rocm7.2, x86-64
+2.14: cdata=16 storage=16 storage_offset=144 numel=152 data_type=160 s_data=16 s_nbytes=48
+"""
+
+#: Field names of `TensorABI` that `_LAYOUTS_TEXT` carries, in `_main`'s order.
+_OFFSETS = tuple(f.name for f in dataclasses.fields(TensorABI) if f.name != "itemsize")
+
+
+def _parse_layouts(text: str) -> dict[tuple[int, int], dict[str, int]]:
+    """Rows of `<major>.<minor>: name=offset ...`; blanks and `#` comments ignored."""
+    table = {}
+    for line in text.splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        version, _, fields = line.partition(":")
+        major, minor = version.split(".")
+        offsets = dict(pair.split("=") for pair in fields.split())
+        if tuple(offsets) != _OFFSETS:
+            raise ValueError(f"intj: layout row for {version} has the wrong fields")
+        table[(int(major), int(minor))] = {k: int(v) for k, v in offsets.items()}
+    return table
+
+
+_LAYOUTS = _parse_layouts(_LAYOUTS_TEXT)
 
 
 def supported_versions() -> list[tuple[int, int]]:
@@ -357,10 +378,9 @@ def _main() -> None:
     layout = probe_layout()
     if layout is None:
         raise SystemExit(f"intj: cannot pin torch {torch.__version__}'s layout")
-    fields = ("cdata", "storage", "storage_offset", "numel", "data_type", "s_data", "s_nbytes")
-    body = ", ".join(f'"{f}": {getattr(layout, f)}' for f in fields)
-    print(f"    # torch {torch.__version__}, x86-64")
-    print(f"    {torch_version()}: {{{body}}},")
+    body = " ".join(f"{f}={getattr(layout, f)}" for f in _OFFSETS)
+    print(f"# torch {torch.__version__}, x86-64")
+    print("%d.%d: %s" % (*torch_version(), body))
 
 
 if __name__ == "__main__":
