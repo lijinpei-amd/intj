@@ -150,11 +150,22 @@ typedef struct {
   uint32_t nparams;   /* kernel params, scratch slots excluded */
 } intj_kernel;
 
+/* At one word `intj_hash` is a bijection, so `hash == h` IS key equality and the
+ * slot has no reason to carry the key: 16 bytes, four to a cache line, against
+ * 8 + 8 + INTJ_NWORDS * 8.  A probe is a cache miss, and the slot size is what
+ * decides how many lines that miss costs. */
+#if INTJ_NWORDS == 1
+typedef struct {
+  uint64_t hash;
+  intj_kernel *val; /* NULL => empty slot */
+} intj_slot;
+#else
 typedef struct {
   uint64_t hash;
   intj_kernel *val; /* NULL => empty slot */
   uint64_t key[INTJ_NWORDS];
 } intj_slot;
+#endif
 
 typedef struct {
   intj_slot *slots;
@@ -166,18 +177,27 @@ typedef struct {
  * mov/cmp/jne per word, while memcmp of a compile-time size vectorizes -- three
  * vpxor/vptest cover 88 bytes.  Measured on an 11-word key: 33 instructions and
  * 11 dependent branches down to 12 and 3. */
+#if INTJ_NWORDS > 1 /* at one word the hash settles it; see intj_slot */
 static inline int intj_key_eq(const uint64_t *a, const uint64_t *b) {
   return memcmp(a, b, INTJ_NWORDS * sizeof(uint64_t)) == 0;
 }
+#endif
 
 static inline intj_kernel *intj_map_get(const intj_map *m, const uint64_t *k,
                                         uint64_t h) {
+#if INTJ_NWORDS == 1
+  (void)k;
+#endif
   uint32_t i = (uint32_t)h & m->mask;
   for (;;) {
     const intj_slot *s = &m->slots[i];
     if (INTJ_UNLIKELY(!s->val))
       return NULL;
+#if INTJ_NWORDS == 1
+    if (INTJ_LIKELY(s->hash == h))
+#else
     if (INTJ_LIKELY(s->hash == h && intj_key_eq(s->key, k)))
+#endif
       return s->val;
     i = (i + 1) & m->mask;
   }
@@ -194,12 +214,17 @@ static int intj_map_init(intj_map *m, uint32_t cap) {
 
 static void intj_map_insert(intj_map *m, const uint64_t *k, uint64_t h,
                             intj_kernel *val) {
+#if INTJ_NWORDS == 1
+  (void)k;
+#endif
   uint32_t i = (uint32_t)h & m->mask;
   while (m->slots[i].val)
     i = (i + 1) & m->mask;
   m->slots[i].hash = h;
   m->slots[i].val = val;
+#if INTJ_NWORDS > 1
   memcpy(m->slots[i].key, k, INTJ_NWORDS * sizeof(uint64_t));
+#endif
   m->used++;
 }
 
@@ -213,8 +238,12 @@ static int intj_map_put(intj_map *m, const uint64_t *k, uint64_t h,
       return -1;
     for (uint32_t i = 0; i <= m->mask; i++)
       if (m->slots[i].val)
+#if INTJ_NWORDS == 1 /* no key to carry over: the hash is the key */
+        intj_map_insert(&grown, NULL, m->slots[i].hash, m->slots[i].val);
+#else
         intj_map_insert(&grown, m->slots[i].key, m->slots[i].hash,
                         m->slots[i].val);
+#endif
     PyMem_RawFree(m->slots);
     *m = grown;
   }
