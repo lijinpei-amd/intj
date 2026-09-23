@@ -590,6 +590,36 @@ class _BoundPointer:
         return self.address
 
 
+@pytest.mark.parametrize(
+    "mode,value,valid",
+    [
+        (BindValue.TENSOR, None, True),
+        (BindValue.TENSOR, 0, False),
+        (BindValue.POINTER, None, True),
+        (BindValue.POINTER, 0, True),
+        (BindValue.POINTER, 4096, True),
+    ],
+)
+def test_binding_null_and_structural_rules(mode, value, valid, pointer_kernel):
+    factory = make_launcher(
+        pointer_kernel,
+        extra_annotation={
+            "x": Argument(
+                type=tl.pointer_type(tl.float32),
+                specialize=NEVER,
+                bind_value=mode,
+            )
+        },
+        verify_annotation=True,
+        no_gpu=True,
+    )
+    if valid:
+        factory.bind(x=value)
+    else:
+        with pytest.raises(TypeError, match="x"):
+            factory.bind(x=value)
+
+
 @pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
 @pytest.mark.parametrize("binding", [BindValue.TENSOR, BindValue.POINTER])
 @pytest.mark.parametrize("verify", [False, True])
@@ -627,30 +657,48 @@ def test_bind_checked_dtype_and_unchecked_promises(pointer_kernel, mode, binding
 
 
 @pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
-def test_bind_tensor_rechecks_storage_after_set(pointer_kernel, mode):
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+@pytest.mark.parametrize("bind_device", [False, True], ids=["module", "no-map"])
+def test_bind_tensor_rechecks_storage_after_set(pointer_kernel, mode, no_gpu, bind_device, monkeypatch):
+    monkeypatch.setattr("intj.launcher._LOADED", {})
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32),
                       specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.TENSOR),
-    }, no_gpu=True, verify_annotation=True, torch_access=mode)
-    tensor = torch.empty(4)
-    bound = factory.bind(x=tensor)
-    assert bound(0, 0, 1) is None
-    tensor.set_(torch.empty(8).untyped_storage(), 1, (7,), (1,))
+    }, no_gpu=no_gpu, bind_device=bind_device, verify_annotation=True, torch_access=mode)
+    device = "cpu" if no_gpu else "cuda"
+    tensor = torch.empty(4, device=device)
+    bound = factory.bind_device(0, x=tensor) if bind_device else factory.bind(x=tensor)
+    calls = []
+    if no_gpu:
+        def record(key, slots, device, *args):
+            calls.append(key)
+            return 0, 1, 0, slots
+        bound.__self__.set_compile_callback(record)
+    controls = (0, 1) if bind_device else (0, 0, 1)
+    assert bound(*controls) is None
+    tensor.set_(torch.empty(8, device=device).untyped_storage(), 1, (7,), (1,))
     with pytest.raises(ValueError, match="x.*aligned_16"):
-        bound(0, 0, 1)
-    tensor.set_(torch.empty(2**29).untyped_storage(), 0, (2**29,), (1,))  # Virtual CPU storage.
+        bound(*controls)
+    # The view is small; the constraint is on the entire underlying storage.
+    tensor.set_(torch.empty(2**29, device=device).untyped_storage(), 0, (4,), (1,))
     with pytest.raises(ValueError, match="x.*pointer_range_32"):
-        bound(0, 0, 1)
+        bound(*controls)
+    tensor.set_(torch.empty(4, device=device).untyped_storage(), 0, (4,), (1,))
+    assert bound(*controls) is None
+    if no_gpu:
+        assert len(calls) == 1  # Both failures preceded even the cached kernel.
 
 
 @pytest.mark.parametrize("verify", [False, True])
-def test_bind_pointer_checks_once_and_warns_at_creation(pointer_kernel, verify):
+@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+def test_bind_pointer_checks_once_and_warns_at_creation(pointer_kernel, verify, mode, no_gpu):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         factory = make_launcher(pointer_kernel, extra_annotation={
             "x": Argument(type=tl.pointer_type(tl.float32),
                           specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.POINTER),
-        }, no_gpu=True, verify_annotation=verify, torch_access=TorchAccess.CPYTHON)
+        }, no_gpu=no_gpu, verify_annotation=verify, torch_access=mode)
         assert len(caught) == int(verify)
         if verify:
             assert caught[0].category is RuntimeWarning
@@ -667,6 +715,131 @@ def test_bind_pointer_checks_once_and_warns_at_creation(pointer_kernel, verify):
         assert bound(0, 0, 1) is None
         assert owner.reads == 1
         assert len(caught) == int(verify)
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("bind_device", [False, True])
+def test_binding_warnings_are_per_parameter_at_factory_creation(bound_kernel, verify, bind_device):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        factory = make_launcher(bound_kernel, extra_annotation={
+            name: Argument(type=tl.pointer_type(tl.float32),
+                           specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.POINTER)
+            for name in ("x", "p")
+        }, no_gpu=True, verify_annotation=verify, bind_device=bind_device)
+        assert [str(w.message) for w in caught] == ([
+            f"intj: pointer-range assumption for bound pointer {name!r} "
+            "cannot be verified from an address and will be trusted"
+            for name in ("x", "p")
+        ] if verify else [])
+        assert all(w.category is RuntimeWarning and w.filename == __file__ for w in caught)
+        # Even a tensor's known >2 GiB range is deliberately trusted in POINTER mode.
+        large = torch.empty(2**29)
+        for _ in range(2):
+            bound = (factory.bind_device(0, x=large, p=4096) if bind_device
+                     else factory.bind(x=large, p=4096))
+            controls = (0, 1) if bind_device else (0, 0, 1)
+            for n in (7, 9):
+                assert bound(*controls, n) is None
+        assert len(caught) == 2 * int(verify)
+
+
+@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("binding", [BindValue.TENSOR, BindValue.POINTER])
+def test_binding_unchecked_assumptions_keep_structural_safety(pointer_kernel, mode, binding):
+    factory = make_launcher(pointer_kernel, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float32),
+                      specialize=Assume(Aligned(16), PointerRange(32)), bind_value=binding),
+    }, no_gpu=True, torch_access=mode)
+    large = torch.empty(2**28 + 1, dtype=torch.float64)
+    wrong = large[1:2]  # Wrong dtype, unaligned pointer, and >2 GiB storage.
+    assert factory.bind(x=wrong)(0, 0, 1) is None
+    class TensorSubclass(torch.Tensor):
+        pass
+    bad = (object(), True, 0.0, 2**64, wrong.as_subclass(TensorSubclass))
+    if binding is BindValue.POINTER:
+        # POINTER deliberately accepts data_ptr() owners, including subclasses.
+        bad = bad[:-1] + (_BoundPointer(True), _BoundPointer(0.0), _BoundPointer(2**64))
+    for value in bad:
+        with pytest.raises((TypeError, OverflowError), match="x"):
+            factory.bind(x=value)(0, 0, 1)
+
+
+@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mode):
+    for verify in (True, False):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            bound = make_launcher(bound_kernel, extra_annotation={
+                "x": Argument(type=tl.pointer_type(tl.float32),
+                              specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.TENSOR),
+                "p": Argument(type=tl.pointer_type(tl.float32),
+                              specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.POINTER),
+                "n": Argument(type=tl.int32, specialize=Assume(Aligned(16))),
+            }, no_gpu=True, verify_annotation=verify, torch_access=mode).bind(x=None, p=0)
+        suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+        source = pathlib.Path(bound.__self__.__file__).with_name(f"bound_kernel{suffix}").read_text()
+        pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
+        bind = source[source.index("static PyObject *make_bound"):source.index("/* Debug/test entry")]
+        for i, body in ((0, pack), (1, bind), (2, pack)):
+            branch, assume = f"INTJ_UNLIKELY(!valid_{i})", f"INTJ_ASSUME(valid_{i})"
+            assert source.count(branch) == source.count(assume) == int(verify)
+            if verify:
+                assert body.index(branch) < body.index(assume)
+        assert "valid_1" not in pack and "valid_0" not in bind and "valid_2" not in bind
+        assert "pointer_range_32" not in bind and "storage_nbytes" not in bind
+        assert source.count("intj_decode_bound_tensor(") == 1
+        assert source.count("intj_decode_pointer(") == 1
+        assert "intj_decode_pointer(" not in pack
+        if not verify:
+            for expression in ("valid_", "violates", "storage_nbytes <=", "INTJ_ASSUME("):
+                assert expression not in source
+
+
+@pytest.mark.parametrize("bind_device", [False, True])
+@pytest.mark.parametrize("annotation,bad,error,constraint", [
+    (Argument(type=tl.int8, specialize=NEVER), True, TypeError, "type"),
+    (Argument(type=tl.int8, specialize=NEVER), 128, OverflowError, "range"),
+    (Argument(type=tl.int32, specialize=Assume(EqualTo(1))), 2, ValueError, "equal_to_one"),
+    (Argument(type=tl.int32, specialize=Assume(Aligned(16))), 17, ValueError, "aligned_16"),
+    (Constexpr(type=tl.int8, power_of_two_or_zero=True), 3, ValueError, "power_of_two_or_zero"),
+])
+def test_checked_failures_precede_cold_and_hot_lookup(
+    scalar_kernel, monkeypatch, bind_device, annotation, bad, error, constraint,
+):
+    monkeypatch.setattr("intj.launcher._LOADED", {})
+    factory = make_launcher(scalar_kernel, extra_annotation={"x": annotation},
+                            no_gpu=True, verify_annotation=True, bind_device=bind_device)
+    bound = factory.bind_device(0) if bind_device else factory
+    calls = []
+    def record(key, slots, device, value):
+        calls.append(key)
+        return 0, 1, 0, slots
+    bound.__self__.set_compile_callback(record)
+    controls = (0, 1) if bind_device else (0, 0, 1)
+    good = 16 if constraint == "aligned_16" else 1
+    for warm in (False, True):
+        if warm:
+            bound(*controls, good)
+        with pytest.raises(error, match=f"x.*{constraint}"):
+            bound(*controls, bad)
+        assert len(calls) == int(warm)
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("annotation,constraint", [
+    (Argument(type=tl.int8, specialize=NEVER, value=128), "fit type"),
+    (Argument(type=tl.int32, specialize=Assume(EqualTo(1)), value=2), "equal_to_one"),
+    (Argument(type=tl.int32, specialize=Assume(Aligned(16)), value=17), "aligned_16"),
+    (Constexpr(type=tl.int8, power_of_two_or_zero=True, value=3), "power of two"),
+])
+def test_baked_constraints_fail_before_materialization(scalar_kernel, monkeypatch, verify, annotation, constraint):
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid baked value reached module materialization")
+    monkeypatch.setattr("intj.launcher._materialize_module", forbidden)
+    with pytest.raises(ValueError, match=f"x.*{constraint}"):
+        make_launcher(scalar_kernel, extra_annotation={"x": annotation}, no_gpu=True,
+                      verify_annotation=verify)
 
 
 @pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
@@ -1929,6 +2102,132 @@ def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key)
     callback(key, 0, device, 1)
     with pytest.raises(RuntimeError, match="two annotated ASTSource inputs"):
         callback(key, 0, device, True)
+
+
+def _recording_input_launcher(kernel, annotation, *, no_gpu, bind_device, monkeypatch, **bound_values):
+    from intj.launcher import _compiler_input, _current_target, _make_compile_callback
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import make_backend
+
+    monkeypatch.setattr("intj.launcher._LOADED", {})
+    factory = make_launcher(kernel, extra_annotation={"x": annotation}, no_gpu=no_gpu,
+                            bind_device=bind_device, verify_annotation=True,
+                            torch_access=TorchAccess.CPYTHON)
+    native = factory.bind_device(0, **bound_values) if bind_device else factory
+    module = native.__self__
+    # Use the placed, resolved annotations, including the inferred bound dtype.
+    from intj.launcher import _LOADED
+    params = next(key.context.params for key, value in _LOADED.items() if value is module)
+    backend = make_backend(GPUTarget("hip", "gfx942", 64) if no_gpu else _current_target())
+    real_compile = None if no_gpu else _make_compile_callback(kernel, params, {})
+    calls = []
+
+    def compiler_input(*args):
+        return _compiler_input(kernel, params, args, backend)
+
+    def record(key, slots, device, *args):
+        source = compiler_input(*args)
+        result = real_compile(key, slots, device, *args) if real_compile else (0, 1, 0, slots)
+        calls.append((key, source))
+        return result
+
+    module.set_compile_callback(record)
+    return native, compiler_input, calls
+
+
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+@pytest.mark.parametrize("bind_device", [False, True], ids=["module", "handle-map"])
+@pytest.mark.parametrize("annotation,groups,field", [
+    pytest.param(Argument(specialize=NEVER), ((2, 3), (2**31, 2**31 + 1), (2**63, 2**63 + 1)),
+                 "signature", id="ordinary-descriptor"),
+    pytest.param(Argument(type=tl.int32), ((1, 1), (2, 3)), "signature", id="equal-one"),
+    pytest.param(Argument(type=tl.int32), ((16, 32), (17, 33)), "attrs", id="scalar-alignment"),
+    pytest.param(Constexpr(), ((False, False), (0, 0), (0.0, 0.0)), "constants", id="constexpr-descriptor"),
+    pytest.param(Constexpr(type=tl.float64), ((0.0, 0.0), (-0.0, -0.0)), "constants", id="float64-sign"),
+    *[pytest.param(Constexpr(type=getattr(tl, f"int{width}")), ((1, 1), (2, 2)),
+                   "constants", id=f"payload-{width}") for width in (8, 16, 32, 64)],
+    pytest.param(Constexpr(type=tl.int64, power_of_two_or_zero=True),
+                 ((0, 0), (1, 1), (-1, -1), (2, 2)), "constants", id="power-payload"),
+])
+def test_runtime_compiler_input_invariant(
+    scalar_kernel, monkeypatch, no_gpu, bind_device, annotation, groups, field,
+):
+    native, compiler_input, calls = _recording_input_launcher(
+        scalar_kernel, annotation, no_gpu=no_gpu, bind_device=bind_device, monkeypatch=monkeypatch,
+    )
+    controls = (0, 1) if bind_device else (0, 0, 1)
+    saved = {}
+    for group_index, group in enumerate(groups):
+        for value in group:
+            source = compiler_input(value)
+            blob, slots = native.__self__.spec_key(value)
+            assert slots == sum(ty != "constexpr" for _, ty in source.signature)
+            assert native(*controls, value) is None
+            assert saved.setdefault(blob, source) == source, "cached key has different CompilerInput"
+            assert len(calls) == group_index + 1, "distinct CompilerInput must cause a miss"
+            assert calls[-1] == (blob, source), "cache hit must retain its CompilerInput"
+    assert len({getattr(source, field) for _, source in calls}) == len(groups)
+    # Revisit the first entry after all distinct inputs have been installed.
+    assert native(*controls, groups[0][0]) is None
+    assert len(calls) == len(groups)
+
+
+@pytest.mark.parametrize("bind_device", [False, True], ids=["module", "handle-map"])
+@pytest.mark.parametrize("fact", ["dtype", "alignment", "range"])
+def test_runtime_pointer_compiler_input_invariant(pointer_kernel, monkeypatch, bind_device, fact):
+    from triton import knobs
+
+    # Keep the range expectation independent of the caller's environment.
+    monkeypatch.setattr(knobs.amd, "use_buffer_ops", True)
+    base = torch.empty(16, device="cuda")
+    if fact == "dtype":
+        groups = ((base, base[4:]), (base.to(torch.int32), base.to(torch.int32)))
+        field = "signature"
+    elif fact == "alignment":
+        groups = ((base, base[4:]), (base[1:], base[2:]))
+        field = "attrs"
+    else:
+        large = torch.empty(2**29, device="cuda")
+        groups = ((base, base[4:]), (large[:4], large[4:8]))
+        field = "attrs"
+    test_runtime_compiler_input_invariant(pointer_kernel, monkeypatch, False, bind_device,
+                                          Argument(), groups, field)
+
+
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+@pytest.mark.parametrize("annotation,values,signature,constants,attrs", [
+    (Argument(type=tl.int32, specialize=NEVER), (7, 9), "i32", (), ()),
+    (Argument(type=tl.float64, specialize=NEVER), (1.25, 2.5), "fp64", (), ()),
+    (Argument(type=tl.pointer_type(tl.float32), specialize=Assume(Aligned(16), PointerRange(32))),
+     (None, 0), "*fp32", (), (((0,), (("tt.divisibility", 16), ("tt.pointer_range", 32))),)),
+    (Constexpr(type=None), (None, None), "constexpr", (((0,), ("none",)),), ()),
+    (Argument(type=tl.pointer_type(tl.float32), specialize=Assume(Aligned(16), PointerRange(32)),
+              bind_value=BindValue.TENSOR), (None, None), "*fp32", (),
+     (((0,), (("tt.divisibility", 16), ("tt.pointer_range", 32))),)),
+])
+def test_no_map_compiler_input_invariant(
+    scalar_kernel, monkeypatch, no_gpu, annotation, values, signature, constants, attrs,
+):
+    from intj.launcher import CompilerInput
+
+    binding = isinstance(annotation, Argument) and annotation.bind_value is not None
+    bound_values = {"x": torch.empty(4, device="cpu" if no_gpu else "cuda")} if binding else {}
+    native, compiler_input, calls = _recording_input_launcher(
+        scalar_kernel, annotation, no_gpu=no_gpu, bind_device=True, monkeypatch=monkeypatch, **bound_values,
+    )
+    expected = CompilerInput((("x", signature),), constants, attrs, ())
+    saved = None
+    for value in values:
+        if bound_values:
+            bound_values["x"].set_(torch.empty(8, device="cpu" if no_gpu else "cuda").untyped_storage(),
+                                    0, (8,), (1,))
+        args = () if bound_values else (value,)
+        assert native(0, 1, *args) is None
+        source = compiler_input(*args)  # Compare EVERY accepted call, including the hit.
+        if saved is None:
+            saved = calls[0][1]
+        assert source == saved == expected, "no-map call changed its saved CompilerInput"
+        assert calls == [(b"", expected)], "no-map handle must compile exactly once"
 
 
 @pytest.mark.parametrize("nparams,nconstexpr", [(1, 0), (1, 1), (7, 2), (8, 3)])
