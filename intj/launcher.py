@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._version import __version__
+from .annotation import _resolve_annotations  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 from .kernel_cache import (
     INSTALL_ERRORS,
     KernelCache,
@@ -128,7 +129,7 @@ def make_launcher(
     jit_func: JitFunction,
     dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
-    extra_annotation: Mapping[str, str] | None = None,
+    extra_annotation: Mapping[str, object] | None = None,
     options: Mapping[str, Any] | None = None,
     torch_access: TorchAccess = TorchAccess.AUTO,
     kernel_cache: KernelCache = KernelCache.INTJ,
@@ -147,22 +148,25 @@ def make_launcher(
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
     `TorchAccess`.  `kernel_cache` picks the hash map behind the kernel cache;
-    see `KernelCache`.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
-    are reserved and currently unsupported.
+    see `KernelCache`.  `dynamic_grid` and `dynamic_options` are reserved and
+    currently unsupported.
     """
     if dynamic_grid:
         raise UnsupportedKernel("intj: dynamic_grid is not implemented; pass an int or tuple grid")
     if dynamic_options:
         raise UnsupportedKernel("intj: dynamic_options is not implemented; pass options=... instead")
-    if extra_annotation:
-        raise UnsupportedKernel("intj: extra_annotation is not implemented")
-
     options = dict(sorted((options or {}).items()))
     jit_func = _check_kernel(jit_func, options)
+    _resolve_annotations(jit_func, extra_annotation)
+    target = _current_target()
+    if target.backend not in BACKENDS:
+        raise UnsupportedKernel(
+            f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
+            f"register() it (have: {', '.join(sorted(BACKENDS))})"
+        )
     params, nwords = _render_params(jit_func)
 
     access = _resolve_access(torch_access)
-    target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
     # last, after every refusal above it: a kernel that is going to be rejected
@@ -598,12 +602,6 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
             f"intj: expected a @triton.jit function, got {type(jit_func).__name__}; "
             "autotuned and heuristic kernels are not supported"
         )
-    target = _current_target()
-    if target.backend not in BACKENDS:
-        raise UnsupportedKernel(
-            f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
-            f"register() it (have: {', '.join(sorted(BACKENDS))})"
-        )
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")
     jit_func.cache_key  # populates used_global_vals
@@ -635,11 +633,6 @@ def _render_params(jit_func: JitFunction) -> tuple[tuple[Param, ...], int]:
         kind = p._param.kind
         if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
             raise UnsupportedKernel(f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported")
-        if not p.is_constexpr and p.annotation:
-            raise UnsupportedKernel(
-                f"intj: parameter {p.name!r} has annotation {p.annotation!r}; only tl.constexpr annotations "
-                "are supported"
-            )
         params.append(
             Param(
                 name=p.name,
