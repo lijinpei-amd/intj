@@ -712,6 +712,59 @@ def test_dtype_code_matches_torch(dtype_name):
     assert itemsize_table()[code] == torch.empty(0, dtype=dtype).element_size()
 
 
+@pytest.mark.parametrize("nparams", [3, 7, 8, 15, 16])
+def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
+    """The template's accumulator/shift arithmetic, checked against a real key.
+
+    `test_render_params_byte_layout` pins the python half.  This pins the C
+    half: each parameter ORs its code into accumulator `i // 4` at shift
+    `(i % 4) * 8`, and the accumulators fold pairwise into one store per word.
+    The counts straddle both boundaries -- 4 bytes per accumulator and 8 per
+    word -- which is where an off-by-one would hide.
+    """
+    import importlib.util
+
+    from intj.launcher import _render_params
+
+    names = [f"p{i}" for i in range(nparams)]
+    path = tmp_path / f"k{nparams}.py"
+    path.write_text(
+        "import triton\nimport triton.language as tl\n\n\n@triton.jit\n"
+        f"def k({', '.join(names)}, C: tl.constexpr):\n    pass\n"
+    )
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    kernel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kernel)
+
+    params, nwords = _render_params(kernel.k)
+    header_words = -(-(nparams + 2) // 8)
+    module = getattr(make_launcher(kernel.k), "__self__")
+
+    b_i32 = 128  # INTJ_B_I32, +1 when the value is divisible by 16
+    # odd, above 1, not divisible by 16: every byte must be the plain i32 code
+    args = [3 + 2 * i for i in range(nparams)] + [256]
+    blob, np_ = module.spec_key(*args)
+
+    assert (len(blob), nwords, np_) == (nwords * 8, header_words + 1, nparams)
+    assert list(blob[:nparams]) == [b_i32] * nparams
+    assert blob[nparams] == 140  # INTJ_B_CX_INT
+    assert blob[nparams + 1] == 0  # the device byte; spec_key keys on device 0
+    assert set(blob[nparams + 2:header_words * 8]) <= {0}  # padding memcmp reads
+    at = header_words * 8
+    assert int.from_bytes(blob[at:at + 8], "little") == 256
+
+    # flipping one parameter must move exactly its own byte and nothing else
+    for i in range(nparams):
+        alt = list(args)
+        alt[i] = 16  # divisible by 16 -> tt.divisibility, so +1
+        other, _ = module.spec_key(*alt)
+        assert other[i] == b_i32 + 1
+        assert [b for j, b in enumerate(other) if j != i] == [
+            b for j, b in enumerate(blob) if j != i
+        ]
+
+
 def test_unsupported_dtype_is_refused_in_every_mode():
     """The path that skipped the dtype check: numel == 0 returns before it.
 
