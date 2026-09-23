@@ -24,6 +24,27 @@ def test_annotation_sequences_are_immutable():
 
 
 @pytest.mark.parametrize(
+    "build",
+    [
+        lambda: intj.Argument(value=[1]),
+        lambda: intj.Constexpr(value=[1]),
+    ],
+)
+def test_annotation_values_reject_unhashable_values(build):
+    with pytest.raises(TypeError):
+        build()
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [intj.EqualTo(True), intj.Aligned(cast(Any, 16.0))],
+)
+def test_assume_fact_values_require_exact_int(fact):
+    with pytest.raises(TypeError, match="Fact value must be an int"):
+        intj.Assume(fact)
+
+
+@pytest.mark.parametrize(
     "build,match",
     [
         (lambda: intj.Argument(type=[]), "type sequence must not be empty"),

@@ -66,7 +66,10 @@ class Assume(Specialization):
             expected = allowed.get(type(fact))
             if expected is None:
                 raise TypeError("intj: Assume accepts exact built-in Fact instances")
-            if getattr(fact, "value") != expected:
+            value = getattr(fact, "value")
+            if type(value) is not int:
+                raise TypeError("intj: Fact value must be an int")
+            if value != expected:
                 raise ValueError(
                     f"intj: only {type(fact).__name__}({expected}) is supported"
                 )
@@ -111,6 +114,8 @@ class Argument(Annotation):
             raise TypeError("intj: bind_value must be a BindValue or None")
         if self.value is not UNSET and self.bind_value is not None:
             raise ValueError("intj: value and bind_value are mutually exclusive")
+        if self.value is not UNSET:
+            hash(self.value)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,6 +128,8 @@ class Constexpr(Annotation):
         object.__setattr__(self, "type", _normalize_type_field(self.type))
         if not isinstance(cast(object, self.power_of_two_or_zero), bool):
             raise TypeError("intj: power_of_two_or_zero must be bool")
+        if self.value is not UNSET:
+            hash(self.value)
 
 
 INT_TYPES = (tl.int32, tl.int64, tl.uint64)
