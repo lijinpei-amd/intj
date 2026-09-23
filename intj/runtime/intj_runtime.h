@@ -7,6 +7,8 @@
 
 #include <Python.h>
 #include <dlfcn.h>
+#include <float.h>
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -26,6 +28,14 @@
 #define INTJ_ALWAYS_INLINE inline
 #define INTJ_LIKELY(x) (x)
 #define INTJ_UNLIKELY(x) (x)
+#endif
+
+#if defined(__clang__)
+#define INTJ_ASSUME(x) __builtin_assume(x)
+#elif defined(__GNUC__)
+#define INTJ_ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+#else
+#define INTJ_ASSUME(x) ((void)0)
 #endif
 
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
@@ -512,7 +522,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
     return -1;
   /* struct THPDtype { PyObject_HEAD at::ScalarType scalar_type; char name[65];
    * } ScalarType is `enum class : int8_t`, so this is the first byte of
-   * payload. Only reached after INTJ_DECODE's exact-type test, so `o` really is
+   * payload. Only reached after intj_decode_argument's exact-type test, so `o` really is
    * a tensor and `d` really is a THPDtype.
    */
   *dt = (int32_t) * (const int8_t *)((char *)d + sizeof(PyObject));
@@ -723,108 +733,139 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
 #define INTJ_B_CX_INT 140u
 #define INTJ_B_CX_UINT 141u
 #define INTJ_B_CX_FLOAT 142u
-/* 143..255 unused.  The constexpr codes are disjoint from the rest even though
+#define INTJ_B_FP64 143u
+#define INTJ_B_I8 144u
+#define INTJ_B_U8 146u
+#define INTJ_B_I16 148u
+#define INTJ_B_U16 150u
+#define INTJ_B_U32 152u
+/* 154..255 unused. Integer codes reserve their low bit for alignment.
+ * The constexpr codes are disjoint from the rest even though
  * a byte position is always known at render time to be one or the other: it
- * costs nothing out of the spare 113, and it turns a wrong render-time offset
+ * costs nothing out of the spare codes, and it turns a wrong render-time offset
  * into a nonsense code rather than a silent alias. */
 
-/* Decode one non-constexpr kernel argument: ORs one code byte into a 32-bit
- * header accumulator at a render-time shift, and appends at most one value
- * slot.  SPEC/ALIGN/SBIT are render-time constants
- * (do_not_specialize, do_not_specialize_on_alignment, and whether the backend
- * specializes pointers on a 2 GiB range).
- *
- * Reads `ob_fval` rather than calling `PyFloat_AS_DOUBLE`: that is a static
- * inline in CPython's headers, and in the c++ mode's much larger translation
- * unit g++ leaves it out of line -- a real call per float argument.  The two
- * are the same field read.
- *
- * `st` must expose tensor_type/param_type and the torch ABI block. On failure
- * it sets a python error and returns NULL from the enclosing function -- which
- * must therefore return PyObject *.  (A `goto` to a shared label would be
- * tidier, but C++ forbids jumping over the initializations that follow in
- * `entry`, and the CXX access mode compiles this as C++.) /
- */
-#define INTJ_DECODE(st, o, acc, shift, vals, np, SPEC, ALIGN, SBIT, pname)     \
-  do {                                                                         \
-    PyObject *_o = (o);                                                        \
-    PyTypeObject *_t = Py_TYPE(_o);                                            \
-    uint32_t _code;                                                            \
-    if (_t == (st)->tensor_type || _t == (st)->param_type) {                   \
-      void *_p = NULL;                                                         \
-      int32_t _dt = -1;                                                        \
-      int64_t _sz = 0;                                                         \
-      int _want = (SPEC) && (SBIT);                                            \
-      if (INTJ_UNLIKELY(intj_read_tensor(&(st)->abi, _o, &_p, &_dt, _want,     \
-                                         &_sz) != 0)) {                        \
-        intj_note_param(pname);                                                \
-        return NULL;                                                           \
-      }                                                                        \
-      /* The three readers disagree about how much they check: the shim one     \
-       * skips its own bound test for a zero-element tensor, and the cpython    \
-       * one has none at all.  One lookup here covers every mode and every path \
-       * through them -- and with a byte code it has to, because an unmapped    \
-       * dtype would otherwise alias into the scalar range. */                  \
-      uint32_t _idx = (_dt >= 0 && _dt < INTJ_NDTYPES)                         \
-                          ? (st)->abi.dtype_index[_dt]                         \
-                          : 0xFFu;                                             \
-      if (INTJ_UNLIKELY(_idx == 0xFFu)) {                                      \
-        PyErr_Format(PyExc_RuntimeError,                                       \
-                     "intj: tensor argument '%s' has dtype code %d, which "    \
-                     "triton does not take",                                   \
-                     pname, (int)_dt);                                         \
-        return NULL;                                                           \
-      }                                                                        \
-      uint32_t _d =                                                            \
-          ((SPEC) && (ALIGN) && (((uintptr_t)_p & 15u) == 0)) ? 1u : 0u;       \
-      uint32_t _s = (_want && _sz <= 2147483647LL) ? 1u : 0u;                  \
-      _code = INTJ_B_PTR(_idx, _d, _s);                                        \
-      (vals)[(np)] = (uint64_t)(uintptr_t)_p;                                  \
-      (np)++;                                                                  \
-    } else if (_o == Py_True || _o == Py_False) {                              \
-      _code = INTJ_B_U1;                                                       \
-      (vals)[(np)] = (uint64_t)(_o == Py_True);                                \
-      (np)++;                                                                  \
-    } else if (PyLong_CheckExact(_o)) {                                        \
-      uint64_t _bits;                                                          \
-      int _kind = intj_as_int(_o, &_bits);                                     \
-      if (INTJ_UNLIKELY(_kind == INTJ_INT_TOO_BIG)) {                          \
-        PyErr_Format(PyExc_OverflowError,                                      \
-                     "intj: integer argument '%s' is too large", pname);       \
-        return NULL;                                                           \
-      }                                                                        \
-      int64_t _v = (int64_t)_bits;                                             \
-      if (_kind == INTJ_INT_I64 && (SPEC) && _v == 1) {                        \
-        _code = INTJ_B_ONE;                                                    \
-      } else {                                                                 \
-        uint32_t _d = ((SPEC) && (ALIGN) && ((_bits & 15u) == 0)) ? 1u : 0u;   \
-        _code = (_kind == INTJ_INT_U64 ? INTJ_B_U64                            \
-                 : (_v >= INT32_MIN && _v <= INT32_MAX) ? INTJ_B_I32           \
-                                                        : INTJ_B_I64) +        \
-                _d;                                                            \
-        (vals)[(np)] = _bits;                                                  \
-        (np)++;                                                                \
-      }                                                                        \
-    } else if (PyFloat_CheckExact(_o)) {                                       \
-      float _f = (float)((PyFloatObject *)_o)->ob_fval;                        \
-      uint32_t _bits;                                                          \
-      memcpy(&_bits, &_f, 4);                                                  \
-      _code = INTJ_B_FP32;                                                     \
-      (vals)[(np)] = (uint64_t)_bits;                                          \
-      (np)++;                                                                  \
-    } else if (_o == Py_None) {                                                \
-      _code = INTJ_B_NONE;                                                     \
-    } else {                                                                   \
-      PyErr_Format(PyExc_TypeError,                                            \
-                   "intj: unsupported argument '%s' of type %s; pass a "       \
-                   "torch.Tensor, int, float, bool or None",                   \
-                   pname, Py_TYPE(_o)->tp_name);                               \
-      return NULL;                                                             \
-    }                                                                          \
-    (acc) |= _code << (shift);                                                 \
-  } while (0)
+/* Structural decoding is independent of template-local state.  It reads each
+ * Python object once; rendering owns semantic promises and GPU packing. */
+typedef enum {
+  INTJ_VALUE_TENSOR,
+  INTJ_VALUE_BOOL,
+  INTJ_VALUE_I64,
+  INTJ_VALUE_U64,
+  INTJ_VALUE_FP64,
+  INTJ_VALUE_NONE
+} intj_value_kind;
 
-/* Decode a tl.constexpr argument into one code byte and one value word. */
+typedef struct {
+  intj_value_kind kind;
+  uint64_t bits;
+  void *pointer;
+  int64_t storage_nbytes;
+  uint8_t dtype_index;
+} intj_decoded;
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                     PyTypeObject *param_type, PyObject *o, int want_size,
+                     const char *pname, intj_decoded *out) {
+  memset(out, 0, sizeof(*out));
+  PyTypeObject *type = Py_TYPE(o);
+  if (type == tensor_type || type == param_type) {
+    int32_t dtype = -1;
+    if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype,
+                                      want_size, &out->storage_nbytes) != 0)) {
+      intj_note_param(pname);
+      return -1;
+    }
+    /* All three readers, including zero-element tensors, share this gate. */
+    uint32_t index = (dtype >= 0 && dtype < INTJ_NDTYPES)
+                         ? abi->dtype_index[dtype] : 0xFFu;
+    if (INTJ_UNLIKELY(index == 0xFFu)) {
+      PyErr_Format(PyExc_RuntimeError,
+                   "intj: tensor argument '%s' has dtype code %d, which "
+                   "triton does not take", pname, (int)dtype);
+      return -1;
+    }
+    out->kind = INTJ_VALUE_TENSOR;
+    out->bits = (uint64_t)(uintptr_t)out->pointer;
+    out->dtype_index = (uint8_t)index;
+  } else if (o == Py_True || o == Py_False) {
+    out->kind = INTJ_VALUE_BOOL;
+    out->bits = (uint64_t)(o == Py_True);
+  } else if (PyLong_CheckExact(o)) {
+    int kind = intj_as_int(o, &out->bits);
+    if (INTJ_UNLIKELY(kind == INTJ_INT_TOO_BIG)) {
+      PyErr_Format(PyExc_OverflowError,
+                   "intj: integer argument '%s' is too large", pname);
+      return -1;
+    }
+    out->kind = kind == INTJ_INT_U64 ? INTJ_VALUE_U64 : INTJ_VALUE_I64;
+  } else if (PyFloat_CheckExact(o)) {
+    out->kind = INTJ_VALUE_FP64;
+    /* Reading ob_fval directly keeps g++ from leaving an accessor call here. */
+    double value = ((PyFloatObject *)o)->ob_fval;
+    memcpy(&out->bits, &value, sizeof(value));
+  } else if (o == Py_None) {
+    out->kind = INTJ_VALUE_NONE;
+  } else {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: unsupported argument '%s' of type %s; pass a "
+                 "torch.Tensor, int, float, bool or None", pname, type->tp_name);
+    return -1;
+  }
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE double intj_as_double(uint64_t bits) {
+  double value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+static INTJ_ALWAYS_INLINE uint32_t intj_infer_type(const intj_decoded *value) {
+  switch (value->kind) {
+  case INTJ_VALUE_TENSOR: return INTJ_B_PTR(value->dtype_index, 0, 0);
+  case INTJ_VALUE_BOOL: return INTJ_B_U1;
+  case INTJ_VALUE_I64:
+    return (int64_t)value->bits >= INT32_MIN && (int64_t)value->bits <= INT32_MAX
+               ? INTJ_B_I32 : INTJ_B_I64;
+  case INTJ_VALUE_U64: return INTJ_B_U64;
+  case INTJ_VALUE_FP64: return INTJ_B_FP32;
+  case INTJ_VALUE_NONE: return INTJ_B_NONE;
+  }
+  return INTJ_B_NONE;
+}
+
+static INTJ_ALWAYS_INLINE int intj_integer_type(uint32_t type) {
+  return type == INTJ_B_I32 || type == INTJ_B_I64 || type == INTJ_B_U64 ||
+         (type >= INTJ_B_I8 && type <= INTJ_B_U32);
+}
+
+static INTJ_ALWAYS_INLINE uint64_t intj_pack_value(uint64_t bits, uint32_t type) {
+  if (type == INTJ_B_FP32) {
+    float value = (float)intj_as_double(bits);
+    uint32_t packed;
+    memcpy(&packed, &value, sizeof(packed));
+    return packed;
+  }
+  return bits;
+}
+
+/* Keys are little endian, independent of the host's byte order. */
+#define INTJ_KEY_STORE(WIDTH)                                                  \
+  static INTJ_ALWAYS_INLINE void intj_key_store##WIDTH(                        \
+      void *out, uint##WIDTH##_t value) {                                      \
+    if (PY_BIG_ENDIAN)                                                        \
+      value = __builtin_bswap##WIDTH(value);                                  \
+    memcpy(out, &value, sizeof(value));                                        \
+  }
+INTJ_KEY_STORE(16)
+INTJ_KEY_STORE(32)
+INTJ_KEY_STORE(64)
+#undef INTJ_KEY_STORE
+
+/* Decode a tl.constexpr into a code and value word; return -1 from intj_pack
+ * on failure. Typed constexpr packing is separate from ordinary decoding. */
 #define INTJ_DECODE_CONSTEXPR(o, acc, shift, valword, pname)                   \
   do {                                                                         \
     PyObject *_o = (o);                                                        \
@@ -841,7 +882,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
       if (INTJ_UNLIKELY(_kind == INTJ_INT_TOO_BIG)) {                          \
         PyErr_Format(PyExc_OverflowError,                                      \
                      "intj: constexpr argument '%s' is too large", pname);     \
-        return NULL;                                                           \
+        return -1;                                                             \
       }                                                                        \
       _code = _kind == INTJ_INT_U64 ? INTJ_B_CX_UINT : INTJ_B_CX_INT;          \
       (valword) = _bits;                                                       \
@@ -854,7 +895,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
                    "intj: unsupported constexpr argument '%s' of type %s; "    \
                    "pass an int, float, bool or None",                         \
                    pname, Py_TYPE(_o)->tp_name);                               \
-      return NULL;                                                             \
+      return -1;                                                               \
     }                                                                          \
     (acc) |= _code << (shift);                                                 \
   } while (0)

@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 import intj
-from intj import make_launcher
+from intj import NEVER, Aligned, Argument, Assume, EqualTo, PointerRange, make_launcher
 from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
     ModuleKey,
@@ -55,6 +55,235 @@ def scale(x, o, n, s, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = off < n
     tl.store(o + off, tl.load(x + off, mask=mask) * s, mask=mask)
+
+
+def _kernel_from_source(tmp_path, name, signature):
+    import importlib.util
+
+    path = tmp_path / f"{name}.py"
+    path.write_text(
+        "import triton\n\n"
+        f"@triton.jit\ndef {name}({signature}):\n"
+        "    pass\n"
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, name)
+
+
+@pytest.fixture
+def scalar_kernel(tmp_path):
+    return _kernel_from_source(tmp_path, "scalar_kernel", "x")
+
+
+@pytest.fixture
+def power_kernel(tmp_path):
+    return _kernel_from_source(tmp_path, "power_kernel", "N")
+
+
+@pytest.fixture
+def bound_kernel(tmp_path):
+    return _kernel_from_source(tmp_path, "bound_kernel", "x, p, n")
+
+
+@pytest.fixture
+def device_kernel(tmp_path):
+    return _kernel_from_source(tmp_path, "device_kernel", "x")
+
+
+@pytest.fixture
+def pointer_kernel(tmp_path):
+    return _kernel_from_source(tmp_path, "pointer_kernel", "x")
+
+
+@pytest.mark.parametrize(
+    "annotation,good,bad",
+    [
+        (Argument(type=tl.int32, specialize=NEVER), 7, 2**31),
+        (Argument(type=tl.int1, specialize=NEVER), True, 1),
+        (Argument(type=tl.float64, specialize=NEVER), 1.25, 1),
+        (Argument(type=None, specialize=NEVER), None, 0),
+        (Argument(type=(tl.int32, tl.float32), specialize=NEVER), 7, None),
+    ],
+)
+def test_checked_ordinary_types(annotation, good, bad, scalar_kernel):
+    launch = make_launcher(
+        scalar_kernel, extra_annotation={"x": annotation},
+        verify_annotation=True, no_gpu=True,
+    )
+    assert launch(0, 0, 1, good) is None
+    with pytest.raises((TypeError, ValueError, OverflowError), match="x"):
+        launch(0, 0, 1, bad)
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("width", [8, 16, 32, 64])
+def test_checked_ordinary_integer_widths(scalar_kernel, signed, width):
+    dtype = getattr(tl, f"{'int' if signed else 'uint'}{width}")
+    low = -(1 << (width - 1)) if signed else 0
+    high = (1 << (width - int(signed))) - 1
+    launch = make_launcher(
+        scalar_kernel, extra_annotation={"x": Argument(type=dtype, specialize=NEVER)},
+        verify_annotation=True, no_gpu=True,
+    )
+    for value in (low, high):
+        assert launch(0, 0, 1, value) is None
+        assert getattr(launch, "__self__").spec_key(value)[1] == 1
+    for value in (low - 1, high + 1, True, 1.0, None):
+        with pytest.raises((TypeError, ValueError, OverflowError), match="x"):
+            launch(0, 0, 1, value)
+
+
+def test_checked_ordinary_reports_type_and_range_separately(scalar_kernel):
+    launch = make_launcher(scalar_kernel, extra_annotation={
+        "x": Argument(type=tl.int8, specialize=NEVER)},
+        verify_annotation=True, no_gpu=True)
+    with pytest.raises(TypeError, match="x.*type"):
+        launch(0, 0, 1, True)
+    with pytest.raises(OverflowError, match="x.*range"):
+        launch(0, 0, 1, 128)
+
+
+def test_checked_ordinary_allowlist_is_not_coercion(scalar_kernel):
+    launch = make_launcher(scalar_kernel, extra_annotation={
+        "x": Argument(type=(tl.int8, tl.int64, tl.float64), specialize=NEVER)},
+        verify_annotation=True, no_gpu=True)
+    assert launch(0, 0, 1, 2**31) is None
+    for value in (7, 1.25):
+        with pytest.raises(TypeError, match="x.*allowlist"):
+            launch(0, 0, 1, value)
+
+
+def test_unchecked_ordinary_keeps_only_structural_checks(scalar_kernel):
+    launch = make_launcher(scalar_kernel, extra_annotation={
+        "x": Argument(type=tl.int8, specialize=Assume(Aligned(16)))},
+        no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    for value in (129, 17, None, True):
+        assert launch(0, 0, 1, value) is None
+    for value in (object(), 2**64):
+        with pytest.raises((TypeError, OverflowError), match="x"):
+            launch(0, 0, 1, value)
+
+
+@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.SHIM, TorchAccess.CXX])
+def test_checked_ordinary_pointer_null_and_dtype(pointer_kernel, mode):
+    launch = make_launcher(
+        pointer_kernel,
+        extra_annotation={"x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER)},
+        verify_annotation=True, no_gpu=True, torch_access=mode,
+    )
+    for value in (None, 0, torch.empty(4)):
+        assert launch(0, 0, 1, value) is None
+        assert getattr(launch, "__self__").spec_key(value)[1] == 1
+    for value in (True, 1, -1, 0.0, torch.empty(4, dtype=torch.int32)):
+        with pytest.raises((TypeError, ValueError), match="x"):
+            launch(0, 0, 1, value)
+
+
+def test_checked_ordinary_pointer_allowlist_rejects_missing_torch_dtype(pointer_kernel):
+    # Triton has fp8e4b15, but torch has no corresponding dtype. It must not
+    # accidentally match the first compact dtype index (uint8).
+    launch = make_launcher(pointer_kernel, extra_annotation={
+        "x": Argument(type=(tl.pointer_type(tl.float8e4b15), tl.int32), specialize=NEVER)},
+        verify_annotation=True, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    assert launch(0, 0, 1, 7) is None
+    with pytest.raises(TypeError, match="x.*allowlist"):
+        launch(0, 0, 1, torch.empty(1, dtype=torch.uint8))
+
+
+def test_ordinary_unannotated_none_and_never(scalar_kernel):
+    auto = getattr(make_launcher(scalar_kernel, no_gpu=True), "__self__")
+    never = getattr(make_launcher(
+        scalar_kernel, extra_annotation={"x": Argument(specialize=NEVER)}, no_gpu=True,
+    ), "__self__")
+    assert auto.spec_key(None)[1] == 0
+    assert auto.spec_key(0)[1] == 1
+    assert len({auto.spec_key(value) for value in (1, 16, 17)}) == 3
+    assert len({never.spec_key(value) for value in (1, 16, 17)}) == 1
+    tensor = torch.empty(8)
+    assert never.spec_key(tensor) == never.spec_key(tensor[1:])
+
+
+def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
+    with pytest.raises(ValueError, match="impossible"):
+        make_launcher(scalar_kernel, extra_annotation={
+            "x": Argument(specialize=Assume(EqualTo(1), Aligned(16)))}, no_gpu=True)
+    equal = make_launcher(scalar_kernel, extra_annotation={
+        "x": Argument(type=tl.int32, specialize=Assume(EqualTo(1)))},
+        verify_annotation=True, no_gpu=True)
+    assert getattr(equal, "__self__").spec_key(1)[1] == 0
+    with pytest.raises(ValueError, match="x.*equal_to_one"):
+        equal(0, 0, 1, 2)
+    pointer = make_launcher(pointer_kernel, extra_annotation={
+        "x": Argument(type=tl.pointer_type(tl.float32),
+                      specialize=Assume(Aligned(16), PointerRange(32)))},
+        verify_annotation=True, no_gpu=True)
+    assert getattr(pointer, "__self__").spec_key(torch.empty(8)) == (bytes(8), 1)
+    with pytest.raises(ValueError, match="x.*aligned_16"):
+        pointer(0, 0, 1, torch.empty(8)[1:])
+    # CPU empty storage is virtual; the test never touches these bytes.
+    with pytest.raises(ValueError, match="x.*pointer_range_32"):
+        pointer(0, 0, 1, torch.empty(2**29, dtype=torch.float32))
+
+
+@pytest.mark.parametrize("value,slots", [(7, 3), (None, 2), (True, 3), (-0.0, 3)])
+def test_baked_argument_removes_public_value_and_key(bound_kernel, value, slots):
+    launch = make_launcher(bound_kernel, extra_annotation={
+        "p": Argument(value=value, specialize=NEVER)}, no_gpu=True)
+    assert launch(0, 0, 1, 7, 17) is None
+    blob, count = getattr(launch, "__self__").spec_key(7, 17)
+    assert count == slots
+    assert len(blob) == 8
+    assert blob[2:] == bytes(6)
+    with pytest.raises(TypeError, match="arguments"):
+        launch(0, 0, 1, 7, value, 17)
+
+
+@pytest.mark.parametrize("value,bits", [(-0.0, "8000000000000000"), (1.25, "3ff4000000000000")])
+def test_baked_argument_preserves_float_bits(scalar_kernel, value, bits):
+    launch = make_launcher(scalar_kernel, extra_annotation={
+        "x": Argument(type=tl.float64, value=value, specialize=NEVER)},
+        no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    assert launch(0, 0, 1) is None
+    assert getattr(launch, "__self__").spec_key() == (bytes(8), 1)
+    path = pathlib.Path(getattr(launch, "__self__").__file__)
+    assert f"UINT64_C(0x{bits})" in path.with_name("scalar_kernel.c").read_text()
+
+
+def test_annotation_module_identity(scalar_kernel):
+    annotations = [
+        Argument(type=(tl.int32, tl.float32), specialize=NEVER),
+        Argument(type=(tl.float32, tl.int32, tl.int32), specialize=NEVER),
+        Argument(type=tl.int32, specialize=NEVER),
+    ]
+    paths = [getattr(make_launcher(scalar_kernel, extra_annotation={"x": a}, no_gpu=True),
+                     "__self__").__file__ for a in annotations]
+    assert paths[0] == paths[1]
+    assert paths[0] != paths[2]
+    checked = make_launcher(scalar_kernel, extra_annotation={"x": annotations[0]},
+                            verify_annotation=True, no_gpu=True)
+    assert getattr(checked, "__self__").__file__ != paths[0]
+
+
+@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+def test_checked_source_has_one_predicted_branch_per_argument(scalar_kernel, mode):
+    sources = []
+    for verify in (True, False):
+        launch = make_launcher(scalar_kernel, extra_annotation={
+            "x": Argument(type=tl.int32, specialize=Assume(Aligned(16)))},
+            verify_annotation=verify, no_gpu=True, torch_access=mode)
+        path = pathlib.Path(getattr(launch, "__self__").__file__)
+        suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+        sources.append(path.with_name(f"scalar_kernel{suffix}").read_text())
+    checked, unchecked = sources
+    assert checked.count("INTJ_UNLIKELY(!valid_0)") == 1
+    assert checked.count("INTJ_ASSUME(valid_0)") == 1
+    assert "valid_0" not in unchecked
+    assert "aligned_16" not in unchecked
+    assert checked.count("intj_decode_argument(") == 1
+    assert unchecked.count("intj_decode_argument(") == 1
 
 
 def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):

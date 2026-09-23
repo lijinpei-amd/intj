@@ -37,6 +37,7 @@ from .torch_abi import (
     TorchAccess,
     dtype_index_table,
     layout_for,
+    live_dtypes,
     supported_versions,
     torch_version,
 )
@@ -103,6 +104,9 @@ class RenderContext:
     #: and these stay None -- which is what keeps them out of the digest.
     torch_version: tuple[int, int] | None
     cxx_abi: int | None
+    # Explicit pointer names -> live torch ScalarType codes. Their compact key
+    # indices still come from the runtime ABI table, in every access mode.
+    pointer_types: tuple[tuple[str, int], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,6 +144,7 @@ def make_launcher(
     torch_access: TorchAccess = TorchAccess.AUTO,
     kernel_cache: KernelCache = KernelCache.INTJ,
     no_gpu: bool = False,
+    verify_annotation: bool = False,
 ) -> Callable[..., None]:
     """Build a fast launcher for `jit_func`.
 
@@ -150,14 +155,16 @@ def make_launcher(
     `device` is a device index in `[0, 256)` -- one byte of the spec key holds
     it -- `stream` a raw stream handle (both ints), `grid` an int or a
     tuple/list of up to 3 ints, and the remaining arguments are the kernel's
-    parameters, positionally, in declaration order.
+    public parameters, positionally, in declaration order. Baked Argument values
+    are omitted from the call.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
     `TorchAccess`.  `kernel_cache` picks the hash map behind the kernel cache;
     see `KernelCache`.  `no_gpu=True` decodes and caches on the host without
     compiling or launching a GPU kernel. `dynamic_grid` and `dynamic_options`
-    are reserved and currently unsupported.
+    are reserved and currently unsupported. `verify_annotation=True` checks
+    declared types, ranges and assumed facts; otherwise these are caller promises.
     """
     if dynamic_grid:
         raise UnsupportedKernel("intj: dynamic_grid is not implemented; pass an int or tuple grid")
@@ -205,7 +212,7 @@ def make_launcher(
         nwords=nwords,
         device_binding=device_binding,
         device_offset=device_offset,
-        verify_annotation=False,
+        verify_annotation=bool(verify_annotation),
         no_gpu=no_gpu,
         max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
@@ -227,6 +234,7 @@ def make_launcher(
         # across torch versions.
         torch_version=torch_version() if access is TorchAccess.CXX else None,
         cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
+        pointer_types=_pointer_types(params),
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -663,6 +671,21 @@ def _render_params(
         if public:
             call_index += 1
     return tuple(params), layout.device_offset, layout.nwords
+
+
+def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:
+    """Resolve explicit pointer names through the same live dtypes as the ABI table."""
+    from triton._utils import type_canonicalisation_dict
+
+    wanted = {ty[1:] for p in params for ty in p.annotation.types or ()
+              if ty is not None and ty.startswith("*")}
+    if not wanted:
+        return ()
+    return tuple(sorted(
+        ("*" + canonical, code)
+        for code, (name, _) in live_dtypes().items()
+        if (canonical := type_canonicalisation_dict.get(name)) in wanted
+    ))
 
 
 @functools.lru_cache(maxsize=1)
