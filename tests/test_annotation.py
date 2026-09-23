@@ -66,21 +66,22 @@ def test_assume_fact_values_require_exact_int(fact):
 
 
 @pytest.mark.parametrize(
-    "build,match",
+    "build,error,match",
     [
-        (lambda: intj.Argument(type=[]), "type sequence must not be empty"),
-        (lambda: intj.Argument(bind_value=cast(Any, "tensor")), "bind_value"),
+        (lambda: intj.Argument(type=[]), ValueError, "type sequence must not be empty"),
+        (lambda: intj.Argument(bind_value=cast(Any, "tensor")), TypeError, "bind_value"),
         (
             lambda: intj.Argument(value=1, bind_value=intj.BindValue.POINTER),
+            ValueError,
             "mutually exclusive",
         ),
-        (lambda: intj.Assume(intj.EqualTo(2)), r"EqualTo\(1\)"),
-        (lambda: intj.Assume(intj.Aligned(8)), r"Aligned\(16\)"),
-        (lambda: intj.Assume(intj.PointerRange(64)), r"PointerRange\(32\)"),
+        (lambda: intj.Assume(intj.EqualTo(2)), ValueError, r"EqualTo\(1\)"),
+        (lambda: intj.Assume(intj.Aligned(8)), ValueError, r"Aligned\(16\)"),
+        (lambda: intj.Assume(intj.PointerRange(64)), ValueError, r"PointerRange\(32\)"),
     ],
 )
-def test_annotation_constructor_errors(build, match):
-    with pytest.raises((TypeError, ValueError), match=match):
+def test_annotation_constructor_errors(build, error, match):
+    with pytest.raises(error, match=match):
         build()
 
 
@@ -136,6 +137,22 @@ def test_raw_inline_shorthands_and_decorator_modes(tmp_path):
     assert (z.types, z.equal_to_one, z.aligned_16, z.pointer_range_32) == (
         (None,), "auto", "never", "auto"
     )
+
+
+@pytest.mark.parametrize("future", ["", "from __future__ import annotations\n"],
+                         ids=["evaluated", "postponed"])
+def test_make_launcher_accepts_legacy_constexpr_annotations(tmp_path, future):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_from_source(tmp_path, future +
+        "import triton\nimport triton.language as tl\n\n"
+        "@triton.jit\ndef kernel(x, BLOCK: tl.constexpr):\n    pass\n")
+    assert kernel.params[1].is_constexpr
+    params = _resolve_annotations(kernel, None)
+    assert params[0].annotation.kind == "argument"
+    assert params[1].annotation.kind == "constexpr"
+    assert params[1].annotation.types is None
+    assert callable(intj.make_launcher(kernel))
 
 
 def test_assumptions_merge_independently_and_types_sort(tmp_path):

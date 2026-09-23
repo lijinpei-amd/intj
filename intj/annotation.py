@@ -398,7 +398,11 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
     resolved: list[ResolvedParam] = []
     for index, param in enumerate(jit_func.params):
         name = param.name
-        inline = _annotation_source(param._param.annotation, name)
+        raw = param._param.annotation
+        # Preserve Triton's legacy constexpr strings, including postponed annotations.
+        inline = _annotation_source(
+            tl.constexpr if isinstance(raw, str) and param.is_constexpr else raw, name
+        )
         other = _annotation_source(extra[name], name) if name in extra else None
         if inline is not None and other is not None and type(inline) is not type(other):
             raise ValueError(f"intj: parameter {name!r} has conflicting kind")
@@ -495,9 +499,9 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             ):
                 raise ValueError(f"intj: parameter {name!r} BindValue.POINTER needs exactly one explicit pointer type")
             if bind_value is BindValue.TENSOR and types is not None and (
-                len(types) != 1 or types[0] is None or not types[0].startswith("*")
+                len(types) != 1 or types[0] is not None and not types[0].startswith("*")
             ):
-                raise ValueError(f"intj: parameter {name!r} BindValue.TENSOR needs a pointer type")
+                raise ValueError(f"intj: parameter {name!r} BindValue.TENSOR needs a pointer type or None")
             if baked is not UNSET or bind_value is not None:
                 if types is not None and len(types) != 1:
                     raise ValueError(f"intj: parameter {name!r} needs one effective type")

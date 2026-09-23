@@ -595,14 +595,23 @@ def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mo
         assert bound(0, 0, 1) is None
 
 
-def test_bind_untyped_none_materializes_triton_constexpr(pointer_kernel):
+@pytest.mark.parametrize("annotation", [
+    Argument(specialize=NEVER, bind_value=BindValue.TENSOR),
+    Argument(type=None, specialize=NEVER, bind_value=BindValue.TENSOR),
+    Argument(type=(None,), specialize=NEVER, bind_value=BindValue.TENSOR),
+], ids=["inferred", "explicit", "sequence"])
+@pytest.mark.parametrize("bind_device", [False, True], ids=["module", "no-map"])
+@pytest.mark.parametrize("verify", [False, True])
+def test_bind_none_materializes_triton_constexpr(pointer_kernel, annotation, bind_device, verify):
     from intj.launcher import _LOADED, _compiler_input, _current_target
     from triton.compiler import make_backend
 
     factory = make_launcher(pointer_kernel, extra_annotation={
-        "x": Argument(specialize=NEVER, bind_value=BindValue.TENSOR),
-    }, no_gpu=True, verify_annotation=True, torch_access=TorchAccess.CPYTHON)
-    bound = factory.bind(x=None)
+        "x": annotation,
+    }, no_gpu=True, verify_annotation=verify, torch_access=TorchAccess.CPYTHON,
+       bind_device=bind_device)
+    bind = (lambda **values: factory.bind_device(0, **values)) if bind_device else factory.bind
+    bound = bind(x=None)
     key = next(key for key, module in _LOADED.items() if module is bound.__self__)
     assert key.context.params[0].annotation.types == (None,)
     source = _compiler_input(pointer_kernel, key.context.params, (), make_backend(_current_target()))
@@ -610,7 +619,10 @@ def test_bind_untyped_none_materializes_triton_constexpr(pointer_kernel):
     assert source.constants == (((0,), ("none",)),)
     assert source.ast_source(pointer_kernel).constants == {(0,): None}
     assert triton_specialization(pointer_kernel, (None,)) == [("constexpr", None)]
-    assert bound(0, 0, 1) is None
+    assert bound(*((0, 1) if bind_device else (0, 0, 1))) is None
+    if annotation.type is None or annotation.type == (None,):
+        with pytest.raises(TypeError, match="x.*None"):
+            bind(x=torch.empty(4))
 
 
 class _BoundPointer:
@@ -1721,6 +1733,35 @@ def test_options_are_baked_in(compiled_kernels):
     launch(launcher, (8,), x, o, 1024, 2.0, 128)
     torch.testing.assert_close(o, x * 2.0)
     assert {k.metadata.num_warps for k in compiled_kernels} == {8}
+
+
+@pytest.mark.parametrize("jit_debug,runtime_debug,explicit_debug,expected", [
+    (True, False, False, False),
+    (False, False, True, True),
+    (False, True, False, True),
+])
+def test_triton_specialization_preserves_explicit_debug(
+    scalar_kernel, monkeypatch, jit_debug, runtime_debug, explicit_debug, expected
+):
+    from triton import knobs
+
+    monkeypatch.setattr(scalar_kernel, "debug", jit_debug)
+    monkeypatch.setattr(knobs.runtime, "debug", runtime_debug)
+    device = torch.cuda.current_device()
+    cache = scalar_kernel.device_caches[device]
+    binder = cache[4]
+    captured = {}
+
+    def capture(*args, **kwargs):
+        result = binder(*args, **kwargs)
+        captured.update(result[2])
+        return result
+
+    monkeypatch.setitem(scalar_kernel.device_caches, device, (*cache[:4], capture))
+    options = {"debug": explicit_debug}
+    assert triton_specialization(scalar_kernel, (7,), options) == [("i32", "")]
+    assert captured["debug"] is expected
+    assert options == {"debug": explicit_debug}
 
 
 @pytest.mark.parametrize("jit_debug,runtime_debug,instrumentation,options,expected_debug", [

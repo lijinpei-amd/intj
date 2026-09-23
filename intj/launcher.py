@@ -200,6 +200,8 @@ class LauncherFactory:
                 value = values[p.name]
                 if value is not None and type(value) not in (torch.Tensor, torch.nn.Parameter):
                     raise TypeError(f"intj: bound tensor {p.name!r} must be a tensor or None")
+                if annotation.types == (None,) and value is not None:
+                    raise TypeError(f"intj: bound tensor {p.name!r} must match declared None type")
                 if annotation.types is None:
                     ty = None
                     if value is not None:
@@ -1013,6 +1015,6 @@ def triton_specialization(
 
     binder = jit_func.device_caches[_current_device()][4]
     kwargs = dict(options or {})
-    kwargs["debug"] = jit_func.debug or knobs.runtime.debug
+    kwargs["debug"] = kwargs.get("debug", jit_func.debug) or knobs.runtime.debug
     kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
     return binder(*args, **kwargs)[1]

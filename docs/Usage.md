@@ -21,7 +21,9 @@ launcher = make_launcher(
 
 `make_launcher` renders a C python extension for `jit_func`, compiles it (through
 triton's build + on-disk cache, so it is free after the first time), loads it, and
-returns its `entry` function. It is slow; call it once, outside any hot loop.
+returns its `entry` function when no value or device binding requires a factory.
+With bindings, the factory materializes the extension when bound. Construction
+is slow; call it once, outside any hot loop.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
 values for binding. `verify_annotation=True` checks declared promises before
 cache lookup; the default trusts them. `bind_device=True` fixes a device on a
@@ -30,15 +32,18 @@ without querying a GPU target or driver, compiling a kernel, or launching one.
 It accepts only default compile options. The `torch_access` and `kernel_cache`
 choices are described below.
 
-`options` are forwarded verbatim to `JITFunction.warmup` on every compile, so they
-must be valid triton options (`num_warps`, `num_stages`, `waves_per_eu`, ...) and are
-fixed for the lifetime of the launcher. `device`, `stream`, `device_type` and
-`warp_size` are rejected, and an unknown option name is an error here rather than a
-silent fall back to the default.
+`options` must be valid triton compile options (`num_warps`, `num_stages`,
+`waves_per_eu`, ...) and are fixed for the lifetime of the launcher. `device`,
+`stream`, `device_type` and `warp_size` are rejected, and an unknown option name
+is an error here rather than a silent fall back to the default.
 
 They are canonicalized through the compiler backend's `parse_options`, so spellings
 that mean the same thing — `{}` and `{"num_warps": 4}` on AMD — share one rendered
-module instead of building it twice.
+module instead of building it twice. The canonical options are passed directly to
+`triton.compiler.compile` with the annotated `triton.compiler.ASTSource` on a cache
+miss. An explicit `debug` option overrides the JIT function's debug default;
+Triton's runtime debug flag can still enable it. Instrumentation mode comes from
+Triton's compilation knob. These effective options also determine module identity.
 
 Most things intj cannot handle raise `intj.launcher.UnsupportedKernel` here. The
 rest — `num_ctas > 1`, a cooperative launch, a kernel needing scratch memory — can
@@ -128,9 +133,16 @@ have one effective type, fit it, and cannot also be bound.
 `torch.nn.Parameter` (or `None`), keeps the owner alive, and reads its current
 pointer and storage on every call. Without an explicit pointer type, the
 bound tensor fixes its effective dtype at binding; untyped `None` becomes a
-constexpr None. `BindValue.POINTER` requires one explicit pointer type and
+constexpr None. Explicit `type=None` accepts only a bound `None` and also compiles
+as constexpr None. `BindValue.POINTER` requires one explicit pointer type and
 accepts an integer address, `None`, a tensor, or an object with `data_ptr()`.
 Its address is captured once at binding, and object owners are retained.
+
+For tensor binding, `TorchAccess.CXX` owns an `at::Tensor` copy; `SHIM` and
+`CPYTHON` retain the Python object. Torch can preserve the Python wrapper while
+the native copy owns its `TensorImpl`. If that wrapper refers back to the bound
+handle, the resulting cycle can retain both until the tensor's back-reference
+is cleared (for example, `tensor.bound = None`).
 
 Binding annotations return a factory, not a callable launcher:
 
@@ -314,10 +326,11 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 3. Hash and look up the key in the module cache, or in the bound handle's cache
    when the device is fixed. A fixed-device handle with no dynamic key fields
    reads its one nullable kernel directly, without hashing or a map.
-4. On a miss, call back into python: `JITFunction.warmup` compiles, `_init_handles`
-   loads the module, and the entry records the function handle, block dim and LDS
-   size. The callback also asserts that intj's key agrees with triton's
-   specialization for these arguments.
+4. On a miss, call back into Python: build the annotated `CompilerInput`, compare
+   it with any input previously recorded for that key, and pass its
+   `triton.compiler.ASTSource` and canonical options to `triton.compiler.compile`.
+   `_init_handles` loads the GPU module; the entry records the function handle,
+   block dim and LDS size.
 5. Pack the param array (plus the two mandatory trailing scratch slots) and call
    `hipModuleLaunchKernel` / `cuLaunchKernel` (identical argument lists).
 
@@ -337,13 +350,17 @@ fields has an empty key and uses its nullable-kernel path.
 
 The invariant intj must not break is:
 
-> if two argument tuples produce the same intj key, triton produces the same
-> specialization for them
+> if two argument tuples produce the same intj key, their annotated compiler
+> inputs have the same signature, constexpr values, and specialization attributes
 
 A coarser key does not crash — it launches, say, a `tt.divisibility = 16` binary on an
 unaligned pointer. `tests/test_launcher.py::test_spec_key_is_never_coarser_than_triton`
 checks it directly through the module's `spec_key(*args)` debug entry point, and every
-cache miss re-checks it against triton's own binder.
+GPU cache miss builds a `CompilerInput` containing the final annotated
+`ASTSource` signature, tagged constexpr values, and attributes. The callback
+compares it with any input previously recorded for the same key and rejects a
+mismatch. Compilation uses that source directly without the JIT function's
+warmup, binder, or device cache.
 
 ## Launch benchmark
 
