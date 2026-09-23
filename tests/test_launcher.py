@@ -9,6 +9,7 @@ import dataclasses
 import gc
 import inspect
 import json
+import os
 import pathlib
 import struct
 import subprocess
@@ -43,6 +44,37 @@ from intj.torch_abi import (
     layout_for,
     probe_layout,
 )
+
+
+def test_benchmark_matrix_runs_without_gpu():
+    run = subprocess.run(
+        [
+            sys.executable,
+            "benchmarks/bench_launch.py",
+            "--no-gpu",
+            "--iters",
+            "20",
+            "--batches",
+            "3",
+        ],
+        cwd=pathlib.Path(__file__).parents[1],
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[1])},
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    for label in (
+        "auto map",
+        "reduced key",
+        "verify off",
+        "verify on",
+        "baked",
+        "bound tensor",
+        "bound pointer",
+        "fixed device map",
+        "fixed device no-map",
+    ):
+        assert label in run.stdout
 
 
 @triton.jit
