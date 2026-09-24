@@ -102,4 +102,7 @@ Run `python benchmarks/bench_launch.py --sweep --iters 100000 --batches 9` for
 host-only timings with 4, 16, and 32 integer or tensor arguments. See the
 [2026-09-24 optimization measurements](benchmarks/journals/2026-09-24_launcher-optimization_0_4f0b13e.md) for before/after results.
 
+For TVM FFI call, callback, utility, and HIP launch timings, see the
+[2026-09-25 script comparison](benchmarks/journals/2026-09-25_tvm-ffi-scripts_0_90b2959.md).
+
 TODO: sweep constexpr argument counts independently.

@@ -81,3 +81,6 @@ repeats. Diagnostics with different parameters get their own indexed record.
 The 2026-09-24 optimization history starts at
 `journals/2026-09-24_launcher-optimization_0_4f0b13e.md`; the 2026-09-25 TVM FFI comparison starts
 at `journals/2026-09-25_tvm-ffi_1_00087e3.md` (index 0 is the long-batch diagnostic).
+
+The 2026-09-25 upstream TVM FFI script comparison starts at
+`journals/2026-09-25_tvm-ffi-scripts_0_90b2959.md` (three separate rounds).
