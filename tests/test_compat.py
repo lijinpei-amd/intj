@@ -136,6 +136,58 @@ def test_launch_refuses_non_jit_targets_without_fallback():
         raise AssertionError("a non-JIT target was launched")
 
 
+def test_launch_or_interpret_only_calls_triton_in_interpreter_mode():
+    import intj.compat as compat
+    from triton import knobs
+
+    grid = lambda meta: (meta["n"],)
+
+    class TritonOnly:
+        def __getitem__(self, actual_grid):
+            assert actual_grid is grid
+            return lambda *args, **kwargs: (args, kwargs)
+
+    kernel = TritonOnly()
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = True
+        assert compat.launch_or_interpret(kernel, grid, 7, n=3) == ((7,), {"n": 3})
+        knobs.runtime.interpret = False
+        with pytest.raises(UnsupportedKernel, match="expected a @triton.jit function"):
+            compat.launch_or_interpret(kernel, grid, 7, n=3)
+
+
+def test_launch_or_interpret_runs_real_triton_interpreter():
+    import intj.compat as compat
+    from triton import knobs
+    from triton.runtime.interpreter import InterpretedFunction
+
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = True
+
+        @triton.jit
+        def interpreted_add_one(x, out, n, BLOCK: tl.constexpr):
+            i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            tl.store(out + i, tl.load(x + i, i < n, other=0) + 1, i < n)
+
+        assert isinstance(interpreted_add_one, InterpretedFunction)
+        x = torch.arange(32, dtype=torch.int32)
+        out = torch.empty_like(x)
+        compat.launch_or_interpret(interpreted_add_one, (1,), x, out=out, n=x.numel(), BLOCK=32)
+        torch.testing.assert_close(out, x + 1)
+
+
+def test_launch_or_interpret_uses_native_launcher_in_compiled_mode():
+    import intj.compat as compat
+    from triton import knobs
+
+    x = torch.arange(32, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(x)
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = False
+        assert compat.launch_or_interpret(add_one, (1,), x, out, x.numel()) is None
+    torch.testing.assert_close(out, x + 1)
+
+
 def test_tensor_wrapper_pointer_annotation_uses_triton_global_default():
     from intj.compat import _pointer_type
 

@@ -149,3 +149,10 @@ def launch(kernel: Any, grid: Any, /, *args: Any, **kwargs: Any) -> None:
     else:
         native = _cached(*cache_key)
     native(stream, *dimensions, *values)
+
+
+def launch_or_interpret(kernel: Any, grid: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Use Triton's launcher only while its interpreter is enabled."""
+    if knobs.runtime.interpret:
+        return kernel[grid](*args, **kwargs)
+    return launch(kernel, grid, *args, **kwargs)
