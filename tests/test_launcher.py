@@ -955,7 +955,7 @@ def test_layout_probe_reproduces_torch():
     assert layout is not None, "probe failed on a torch intj is expected to support"
     assert len(layout.itemsize) == NDTYPES
     for x in _read_corpus() + [torch.arange(9, dtype=torch.float64)[2:]]:
-        impl = ctypes.c_size_t.from_address(id(x) + layout.cdata).value
+        impl = ctypes.c_size_t.from_address(id(x) + cpython_abi.pyobject_size() + layout.cdata).value
         assert impl == x._cdata
         assert ctypes.c_int64.from_address(impl + layout.numel).value == x.numel()
         assert ctypes.c_int64.from_address(impl + layout.storage_offset).value == x.storage_offset()
@@ -1001,7 +1001,7 @@ def test_hardcoded_layout_matches_this_torch():
     accessors, so it is an independent oracle for the hardcoded row -- and the
     thing that generates entries in the first place (`python -m intj.torch_intf.abi_detect`).
     """
-    table, probed = layout_for(), probe_layout()
+    table, probed = layout_for(), probe_layout(cpython_abi.pyobject_size())
     assert table is not None, "no entry for the torch the suite is running against"
     assert probed is not None, "probe could not pin this torch's layout"
     assert table == probed
@@ -1198,12 +1198,12 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
     assert layout is not None
     nested = torch.nested.nested_tensor([torch.randn(3), torch.randn(5)])
     assert nested.numel() == 8 and nested.data_ptr() != 0
-    assert _read(layout, nested)[0] == 0, "expected the known-wrong null pointer"
+    assert _read(layout, nested, cpython_abi.pyobject_size())[0] == 0, "expected the known-wrong null pointer"
 
     # mkldnn has no storage at all, and that *is* detected
     mkl = torch.randn(4, 4).to_mkldnn()
     with pytest.raises(RuntimeError):
-        _read(layout, mkl)
+        _read(layout, mkl, cpython_abi.pyobject_size())
     o = torch.empty(16, device="cuda")
     for m in ACCESS_MODES:
         module = getattr(make_launcher(scale, torch_access_mode=m), "__self__")

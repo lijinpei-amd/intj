@@ -305,7 +305,7 @@ def _unverified_torch_message() -> str:
         "dtypes no longer match the recorded entry, or CPython's object header "
         "makes the tensor offset unrepresentable; pass "
         "torch_access_mode=TorchAccessMode.INTERPRETER, or add an entry to intj/torch_intf/torch_abi.toml "
-        "with `python -m intj.torch_intf.abi_detect` on a default-GIL build of this torch version"
+        "with `python -m intj.torch_intf.abi_detect` on this torch version"
     )
 
 
@@ -374,9 +374,8 @@ def _loaded_module(
         if module is None:
             module = _load(key, jit_func, context)
             module.set_compile_callback(_make_compile_callback(jit_func, params, options))
-            # The layout's cdata offset includes CPython's reported object header
-            # size. Install it in module state before exposing the module; launches
-            # read that saved offset without calling back into Python.
+            # Pass relative cdata; the compiled setter saves the absolute offset
+            # before exposing the module. Launches read that saved offset.
             module.set_torch_version(
                 torch_version(), layout.as_args() if layout else None, dtype_index_table()
             )

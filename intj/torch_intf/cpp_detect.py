@@ -160,7 +160,9 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
 
 
 def detect() -> tuple[dict[str, int], dict[int, int]]:
-    """(offsets, dtype code -> element size), as torch's headers declare them.
+    """(offsets, dtype code -> element size), with cdata relative to PyObject_HEAD.
+
+    `measure()` keeps the raw absolute offsets declared by torch's headers.
 
     Raises if the toolchain is missing, the program does not build, or the
     STATIC_COMPILE mode's `intj_THPVariable` (runtime/intj_thpvariable.h) no
@@ -174,6 +176,9 @@ def detect() -> tuple[dict[str, int], dict[int, int]]:
             f"(cdata at {head['thpvariable_cdata']}, "
             f"{'a Tensor' if head['cdata_is_tensor'] else 'a MaybeOwned<Tensor>'})"
         )
+    if offsets["cdata"] < head["pyobject"]:
+        raise RuntimeError("intj: torch's cdata pointer slot precedes PyObject_HEAD")
+    offsets["cdata"] -= head["pyobject"]
     return offsets, sizes
 
 

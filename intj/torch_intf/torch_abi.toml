@@ -7,8 +7,8 @@
 # lies at that address.  `python -m intj.torch_intf.cpp_detect` checks the same
 # numbers independently, from torch's C++ headers.
 #
-#   cdata: absolute offset measured with a 16-byte PyObject header; layout_for
-#          replaces that header portion with the running CPython object size
+#   cdata: byte offset from the end of PyObject_HEAD to the TensorImpl* slot;
+#          set_torch_version adds its compiled sizeof(PyObject) at module load
 #   storage .. s_nbytes: byte offsets into TensorImpl / StorageImpl
 #   dtypes: [torch's spelling, element size], indexed by at::ScalarType code
 #
@@ -18,7 +18,7 @@
 
 # torch 2.2.2+cpu, x86-64
 ["2.2"]
-cdata = 24
+cdata = 8
 storage = 24
 storage_offset = 160
 numel = 168
@@ -57,7 +57,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.3.1+cpu, x86-64
 ["2.3"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -106,7 +106,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.4.1+cpu, x86-64
 ["2.4"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -155,7 +155,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.5.1+cpu, x86-64
 ["2.5"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -204,7 +204,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.6.0+cpu, x86-64
 ["2.6"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -260,7 +260,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.7.1+cpu, x86-64
 ["2.7"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -317,7 +317,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.8.0+cpu, x86-64
 ["2.8"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -375,7 +375,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.9.1+cpu, x86-64
 ["2.9"]
-cdata = 24
+cdata = 8
 storage = 16
 storage_offset = 152
 numel = 160
@@ -433,7 +433,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.10.0+cpu, x86-64
 ["2.10"]
-cdata = 16
+cdata = 0
 storage = 16
 storage_offset = 152
 numel = 160
@@ -491,7 +491,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.11.0+cpu, x86-64
 ["2.11"]
-cdata = 16
+cdata = 0
 storage = 16
 storage_offset = 152
 numel = 160
@@ -549,7 +549,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.12.1+cpu, x86-64
 ["2.12"]
-cdata = 16
+cdata = 0
 storage = 16
 storage_offset = 152
 numel = 160
@@ -607,7 +607,7 @@ dtypes = [  # indexed by at::ScalarType code
 
 # torch 2.13.0+cpu, x86-64
 ["2.13"]
-cdata = 16
+cdata = 0
 storage = 16
 storage_offset = 144
 numel = 152
@@ -663,9 +663,9 @@ dtypes = [  # indexed by at::ScalarType code
   ["float4_e2m1fn_x2", 1],  # 45
 ]
 
-# torch 2.14.0.dev20260721+rocm7.2, x86-64
+# torch 2.14.0+rocm7.2, x86-64
 ["2.14"]
-cdata = 16
+cdata = 0
 storage = 16
 storage_offset = 144
 numel = 152

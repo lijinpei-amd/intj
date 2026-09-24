@@ -399,6 +399,12 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                  INTJ_NDTYPES, n);
     return NULL;
   }
+  size_t absolute_cdata = (size_t)off[0] + sizeof(PyObject);
+  if (absolute_cdata > UINT16_MAX) {
+    PyErr_SetString(PyExc_ValueError,
+                    "intj: tensor layout cdata plus PyObject header must fit a 16-bit offset");
+    return NULL;
+  }
 {% else %}
   if (layout != Py_None) {
     PyErr_SetString(PyExc_ValueError,
@@ -414,7 +420,7 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
   }
   /* checks done; commit */
 {% if torch_access_mode == 'runtime_shim' %}
-  st->abi.cdata = off[0];
+  st->abi.cdata = (uint16_t)absolute_cdata;
   st->abi.storage = off[1];
   st->abi.storage_offset = off[2];
   st->abi.numel = off[3];

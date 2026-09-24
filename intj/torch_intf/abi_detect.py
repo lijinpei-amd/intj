@@ -15,7 +15,6 @@ from typing import Any
 
 from ..python_intf.cpython_abi import pyobject_size
 from .torch_abi import (
-    MEASURED_PYOBJECT_SIZE,
     OFFSETS,
     TensorABI,
     dtype_code,
@@ -94,7 +93,7 @@ def _find_u8(blob: bytes, want: int) -> set[int]:
     return {i for i in range(len(blob)) if blob[i] == want}
 
 
-def probe_layout() -> TensorABI | None:
+def probe_layout(header_size: int) -> TensorABI | None:
     """Discover the offsets from the running torch, or return None.
 
     Not used when launching: `_LAYOUTS` is consulted instead, so a torch intj has
@@ -108,7 +107,9 @@ def probe_layout() -> TensorABI | None:
     refuses the RUNTIME_SHIM mode rather than reading a guessed offset, which
     is the one failure here that cannot raise.
     """
-    head = pyobject_size()
+    if header_size <= 0:
+        return None
+    head = header_size
     cdata: set[int] | None = None
     ti_fields: dict[str, set[int]] = {}
     si_fields: dict[str, set[int]] = {}
@@ -147,13 +148,18 @@ def probe_layout() -> TensorABI | None:
             return None
         pinned[name] = hits.pop()
 
+    absolute_cdata = pinned["cdata"]
+    if absolute_cdata < header_size:
+        return None
+    pinned["cdata"] = absolute_cdata - header_size
+
     # the live dtypes, not the recorded ones: this is what *generates* an entry,
     # so it has to run on a torch that has none yet
     layout = TensorABI(itemsize=itemsize_bytes(live_dtypes()), **pinned)
-    return layout if _selfcheck(layout) else None
+    return layout if _selfcheck(layout, header_size) else None
 
 
-def _selfcheck(layout: TensorABI) -> bool:
+def _selfcheck(layout: TensorABI, header_size: int) -> bool:
     """Reproduce torch's own `data_ptr()` through the discovered offsets.
 
     The probe pins each offset independently; this checks the arithmetic that
@@ -171,12 +177,12 @@ def _selfcheck(layout: TensorABI) -> bool:
     if torch.cuda.is_initialized():  # probing must not be what starts the GPU
         gpu = torch.arange(1024, device="cuda", dtype=torch.float32)
         cases += [gpu, gpu[7:], gpu[1024:]]
-    return all(_read(layout, t) == _expected(t) for t in cases)
+    return all(_read(layout, t, header_size) == _expected(t) for t in cases)
 
 
-def _read(layout: TensorABI, t: Any) -> tuple[int, int, int]:
+def _read(layout: TensorABI, t: Any, header_size: int) -> tuple[int, int, int]:
     """What the C reader in RUNTIME_SHIM mode would compute, in Python."""
-    impl = ctypes.c_size_t.from_address(id(t) + layout.cdata).value
+    impl = ctypes.c_size_t.from_address(id(t) + header_size + layout.cdata).value
     simpl = ctypes.c_size_t.from_address(impl + layout.storage).value
     numel = ctypes.c_int64.from_address(impl + layout.numel).value
     code = ctypes.c_uint8.from_address(impl + layout.data_type).value
@@ -198,13 +204,8 @@ def _main() -> None:
     """Print the entry for the running torch, to paste into `torch_abi.toml`."""
     import torch
 
-    if pyobject_size() != MEASURED_PYOBJECT_SIZE:
-        raise SystemExit(
-            f"intj: sizeof(PyObject) is {pyobject_size()} here, but every torch_abi.toml "
-            f"entry is measured on a build where it is {MEASURED_PYOBJECT_SIZE}; "
-            "run this on a default (GIL) build"
-        )
-    layout = probe_layout()
+    header_size = pyobject_size()
+    layout = probe_layout(header_size)
     if layout is None:
         raise SystemExit(f"intj: cannot pin torch {torch.__version__}'s layout")
 

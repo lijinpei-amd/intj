@@ -147,13 +147,15 @@ def _f32(v: float) -> int:
 
 
 @pytest.mark.parametrize("head, version, expected", [
-    (16, (2, 9), 24),
-    (32, (2, 9), 40),
-    (16, (2, 10), 16),
-    (32, (2, 10), 32),
+    (16, (2, 9), 8),
+    (32, (2, 9), 8),
+    (16, (2, 10), 0),
+    (32, (2, 10), 0),
+    (65535, (2, 9), None),
+    (65535, (2, 10), 0),
     (65536, (2, 10), None),
 ])
-def test_runtime_shim_cdata_tracks_pyobject_header(monkeypatch, head, version, expected):
+def test_runtime_shim_cdata_is_header_relative(monkeypatch, head, version, expected):
     from intj.torch_intf import torch_abi as abi
 
     monkeypatch.setattr(abi, "pyobject_size", lambda: head)
@@ -161,11 +163,7 @@ def test_runtime_shim_cdata_tracks_pyobject_header(monkeypatch, head, version, e
     abi.layout_for.cache_clear()
     try:
         layout = abi.layout_for(version)
-        if expected is None:
-            assert layout is None
-        else:
-            assert layout is not None
-            assert layout.cdata == expected
+        assert (layout.cdata if layout else None) == expected
     finally:
         abi.layout_for.cache_clear()
 
@@ -191,6 +189,7 @@ def test_runtime_shim_layout_matches_live_torch(monkeypatch):
         assert layout is not None, "free-threaded matrix must exercise RUNTIME_SHIM"
     elif layout is None:
         pytest.skip("no verified layout for this torch")
+    assert layout is not None
 
     probes = abi_detect._probes()
     limits = {id(t): type(t).__basicsize__ for t in probes}
@@ -203,9 +202,38 @@ def test_runtime_shim_layout_matches_live_torch(monkeypatch):
 
     monkeypatch.setattr(abi_detect, "_probes", lambda: probes)
     monkeypatch.setattr(abi_detect, "_window", checked_window)
-    assert abi_detect.probe_layout() == layout
+    assert abi_detect.probe_layout(cpython_abi.pyobject_size()) == layout
     tensor = torch.arange(8, dtype=torch.float32)
-    assert ctypes.c_void_p.from_address(id(tensor) + layout.cdata).value == tensor._cdata
+    absolute = cpython_abi.pyobject_size() + layout.cdata
+    assert ctypes.c_void_p.from_address(id(tensor) + absolute).value == tensor._cdata
+
+
+def test_runtime_shim_probe_refuses_slot_before_header():
+    from intj.torch_intf.abi_detect import probe_layout
+
+    assert probe_layout(torch.Tensor.__basicsize__ + 1) is None
+
+
+def test_runtime_shim_rejects_rebased_cdata_overflow(built):
+    module, stub, _ = built
+    if module.__name__ != "rt_runtime_shim":
+        pytest.skip("only RUNTIME_SHIM installs cdata")
+    layout = layout_for()
+    assert layout is not None
+    x = torch.arange(8, dtype=torch.float32)
+    args = (0, 0, 1, x, 5, 0, 0.0, False, 64)
+    module.entry(*args)
+    assert stub.last(5)[3][0] == x.data_ptr()
+
+    relative = (1 << 16) - cpython_abi.pyobject_size()
+    assert 0 <= relative <= 65535
+    bad = (relative, *layout.as_args()[1:])
+    index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
+    with pytest.raises(ValueError, match="16-bit"):
+        module.set_torch_version(torch_version(), bad, index)
+
+    module.entry(*args)
+    assert stub.last(5)[3][0] == x.data_ptr()
 
 
 def test_torch_abi_is_installed_once(built):

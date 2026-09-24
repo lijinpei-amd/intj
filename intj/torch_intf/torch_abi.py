@@ -47,7 +47,7 @@ class TensorABI:
     they are verified together or not at all.
     """
 
-    cdata: int  # PyObject*    -> TensorImpl*
+    cdata: int  # bytes after PyObject_HEAD to the TensorImpl* slot
     storage: int  # TensorImpl*  -> StorageImpl*
     storage_offset: int  # TensorImpl*  -> int64
     numel: int  # TensorImpl*  -> int64
@@ -187,10 +187,6 @@ def dtype_index_table() -> bytes:
 #: whatever torch the suite runs against, with both detectors.
 _ABI_PATH = pathlib.Path(__file__).with_name("torch_abi.toml")
 
-#: `sizeof(PyObject)` on the default, GIL builds used to measure every entry.
-#: A row's `cdata` includes this header plus Torch's own post-header offset.
-MEASURED_PYOBJECT_SIZE = 16
-
 #: Field names of `TensorABI` that an entry carries as offsets, in its order.
 OFFSETS = tuple(f.name for f in dataclasses.fields(TensorABI) if f.name != "itemsize")
 
@@ -257,9 +253,8 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
     None rather than a guess: a wrong offset cannot raise, it reads whatever
     happens to be at that address and hands the kernel a pointer built from it.
     An entry whose `dtypes` no longer describe the running torch counts as no
-    entry at all -- see `itemsize_table`. The recorded `cdata` includes a
-    16-byte PyObject header; replace that portion with the running CPython's
-    reported size before installing the layout in the module.
+    entry at all -- see `itemsize_table`. The recorded `cdata` is relative to
+    the end of PyObject_HEAD; the C setter reconstructs the absolute offset.
     """
     if ctypes.sizeof(ctypes.c_void_p) != 8:  # every recorded Torch layout is 64-bit
         return None
@@ -268,10 +263,12 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
     items = itemsize_table(version)
     if offsets is None or items is None:
         return None
-    cdata = offsets["cdata"] + pyobject_size() - MEASURED_PYOBJECT_SIZE
-    if not 0 <= cdata < 1 << 16:  # the C module stores offsets in uint16_t
+    # Preflight with the interpreter's reported size; the compiled setter repeats
+    # the bound check using its own sizeof(PyObject) before saving the offset.
+    absolute = pyobject_size() + offsets["cdata"]
+    if not 0 <= absolute < 1 << 16:
         return None
-    return TensorABI(itemsize=items, **{**offsets, "cdata": cdata})
+    return TensorABI(itemsize=items, **offsets)
 
 
 @functools.lru_cache(maxsize=1)
