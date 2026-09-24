@@ -26,15 +26,16 @@ def noop(x, y, o, n, a, BLOCK: tl.constexpr):
     tl.store(o + off, tl.load(x + off, mask=mask) + tl.load(y + off, mask=mask) * a, mask=mask)
 
 
-def bench(fn, iters, batches, sync):
+def bench(fn, args, iters, batches, sync):
+    """Time calls using a tuple prepared by the caller, without a wrapper lambda."""
     for _ in range(100):
-        fn()
+        fn(*args)
     sync()
     samples = []
     for _ in range(batches):
         start = time.perf_counter_ns()
         for _ in range(iters):
-            fn()
+            fn(*args)
         elapsed = time.perf_counter_ns() - start
         sync()
         samples.append(elapsed / iters)
@@ -54,7 +55,7 @@ def bench_readme(iters, batches):
         start = time.perf_counter_ns()
         module = getattr(make_launcher(noop, torch_access=mode), "__self__")
         build_s = (time.perf_counter_ns() - start) / 1e9
-        decode_ns = bench(lambda: module.spec_key(*args), iters, batches, sync)
+        decode_ns = bench(module.spec_key, args, iters, batches, sync)
         access_rows.append((mode.name.lower(), decode_ns, build_s))
 
     launcher = make_launcher(noop)
@@ -63,8 +64,9 @@ def bench_readme(iters, batches):
     print(f"mode=readme; {iters} calls × {batches} batches; median")
     print(f"{'path':>12} {'triton us':>11} {'intj us':>10} {'speedup':>9}")
     for label, grid in (("grid=(1,)", (1,)), ("grid=(0,)", (0,))):
-        triton_ns = bench(lambda: noop[grid](*args), iters, batches, sync)  # pyright: ignore[reportArgumentType]
-        intj_ns = bench(lambda: launcher(device, stream, grid, *args), iters, batches, sync)
+        triton_ns = bench(noop[grid], args, iters, batches, sync)  # pyright: ignore[reportArgumentType]
+        launch_args = (device, stream, grid) + args
+        intj_ns = bench(launcher, launch_args, iters, batches, sync)
         print(f"{label:>12} {triton_ns / 1000:11.2f} {intj_ns / 1000:10.2f} "
               f"{triton_ns / intj_ns:8.1f}x")
 
@@ -88,8 +90,8 @@ def bench_sweep(iters, batches):
             spec.loader.exec_module(module)
             launcher = make_launcher(module.noop, no_gpu=True)
             for kind, value in (("int", 17), ("tensor", torch.empty(4096))):
-                args = (value,) * count
-                elapsed = bench(lambda: launcher(0, 0, (1,), *args), iters, batches, lambda: None)
+                args = (0, 0, (1,)) + (value,) * count
+                elapsed = bench(launcher, args, iters, batches, lambda: None)
                 print(f"{count:5d} {kind:>6} {elapsed:10.1f}")
 
 
@@ -140,7 +142,8 @@ def main(iters=20000, batches=7, no_gpu=False):
         if baked_block:
             call_args = call_args[:-1]
         controls = (stream, (1,)) if fixed_device else (ordinal, stream, (1,))
-        elapsed = bench(lambda: launcher(*controls, *call_args), iters, batches, sync)
+        launch_args = controls + call_args
+        elapsed = bench(launcher, launch_args, iters, batches, sync)
         baseline = elapsed if label == "auto map" else auto_ns
         delta = elapsed - baseline
         binding_time = f"{bind_ms:.2f}" if bind_ms is not None else "-"
