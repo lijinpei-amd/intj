@@ -1,4 +1,4 @@
-/* The head of torch's THPVariable, for the CXX access mode.
+/* The head of torch's THPVariable, for the STATIC_COMPILE access mode.
  *
  * Deliberately NOT torch/csrc/autograd/python_variable.h.  That header declares
  * the four-line struct below and nothing else intj needs, but it also pulls in

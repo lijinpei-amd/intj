@@ -16,9 +16,9 @@ kernel a pointer built from it. So:
   add an entry. Never fall back silently, and never fill a gap with a nearby
   version's entry.
 
-## The generator checks what CXX assumes
+## The generator checks what STATIC_COMPILE assumes
 
-CXX mode needs no table, but it declares `intj_THPVariable` itself
+STATIC_COMPILE mode needs no table, but it declares `intj_THPVariable` itself
 (`intj/runtime/intj_thpvariable.h`) instead of including `python_variable.h`, which
 drags in pybind11, and does not check that at load. `cpp_detect` compiles it beside
 torch's own and refuses a torch where they differ. Any new layout assumption in C++

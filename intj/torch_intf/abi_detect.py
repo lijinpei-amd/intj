@@ -105,8 +105,8 @@ def probe_layout() -> TensorABI | None:
     Each offset is the intersection, over every probe tensor, of the positions
     whose value matches what torch's own python accessors report.  Anything that
     does not come down to exactly one candidate yields None -- the caller then
-    refuses the shim mode rather than reading a guessed offset, which is the one
-    failure here that cannot raise.
+    refuses the RUNTIME_SHIM mode rather than reading a guessed offset, which
+    is the one failure here that cannot raise.
     """
     head = pyobject_size()
     cdata: set[int] | None = None
@@ -119,7 +119,8 @@ def probe_layout() -> TensorABI | None:
         if not impl or not simpl:
             return None
 
-        obj = _window(id(t), head + 8 * 4)
+        # The fixed search window extends past a THPVariable on both build types.
+        obj = _window(id(t), min(head + 8 * 4, type(t).__basicsize__))
         ti = _heap_window(impl, _TENSORIMPL_WINDOW)
         si = _heap_window(simpl, _STORAGEIMPL_WINDOW)
 
@@ -174,7 +175,7 @@ def _selfcheck(layout: TensorABI) -> bool:
 
 
 def _read(layout: TensorABI, t: Any) -> tuple[int, int, int]:
-    """What the C shim reader would compute, in python."""
+    """What the C reader in RUNTIME_SHIM mode would compute, in Python."""
     impl = ctypes.c_size_t.from_address(id(t) + layout.cdata).value
     simpl = ctypes.c_size_t.from_address(impl + layout.storage).value
     numel = ctypes.c_int64.from_address(impl + layout.numel).value

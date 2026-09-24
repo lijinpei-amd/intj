@@ -28,7 +28,7 @@ from .kernel_cache import (
 from .python_intf import cpython_abi
 from .torch_intf.torch_abi import (
     TensorABI,
-    TorchAccess,
+    TorchAccessMode,
     dtype_index_table,
     layout_for,
     supported_versions,
@@ -90,13 +90,13 @@ class RenderContext:
     launch_symbol: str
     error_symbol: str
     error_style: str  # "return" | "outparam"
-    torch_access: str  # TorchAccess value; never "auto" by this point
+    torch_access_mode: str  # resolved TorchAccessMode value
     kernel_cache: str  # KernelCache value: which hash map holds the kernels
     #: where that map comes from, when it is not intj's own. In the digest
     #: because the module is built against it.
     cache_include_dirs: tuple[str, ...]
     cache_archives: tuple[str, ...]
-    #: `cxx` only: what the binary was compiled against.  The other modes
+    #: STATIC_COMPILE only: what the binary was compiled against. The other modes
     #: discover everything at load, so their `.so` is torch-version-independent
     #: and these stay None -- which is what keeps them out of the digest.
     torch_version: tuple[int, int] | None
@@ -107,7 +107,7 @@ class RenderContext:
     #: against any other `Python.h`.  ABI flags (`t`, `d`) are also in `ext_suffix`.
     python_version: tuple[int, int, int]
     free_threaded: bool
-    python_abi: str  # the intj/python_intf header implementing that version
+    cpython_static_compile_header: str  # intj/python_intf header for that version
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,7 +143,7 @@ def make_launcher(
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, str] | None = None,
     options: Mapping[str, Any] | None = None,
-    torch_access: TorchAccess = TorchAccess.AUTO,
+    torch_access_mode: TorchAccessMode | None = None,
     kernel_cache: KernelCache = KernelCache.INTJ,
 ) -> Callable[..., None]:
     """Build a fast launcher for `jit_func`.
@@ -158,8 +158,9 @@ def make_launcher(
     parameters, positionally, in declaration order.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
-    into every launch.  `torch_access` picks how the module reads a tensor; see
-    `TorchAccess`.  `kernel_cache` picks the hash map behind the kernel cache;
+    into every launch. `torch_access_mode` picks how the module reads a tensor;
+    None selects automatically. See `TorchAccessMode`. `kernel_cache` picks the
+    hash map behind the kernel cache;
     see `KernelCache`.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
     are reserved and currently unsupported.
     """
@@ -174,14 +175,14 @@ def make_launcher(
     jit_func = _check_kernel(jit_func, options)
     params, nwords = _render_params(jit_func)
 
-    python_abi = cpython_abi.header_for()
-    if python_abi is None:
+    cpython_static_compile_header = cpython_abi.header_for()
+    if cpython_static_compile_header is None:
         raise UnsupportedKernel(
             f"intj: no verified CPython layer for python {'%d.%d.%d' % cpython_abi.python_version()} "
             f"(have {', '.join('%d.%d' % v for v in cpython_abi.supported_versions())}); "
             "run `python -m intj.python_intf.check` on it and add it to intj/python_intf/cpython_abi.py"
         )
-    access = _resolve_access(torch_access)
+    access = _resolve_torch_access_mode(torch_access_mode)
     target = _current_target()
     backend = BACKENDS[target.backend]
     canonical_options = _canonical_options(target, options)
@@ -208,7 +209,7 @@ def make_launcher(
         launch_symbol=backend.launch_symbol,
         error_symbol=backend.error_symbol,
         error_style=backend.error_style,
-        torch_access=access.value,
+        torch_access_mode=access.value,
         kernel_cache=kernel_cache.value,
         cache_include_dirs=cache_toolchain["include_dirs"],
         cache_archives=cache_toolchain["archives"],
@@ -216,11 +217,11 @@ def make_launcher(
         # to be rebuilt when torch changes.  Leaving these None for the other
         # two is what keeps their digest -- and so their cached `.so` -- stable
         # across torch versions.
-        torch_version=torch_version() if access is TorchAccess.CXX else None,
-        cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
+        torch_version=torch_version() if access is TorchAccessMode.STATIC_COMPILE else None,
+        cxx_abi=_cxx_abi() if access is TorchAccessMode.STATIC_COMPILE else None,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
-        python_abi=python_abi,
+        cpython_static_compile_header=cpython_static_compile_header,
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -238,12 +239,10 @@ def make_launcher(
         target=(target.backend, target.arch, target.warp_size),
         options=canonical_options.hash(),
         triton=_triton_identity(),
-        compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
+        compiler=_compiler_identity("c++" if access is TorchAccessMode.STATIC_COMPILE else "c"),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
     )
-    # the c++ mode gets it too, not to read from but to check its own
-    # compiled-in offset against
-    layout = layout_for() if access is TorchAccess.SHIM else None
+    layout = layout_for() if access is TorchAccessMode.RUNTIME_SHIM else None
     return _loaded_module(key, jit_func, context, params, options, layout).entry
 
 
@@ -276,37 +275,37 @@ def get_full_name(fn: Any) -> str:
     return f"{fn.__module__}.{fn.__qualname__}"
 
 
-def _resolve_access(requested: TorchAccess) -> TorchAccess:
-    """Turn `AUTO` into a concrete mode, or check the one the caller asked for.
+def _resolve_torch_access_mode(requested: TorchAccessMode | None) -> TorchAccessMode:
+    """Select a concrete mode from an automatic or explicit request.
 
     Explicit modes are validated rather than silently downgraded: a caller who
-    asked for `SHIM` because they measured it wants to hear that it is
-    unavailable, not to get `CPYTHON` and wonder where the time went.
+    asked for `RUNTIME_SHIM` because they measured it wants to hear that it is
+    unavailable, not to get `INTERPRETER` and wonder where the time went.
     """
-    if requested is TorchAccess.SHIM and layout_for() is None:
+    if requested is TorchAccessMode.RUNTIME_SHIM and layout_for() is None:
         raise UnsupportedKernel(_unverified_torch_message())
-    if requested is TorchAccess.CXX and not _cxx_toolchain():
+    if requested is TorchAccessMode.STATIC_COMPILE and not _cxx_toolchain():
         raise UnsupportedKernel(
-            "intj: the c++ access mode needs a c++ compiler and torch's headers; "
-            "set $CXX or pass torch_access=TorchAccess.SHIM"
+            "intj: STATIC_COMPILE needs a C++ compiler and torch's headers; "
+            "set $CXX or pass torch_access_mode=TorchAccessMode.RUNTIME_SHIM"
         )
-    if requested is not TorchAccess.AUTO:
+    if requested is not None:
         return requested
     if _cxx_toolchain():
-        return TorchAccess.CXX
+        return TorchAccessMode.STATIC_COMPILE
     if layout_for() is not None:
-        return TorchAccess.SHIM
-    return TorchAccess.CPYTHON
+        return TorchAccessMode.RUNTIME_SHIM
+    return TorchAccessMode.INTERPRETER
 
 
 def _unverified_torch_message() -> str:
     return (
         f"intj: no verified tensor layout for torch {_torch_version_string()} "
         f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
-        "dtypes are no longer the ones the entry was measured against, or this "
-        "is a free-threaded build, which no entry covers; pass "
-        "torch_access=TorchAccess.CPYTHON, or add an entry to intj/torch_intf/torch_abi.toml "
-        "with `python -m intj.torch_intf.abi_detect` on this torch"
+        "dtypes no longer match the recorded entry, or CPython's object header "
+        "makes the tensor offset unrepresentable; pass "
+        "torch_access_mode=TorchAccessMode.INTERPRETER, or add an entry to intj/torch_intf/torch_abi.toml "
+        "with `python -m intj.torch_intf.abi_detect` on a default-GIL build of this torch version"
     )
 
 
@@ -375,8 +374,9 @@ def _loaded_module(
         if module is None:
             module = _load(key, jit_func, context)
             module.set_compile_callback(_make_compile_callback(jit_func, params, options))
-            # The tensor layout is installed, not compiled in, so it describes the
-            # torch running now rather than the one this `.so` was built against.
+            # The layout's cdata offset includes CPython's reported object header
+            # size. Install it in module state before exposing the module; launches
+            # read that saved offset without calling back into Python.
             module.set_torch_version(
                 torch_version(), layout.as_args() if layout else None, dtype_index_table()
             )
@@ -462,7 +462,7 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
     A kernel cache other than intj's is a C++ map, so it drags the whole module
     into C++ even where the tensor reader would not have.
     """
-    cxx_access = context.torch_access == TorchAccess.CXX.value
+    torch_static_compile = context.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
     cxx_cache = context.kernel_cache != KernelCache.INTJ.value
     flags: dict[str, Any] = {
         "include_dirs": [str(_RUNTIME), str(_PYTHON_INTF), *context.cache_include_dirs],
@@ -472,14 +472,14 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
         # abseil's own link order is not intj's to encode, so the archives go in
         # a group and the linker sorts it out.
         flags["ccflags"] += ["-Wl,--start-group", *context.cache_archives, "-Wl,--end-group"]
-    if not cxx_access and not cxx_cache:
+    if not torch_static_compile and not cxx_cache:
         return {"language": "c", **flags}
 
     flags["language"] = "c++"
     # triton puts its own -std=c++17 early and appends ccflags last, so this
     # wins.  torch >= 2.14 needs c++20 to compile warning-clean.
     flags["ccflags"].insert(0, "-std=c++20")
-    if not cxx_access:
+    if not torch_static_compile:
         return flags
 
     toolchain = _cxx_toolchain()

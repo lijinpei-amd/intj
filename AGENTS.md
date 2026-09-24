@@ -1,5 +1,7 @@
 # Conventions
 
+Access-mode terminology is defined in [CONCETPS.md](CONCETPS.md).
+
 ## Shared C/C++ and python definitions
 
 Anything both sides need (enums, key layout, structs) is defined **once in C++**:

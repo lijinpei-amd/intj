@@ -27,7 +27,7 @@ _SOURCE = """
 #define INTJ_ALWAYS_INLINE inline
 #define INTJ_LIKELY(x) (x)
 #define INTJ_UNLIKELY(x) (x)
-#include INTJ_PYTHON_ABI
+#include INTJ_CPYTHON_STATIC_COMPILE_HEADER
 
 int check_int(PyObject *o, uint64_t *out) { return intj_as_int(o, out); }
 int check_i64(PyObject *o, int64_t *out) { return intj_as_i64(o, out); }
@@ -58,7 +58,7 @@ def _build(header: str, out: pathlib.Path) -> ctypes.PyDLL:
     subprocess.run(
         [
             os.environ.get("CC", "cc"), "-shared", "-fPIC", "-O2",
-            f"-DINTJ_PYTHON_ABI=\"{header}\"",
+            f"-DINTJ_CPYTHON_STATIC_COMPILE_HEADER=\"{header}\"",
             f"-I{sysconfig.get_paths()['include']}", f"-I{_HERE}",
             str(src), "-o", str(out),
         ],

@@ -62,7 +62,7 @@ def _build(cache: KernelCache, nwords: int, include: str, libraries: list[str], 
         f"-DINTJ_CACHE_{cache.value.upper()}",
         f'-DINTJ_CACHE_NAME="{cache.value}"',
         str(_SOURCE), "-o", str(out),
-        f'-DINTJ_PYTHON_ABI="{cpython_abi.header_for()}"', f"-I{_PYTHON_INTF}",
+        f'-DINTJ_CPYTHON_STATIC_COMPILE_HEADER="{cpython_abi.header_for()}"', f"-I{_PYTHON_INTF}",
         f"-I{_RUNTIME}", f"-I{include}", f"-I{sysconfig.get_paths()['include']}",
         *(f"-I{d}" for d in toolchain["include_dirs"]),
     ]

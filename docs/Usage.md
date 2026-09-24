@@ -11,6 +11,7 @@ launcher = make_launcher(
     dynamic_options=(),    # reserved, must be empty
     extra_annotation=None, # reserved, must be None
     options=None,          # triton compile options, e.g. {"num_warps": 8}
+    torch_access_mode=None, # automatic; pass a TorchAccessMode to select one
 )
 ```
 
@@ -102,56 +103,68 @@ passes a null pointer to the kernel; the launch then faults on the GPU rather th
 raising. `.to_mkldnn()` has no storage at all and is refused cleanly.
 
 This is a deliberate limitation of reading the fields rather than calling the
-accessors, and it is shared by the `shim` and `cxx` modes alike — they are kept
-consistent on purpose, since the `shim` mode cannot see the policy bit at all. Neither
-kind of tensor is a usable triton kernel argument in the first place.
+accessors. `RUNTIME_SHIM` and `STATIC_COMPILE` share it because `RUNTIME_SHIM`
+cannot see the policy bit. Neither kind of tensor is a usable triton kernel
+argument in the first place.
 - Kernels that read global variables (triton revalidates those on every launch;
   intj cannot, so it refuses instead of silently launching a stale kernel).
 - Kernels with pre-run hooks, `num_ctas > 1`, cooperative launches, or non-zero
   global/profile scratch.
 
-## Reaching torch: `torch_access`
+## Reaching torch: `torch_access_mode`
 
 Every launch reads three things off each tensor: the data pointer, the dtype, and (on
-AMD) the storage size. `make_launcher(..., torch_access=...)` picks how, with
-`intj.TorchAccess`:
+AMD) the storage size. `make_launcher(..., torch_access_mode=...)` picks how, with
+`intj.TorchAccessMode`:
 
 | | how it reads | decode + key, 3 tensors | first build | rebuilt when torch changes |
 |---|---|---|---|---|
-| `SHIM` | `TensorImpl`/`StorageImpl` at offsets probed from the running torch | 89 ns | 0.6 s | no |
-| `CXX` | the same fields, offsets supplied by the compiler | 90 ns | 1.9 s | yes |
-| `CPYTHON` | `data_ptr()` / `untyped_storage().nbytes()` through the interpreter | 300 ns | 0.6 s | no |
-| `AUTO` (default) | `CXX` if a C++ compiler and torch's headers are present, else `SHIM`, else `CPYTHON` | | | |
+| `RUNTIME_SHIM` | `TensorImpl`/`StorageImpl` at recorded offsets selected for the running torch | 89 ns | 0.6 s | no |
+| `STATIC_COMPILE` | the same fields, offsets supplied by the compiler | 90 ns | 1.9 s | yes |
+| `INTERPRETER` | `data_ptr()` / `untyped_storage().nbytes()` through the interpreter | 300 ns | 0.6 s | no |
+
+With `torch_access_mode=None` (the default), intj selects `STATIC_COMPILE` if a
+C++ compiler and torch's headers are present, else `RUNTIME_SHIM` if a verified
+layout exists, else `INTERPRETER`. An explicit unavailable mode raises.
 
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
-`SHIM` reads offsets from a table of torch versions intj has been verified against
-(`intj/torch_intf/torch_abi.toml`), installed at load by `set_torch_version`. A torch with no
-entry is **refused, never guessed at** — a wrong offset cannot raise, it reads whatever
-lies at that address and hands the kernel a pointer built from it. On an unverified
-torch, `torch_access=TorchAccess.SHIM` raises and `AUTO` falls through to `CPYTHON`.
+`RUNTIME_SHIM` reads offsets from a table of verified torch versions
+(`intj/torch_intf/torch_abi.toml`), installed at load by `set_torch_version`.
+For `THPVariable::cdata`, intj replaces the recorded 16-byte `PyObject` header
+with CPython's reported `object.__basicsize__` and saves the resulting offset
+in the module before any launch.
+A torch with no entry is **refused, never guessed at** — a wrong offset cannot
+raise; it reads whatever lies at that address and hands the kernel a pointer
+built from it. On an unverified torch,
+`torch_access_mode=TorchAccessMode.RUNTIME_SHIM` raises. Automatic selection uses
+`INTERPRETER` if `STATIC_COMPILE` is unavailable.
 
 Each entry records the dtypes the running torch had when the offsets were measured
 (`[name, element size]`, indexed by dtype code) alongside the offsets themselves. A
 torch whose dtype set has drifted from its entry — one renamed, dropped or inserted — is treated as
 unverified too, offsets and all: the same refusal, not a partial trust.
 
-`CXX` needs no entry: the compiler supplies every offset from torch's headers. The
-one thing it declares itself rather than includes is the head of `THPVariable`
+`STATIC_COMPILE` needs no entry: the compiler supplies every offset from torch's
+headers. It declares the head of `THPVariable` itself instead of including it
 (`intj/runtime/intj_thpvariable.h`: a `MaybeOwned<Tensor>` before torch 2.10, a
 `Tensor` since); `cpp_detect` below refuses a torch where that declaration is wrong.
-On torch older than 2.10 the `CXX` mode is compile-checked only.
+On torch older than 2.10 the `STATIC_COMPILE` mode is compile-checked only.
 
-To add a version, run `python -m intj.torch_intf.abi_detect` on it and paste the entry it
-prints. That derives each offset by matching field values against what torch's own
-accessors report, so an entry produced that way is verified rather than reasoned about.
+To add a version, run `python -m intj.torch_intf.abi_detect` on a default-GIL
+CPython build with that Torch and paste the entry it prints. The recorded `cdata`
+offset uses that build's 16-byte `PyObject` header; free-threaded builds use the
+reported size when loading the module. The detector derives each offset by
+matching field values against torch's own accessors, so the entry is measured.
 `python -m intj.torch_intf.cpp_detect` derives the same offsets independently, by
 compiling against torch's C++ headers. The test suite checks the entry for the torch
 it runs on against both.
 
-`CPYTHON` assumes nothing about torch's layout except `THPDtype`, which checks itself at
-load against the name the struct embeds. It is the independent oracle the test suite
-compares the other two against.
+`INTERPRETER` obtains the pointer and storage size through CPython calls but
+reads the dtype code directly from `THPDtype`, whose layout checks itself at load
+against the embedded name. It is the independent oracle the test suite compares
+the other two against. CPython scalar readers use `STATIC_COMPILE` in every
+Torch mode.
 
 ## The kernel cache: `kernel_cache`
 
@@ -165,7 +178,7 @@ Every launch turns the spec key into a compiled kernel through a hash map.
 | `ABSL` | `absl::flat_hash_map` | a download, then a build of 90 libraries: 28 s on 224 cores, minutes on a few |
 
 `TSL` and `ABSL` are C++ maps, so either one compiles the whole module as C++
-even under `SHIM` or `CPYTHON` access.
+even under `RUNTIME_SHIM` or `INTERPRETER` access.
 
 Neither is vendored, and **nothing installed on the machine is searched for**:
 `make_launcher` downloads a pinned version, checks its sha256, and (for
@@ -207,7 +220,7 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 1. Parse `device`, `stream` and `grid`; return early on a zero-volume grid.
 2. Decode every argument into one spec-key *byte* and at most one param slot,
    accumulating the key's header in 32-bit registers. How the tensor fields are read
-   is `torch_access`'s choice; no mode calls an `aoti_torch_*` shim.
+   is `torch_access_mode`'s choice; no mode calls an `aoti_torch_*` shim.
 3. Hash the key and look it up in the module's open-addressed kernel cache.
 4. On a miss, call back into python: `JITFunction.warmup` compiles, `_init_handles`
    loads the module, and the entry records the function handle, block dim and LDS

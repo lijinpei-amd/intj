@@ -7,7 +7,9 @@
 # lies at that address.  `python -m intj.torch_intf.cpp_detect` checks the same
 # numbers independently, from torch's C++ headers.
 #
-#   cdata .. s_nbytes: byte offsets into PyObject / TensorImpl / StorageImpl
+#   cdata: absolute offset measured with a 16-byte PyObject header; layout_for
+#          replaces that header portion with the running CPython object size
+#   storage .. s_nbytes: byte offsets into TensorImpl / StorageImpl
 #   dtypes: [torch's spelling, element size], indexed by at::ScalarType code
 #
 # The dtypes list is what makes a version *known*: intj refuses to read tensors

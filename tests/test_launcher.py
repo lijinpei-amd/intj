@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+import intj
 from intj import launcher, make_launcher
 from intj.launcher import (
     ModuleKey,
@@ -32,7 +33,7 @@ from intj.python_intf import cpython_abi
 from intj.torch_intf.abi_detect import probe_layout
 from intj.torch_intf.torch_abi import (
     NDTYPES,
-    TorchAccess,
+    TorchAccessMode,
     dtype_code,
     dtype_index_table,
     itemsize_table,
@@ -301,7 +302,7 @@ def test_modules_stay_out_of_the_import_system():
 
 
 def test_source_and_binary_are_cached_on_disk():
-    launcher = make_launcher(scale, options={"num_stages": 4}, torch_access=TorchAccess.SHIM)
+    launcher = make_launcher(scale, options={"num_stages": 4}, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
     source = so_path.with_name("scale.c")
     assert so_path.exists() and source.exists()
@@ -443,9 +444,9 @@ def _render_context(**overrides):
         ),
         nwords=2, header_words=1, max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
         launch_symbol="launch", error_symbol="error", error_style="return",
-        torch_access="shim", torch_version=None, cxx_abi=None,
+        torch_access_mode="runtime_shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
-        python_version=(3, 12, 3), free_threaded=False, python_abi="cpython_abi.h",
+        python_version=(3, 12, 3), free_threaded=False, cpython_static_compile_header="cpython_abi.h",
     )
     return RenderContext(**{**fields, **overrides})
 
@@ -515,7 +516,7 @@ def test_free_threaded_build_changes_module_digest():
 def test_render_rejects_mismatched_free_threaded_headers(tmp_path, capfd):
     context = _render_context(
         python_version=cpython_abi.python_version(),
-        python_abi=cpython_abi.header_for() or "",
+        cpython_static_compile_header=cpython_abi.header_for() or "",
         free_threaded=not bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
     )
     with pytest.raises(subprocess.CalledProcessError):
@@ -568,11 +569,11 @@ def _provisioned(cache):
 def test_kernel_cache_backends_launch_the_same(cache):
     """Every backend is a kernel cache: same key in, same kernel out.
 
-    tsl and absl are C++ maps, so they also drag a shim-mode module into a C++
+    tsl and absl are C++ maps, so they also drag a RUNTIME_SHIM module into a C++
     build -- which is the part most likely to break.
     """
     _provisioned(cache)
-    launcher = make_launcher(scale, torch_access=TorchAccess.SHIM, kernel_cache=cache)
+    launcher = make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM, kernel_cache=cache)
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
     for block in (64, 128):  # two specializations, so the cache is used
@@ -667,7 +668,11 @@ def uses_global(x, o, n, BLOCK: tl.constexpr):
 
 # ---------------------------------------------------------------- torch access
 
-ACCESS_MODES = [TorchAccess.SHIM, TorchAccess.CPYTHON, TorchAccess.CXX]
+ACCESS_MODES = [
+    TorchAccessMode.RUNTIME_SHIM,
+    TorchAccessMode.INTERPRETER,
+    TorchAccessMode.STATIC_COMPILE,
+]
 
 
 @pytest.fixture(scope="module", params=ACCESS_MODES, ids=lambda m: m.name.lower())
@@ -677,7 +682,7 @@ def mode(request):
 
 @pytest.fixture(scope="module")
 def scale_by_mode(mode):
-    return mode, make_launcher(scale, torch_access=mode)
+    return mode, make_launcher(scale, torch_access_mode=mode)
 
 
 def _read_corpus():
@@ -685,8 +690,8 @@ def _read_corpus():
 
     The empty views matter most: `Tensor::data_ptr()` returns null for any
     zero-element tensor even when its storage is live and its storage_offset is
-    not, so the shim's `data + offset * itemsize` arithmetic has to special-case
-    them or it keys differently from the other two modes.
+    not, so RUNTIME_SHIM must special-case its `data + offset * itemsize`
+    arithmetic or it keys differently from the other two modes.
     """
     base = torch.randn(4096, device="cuda")
     half = torch.randn(4096, device="cuda", dtype=torch.float16)
@@ -718,13 +723,13 @@ def test_every_mode_matches_triton_specialization(scale_by_mode):
 
 
 def test_modes_agree_on_every_read():
-    """The independent-oracle test: cpython assumes nothing about TensorImpl.
+    """The independent-oracle test: INTERPRETER assumes nothing about TensorImpl.
 
-    If torch moves a field, the shim mode keeps reading the old offset and this
+    If torch moves a field, RUNTIME_SHIM keeps reading the old offset and this
     is what notices.
     """
     modules = {
-        m: getattr(make_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES
+        m: getattr(make_launcher(scale, torch_access_mode=m), "__self__") for m in ACCESS_MODES
     }
     o = torch.empty(4096, device="cuda")
     for x in _read_corpus():
@@ -750,7 +755,7 @@ def test_recorded_dtypes_match_this_torch():
     A drifted row is not cosmetic: the offsets in the same stanza were measured
     against that set of dtypes, and `itemsize_table` refuses the whole stanza
     when they no longer agree -- so this failing is what a silent fall back to
-    `CPYTHON` on a torch intj thinks it supports looks like before it happens.
+    another mode on a torch intj thinks it supports looks like before it happens.
     """
     from intj.torch_intf.torch_abi import _DTYPES, live_dtypes, torch_version
 
@@ -876,15 +881,15 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
 def test_unsupported_dtype_is_refused_in_every_mode():
     """The path that skipped the dtype check: numel == 0 returns before it.
 
-    The shim reader bails at numel == 0 ahead of its own bound test, and the
-    cpython reader has no bound test at all.  Harmless while the dtype had 32
+    RUNTIME_SHIM bails at numel == 0 ahead of its own bound test, and the
+    INTERPRETER reader has no bound test at all. Harmless while the dtype had 32
     bits of the key to itself; under a byte code every unmapped dtype would
     alias every other one.  So the check lives in the decode, which all three
     readers pass through.
     """
     o = torch.empty(4096, device="cuda")
     for mode in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=mode), "__self__")
+        module = getattr(make_launcher(scale, torch_access_mode=mode), "__self__")
         for x in (torch.zeros(4, device="cuda", dtype=torch.complex64),
                   torch.zeros(0, device="cuda", dtype=torch.complex64)):
             with pytest.raises(RuntimeError, match="triton does not take"):
@@ -929,8 +934,9 @@ def test_dtype_index_table_matches_triton():
 
     assert canonical, "no torch dtype canonicalized; the table is empty"
     # the three spellings triton folds into one type must share one index
-    assert table[dtype_code(torch.bool)] == table[dtype_code(torch.uint1)]
-    assert table[dtype_code(torch.int1)] == table[dtype_code(torch.bool)]
+    # torch's stubs omit uint1 and int1.
+    assert table[dtype_code(torch.bool)] == table[dtype_code(getattr(torch, "uint1"))]
+    assert table[dtype_code(getattr(torch, "int1"))] == table[dtype_code(torch.bool)]
     # and a dtype triton has never accepted must be refused
     assert table[dtype_code(torch.complex64)] == 0xFF
 
@@ -944,7 +950,7 @@ def test_dtype_index_table_is_deterministic():
 
 
 def test_layout_probe_reproduces_torch():
-    """Every offset the shim mode reads, checked against torch's own accessors."""
+    """Every offset RUNTIME_SHIM reads, checked against torch's own accessors."""
     layout = layout_for()
     assert layout is not None, "probe failed on a torch intj is expected to support"
     assert len(layout.itemsize) == NDTYPES
@@ -964,12 +970,28 @@ def test_launch_correctness_per_mode(scale_by_mode):
     check_matches_triton(scale, launcher, (8,), (x[1:], o, 1023, 2.0, 128), 1)
 
 
-def test_auto_resolves_and_explicit_modes_validate():
-    from intj.launcher import _resolve_access
+def test_default_resolves_and_explicit_modes_validate(monkeypatch):
+    from intj import launcher as launcher_mod
 
-    assert _resolve_access(TorchAccess.AUTO) in set(ACCESS_MODES)
+    resolve = launcher_mod._resolve_torch_access_mode
+    monkeypatch.setattr(launcher_mod, "_cxx_toolchain", lambda: ([], []))
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda: object())
     for m in ACCESS_MODES:
-        assert _resolve_access(m) is m
+        assert resolve(m) is m
+    assert resolve(None) is TorchAccessMode.STATIC_COMPILE
+    monkeypatch.setattr(launcher_mod, "_cxx_toolchain", lambda: None)
+    assert resolve(None) is TorchAccessMode.RUNTIME_SHIM
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda: None)
+    assert resolve(None) is TorchAccessMode.INTERPRETER
+
+
+def test_public_torch_access_modes():
+    assert intj.TorchAccessMode is TorchAccessMode
+    assert list(TorchAccessMode) == [
+        TorchAccessMode.INTERPRETER,
+        TorchAccessMode.RUNTIME_SHIM,
+        TorchAccessMode.STATIC_COMPILE,
+    ]
 
 
 def test_hardcoded_layout_matches_this_torch():
@@ -1005,57 +1027,57 @@ def test_hardcoded_layout_matches_torch_headers():
     assert {c: s for c, s in sizes.items() if s} == {c: table.itemsize[c] for c in range(NDTYPES) if table.itemsize[c]}
 
 
-def test_shim_is_refused_rather_than_guessed(monkeypatch):
+def test_runtime_shim_is_refused_rather_than_guessed(monkeypatch):
     """An unverified torch must raise, never fall back to a guessed offset."""
     from intj import launcher as launcher_mod
 
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
-        make_launcher(scale, torch_access=TorchAccess.SHIM)
+        make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
 
 
-def test_cxx_needs_no_table(monkeypatch):
-    """The compiler supplies CXX's offsets, so an unverified torch still gets it."""
+def test_static_compile_needs_no_table(monkeypatch):
+    """The compiler supplies offsets, even for an unverified torch."""
     from intj import launcher as launcher_mod
 
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     x = torch.arange(128, device="cuda", dtype=torch.float32)
     o = torch.empty_like(x)
-    check_matches_triton(scale, make_launcher(scale, torch_access=TorchAccess.CXX), (1,), (x, o, 128, 2.0, 128), 1)
+    check_matches_triton(scale, make_launcher(scale, torch_access_mode=TorchAccessMode.STATIC_COMPILE), (1,), (x, o, 128, 2.0, 128), 1)
 
 
-def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
-    """shim and cpython bake in nothing torch-specific, so their `.so` is reusable.
+def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
+    """RUNTIME_SHIM and INTERPRETER bake in no Torch version.
 
-    Moving the reported torch version must not move their digest -- and must move
-    the c++ one, which really did compile against those headers.
+    Their `.so` is reusable across Torch versions, while STATIC_COMPILE compiles
+    against Torch's headers and must get a different digest.
     """
     from intj import launcher as launcher_mod
 
     def digest_dir(m):
-        return pathlib.Path(getattr(make_launcher(scale, torch_access=m), "__self__").__file__).parent.parent.name
+        return pathlib.Path(getattr(make_launcher(scale, torch_access_mode=m), "__self__").__file__).parent.parent.name
 
     before = {m: digest_dir(m) for m in ACCESS_MODES}
     monkeypatch.setattr(launcher_mod, "torch_version", lambda: (99, 99))
     after = {m: digest_dir(m) for m in ACCESS_MODES}
 
-    assert after[TorchAccess.SHIM] == before[TorchAccess.SHIM]
-    assert after[TorchAccess.CPYTHON] == before[TorchAccess.CPYTHON]
-    assert after[TorchAccess.CXX] != before[TorchAccess.CXX]
+    assert after[TorchAccessMode.RUNTIME_SHIM] == before[TorchAccessMode.RUNTIME_SHIM]
+    assert after[TorchAccessMode.INTERPRETER] == before[TorchAccessMode.INTERPRETER]
+    assert after[TorchAccessMode.STATIC_COMPILE] != before[TorchAccessMode.STATIC_COMPILE]
 
 
 def test_unconfigured_module_refuses_to_launch():
     """`entry` is unreachable before set_torch_version; prove the guard exists."""
-    module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    module = getattr(make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM), "__self__")
     assert hasattr(module, "set_torch_version")
     index = dtype_index_table()
     with pytest.raises(ValueError, match="needs a tensor layout"):
         module.set_torch_version((2, 14), None, index)
     layout = layout_for()
     assert layout is not None
-    cpython = getattr(make_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
+    interpreter = getattr(make_launcher(scale, torch_access_mode=TorchAccessMode.INTERPRETER), "__self__")
     with pytest.raises(ValueError, match="takes no tensor layout"):
-        cpython.set_torch_version((2, 14), layout.as_args(), index)
+        interpreter.set_torch_version((2, 14), layout.as_args(), index)
 
 
 def test_a_failed_set_torch_version_changes_nothing():
@@ -1068,7 +1090,7 @@ def test_a_failed_set_torch_version_changes_nothing():
     on float32 memory with no error at all.  Silent, and the worst failure this
     design has.
     """
-    module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    module = getattr(make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM), "__self__")
     o = torch.empty(64, device="cuda")
 
     def keys():
@@ -1084,7 +1106,7 @@ def test_a_failed_set_torch_version_changes_nothing():
     assert good is not None
     index = dtype_index_table()
     for layout, table in (
-        (None, bytes(NDTYPES)),  # shim rejects a None layout...
+        (None, bytes(NDTYPES)),  # RUNTIME_SHIM rejects a None layout...
         (None, index),  # ...whichever table comes with it
         (good.as_args(), b"\xff" * (NDTYPES - 1)),  # wrong length
         (good.as_args(), bytes([32]) + index[1:]),  # an index past five bits
@@ -1097,7 +1119,7 @@ def test_a_failed_set_torch_version_changes_nothing():
 
 
 def test_set_torch_version_needs_the_dtype_index_in_every_mode():
-    """The dtype table is not a shim detail: all three readers key on it.
+    """The dtype table is not a RUNTIME_SHIM detail: all three readers key on it.
 
     Installed in only some modes, the others would see an all-zero table and key
     every dtype to index 0 -- coarse in the same way in each, so the cross-mode
@@ -1106,8 +1128,8 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
     layout = layout_for()
     assert layout is not None
     for mode in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=mode), "__self__")
-        args = layout.as_args() if mode is TorchAccess.SHIM else None
+        module = getattr(make_launcher(scale, torch_access_mode=mode), "__self__")
+        args = layout.as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None
         with pytest.raises(TypeError, match="dtype_index"):
             module.set_torch_version((2, 14), args)
         with pytest.raises(ValueError, match="dtype index table"):
@@ -1117,7 +1139,7 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
 def test_modes_agree_on_rejecting_a_storageless_tensor():
     """A sparse tensor has no data pointer at all, so every mode must raise.
 
-    The shim reads offsets rather than calling torch, so this is the one place it
+    RUNTIME_SHIM reads offsets rather than calling torch, so this is the one place it
     could have handed the kernel a null pointer instead of failing.
     """
     sparse = torch.sparse_coo_tensor(
@@ -1125,21 +1147,21 @@ def test_modes_agree_on_rejecting_a_storageless_tensor():
     ).cuda()
     o = torch.empty(1024, device="cuda")
     for m in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=m), "__self__")
+        module = getattr(make_launcher(scale, torch_access_mode=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(sparse, o, 1024, 2.0, 128)
 
 
 def test_modes_agree_on_tensors_with_unusual_impls():
-    """The shim cannot see the bitfields that make torch's accessors throw.
+    """RUNTIME_SHIM cannot see the bitfields that make torch's accessors throw.
 
     `storage_access_should_throw_`, `throw_on_immutable_data_ptr_` and
     `size_bytes_is_heap_allocated_` are invisible to offset arithmetic, so the
-    shim could in principle accept a tensor the c++ mode rejects.  In practice
-    the impls carrying them belong to `Tensor` *subclasses*, which INTJ_DECODE's
+    RUNTIME_SHIM could accept a tensor STATIC_COMPILE rejects. In practice the
+    impls carrying them belong to `Tensor` *subclasses*, which INTJ_DECODE's
     exact-type test already refuses -- this pins that reasoning.
     """
-    modules = {m: getattr(make_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES}
+    modules = {m: getattr(make_launcher(scale, torch_access_mode=m), "__self__") for m in ACCESS_MODES}
     o = torch.empty(1024, device="cuda")
 
     with torch.inference_mode():
@@ -1163,8 +1185,8 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
     """Nested tensors read as empty, identically in every mode.  Documented, not fixed.
 
     A nested tensor stores `numel_ == 0` and reports `numel() == 8` through a
-    virtual override.  `shim` cannot see the policy bit that says so, and `cxx`
-    reads the field too rather than diverge from it -- one documented limitation
+    virtual override. RUNTIME_SHIM cannot see the policy bit that says so, and
+    STATIC_COMPILE reads the field too rather than diverge from it -- one documented limitation
     beats two modes that disagree.  See `docs/Usage.md`.
 
     This pins the behaviour so that a torch change, or a decision to start
@@ -1184,7 +1206,6 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
         _read(layout, mkl)
     o = torch.empty(16, device="cuda")
     for m in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=m), "__self__")
+        module = getattr(make_launcher(scale, torch_access_mode=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(mkl, o, 16, 2.0, 128)
-

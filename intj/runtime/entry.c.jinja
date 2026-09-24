@@ -16,9 +16,9 @@
 #error "intj: compiling against headers of the wrong GIL build"
 #endif
 
-#define INTJ_PYTHON_ABI "{{ python_abi }}"
+#define INTJ_CPYTHON_STATIC_COMPILE_HEADER "{{ cpython_static_compile_header }}"
 #define INTJ_NWORDS {{ nwords }}
-#define INTJ_ACCESS_{{ torch_access | upper }} 1
+#define INTJ_TORCH_ACCESS_{{ torch_access_mode | upper }} 1
 #include "intj_runtime.h"
 
 #define INTJ_NPARAMS {{ params | length }}
@@ -310,13 +310,11 @@ static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
  *
  * Deliberately not baked into the binary: the offsets come from the torch that
  * is running now, so there is no window in which a cached .so built against one
- * torch is loaded against another.  `layout` is None outside the shim mode.
+ * torch is loaded against another. `layout` is None outside RUNTIME_SHIM.
  *
- * Nothing is written into `st->abi` until every argument has been checked.  The
- * method is reachable from python on a module that is already configured and
- * whose kernel cache already holds entries, so a call that failed halfway used
- * to leave it live with a half-installed table -- one key byte for every dtype,
- * which is a silently wrong kernel rather than an error.
+ * Nothing is written into `st->abi` until every argument has been checked, and
+ * a configured module cannot be configured again. The method is reachable from
+ * python after load, when its kernel cache may already hold entries.
  *
  * Launches read `st->abi` unlocked, so on a free-threaded build this must not
  * race one.  The launcher calls it once, under its load lock, before the module
@@ -362,19 +360,37 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
       }
   }
 
-{% if torch_access == 'shim' %}
-  unsigned int off[7];
-  PyObject *sizes;
+{% if torch_access_mode == 'runtime_shim' %}
+  uint16_t off[7];
   if (!PyTuple_Check(layout)) {
     PyErr_Format(PyExc_ValueError,
-                 "intj: this module was built with the shim access mode and needs "
+                 "intj: this module was built with RUNTIME_SHIM and needs "
                  "a tensor layout, got %s",
                  Py_TYPE(layout)->tp_name);
     return NULL;
   }
-  if (!PyArg_ParseTuple(layout, "IIIIIIIO", &off[0], &off[1], &off[2], &off[3],
-                        &off[4], &off[5], &off[6], &sizes))
+  if (PyTuple_GET_SIZE(layout) != 8) {
+    PyErr_SetString(PyExc_ValueError,
+                    "intj: tensor layout needs seven offsets and an itemsize table");
     return NULL;
+  }
+  for (int i = 0; i < 7; i++) {
+    PyObject *value = PyTuple_GET_ITEM(layout, i);
+    if (!PyLong_CheckExact(value)) {
+      PyErr_Format(PyExc_ValueError,
+                   "intj: tensor layout offset %d must be a 16-bit integer", i);
+      return NULL;
+    }
+    long v = PyLong_AsLong(value);
+    if (v < 0 || v > UINT16_MAX || PyErr_Occurred()) {
+      PyErr_Clear();
+      PyErr_Format(PyExc_ValueError,
+                   "intj: tensor layout offset %d must be a 16-bit integer", i);
+      return NULL;
+    }
+    off[i] = (uint16_t)v;
+  }
+  PyObject *sizes = PyTuple_GET_ITEM(layout, 7);
   Py_ssize_t n = PyBytes_Size(sizes);
   if (n < 0)
     return NULL;
@@ -383,24 +399,30 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                  INTJ_NDTYPES, n);
     return NULL;
   }
-  /* checks done; commit */
-  st->abi.cdata = (uint16_t)off[0];
-  st->abi.storage = (uint16_t)off[1];
-  st->abi.storage_offset = (uint16_t)off[2];
-  st->abi.numel = (uint16_t)off[3];
-  st->abi.data_type = (uint16_t)off[4];
-  st->abi.s_data = (uint16_t)off[5];
-  st->abi.s_nbytes = (uint16_t)off[6];
-  memcpy(st->abi.itemsize, PyBytes_AS_STRING(sizes), INTJ_NDTYPES);
 {% else %}
   if (layout != Py_None) {
     PyErr_SetString(PyExc_ValueError,
-                    "intj: this module was built without the shim access mode, "
+                    "intj: this module was built without RUNTIME_SHIM, "
                     "so it takes no tensor layout");
     return NULL;
   }
 {% endif %}
 
+  if (st->abi.ready) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: torch ABI already installed");
+    return NULL;
+  }
+  /* checks done; commit */
+{% if torch_access_mode == 'runtime_shim' %}
+  st->abi.cdata = off[0];
+  st->abi.storage = off[1];
+  st->abi.storage_offset = off[2];
+  st->abi.numel = off[3];
+  st->abi.data_type = off[4];
+  st->abi.s_data = off[5];
+  st->abi.s_nbytes = off[6];
+  memcpy(st->abi.itemsize, PyBytes_AS_STRING(sizes), INTJ_NDTYPES);
+{% endif %}
   memcpy(st->abi.dtype_index, index, INTJ_NDTYPES);
   st->abi.ready = 1;
   Py_RETURN_NONE;
@@ -443,7 +465,7 @@ static int intj_exec(PyObject *m) {
 
   if (intj_intern_names() != 0)
     return -1;
-{% if torch_access == 'cpython' %}
+{% if torch_access_mode == 'interpreter' %}
   /* The one layout bet this mode makes, and the only one that can check itself. */
   {
     PyObject *t = PyImport_ImportModule("torch");

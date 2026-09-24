@@ -78,18 +78,26 @@ torch 2.14+rocm7.2, 20k iterations:
 | `grid=(0,)`, i.e. no driver call | 14.0 us | 0.15 us |
 | argument decoding + spec key only | — | 0.11 us |
 
-Argument decoding depends on how the module reads a tensor (`torch_access`), for a
+Argument decoding depends on how the module reads a tensor (`torch_access_mode`), for a
 kernel with three tensor arguments:
 
-| `TorchAccess` | decode + spec key | first build |
+| `TorchAccessMode` | decode + spec key | first build |
 |---|---|---|
-| `SHIM` — torch's structs, at offsets discovered at load | 89 ns | 0.6 s |
-| `CXX` — compiled against torch's headers | 90 ns | 1.9 s |
-| `CPYTHON` — through the interpreter | 300 ns | 0.6 s |
+| `RUNTIME_SHIM` — torch's structs, at recorded offsets selected at load | 89 ns | 0.6 s |
+| `STATIC_COMPILE` — compiled against torch's headers | 90 ns | 1.9 s |
+| `INTERPRETER` — pointer and storage size through the interpreter | 300 ns | 0.6 s |
 
-`SHIM` and `CXX` make the same loads and land within ~1 ns of each other; `CXX`
-has the compiler supply the field offsets that `SHIM` probes for. `CXX` pays a little build time for that, and is the only mode whose `.so` must
-be rebuilt when torch is upgraded.
+Omitting `torch_access_mode` selects `STATIC_COMPILE` when its toolchain is
+available, else `RUNTIME_SHIM` when a verified layout exists, else `INTERPRETER`.
+
+`RUNTIME_SHIM` can reuse its `.so` across supported PyTorch versions, but not
+across CPython ABIs: the module is compiled and cached for the exact CPython
+version and GIL/free-threaded build.
+
+`RUNTIME_SHIM` and `STATIC_COMPILE` make the same loads and land within ~1 ns of
+each other; `STATIC_COMPILE` has the compiler supply the field offsets that
+`RUNTIME_SHIM` gets from the verified table. It pays a little build time for
+that and is the only mode whose `.so` must be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
 which is the third row's 0.15 us. Host overhead is therefore ~0.3 us against

@@ -4,8 +4,8 @@
  * compile time and all three define `intj_cache`.  `tests/test_kernel_cache.py`
  * does the building and runs whichever backends are available.
  *
- *   g++ -O3 -DNDEBUG -DINTJ_CACHE_INTJ -DINTJ_ACCESS_SHIM -DINTJ_NWORDS=5 \
- *       -DINTJ_PYTHON_ABI='"cpython_abi.h"' -I intj/python_intf \
+ *   g++ -O3 -DNDEBUG -DINTJ_CACHE_INTJ -DINTJ_TORCH_ACCESS_RUNTIME_SHIM -DINTJ_NWORDS=5 \
+ *       -DINTJ_CPYTHON_STATIC_COMPILE_HEADER='"cpython_abi.h"' -I intj/python_intf \
  *       -I intj/runtime $(python3-config --includes) tests/bench_kernel_cache.cpp \
  *       -lbenchmark -lpython3.12 -o bench
  *
@@ -41,7 +41,7 @@
 #include <random>
 #include <vector>
 
-#define INTJ_ACCESS_SHIM /* the cache does not touch the tensor reader */
+#define INTJ_TORCH_ACCESS_RUNTIME_SHIM /* the cache does not touch the tensor reader */
 #include "intj_runtime.h"
 
 #ifndef INTJ_CACHE_NAME

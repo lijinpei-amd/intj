@@ -28,7 +28,7 @@ import torch
 from intj import launcher
 from intj.launcher import Param, RenderContext
 from intj.python_intf import cpython_abi
-from intj.torch_intf.torch_abi import NDTYPES, TorchAccess, layout_for, torch_version
+from intj.torch_intf.torch_abi import NDTYPES, TorchAccessMode, layout_for, torch_version
 
 _STUB = r"""
 #include <stdint.h>
@@ -65,7 +65,7 @@ _PARAMS = (
     Param("BLOCK", True, 1, 1, 1),
 )
 
-_MODES = [TorchAccess.CPYTHON] + ([TorchAccess.SHIM] if layout_for() else [])
+_MODES = [TorchAccessMode.INTERPRETER] + ([TorchAccessMode.RUNTIME_SHIM] if layout_for() else [])
 
 
 def _cc(language: str) -> str:
@@ -104,11 +104,11 @@ def built(request, stub, tmp_path_factory):
         module_name=f"rt_{mode.value}", kernel_repr="test_runtime.kernel", params=_PARAMS,
         nwords=2, header_words=1, max_slots=5, spec_pointer_range=1, driver_path=lib_path,
         launch_symbol="stub_launch", error_symbol="stub_error", error_style="return",
-        torch_access=mode.value, kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
+        torch_access_mode=mode.value, kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
         torch_version=None, cxx_abi=None,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
-        python_abi=cpython_abi.header_for() or "",
+        cpython_static_compile_header=cpython_abi.header_for() or "",
     )
     flags = launcher._build_flags(context)
     template = jinja2.Template(launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
@@ -136,7 +136,7 @@ def built(request, stub, tmp_path_factory):
         return (0xBAD if args[-1] == 999 else 0x1000 + nparams, 128, 0, nparams)
 
     module.set_compile_callback(compile_cb)
-    layout = layout_for().as_args() if mode is TorchAccess.SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
+    layout = layout_for().as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
     # every torch code its own 5-bit index; the real one comes from triton
     module.set_torch_version(torch_version(), layout, bytes(c if c < 32 else 0xFF for c in range(NDTYPES)))
     return module, Stub(lib), compiles
@@ -144,6 +144,89 @@ def built(request, stub, tmp_path_factory):
 
 def _f32(v: float) -> int:
     return struct.unpack("<I", struct.pack("<f", v))[0]
+
+
+@pytest.mark.parametrize("head, version, expected", [
+    (16, (2, 9), 24),
+    (32, (2, 9), 40),
+    (16, (2, 10), 16),
+    (32, (2, 10), 32),
+    (65536, (2, 10), None),
+])
+def test_runtime_shim_cdata_tracks_pyobject_header(monkeypatch, head, version, expected):
+    from intj.torch_intf import torch_abi as abi
+
+    monkeypatch.setattr(abi, "pyobject_size", lambda: head)
+    monkeypatch.setattr(abi, "itemsize_table", lambda _version: b"\x01" * NDTYPES)
+    abi.layout_for.cache_clear()
+    try:
+        layout = abi.layout_for(version)
+        if expected is None:
+            assert layout is None
+        else:
+            assert layout is not None
+            assert layout.cdata == expected
+    finally:
+        abi.layout_for.cache_clear()
+
+
+def test_runtime_shim_refuses_32_bit_pointer_layout(monkeypatch):
+    from intj.torch_intf import torch_abi as abi
+
+    monkeypatch.setattr(abi, "pyobject_size", lambda: 8)
+    monkeypatch.setattr(abi.ctypes, "sizeof", lambda _: 4)
+    monkeypatch.setattr(abi, "itemsize_table", lambda _version: b"\x01" * NDTYPES)
+    abi.layout_for.cache_clear()
+    try:
+        assert abi.layout_for((2, 10)) is None
+    finally:
+        abi.layout_for.cache_clear()
+
+
+def test_runtime_shim_layout_matches_live_torch(monkeypatch):
+    from intj.torch_intf import abi_detect
+
+    layout = layout_for()
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        assert layout is not None, "free-threaded matrix must exercise RUNTIME_SHIM"
+    elif layout is None:
+        pytest.skip("no verified layout for this torch")
+
+    probes = abi_detect._probes()
+    limits = {id(t): type(t).__basicsize__ for t in probes}
+    window = abi_detect._window
+
+    def checked_window(address, size):
+        if address in limits:
+            assert size <= limits[address], "probe read past the tensor object"
+        return window(address, size)
+
+    monkeypatch.setattr(abi_detect, "_probes", lambda: probes)
+    monkeypatch.setattr(abi_detect, "_window", checked_window)
+    assert abi_detect.probe_layout() == layout
+    tensor = torch.arange(8, dtype=torch.float32)
+    assert ctypes.c_void_p.from_address(id(tensor) + layout.cdata).value == tensor._cdata
+
+
+def test_torch_abi_is_installed_once(built):
+    module, _, _ = built
+    layout = layout_for() if module.__name__ == "rt_runtime_shim" else None
+    index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
+    with pytest.raises(RuntimeError, match="already installed"):
+        module.set_torch_version(torch_version(), layout.as_args() if layout else None, index)
+
+
+@pytest.mark.parametrize("oversized_offset", [65536, 2**32])
+def test_runtime_shim_rejects_offset_truncation(built, oversized_offset):
+    module, _, _ = built
+    if module.__name__ != "rt_runtime_shim":
+        pytest.skip("only RUNTIME_SHIM reads the offsets")
+    layout = layout_for()
+    assert layout is not None
+    oversized = (oversized_offset, *layout.as_args()[1:])
+    index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
+    with pytest.raises(ValueError, match="16-bit"):
+        module.set_torch_version(torch_version(), oversized, index)
 
 
 def test_gil_stays_off_on_a_free_threaded_build(built):
@@ -232,8 +315,8 @@ def test_unreadable_tensor_names_the_argument(built):
     Goes through `PyErr_GetRaisedException`, which is a shim below 3.12.
     """
     module, _, _ = built
-    if module.__name__ != "rt_cpython":
-        pytest.skip("only the cpython reader calls into torch")
+    if module.__name__ != "rt_interpreter":
+        pytest.skip("only the interpreter tensor reader calls into torch")
     sparse = torch.zeros(4).to_sparse()
     with pytest.raises(RuntimeError, match="tensor argument 'x'") as info:
         module.entry(0, 0, 1, sparse, 5, 0, 0.0, False, 64)

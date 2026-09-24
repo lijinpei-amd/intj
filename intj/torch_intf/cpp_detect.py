@@ -95,7 +95,8 @@ extern "C" const char *intj_detect() {
   // the reader actually loads; `data_type` is TypeMeta's low byte, which is
   // the ScalarType on a little-endian machine.
   size_t thp_cdata = offsetof(THPVariable, cdata);
-  // The CXX mode's own declaration, which it trusts without a load-time check.
+  // The STATIC_COMPILE mode's own declaration, which it trusts without a
+  // load-time check.
   bool intj_ok = std::is_same_v<Cdata, decltype(intj_THPVariable::cdata)> &&
                  offsetof(intj_THPVariable, cdata) == thp_cdata;
   (void)&intj_cdata;  // and its accessor still compiles against this torch
@@ -123,9 +124,9 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
     """(facts, offsets, dtype code -> element size), unchecked.
 
     `facts` are what the layout rests on rather than the layout itself:
-    `sizeof(PyObject)`, where and what `THPVariable::cdata` is, whether the CXX
-    mode's `intj_THPVariable` matches it, and the sizes of TensorImpl and
-    StorageImpl.
+    `sizeof(PyObject)`, where and what `THPVariable::cdata` is, whether the
+    STATIC_COMPILE mode's `intj_THPVariable` matches it, and the sizes of
+    TensorImpl and StorageImpl.
     """
     import torch
     from torch.utils import cpp_extension
@@ -161,9 +162,9 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
 def detect() -> tuple[dict[str, int], dict[int, int]]:
     """(offsets, dtype code -> element size), as torch's headers declare them.
 
-    Raises if the toolchain is missing, the program does not build, or the CXX
-    mode's `intj_THPVariable` (runtime/intj_thpvariable.h) no longer matches
-    torch's `THPVariable` -- the one layout that mode declares rather than
+    Raises if the toolchain is missing, the program does not build, or the
+    STATIC_COMPILE mode's `intj_THPVariable` (runtime/intj_thpvariable.h) no
+    longer matches torch's `THPVariable` -- the one layout that mode declares rather than
     includes.
     """
     head, offsets, sizes = measure()

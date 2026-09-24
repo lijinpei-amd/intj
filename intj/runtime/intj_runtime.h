@@ -24,11 +24,11 @@
 #define INTJ_UNLIKELY(x) (x)
 #endif
 
-/* The CPython layer selects its layout by PY_VERSION_HEX. */
-#ifndef INTJ_PYTHON_ABI
-#error "define INTJ_PYTHON_ABI to a header from intj/python_intf"
+/* CPYTHON_ACCESS_MODE.STATIC_COMPILE selects its layout by PY_VERSION_HEX. */
+#ifndef INTJ_CPYTHON_STATIC_COMPILE_HEADER
+#error "define INTJ_CPYTHON_STATIC_COMPILE_HEADER to a header from intj/python_intf"
 #endif
-#include INTJ_PYTHON_ABI
+#include INTJ_CPYTHON_STATIC_COMPILE_HEADER
 
 static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
   __uint128_t r = (__uint128_t)a * b;
@@ -326,9 +326,9 @@ static inline void intj_cache_free(intj_cache *c) {
  * opaque int32 discriminator) and, where the backend specializes on pointer
  * range, the storage size.  Exactly one of three strategies is compiled in.
  *
- *   INTJ_ACCESS_SHIM     read torch's structs at offsets installed at load
- *   INTJ_ACCESS_CPYTHON  call through the interpreter
- *   INTJ_ACCESS_CXX      C++, against torch's own headers
+ *   INTJ_TORCH_ACCESS_RUNTIME_SHIM    read structs at load-time offsets
+ *   INTJ_TORCH_ACCESS_INTERPRETER     call through the interpreter
+ *   INTJ_TORCH_ACCESS_STATIC_COMPILE C++, against torch's own headers
  *
  * No mode calls libtorch's aoti_torch_* shims, and no mode dlopens libtorch.
  */
@@ -336,7 +336,7 @@ static inline void intj_cache_free(intj_cache *c) {
 #define INTJ_NDTYPES 64
 
 typedef struct {
-  /* SHIM: byte offsets into THPVariable / TensorImpl / StorageImpl. Unused, and
+  /* RUNTIME_SHIM: byte offsets into THPVariable / TensorImpl / StorageImpl. Unused, and
    * left zero, in the other two modes. */
   uint16_t cdata;          /* PyObject*   -> TensorImpl**   */
   uint16_t storage;        /* TensorImpl* -> StorageImpl**  */
@@ -353,21 +353,21 @@ typedef struct {
   int ready;               /* set_torch_version has run */
 } intj_torch_abi;
 
-#ifdef INTJ_ACCESS_CXX
+#ifdef INTJ_TORCH_ACCESS_STATIC_COMPILE
 #include <c10/core/StorageImpl.h>
 #include <c10/core/TensorImpl.h>
 
 #include "intj_thpvariable.h"
 #endif
 
-/* Interned method names, used only by the CPYTHON reader. Filled by
+/* Interned method names, used only by the INTERPRETER tensor reader. Filled by
  * intj_abi_init; never released, like every other module-lifetime singleton. */
 static PyObject *intj_str_dtype;
 static PyObject *intj_str_data_ptr;
 static PyObject *intj_str_untyped_storage;
 static PyObject *intj_str_nbytes;
 
-#if defined(INTJ_ACCESS_SHIM)
+#if defined(INTJ_TORCH_ACCESS_RUNTIME_SHIM)
 
 /* Reads torch's structs directly. `want_size` is a compile-time-ish flag: the
  * storage size is only needed where the backend specializes on pointer range.
@@ -421,7 +421,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   return 0;
 }
 
-#elif defined(INTJ_ACCESS_CPYTHON)
+#elif defined(INTJ_TORCH_ACCESS_INTERPRETER)
 
 /* Calls through the interpreter.  Slowest, but assumes nothing about torch's
  * layout beyond THPDtype, which self-checks at load. */
@@ -464,9 +464,9 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   return 0;
 }
 
-#elif defined(INTJ_ACCESS_CXX)
+#elif defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
 
-/* Exactly the loads the shim mode makes, with the compiler supplying the field
+/* Exactly the loads RUNTIME_SHIM makes, with the compiler supplying the field
  * offsets instead of a probe.
  *
  * The fields are private, so they are reached through the
@@ -492,7 +492,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
  *
  * The cost is that a torch release renaming any of these fields breaks the
  * build.  That is the right failure: a compile error, not a wrong pointer --
- * which is what the shim mode would get, since it cannot see names at all.
+ * which is what RUNTIME_SHIM would get, since it cannot see names at all.
  */namespace intj_rob {
 template <typename Tag, typename Tag::type M>
 struct Rob {
@@ -545,8 +545,8 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
     *sz = (si->*get(si_size_bytes())).as_int_unchecked();
 
   /* torch returns null for every zero-element tensor, even one whose storage is
-   * live and whose storage_offset is not zero; see the shim reader.  Reading
-   * `numel_` rather than calling `numel()` also matches the shim mode on a
+   * live and whose storage_offset is not zero; see RUNTIME_SHIM. Reading
+   * `numel_` rather than calling `numel()` also matches RUNTIME_SHIM on a
    * tensor whose impl overrides it -- see docs/Usage.md. */
   const int64_t itemsize = (int64_t)meta.itemsize();
   *p = (ti->*get(ti_numel())) == 0
@@ -557,7 +557,7 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
 }
 
 #else
-#error "intj: define one of INTJ_ACCESS_{SHIM,CPYTHON,CXX}"
+#error "intj: define one INTJ_TORCH_ACCESS_{INTERPRETER,RUNTIME_SHIM,STATIC_COMPILE}"
 #endif
 
 /* Re-raise the reader's error as "which argument", keeping torch's own message
@@ -575,7 +575,7 @@ static inline void intj_note_param(const char *pname) {
   }
 }
 
-/* Intern the method names the CPYTHON reader uses.  Interning once and holding
+/* Intern the method names the INTERPRETER tensor reader uses. Interning once and holding
  * the references for the module's life keeps the reader down to a pointer
  * compare in the attribute lookup.  Returns -1 with a python error set. */
 static inline int intj_intern_names(void) {
@@ -610,7 +610,7 @@ static inline int intj_dtype_selfcheck(PyObject *torch) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: torch.dtype is not laid out as intj expects "
                     "(THPDtype { PyObject_HEAD ScalarType; char name[] }); "
-                    "this torch is too new or too old for the cpython mode");
+                    "this torch is too new or too old for INTERPRETER tensor access");
     return -1;
   }
   return 0;
@@ -660,7 +660,7 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
  * it sets a python error and returns NULL from the enclosing function -- which
  * must therefore return PyObject *.  (A `goto` to a shared label would be
  * tidier, but C++ forbids jumping over the initializations that follow in
- * `entry`, and the CXX access mode compiles this as C++.) /
+ * `entry`, and STATIC_COMPILE tensor access compiles this as C++.)
  */
 #define INTJ_DECODE(st, o, acc, shift, vals, np, SPEC, ALIGN, SBIT, pname)     \
   do {                                                                         \
@@ -677,8 +677,8 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
         intj_note_param(pname);                                                \
         return NULL;                                                           \
       }                                                                        \
-      /* The three readers disagree about how much they check: the shim one     \
-       * skips its own bound test for a zero-element tensor, and the cpython    \
+      /* The three readers disagree about how much they check: RUNTIME_SHIM    \
+       * skips its own bound test for a zero-element tensor, and INTERPRETER    \
        * one has none at all.  One lookup here covers every mode and every path \
        * through them -- and with a byte code it has to, because an unmapped    \
        * dtype would otherwise alias into the scalar range. */                  \
