@@ -69,30 +69,33 @@ Perhaps some of the feature may not contribute much to the overhead, but, I don'
 
 ## Benchmark results
 
-`python benchmarks/bench_launch.py`, 5-argument kernel, MI300X (gfx942), triton 3.8.0,
-torch 2.14+rocm7.2, 20k iterations:
+`taskset -c 0 python benchmarks/bench_launch.py --readme --iters 20000 --batches 7`,
+5-argument kernel, MI308X (gfx942), triton 3.8.0, torch 2.14+rocm7.2. The
+numbers below are the median of five fresh-cache runs; each run reports the
+median of seven 20k-call batches. Each process used a separate empty
+`TRITON_HOME` for the cold-build column.
 
 | | triton `JitFunction` | INTJ |
 |---|---|---|
-| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.4 us) | 18.7 us | 3.8 us |
-| `grid=(0,)`, i.e. no driver call | 14.0 us | 0.15 us |
-| argument decoding + spec key only | — | 0.11 us |
+| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.0 us) | 16.81 us | 3.16 us |
+| `grid=(0,)`, i.e. no driver call | 13.60 us | 0.15 us |
+| argument decoding + spec key only | — | 0.13 us |
 
 Argument decoding depends on how the module reads a tensor (`torch_access`), for a
 kernel with three tensor arguments:
 
 | `TorchAccess` | decode + spec key | first build |
 |---|---|---|
-| `SHIM` — torch's structs, at offsets discovered at load | 89 ns | 0.6 s |
-| `CXX` — compiled against torch's headers | 90 ns | 1.9 s |
-| `CPYTHON` — through the interpreter | 300 ns | 0.6 s |
+| `SHIM` — torch's structs, at offsets discovered at load | 126.7 ns | 1.11 s |
+| `CXX` — compiled against torch's headers | 127.2 ns | 2.25 s |
+| `CPYTHON` — through the interpreter | 913.7 ns | 0.82 s |
 
 `SHIM` and `CXX` make the same loads and land within ~1 ns of each other; `CXX`
 has the compiler supply the field offsets that `SHIM` probes for. `CXX` pays a little build time for that, and is the only mode whose `.so` must
 be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
-which is the third row's 0.15 us. Host overhead is therefore ~0.3 us against
+which is the third row's 0.13 us. Host overhead is therefore ~0.3 us against
 ~14 us.
 
 TODO: sweep the number of dynamic/constexpr arguments and the number of tensors.

@@ -1,7 +1,7 @@
 # pyright: standard
-"""Repeated per-launch timings for argument annotations.
+"""Repeated per-launch timings for argument annotations and README comparisons.
 
-Usage: python benchmarks/bench_launch.py [--no-gpu] [--iters N] [--batches N]
+Usage: python benchmarks/bench_launch.py [--no-gpu | --readme] [--iters N] [--batches N]
 """
 
 import argparse
@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from intj import Annotation, Argument, Assume, Aligned, BindValue, Constexpr, NEVER, PointerRange, make_launcher
+from intj.torch_abi import TorchAccess
 
 
 @triton.jit
@@ -34,6 +35,39 @@ def bench(fn, iters, batches, sync):
         sync()
         samples.append((time.perf_counter_ns() - start) / iters)
     return statistics.median(samples)
+
+
+def bench_readme(iters, batches):
+    n = 4096
+    x = torch.randn(n, device="cuda")
+    y = torch.randn(n, device="cuda")
+    o = torch.empty(n, device="cuda")
+    args = (x, y, o, n, 1.5, 128)
+    sync = torch.cuda.synchronize
+
+    access_rows = []
+    for mode in (TorchAccess.SHIM, TorchAccess.CXX, TorchAccess.CPYTHON):
+        start = time.perf_counter_ns()
+        module = getattr(make_launcher(noop, torch_access=mode), "__self__")
+        build_s = (time.perf_counter_ns() - start) / 1e9
+        decode_ns = bench(lambda: module.spec_key(*args), iters, batches, sync)
+        access_rows.append((mode.name.lower(), decode_ns, build_s))
+
+    launcher = make_launcher(noop)
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    print(f"mode=readme; {iters} calls × {batches} batches; median")
+    print(f"{'path':>12} {'triton us':>11} {'intj us':>10} {'speedup':>9}")
+    for label, grid in (("grid=(1,)", (1,)), ("grid=(0,)", (0,))):
+        triton_ns = bench(lambda: noop[grid](*args), iters, batches, sync)  # pyright: ignore[reportArgumentType]
+        intj_ns = bench(lambda: launcher(device, stream, grid, *args), iters, batches, sync)
+        print(f"{label:>12} {triton_ns / 1000:11.2f} {intj_ns / 1000:10.2f} "
+              f"{triton_ns / intj_ns:8.1f}x")
+
+    print()
+    print(f"{'torch_access':>12} {'decode ns':>11} {'build s':>10}")
+    for mode, decode_ns, build_s in access_rows:
+        print(f"{mode:>12} {decode_ns:11.1f} {build_s:10.2f}")
 
 
 def main(iters=20000, batches=7, no_gpu=False):
@@ -109,9 +143,15 @@ def main(iters=20000, batches=7, no_gpu=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-gpu", action="store_true", help="decode and cache on the host only")
+    parser.add_argument("--readme", action="store_true", help="reproduce the README launcher comparison")
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
     options = parser.parse_args()
     if options.iters < 1 or options.batches < 1:
         parser.error("--iters and --batches must be positive")
-    main(options.iters, options.batches, options.no_gpu)
+    if options.readme and options.no_gpu:
+        parser.error("--readme and --no-gpu are mutually exclusive")
+    if options.readme:
+        bench_readme(options.iters, options.batches)
+    else:
+        main(options.iters, options.batches, options.no_gpu)

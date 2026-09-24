@@ -77,6 +77,27 @@ def test_benchmark_matrix_runs_without_gpu():
         assert label in run.stdout
 
 
+def test_readme_benchmark_matrix_runs():
+    run = subprocess.run(
+        [
+            sys.executable,
+            "benchmarks/bench_launch.py",
+            "--readme",
+            "--iters",
+            "2",
+            "--batches",
+            "1",
+        ],
+        cwd=pathlib.Path(__file__).parents[1],
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[1])},
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    for label in ("grid=(1,)", "grid=(0,)", "shim", "cxx", "cpython"):
+        assert label in run.stdout
+
+
 @triton.jit
 def axpy(x, y, o, n, a, flag, bias, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
