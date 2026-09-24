@@ -48,14 +48,14 @@ class Pair:
     y: int
 
 
-def time_calls(fn: Callable[[], object], iters: int, batches: int) -> list[float]:
+def time_calls(fn: Callable[..., object], iters: int, batches: int, args: tuple = ()) -> list[float]:
     for _ in range(100):
-        fn()
+        fn(*args)
     samples = []
     for _ in range(batches):
         start = time.perf_counter_ns()
         for _ in range(iters):
-            fn()
+            fn(*args)
         samples.append((time.perf_counter_ns() - start) / iters)
     return samples
 
@@ -88,7 +88,10 @@ def callback(iters: int, batches: int) -> None:
     print(f"callback_count={count} (100 warmup + {iters * batches} unique misses)")
     report("INTJ cold compile callback + cache", samples)
     report("INTJ hot call (no callback)", time_calls(
-        lambda: launch(0, 1, *tensors, 1), iters, batches))
+        launch, iters, batches, (0, 1, *tensors, 1)))
+    noop = make_launcher(three, no_gpu=True)
+    report("INTJ 3-tensor host-only nop", time_calls(
+        noop, iters, batches, (0, 0, 1, *tensors)))
 
 
 def kwargs(iters: int, batches: int) -> None:
