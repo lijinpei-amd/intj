@@ -130,3 +130,75 @@ is unavailable. Existing sparse/nested Torch warnings remain.
 `pyright --pythonpath /tmp/gb2/bin/python`: **0 errors**. The new sweep smoke test
 and grid overflow regressions were each checked failing before their fixes.
 CUDA is compile-checked by the suite; NVIDIA GPU runtime behavior remains untested.
+
+## TVM FFI comparison — 2026-09-25
+
+Measured at `00087e3` on an Intel Xeon Platinum 8480C (CPU 0 pinned) and
+AMD Instinct MI308X (gfx942). Python 3.12.3, Torch 2.14.0+rocm7.2, Triton
+3.8.0, and apache-tvm-ffi 0.1.14.post2.dev1+g424558557.d20260924.
+Each number is the median of three separate process medians, in **µs per host
+call**; each process used nine batches of 1,000 calls. The benchmark warms each
+case, prepares its argument tuple, compiles the launchers, and converts FFI
+tensors before timing. The timer stops before GPU synchronization, so kernel
+rows include host enqueue and possible queue backpressure, not GPU completion.
+The FFI no-op rows make no GPU launch.
+
+The FFI kernels are compiled HIP C++ kernels; the INTJ kernels are Triton
+kernels. FFI receives preconverted TensorViews while INTJ receives Torch
+tensors, so these are the actual call paths, not identical GPU binaries. In
+the zero-argument sweep, FFI selects the stream using a constant device type
+and ID; other FFI kernel rows read it from a tensor.
+
+### Default: three tensor arguments
+
+| Case | µs/call |
+|---|---:|
+| FFI packed nop | 0.1451 |
+| FFI typed nop | 0.1490 |
+| FFI empty kernel | 3.3306 |
+| INTJ empty kernel | 2.9967 |
+| INTJ fixed-device kernel | 2.8683 |
+
+### Mixed: three tensors, integer, float
+
+| Case | µs/call |
+|---|---:|
+| FFI packed nop mixed | 0.1740 |
+| FFI typed nop mixed | 0.1778 |
+| FFI mixed kernel | 3.2923 |
+| INTJ mixed kernel | 2.8943 |
+| INTJ fixed mixed kernel | 2.8973 |
+
+### Argument-count sweep
+
+For each count, the first three arguments are tensors; later arguments repeat
+integer, float, tensor. INTJ uses device-bound launchers with CXX or SHIM
+tensor access and one value-independent specialization key per count.
+
+| Arguments | FFI packed nop | FFI typed nop | FFI empty kernel | INTJ CXX kernel | INTJ SHIM kernel |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.1174 | 0.1204 | 1.6480 | 2.7306 | 2.7129 |
+| 3 | 0.1436 | 0.1491 | 3.2107 | 2.9134 | 2.8924 |
+| 5 | 0.1737 | 0.1772 | 3.2947 | 2.8931 | 2.8570 |
+| 8 | 0.2061 | 0.2096 | 3.3981 | 3.0216 | 2.8900 |
+| 16 | 0.2931 | 0.3039 | 3.6678 | 3.3526 | 3.2411 |
+| 32 | 0.4778 | 0.4941 | 4.2349 | 3.6359 | 3.4357 |
+| 64 | 0.8366 | 0.8686 | 5.0639 | 4.6199 | 4.5667 |
+
+A preliminary five-batch run at 10,000 calls per batch gave wide launch
+variation within a single case (for example, 32-argument FFI kernel:
+4.28–15.01 µs/call). These tables use 1,000 calls per batch and should not be
+compared directly to the 20,000-call historical launcher measurements above.
+The zero-argument FFI kernel also varied across processes: 1.5929–1.8904
+µs/call (process medians).
+
+Repeat each command three times from the repository root:
+
+```sh
+PYTHONPATH=$PWD taskset -c 0 /tmp/gb2/bin/python benchmarks/bench_ffi_compare.py --iters 1000 --batches 9
+PYTHONPATH=$PWD taskset -c 0 /tmp/gb2/bin/python benchmarks/bench_ffi_compare.py --sweep --iters 1000 --batches 9
+```
+
+Raw process outputs are local at `/tmp/intj-tvm-ffi-20260925.ryY7sD/`:
+`{default,sweep}-{2,3,4}.log` are the reported runs; `*-1.log` are the
+10,000-call diagnostics.
