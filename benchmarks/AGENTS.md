@@ -16,6 +16,9 @@ before timing when the benchmark writes data.
 - `bench_ffi_compare.py`: cached INTJ versus preconverted TVM FFI no-ops and GPU
   kernel launches; `--sweep` measures 0, 3, 5, 8, 16, 32, and 64 arguments.
   Requires `apache-tvm-ffi` and a ROCm or CUDA GPU.
+- `bench_intj_ffi_paths.py`: INTJ host-only cache-miss callback and cached
+  launch, positional/keyword adapter, and manual versus TVM FFI dataclass
+  unpacking. Requires `apache-tvm-ffi`; callback mode also needs a GPU tensor.
 - `../tests/bench_kernel_cache.cpp`, run by `../tests/test_kernel_cache.py`:
   direct cache hits, misses, and hashes for 1-, 2-, and 5-word keys and 1, 8,
   64, or 512 entries. Requires Google Benchmark (`INTJ_BENCHMARK_ROOT` if it is
@@ -28,6 +31,7 @@ PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_launch.py --no-gpu --iters 
 PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_launch.py --readme --iters 20000 --batches 7
 PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_ffi_compare.py --iters 1000 --batches 9
 PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_ffi_compare.py --sweep --iters 1000 --batches 9
+PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_intj_ffi_paths.py --iters 1000 --batches 9
 PYTHONPATH=$PWD python -m pytest tests/test_kernel_cache.py -s
 ```
 
@@ -44,6 +48,16 @@ PYTHONPATH=$PWD python -m pytest tests/test_kernel_cache.py -s
 - The 2026-09-24 optimization used an older runner that timed a Python wrapper.
   Commit `30803c4` changed it to direct calls with prebuilt tuples. Its old
   numbers and newer launcher numbers have different timing boundaries.
+- INTJ calls reject keyword arguments and dataclass values. The Python
+  adapters in `bench_intj_ffi_paths.py` add those conveniences outside INTJ.
+  Its callback row is a cold compile callback with a distinct cache key for
+  every call, including decoding and cache insertion; TVM FFI's callback
+  benchmark measures a C++ loop with per-argument tensor conversion. These
+  rows have different boundaries and must not be used to claim relative
+  callback throughput.
+- TVM FFI's CUBIN example uses CUDA-specific code and cannot run on ROCm.
+  `bench_ffi_compare.py` provides a HIP empty-launch analogue with different
+  GPU binaries; do not describe it as the same-kernel comparison.
 - CUDA runtime cannot be tested on this development machine; mark it untested
   when reporting GPU results. A skipped cache benchmark supplies no timing data.
 
