@@ -38,8 +38,11 @@ integer decoder requires 30-bit digits, enforced by a compile-time assertion.
 Python reads layout facts from the interpreter (`object.__basicsize__`), never
 from `ctypes` pointer sizes; the free-threaded header is not two pointers.
 The C side uses `sizeof(PyObject)` to locate `THPDtype::scalar_type` after
-`PyObject_HEAD`; the Python side uses `pyobject_size()` to adjust
-`THPVariable::cdata`.
+`PyObject_HEAD`. `pyobject_size()` supplies the detecting interpreter's header
+size and lets `layout_for()` refuse an unrepresentable offset early. For
+`RUNTIME_SHIM`, the generated C setter adds its compiled `sizeof(PyObject)` to
+the table's post-header `cdata` offset and saves the absolute result before
+any launch.
 
 ## Scalar-reader contract
 
@@ -113,10 +116,12 @@ cache miss checks again under the lock before inserting its result because
 another thread may have filled the same key during compilation. On a regular
 build, the lock operations compile away.
 
-For Torch's `RUNTIME_SHIM` mode, `pyobject_size()` replaces the 16-byte header
-portion of the recorded `THPVariable::cdata` offset. The adjusted offset is
-saved in the module at load time, so free-threaded builds use a verified Torch
-layout without a per-launch CPython size query.
+For Torch's `RUNTIME_SHIM` mode, `pyobject_size()` supplies the detecting
+interpreter's header size and lets `layout_for()` refuse an unrepresentable
+offset early. The generated C setter adds its compiled `sizeof(PyObject)` to
+the table's post-header `cdata` offset and saves the absolute result before
+any launch, so free-threaded builds use a verified Torch layout without a
+per-launch CPython size query.
 
 ## Verification
 

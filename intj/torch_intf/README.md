@@ -13,13 +13,14 @@ And these details depend on pytorch version, and different pytorch interface mod
 
 For the abi table used by RUNTIME_SHIM, a toml file mapping torch version to abi details is included. To rebuild or verify the table, there are two ways:
 
-Its recorded `cdata` offset includes a 16-byte `PyObject` header. At module load,
-intj replaces that portion with the size reported by `python_intf` and saves the
-resulting offset in the module's ABI state.
-
-- Through runtime detection on a default-GIL CPython build, see abi_detect.py. This method doesn't need to compile and run a C++ extension.
+- Through runtime detection on a supported CPython build, see abi_detect.py. This method doesn't need to compile and run a C++ extension.
 - Through compile and run detection, see cpp_detect.py. This method compiles some C++ files using pytorch C++ headers, then runs the resulting binary and outputs the needed info.
 
-Our provided table is checked using both method in our CI for supported pytorch version.
+The table stores `cdata` relative to the end of `PyObject_HEAD`. The runtime
+detector subtracts `python_intf.cpython_abi.pyobject_size()` from the measured
+pointer-slot offset; the independent C++ detector subtracts its compiled
+`sizeof(PyObject)`. The generated module adds its own compiled size once when
+installing the layout. Run `python -m intj.torch_intf.abi_detect` to generate an
+entry and `python -m intj.torch_intf.cpp_detect` to check it independently.
 
 Supported: pytorch >= 2.2; for python, see `../python_intf`.

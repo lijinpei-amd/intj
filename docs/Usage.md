@@ -131,9 +131,9 @@ No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
 `RUNTIME_SHIM` reads offsets from a table of verified torch versions
 (`intj/torch_intf/torch_abi.toml`), installed at load by `set_torch_version`.
-For `THPVariable::cdata`, intj replaces the recorded 16-byte `PyObject` header
-with CPython's reported `object.__basicsize__` and saves the resulting offset
-in the module before any launch.
+The recorded `cdata` starts after `PyObject_HEAD`; the generated module adds
+its compiled `sizeof(PyObject)` once and saves the absolute offset before any
+launch.
 A torch with no entry is **refused, never guessed at** — a wrong offset cannot
 raise; it reads whatever lies at that address and hands the kernel a pointer
 built from it. On an unverified torch,
@@ -151,14 +151,13 @@ headers. It declares the head of `THPVariable` itself instead of including it
 `Tensor` since); `cpp_detect` below refuses a torch where that declaration is wrong.
 On torch older than 2.10 the `STATIC_COMPILE` mode is compile-checked only.
 
-To add a version, run `python -m intj.torch_intf.abi_detect` on a default-GIL
-CPython build with that Torch and paste the entry it prints. The recorded `cdata`
-offset uses that build's 16-byte `PyObject` header; free-threaded builds use the
-reported size when loading the module. The detector derives each offset by
-matching field values against torch's own accessors, so the entry is measured.
-`python -m intj.torch_intf.cpp_detect` derives the same offsets independently, by
-compiling against torch's C++ headers. The test suite checks the entry for the torch
-it runs on against both.
+To add a version, run `python -m intj.torch_intf.abi_detect` on a supported
+GIL or free-threaded CPython build with that Torch and paste the entry it
+prints. The detector subtracts that interpreter's reported header size from
+the measured pointer-slot offset. `python -m intj.torch_intf.cpp_detect`
+derives the relative offset independently from Torch's C++ headers.
+The test suite compares the table entry with both detectors on the Torch
+version it runs against.
 
 `INTERPRETER` obtains the pointer and storage size through CPython calls but
 reads the dtype code directly from `THPDtype`, whose layout checks itself at load

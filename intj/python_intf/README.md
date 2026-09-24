@@ -40,9 +40,10 @@ INTJ reads that field directly; `Python.h` supplies its offset for the build.
 `Python.h` defines `PyObject_HEAD`, so the compiler knows its size as
 `sizeof(PyObject)`. In `STATIC_COMPILE`, that header is part of the C++
 `THPVariable` declaration and the compiler locates `cdata`. In
-`RUNTIME_SHIM`, each recorded `cdata` offset includes a 16-byte header;
-Python currently replaces those 16 bytes with the running interpreter's
-equivalent `object.__basicsize__` and saves the adjusted offset at module load.
+`RUNTIME_SHIM`, the recorded `cdata` offset starts after `PyObject_HEAD`.
+`cpython_abi.pyobject_size()` (`object.__basicsize__`) supplies the detecting
+interpreter's header size. At module load, the compiled setter adds its own
+`sizeof(PyObject)` and saves the absolute offset before the first launch.
 
 ## Free-threaded Builds
 

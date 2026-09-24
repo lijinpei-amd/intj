@@ -26,7 +26,7 @@ in `cpython_abi.h`, independently of the Torch mode. One runtime shim
 implementation can serve multiple Torch versions, while each compiled
 extension still targets a compatible CPython ABI.
 
-For `RUNTIME_SHIM`, the recorded tensor `cdata` offset includes a 16-byte
-`PyObject` header. `layout_for()` replaces that portion with CPython's reported
-`object.__basicsize__`, and `set_torch_version()` saves the adjusted offset in
-module state before the first launch.
+For `RUNTIME_SHIM`, `torch_abi.toml` stores `cdata` relative to the end of
+`PyObject_HEAD`. `layout_for()` selects the verified Torch row, and the
+generated module's `set_torch_version()` adds its compiled `sizeof(PyObject)`
+and saves the absolute offset before the first launch.
