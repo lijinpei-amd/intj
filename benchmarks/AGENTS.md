@@ -50,8 +50,9 @@ PYTHONPATH=$PWD python -m pytest tests/test_kernel_cache.py -s
 ## Result journals
 
 `journals/` contains benchmark result history. Name each Markdown record
-`YYYY-MM-DD_<commit>_<repeat-index>.md`, using the local measurement date, the
-measured source commit's short Git SHA, and a zero-based repeat-round index.
+`YYYY-MM-DD_<topic>_<index>_<commit>.md`, using the local measurement date, a
+short kebab-case topic, a zero-based repeat-round index for that topic, and
+the measured source commit's short Git SHA.
 Record the exact command (or the saved driver and its flags), raw output
 (including per-batch samples), CPU/core affinity, GPU/architecture, Python and
 dependency versions, relevant
@@ -64,5 +65,5 @@ Keep aggregate results in the first reported repeat record and link the other
 repeats. Diagnostics with different parameters get their own indexed record.
 
 The 2026-09-24 optimization history starts at
-`journals/2026-09-24_4f0b13e_0.md`; the 2026-09-25 TVM FFI comparison starts
-at `journals/2026-09-25_00087e3_1.md` (index 0 is the long-batch diagnostic).
+`journals/2026-09-24_launcher-optimization_0_4f0b13e.md`; the 2026-09-25 TVM FFI comparison starts
+at `journals/2026-09-25_tvm-ffi_1_00087e3.md` (index 0 is the long-batch diagnostic).

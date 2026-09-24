@@ -4,7 +4,7 @@
 candidate working tree, before commit `4f0b13e`). Baseline source:
 `4a3df7f`, archived; candidate source: working tree later committed as
 `4f0b13e` with matching `entry.c.jinja` SHA-256 `38b8a7ae495d22eeb3ecebfad40d2d85dba1f6142ac38d6321097a467e63481c`. Baseline
-and candidate both used the updated runner. [Five-repeat summary and repeat 0](2026-09-24_4f0b13e_0.md).
+and candidate both used the updated runner. [Five-repeat summary and repeat 0](2026-09-24_launcher-optimization_0_4f0b13e.md).
 
 **Environment:** Intel Xeon Platinum 8480C, CPU 0 affinity; AMD Instinct
 MI308X (gfx942), GPU 0; CPython 3.12.3, Torch 2.14.0+rocm7.2, Triton 3.8.0,

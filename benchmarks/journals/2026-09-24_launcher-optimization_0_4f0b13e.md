@@ -1,7 +1,7 @@
 # Launcher optimization — 2026-09-24, repeat 0 of 5
 
 This record keeps the five-repeat aggregate from the old
-`docs/benchmark-2026-09-24.md` and raw output from repeat 0; see [repeat 1](2026-09-24_4f0b13e_1.md), [repeat 2](2026-09-24_4f0b13e_2.md), [repeat 3](2026-09-24_4f0b13e_3.md), [repeat 4](2026-09-24_4f0b13e_4.md).
+`docs/benchmark-2026-09-24.md` and raw output from repeat 0; see [repeat 1](2026-09-24_launcher-optimization_1_4f0b13e.md), [repeat 2](2026-09-24_launcher-optimization_2_4f0b13e.md), [repeat 3](2026-09-24_launcher-optimization_3_4f0b13e.md), [repeat 4](2026-09-24_launcher-optimization_4_4f0b13e.md).
 
 The candidate was measured before commit `4f0b13e` existed: its saved
 `entry.c.jinja` SHA-256 is `38b8a7ae495d22eeb3ecebfad40d2d85dba1f6142ac38d6321097a467e63481c`, identical to the version in
