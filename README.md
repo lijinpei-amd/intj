@@ -98,4 +98,8 @@ The zero-volume row flatters INTJ a little: it returns before decoding arguments
 which is the third row's 0.12 us. Host overhead is therefore ~0.3 us against
 ~14 us.
 
-TODO: sweep the number of dynamic/constexpr arguments and the number of tensors.
+Run `python benchmarks/bench_launch.py --sweep --iters 100000 --batches 9` for
+host-only timings with 4, 16, and 32 integer or tensor arguments. See the
+[2026-09-24 optimization measurements](docs/benchmark-2026-09-24.md) for before/after results.
+
+TODO: sweep constexpr argument counts independently.

@@ -6,7 +6,17 @@
  * {{ 'bound(' if fixed_device else 'entry(device, ' }}stream, grid{% for p in params if p.call_index is not none %}, {{ p.name }}{% endfor %})
  */
 #define PY_SSIZE_T_CLEAN
+/* Inputs are checked explicitly below; omit redundant CPython assertions.
+ * Keep this in the template so the module cache tracks the build mode. */
+#ifndef NDEBUG
+#define NDEBUG
+#define INTJ_RESTORE_DEBUG
+#endif
 #include <Python.h>
+#ifdef INTJ_RESTORE_DEBUG
+#undef NDEBUG
+#undef INTJ_RESTORE_DEBUG
+#endif
 
 {% set bound_params = params | rejectattr('annotation.bind_value', 'none') | list %}
 {% set auto_decode = namespace(enabled=true) %}
@@ -496,7 +506,7 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
       return NULL;
     }
   }
-  if (INTJ_UNLIKELY((uint64_t)gx * (uint64_t)gy * (uint64_t)gz == 0))
+  if (INTJ_UNLIKELY(gx == 0 || gy == 0 || gz == 0))
     Py_RETURN_NONE;
 
   /* Key words are accumulated in registers and written once after decoding. */

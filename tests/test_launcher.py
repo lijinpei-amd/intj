@@ -46,12 +46,14 @@ from intj.torch_abi import (
 )
 
 
-def test_benchmark_matrix_runs_without_gpu():
+@pytest.mark.parametrize("sweep", [False, True])
+def test_benchmark_matrix_runs_without_gpu(sweep):
     run = subprocess.run(
         [
             sys.executable,
             "benchmarks/bench_launch.py",
             "--no-gpu",
+            *(["--sweep"] if sweep else []),
             "--iters",
             "20",
             "--batches",
@@ -63,6 +65,14 @@ def test_benchmark_matrix_runs_without_gpu():
         text=True,
     )
     assert run.returncode == 0, run.stderr
+    if sweep:
+        assert "mode=sweep; host-only" in run.stdout
+        rows = [line.split() for line in run.stdout.splitlines()[2:]]
+        assert [(int(count), kind) for count, kind, _ in rows] == [
+            (count, kind) for count in (4, 16, 32) for kind in ("int", "tensor")
+        ]
+        assert all(float(ns) > 0 for _, _, ns in rows)
+        return
     for label in (
         "auto map",
         "reduced key",
@@ -1683,6 +1693,35 @@ def test_grid_spellings(scale_launcher):
         o.zero_()
         launch(scale_launcher, grid, x, o, 1024, 2.0, 128)
         torch.testing.assert_close(o, x * 2.0)
+
+
+@pytest.mark.parametrize("sequence", [tuple, list])
+def test_nonzero_grid_product_overflow_does_not_skip_decoding(scalar_kernel, sequence):
+    host = make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    # The product is 2**64; every dimension is valid and nonzero.
+    with pytest.raises(TypeError, match="argument 'x'"):
+        host(0, 0, sequence((1 << 22, 1 << 21, 1 << 21)), object())
+
+
+@pytest.mark.parametrize("sequence", [tuple, list])
+def test_grid_sequence_validation_and_zero_dimensions(scalar_kernel, sequence):
+    host = make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    for size in (1, 2, 3):
+        assert host(0, 0, sequence([2**32 - 1] * size), 7) is None
+        for dim in range(size):
+            grid = [1] * size
+            grid[dim] = 0
+            assert host(0, 0, sequence(grid), object()) is None
+            for bad in (-1, 2**32, 2**64, True, 1.0, None):
+                invalid = [bad if i == dim else 0 for i in range(size)]
+                with pytest.raises(ValueError, match="grid dimensions"):
+                    host(0, 0, sequence(invalid), 7)
+    for grid in ((), (1, 1, 1, 1)):
+        with pytest.raises(ValueError, match="between 1 and 3 dimensions"):
+            host(0, 0, sequence(grid), 7)
+    for grid in (True, 1.0, None, range(1)):
+        with pytest.raises(TypeError, match="grid must be"):
+            host(0, 0, grid, 7)
 
 
 @triton.jit

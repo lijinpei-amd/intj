@@ -1,11 +1,14 @@
 # pyright: standard
 """Repeated per-launch timings for argument annotations and README comparisons.
 
-Usage: python benchmarks/bench_launch.py [--no-gpu | --readme] [--iters N] [--batches N]
+Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep] [--iters N] [--batches N]
 """
 
 import argparse
+import importlib.util
+import pathlib
 import statistics
+import tempfile
 import time
 
 import torch
@@ -32,8 +35,9 @@ def bench(fn, iters, batches, sync):
         start = time.perf_counter_ns()
         for _ in range(iters):
             fn()
+        elapsed = time.perf_counter_ns() - start
         sync()
-        samples.append((time.perf_counter_ns() - start) / iters)
+        samples.append(elapsed / iters)
     return statistics.median(samples)
 
 
@@ -68,6 +72,25 @@ def bench_readme(iters, batches):
     print(f"{'torch_access':>12} {'decode ns':>11} {'build s':>10}")
     for mode, decode_ns, build_s in access_rows:
         print(f"{mode:>12} {decode_ns:11.1f} {build_s:10.2f}")
+
+
+def bench_sweep(iters, batches):
+    print(f"mode=sweep; host-only; {iters} calls × {batches} batches; median ns/call")
+    print(f"{'count':>5} {'kind':>6} {'ns/call':>10}")
+    with tempfile.TemporaryDirectory() as tmp:
+        for count in (4, 16, 32):
+            path = pathlib.Path(tmp) / f"args_{count}.py"
+            names = ", ".join(f"x{i}" for i in range(count))
+            path.write_text(f"import triton\n\n@triton.jit\ndef noop({names}):\n    pass\n")
+            spec = importlib.util.spec_from_file_location(path.stem, path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            launcher = make_launcher(module.noop, no_gpu=True)
+            for kind, value in (("int", 17), ("tensor", torch.empty(4096))):
+                args = (value,) * count
+                elapsed = bench(lambda: launcher(0, 0, (1,), *args), iters, batches, lambda: None)
+                print(f"{count:5d} {kind:>6} {elapsed:10.1f}")
 
 
 def main(iters=20000, batches=7, no_gpu=False):
@@ -143,7 +166,9 @@ def main(iters=20000, batches=7, no_gpu=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-gpu", action="store_true", help="decode and cache on the host only")
-    parser.add_argument("--readme", action="store_true", help="reproduce the README launcher comparison")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--readme", action="store_true", help="reproduce the README launcher comparison")
+    modes.add_argument("--sweep", action="store_true", help="compare argument counts on the host only")
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
     options = parser.parse_args()
@@ -153,5 +178,7 @@ if __name__ == "__main__":
         parser.error("--readme and --no-gpu are mutually exclusive")
     if options.readme:
         bench_readme(options.iters, options.batches)
+    elif options.sweep:
+        bench_sweep(options.iters, options.batches)
     else:
         main(options.iters, options.batches, options.no_gpu)
