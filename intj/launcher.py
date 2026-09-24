@@ -8,8 +8,10 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import sysconfig
+import tempfile
 import threading
 import types
 import warnings
@@ -28,6 +30,7 @@ from .annotation import (
     _layout_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
     _resolve_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
+from .grid import GridCode, GridError, compile_grid
 from .kernel_cache import (
     INSTALL_ERRORS,
     KernelCache,
@@ -88,7 +91,12 @@ class CompilerInput:
     def ast_source(self, jit_func: JitFunction) -> Any:
         from triton.compiler import ASTSource
 
-        return ASTSource(
+        source_type = ASTSource
+        if jit_func.is_gluon():
+            from triton.experimental.gluon._runtime import GluonASTSource
+
+            source_type = GluonASTSource
+        return source_type(
             jit_func, dict(self.signature), dict(self.values),
             {path: [list(attr) for attr in attrs] for path, attrs in self.attrs},
         )
@@ -131,6 +139,10 @@ class RenderContext:
     # Explicit pointer names -> live torch ScalarType codes. Their compact key
     # indices still come from the runtime ABI table, in every access mode.
     pointer_types: tuple[tuple[str, int], ...] = ()
+    grid_arg: int | None = None
+    grid_py_mode: bool = False
+    grid_cpp_source: str = ""
+    grid_extra: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,7 +157,7 @@ class ModuleKey:
     template: str  # entry.c.jinja bytes, hex
     runtime_header: str  # intj_runtime.h bytes, hex
     context: RenderContext  # the render is a pure function of this and the template
-    cache_key: str  # jit_func.cache_key: the kernel source and its callees
+    cache_key: str  # jit_func.cache_key plus AST language: source and callees
     target: tuple[Any, ...]  # backend, arch, warp size
     options: str  # canonicalized compile options, hashed by triton
     triton: tuple[Any, ...]  # triton version and libtriton identity
@@ -169,6 +181,9 @@ class LauncherFactory:
     verify_annotation: bool
     no_gpu: bool
     bind_device_requested: bool
+    grid_arg: int | None = None
+    grid_py: Callable[[dict[str, object]], object] | None = None
+    grid_cpp: GridCode | None = None
 
     def bind(self, /, **values: object) -> Callable[..., None]:
         if self.bind_device_requested:
@@ -216,21 +231,38 @@ class LauncherFactory:
             self.jit_func, tuple(resolved), dict(self.options), self.torch_access,
             self.kernel_cache, self.no_gpu, self.verify_annotation,
             DeviceBinding.FIXED if self.bind_device_requested else DeviceBinding.NOT_FIXED,
+            grid_arg=self.grid_arg,
+            grid_py_mode=self.grid_py is not None,
+            grid_cpp=self.grid_cpp,
         )
         public_names = tuple(
             p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
         )
         control_names: list[str] = []
-        for name in (("stream", "grid") if self.bind_device_requested else ("device", "stream", "grid")):
-            while name in public_names:
+        grid_names = (() if self.grid_cpp is not None or self.grid_py is not None else
+                      ("grid",) if self.grid_arg is None else
+                      ("grid_x", "grid_y", "grid_z")[:self.grid_arg])
+        extra_names = self.grid_cpp.extras if self.grid_cpp is not None else ()
+        occupied = set(public_names) | set(extra_names)
+        for name in (("stream", *grid_names) if self.bind_device_requested
+                     else ("device", "stream", *grid_names)):
+            while name in occupied:
                 name += "_"
             control_names.append(name)
+            occupied.add(name)
+        control_names.extend(extra_names)
         signature = inspect.Signature(tuple(
             inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
             for name in (*control_names, *public_names)
         ))
+        bound_values = tuple(values[p.name] for p in resolved if p.name in names)
+        if self.grid_py is not None:
+            hidden = tuple(values[p.name] if p.name in names else p.baked for p in resolved
+                           if p.annotation.bind_value is not None or p.annotation.baked_value)
+            return module.make_bound(signature, self.grid_py, hidden,
+                                     *((device,) if self.bind_device_requested else ()), *bound_values)
         return module.make_bound(signature, *((device,) if self.bind_device_requested else ()),
-                                 *(values[p.name] for p in resolved if p.name in names))
+                                 *bound_values)
 
 
 def make_launcher(
@@ -244,6 +276,10 @@ def make_launcher(
     no_gpu: bool = False,
     verify_annotation: bool = False,
     bind_device: bool = False,
+    *,
+    grid_arg: int | None = None,
+    grid_cpp: object | None = None,
+    grid_py: Callable[[dict[str, object]], object] | None = None,
 ) -> Any:
     """Build a fast launcher for `jit_func`.
 
@@ -252,12 +288,16 @@ def make_launcher(
         launcher(device, stream, grid, arg0, arg1, ...)
 
     `device` is a device index in `[0, 256)` -- one byte of the spec key holds
-    it -- `stream` a raw stream handle (both ints), `grid` an int or a
-    tuple/list of up to 3 ints, and the remaining arguments are the kernel's
-    public parameters, positionally, in declaration order. Baked Argument and
-    Constexpr values are omitted from the call. With bound parameters this
-    returns a non-callable factory; `.bind(**values)` creates the native callable
-    and removes those parameters from its signature. `bind_device=True` also
+    it -- and `stream` is a raw stream handle (both ints). The default `grid`
+    is an int or a tuple/list of up to 3 ints. `grid_arg=1|2|3` takes that many
+    separate dimensions; `grid_cpp=annotated_def` computes them in the extension
+    from same-name JIT inputs and keyword-only extra inputs; `grid_py=callable`
+    calls Python with a fresh dict of JIT inputs on every launch. These three
+    keyword-only options are mutually exclusive. The remaining call arguments
+    are the kernel's public parameters, positionally, in declaration order.
+    Baked Argument and Constexpr values are omitted from the call. With bound
+    parameters this returns a non-callable factory; `.bind(**values)` creates the
+    native callable and removes those parameters from its signature. `bind_device=True` also
     returns a factory: `.bind_device(ordinal, **values)` fixes a non-negative
     int32 device ordinal and returns `(stream, grid, ...)`. It owns a separate
     kernel cache, or one kernel when no dynamic specialization key remains.
@@ -273,6 +313,12 @@ def make_launcher(
     """
     if dynamic_grid:
         raise UnsupportedKernel("intj: dynamic_grid is not implemented; pass an int or tuple grid")
+    if grid_arg is not None and (type(grid_arg) is not int or grid_arg not in (1, 2, 3)):
+        raise ValueError("intj: grid_arg must be 1, 2, or 3")
+    if sum(value is not None for value in (grid_arg, grid_cpp, grid_py)) > 1:
+        raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
+    if grid_py is not None and not callable(grid_py):
+        raise TypeError("intj: grid_py must be callable")
     if dynamic_options:
         raise UnsupportedKernel("intj: dynamic_options is not implemented; pass options=... instead")
     options = dict(sorted((options or {}).items()))
@@ -286,13 +332,26 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
+    compiled_grid: GridCode | None = None
+    if grid_cpp is not None:
+        grid_params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+        try:
+            compiled_grid = compile_grid(
+                grid_cpp, grid_params, {p.index: p.baked for p in resolved if p.annotation.baked_value}
+            )
+        except GridError as error:
+            raise UnsupportedKernel(f"intj: {error}") from error
     if not no_gpu:
         from triton import knobs
 
         options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
         options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+        fpsan_casts = getattr(knobs.compilation, "fpsan_homomorphic_casts", None)
+        if fpsan_casts is not None:
+            options["fpsan_homomorphic_casts"] = fpsan_casts
     access = _resolve_access(torch_access)
-    if bind_device or any(p.annotation.bind_value is not None for p in resolved):
+    needs_binding = bind_device or any(p.annotation.bind_value is not None for p in resolved)
+    if needs_binding or grid_py is not None:
         if not no_gpu:
             _canonical_options(_current_target(), options)
         if verify_annotation:
@@ -304,16 +363,22 @@ def make_launcher(
                         RuntimeWarning,
                         stacklevel=2,
                     )
-        return LauncherFactory(jit_func, resolved, tuple(options.items()), access, kernel_cache,
-                               bool(verify_annotation), no_gpu, bool(bind_device))
+        factory = LauncherFactory(jit_func, resolved, tuple(options.items()), access, kernel_cache,
+                                  bool(verify_annotation), no_gpu, bool(bind_device),
+                                  grid_arg, grid_py, compiled_grid)
+        return factory if needs_binding else factory.bind()
     return _materialize_module(jit_func, resolved, options, access, kernel_cache,
-                               no_gpu, bool(verify_annotation)).entry
+                               no_gpu, bool(verify_annotation), grid_arg=grid_arg,
+                               grid_cpp=compiled_grid).entry
 
 
 def _materialize_module(
     jit_func: JitFunction, resolved: tuple[ResolvedParam, ...], options: Mapping[str, Any],
     access: TorchAccess, kernel_cache: KernelCache, no_gpu: bool, verify_annotation: bool,
     device_binding: DeviceBinding = DeviceBinding.NOT_FIXED,
+    grid_arg: int | None = None,
+    grid_py_mode: bool = False,
+    grid_cpp: GridCode | None = None,
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -368,6 +433,10 @@ def _materialize_module(
         torch_version=torch_version() if access is TorchAccess.CXX else None,
         cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
         pointer_types=_pointer_types(params),
+        grid_arg=grid_arg,
+        grid_py_mode=grid_py_mode,
+        grid_cpp_source=grid_cpp.source if grid_cpp else "",
+        grid_extra=grid_cpp.extras if grid_cpp else (),
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -376,11 +445,11 @@ def _materialize_module(
         template=_ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
         context=context,
-        cache_key=jit_func.cache_key,
+        cache_key=jit_func.cache_key + (":gluon" if jit_func.is_gluon() else ""),
         target=(target.backend, target.arch, target.warp_size) if target is not None else ("host-only",),
         options=canonical_options.hash() if canonical_options is not None else "host-defaults",
         triton=_triton_identity(),
-        compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
+        compiler=_compiler_identity(_build_flags(context)["language"]),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
     )
@@ -475,10 +544,8 @@ def _cxx_toolchain() -> tuple[list[str], list[str]] | None:
     Both come from the loaded torch rather than from `torch.__file__`, so a torch
     that reorganises its tree, or one built out of tree, keeps working.
     """
-    from triton.runtime import build
-
     try:
-        build._find_compiler("c++")  # pyright: ignore[reportPrivateUsage]
+        _compiler_path("c++")
     except Exception:
         return None
     try:
@@ -568,21 +635,47 @@ def _build(so_path: Path, context: RenderContext) -> None:
     """Render and compile, then install both artifacts next to each other."""
     import jinja2
 
-    from triton.runtime.build import compile_so_from_src
-
     template = jinja2.Template(_ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
     src = template.render(**dataclasses.asdict(context))
-    built = compile_so_from_src(
-        src=src, name=context.module_name, **_build_flags(context)
-    )
-
-
+    flags = _build_flags(context)
+    binary = _compile_so_bytes(src, context.module_name, flags)
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
     # misbehaves, and what you recompile by hand to debug it.
-    suffix = ".cpp" if _build_flags(context)["language"] == "c++" else ".c"
+    suffix = ".cpp" if flags["language"] == "c++" else ".c"
     _install(src.encode(), so_path.with_name(f"{context.module_name}{suffix}"))
-    _install(Path(built).read_bytes(), so_path)
+    _install(binary, so_path)
+
+
+def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
+    """Use Triton's compiler, or its 3.7-era command when the helper is absent."""
+    from triton.runtime import build
+
+    compile_so = getattr(build, "compile_so_from_src", None)
+    if compile_so is not None:
+        return Path(compile_so(src=src, name=name, **flags)).read_bytes()
+
+    from triton import knobs
+
+    language = flags["language"]
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / f"{name}{'.cpp' if language == 'c++' else '.c'}"
+        source.write_text(src)
+        suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+        binary = Path(directory) / f"{name}{suffix}"
+        scheme = sysconfig.get_default_scheme()
+        if scheme == "posix_local":
+            scheme = "posix_prefix"
+        includes = [*flags.get("include_dirs", ()), directory,
+                    sysconfig.get_paths(scheme=scheme)["include"], *knobs.build.backend_dirs]
+        command = [_compiler_path(language), str(source), "-O3", "-shared", "-fPIC",
+                   "-Wno-psabi", "-o", str(binary)]
+        command += [f"-l{lib}" for lib in flags.get("libraries", ())]
+        command += [f"-L{path}" for path in flags.get("library_dirs", ())]
+        command += [f"-I{path}" for path in includes if path is not None]
+        command += list(flags.get("ccflags", ()))
+        subprocess.check_call(command, stdout=subprocess.DEVNULL)
+        return binary.read_bytes()
 
 
 def _runtime_header_flag() -> str:
@@ -837,11 +930,28 @@ def _triton_identity() -> tuple[Any, ...]:
 
 
 @functools.lru_cache(maxsize=2)
-def _compiler_identity(language: str = "c") -> tuple[str, ...]:
+def _compiler_path(language: str) -> str:
     from triton.runtime import build
 
-    cc = build._find_compiler(language)  # pyright: ignore[reportPrivateUsage]  # the compiler triton itself picks
-    cc = cc[0] if isinstance(cc, tuple) else cc
+    find_compiler = getattr(build, "_find_compiler", None)
+    if find_compiler is not None:
+        cc = find_compiler(language)
+        return str(cc[0] if isinstance(cc, tuple) else cc)
+    variable, candidates = (("CC", ("gcc", "clang")) if language == "c" else
+                            ("CXX", ("g++", "clang++")))
+    configured = os.environ.get(variable)
+    if configured is not None:
+        return configured
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found is not None:
+            return found
+    raise RuntimeError(f"Failed to find {language} compiler; set {variable}")
+
+
+@functools.lru_cache(maxsize=2)
+def _compiler_identity(language: str = "c") -> tuple[str, ...]:
+    cc = _compiler_path(language)
     try:
         version = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
     except Exception:  # pragma: no cover - compiler without --version
@@ -982,7 +1092,7 @@ def _make_compile_callback(
             raise UnsupportedKernel("intj: launch_cooperative_grid is not supported")
         if getattr(md, "launch_pdl", False):  # nvidia only
             raise UnsupportedKernel("intj: launch_pdl is not supported")
-        if md.global_scratch_size or md.profile_scratch_size:
+        if getattr(md, "global_scratch_size", 0) or md.profile_scratch_size:
             raise UnsupportedKernel("intj: kernels requiring scratch memory are not supported")
 
         expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")

@@ -14,15 +14,21 @@ import pathlib
 import struct
 import subprocess
 import sys
-import tomllib
 import types
 import warnings
 import weakref
+
+try:
+    import tomllib  # pyright: ignore[reportMissingImports]  # Python 3.10 uses tomli below
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # pyright: ignore[reportMissingImports]  # test-only on 3.10
 
 import pytest
 import torch
 import triton
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 import intj
 from intj import AUTO, NEVER, Aligned, Argument, Assume, BindValue, Constexpr, EqualTo, PointerRange, make_launcher
@@ -115,6 +121,14 @@ def scale(x, o, n, s, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = off < n
     tl.store(o + off, tl.load(x + off, mask=mask) * s, mask=mask)
+
+
+@gluon.jit
+def gluon_copy(x, o, n, BLOCK: gl.constexpr, WARP: gl.constexpr):
+    off = gl.program_id(0) * BLOCK + gl.arange(
+        0, BLOCK, layout=gl.BlockedLayout([1], [WARP], [4], [0])  # pyright: ignore[reportArgumentType]  # JIT constexpr is an int
+    )
+    gl.store(o + off, gl.load(x + off, mask=off < n, other=0), mask=off < n)
 
 
 def _kernel_from_source(tmp_path, name, signature):
@@ -1634,6 +1648,27 @@ def test_matches_triton(axpy_launcher, n, flag, bias):
     check_matches_triton(axpy, axpy_launcher, grid, (x, y, o, n, 1.5, flag, bias, 128), 2)
 
 
+def test_gluon_launch_matches_triton():
+    n = 257
+    block = 256
+    target = triton.runtime.driver.active.get_current_target()
+    assert target is not None
+    warp = target.warp_size
+    x = torch.arange(n, device="cuda", dtype=torch.float32)
+    o = torch.empty_like(x)
+    check_matches_triton(
+        gluon_copy, make_launcher(gluon_copy), (triton.cdiv(n, block),),
+        (x, o, n, block, warp), 1,
+    )
+
+
+def test_gluon_and_triton_share_no_compiled_module():
+    plain = triton.jit(gluon_copy.fn)  # pyright: ignore[reportFunctionMemberAccess]  # Gluon wraps the function at runtime
+    gluon_module = make_launcher(gluon_copy, no_gpu=True).__self__
+    triton_module = make_launcher(plain, no_gpu=True).__self__
+    assert gluon_module.__file__ != triton_module.__file__
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32])
 def test_dtypes(scale_launcher, dtype):
     x = torch.ones(1024, device="cuda", dtype=dtype)
@@ -1826,9 +1861,11 @@ def test_annotated_effective_compile_options_and_identity(
             callback(b"\x00" * 8, 1, torch.cuda.current_device(), 7)
         assert captured["debug"] is expected_debug
         assert captured["instrumentation_mode"] == instrumentation
-        expected_options = triton.compiler.make_backend(launcher._current_target()).parse_options({
-            "debug": expected_debug, "instrumentation_mode": instrumentation,
-        })
+        expected_values = {"debug": expected_debug, "instrumentation_mode": instrumentation}
+        fpsan_casts = getattr(knobs.compilation, "fpsan_homomorphic_casts", None)
+        if fpsan_casts is not None:
+            expected_values["fpsan_homomorphic_casts"] = fpsan_casts
+        expected_options = triton.compiler.make_backend(launcher._current_target()).parse_options(expected_values)
         assert key.options == getattr(expected_options, "hash")()
         assert (key.options != baseline_key.options) == (expected_debug or bool(instrumentation))
         return types.SimpleNamespace(entry=None)
@@ -1836,6 +1873,22 @@ def test_annotated_effective_compile_options_and_identity(
     monkeypatch.setattr(triton.compiler, "compile", capture_compile)
     monkeypatch.setattr(launcher, "_loaded_module", capture_module)
     make_launcher(scalar_kernel, options=options, torch_access=TorchAccess.CPYTHON)
+
+
+def test_newer_triton_fpsan_knob_is_baked_into_compile_options(scalar_kernel, monkeypatch):
+    import intj.launcher as launcher
+    from triton import knobs
+
+    seen = {}
+
+    def capture(_kernel, _resolved, options, *_args, **_kwargs):
+        seen.update(options)
+        return types.SimpleNamespace(entry=None)
+
+    monkeypatch.setattr(knobs.compilation, "fpsan_homomorphic_casts", True, raising=False)
+    monkeypatch.setattr(launcher, "_materialize_module", capture)
+    make_launcher(scalar_kernel, torch_access=TorchAccess.CPYTHON)
+    assert seen["fpsan_homomorphic_casts"] is True
 
 
 def test_launchers_of_one_kernel_stay_independent(compiled_kernels):
@@ -2420,6 +2473,23 @@ def test_module_key_uses_major_minor_version_only(monkeypatch):
     assert launcher._cache_version() == (7, 9)
 
 
+@pytest.mark.parametrize("cache,language", [
+    (KernelCache.INTJ, "c"),
+    (KernelCache.TSL, "c++"),
+    (KernelCache.ABSL, "c++"),
+])
+def test_module_key_tracks_cache_compiler_language(scalar_kernel, monkeypatch, cache, language):
+    import intj.launcher as launcher
+
+    keys = []
+    monkeypatch.setattr(launcher, "_provision", lambda _: {"include_dirs": (), "archives": ()})
+    monkeypatch.setattr(launcher, "_loaded_module", lambda key, *_: keys.append(key) or types.SimpleNamespace(entry=None))
+    make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON,
+                  kernel_cache=cache)
+    assert len(keys) == 1
+    assert keys[0].compiler == launcher._compiler_identity(language)
+
+
 @pytest.mark.parametrize(
     "build,differing",
     [(_render_context, {"nwords": 5}), (_module_key, {"cache_key": "d"})],
@@ -2589,6 +2659,15 @@ def test_refuses_non_jit_function():
 def test_refuses_kernel_reading_globals():
     with pytest.raises(UnsupportedKernel, match="global variable"):
         make_launcher(uses_global)
+
+
+def test_accepts_kernel_with_lazy_launch_metadata():
+    make_launcher(uses_launch_metadata, no_gpu=True)
+
+
+@triton.jit(launch_metadata=lambda *_args: {})
+def uses_launch_metadata(x):
+    pass
 
 
 GLOBAL_SCALE = 2.0

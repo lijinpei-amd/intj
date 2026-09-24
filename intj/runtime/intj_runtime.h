@@ -17,8 +17,11 @@
 #include <new>
 #endif
 
-#if PY_VERSION_HEX < 0x030C0000
-#error "intj requires CPython 3.12 or newer (PyLongObject layout)"
+#if PY_VERSION_HEX < 0x030A0000
+#error "intj requires CPython 3.10 or newer"
+#endif
+#if PY_VERSION_HEX < 0x030B0000
+#include <longintrepr.h> /* Python.h includes it itself from 3.11 */
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -43,28 +46,89 @@
 #define INTJ_ASSUME(x) ((void)0)
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+/* Before 3.12, the error indicator is a (type, value, traceback) triple. */
+static inline PyObject *PyErr_GetRaisedException(void) {
+  PyObject *type, *value, *tb;
+  PyErr_Fetch(&type, &value, &tb);
+  if (!type)
+    return NULL;
+  PyErr_NormalizeException(&type, &value, &tb);
+  if (tb)
+    PyException_SetTraceback(value, tb);
+  Py_DECREF(type);
+  Py_XDECREF(tb);
+  return value;
+}
+static inline void PyErr_SetRaisedException(PyObject *exc) { /* steals exc */
+  PyErr_Restore(Py_NewRef((PyObject *)Py_TYPE(exc)), exc,
+                PyException_GetTraceback(exc));
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+static INTJ_ALWAYS_INLINE int intj_long_compact(PyLongObject *v, int64_t *out) {
+  Py_ssize_t size = Py_SIZE(v);
+  if (size < -1 || size > 1)
+    return 0;
+  *out = size == 0 ? 0 : (int64_t)size * (int64_t)v->ob_digit[0];
+  return 1;
+}
+
+static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
+                                                         size_t *nd,
+                                                         int *negative) {
+  Py_ssize_t size = Py_SIZE(v);
+  *negative = size < 0;
+  *nd = (size_t)(size < 0 ? -size : size);
+  return v->ob_digit;
+}
+#else
+/* The compact case has a public reader. Larger ints use CPython's own tag. */
+static INTJ_ALWAYS_INLINE int intj_long_compact(PyLongObject *v, int64_t *out) {
+  if (!PyUnstable_Long_IsCompact(v))
+    return 0;
+  *out = (int64_t)PyUnstable_Long_CompactValue(v);
+  return 1;
+}
+
+static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
+                                                         size_t *nd,
+                                                         int *negative) {
+  uintptr_t tag = v->long_value.lv_tag;
+  *nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
+  *negative = (tag & _PyLong_SIGN_MASK) == 2;
+  return v->long_value.ob_digit;
+}
+#endif
+
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
-/* The compact case has a public reader (`PyUnstable_Long_*`, 3.12+).  Above it
- * the digits have none before `PyLong_AsNativeBytes` in 3.13, so the rest walks
- * `ob_digit` with CPython's own layout macros from cpython/longintrepr.h.
- */
+/* The magnitude, if it fits 90 bits: 0 = ok, -1 = larger. */
+static INTJ_ALWAYS_INLINE int intj_long_magnitude(PyLongObject *v,
+                                                  __uint128_t *acc,
+                                                  int *negative) {
+  size_t nd;
+  const digit *digits = intj_long_digits(v, &nd, negative);
+  if (INTJ_UNLIKELY(nd > 3))
+    return -1;
+  __uint128_t value = 0;
+  for (size_t i = nd; i-- > 0;)
+    value = (value << PyLong_SHIFT) | digits[i];
+  *acc = value;
+  return 0;
+}
 
 /* 0 = ok, -1 = does not fit, 1 = not an exact int */
 static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
-  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
-    *out = (int64_t)PyUnstable_Long_CompactValue(v);
+  if (INTJ_LIKELY(intj_long_compact(v, out)))
     return 0;
-  }
-  uintptr_t tag = v->long_value.lv_tag;
-  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
+  __uint128_t acc;
+  int negative;
+  if (INTJ_UNLIKELY(intj_long_magnitude(v, &acc, &negative) != 0))
     return -1;
-  __uint128_t acc = 0;
-  for (size_t i = nd; i-- > 0;)
-    acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & _PyLong_SIGN_MASK) == 2) {
+  if (negative) {
     if (acc > ((__uint128_t)1 << 63))
       return -1;
     *out = (int64_t)(-(__int128_t)acc);
@@ -73,6 +137,78 @@ static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
       return -1;
     *out = (int64_t)acc;
   }
+  return 0;
+}
+
+/* The compiled grid subset uses checked Python-style signed integer arithmetic. */
+static INTJ_ALWAYS_INLINE int intj_grid_overflow(void) {
+  PyErr_SetString(PyExc_OverflowError, "intj: grid integer overflow");
+  return -1;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_input_int(PyObject *o, const char *name,
+                                                   int64_t *out) {
+  if (INTJ_UNLIKELY(!PyLong_CheckExact(o))) {
+    PyErr_Format(PyExc_TypeError, "intj: grid argument '%s' must be an int", name);
+    return -1;
+  }
+  if (INTJ_UNLIKELY(intj_as_i64(o, out) != 0))
+    return intj_grid_overflow();
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_input_bool(PyObject *o, const char *name,
+                                                    int64_t *out) {
+  if (INTJ_UNLIKELY(o != Py_True && o != Py_False)) {
+    PyErr_Format(PyExc_TypeError, "intj: grid argument '%s' must be a bool", name);
+    return -1;
+  }
+  *out = o == Py_True;
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_add(int64_t a, int64_t b, int64_t *out) {
+  return INTJ_UNLIKELY(__builtin_add_overflow(a, b, out)) ? intj_grid_overflow() : 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_sub(int64_t a, int64_t b, int64_t *out) {
+  return INTJ_UNLIKELY(__builtin_sub_overflow(a, b, out)) ? intj_grid_overflow() : 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_mul(int64_t a, int64_t b, int64_t *out) {
+  return INTJ_UNLIKELY(__builtin_mul_overflow(a, b, out)) ? intj_grid_overflow() : 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_floor128(__int128 n, int64_t d, int64_t *out) {
+  if (INTJ_UNLIKELY(d == 0)) {
+    PyErr_SetString(PyExc_ZeroDivisionError, "intj: grid division by zero");
+    return -1;
+  }
+  __int128 q = n / d;
+  __int128 r = n % d;
+  if (r && ((r < 0) != (d < 0)))
+    --q;
+  if (INTJ_UNLIKELY(q < INT64_MIN || q > INT64_MAX))
+    return intj_grid_overflow();
+  *out = (int64_t)q;
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_floor(int64_t a, int64_t b, int64_t *out) {
+  return intj_grid_floor128(a, b, out);
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_cdiv(int64_t a, int64_t b, int64_t *out) {
+  return intj_grid_floor128((__int128)a + b - 1, b, out);
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_output(int64_t value, uint32_t *out) {
+  if (INTJ_UNLIKELY(value < 0 || (uint64_t)value >= UINT64_C(4294967296))) {
+    PyErr_SetString(PyExc_ValueError,
+                    "intj: grid dimensions must be ints in [0, 2**32)");
+    return -1;
+  }
+  *out = (uint32_t)value;
   return 0;
 }
 
@@ -86,18 +222,16 @@ static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
 
 static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
   PyLongObject *v = (PyLongObject *)o;
-  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
-    *out = (uint64_t)(int64_t)PyUnstable_Long_CompactValue(v);
+  int64_t small;
+  if (INTJ_LIKELY(intj_long_compact(v, &small))) {
+    *out = (uint64_t)small;
     return INTJ_INT_I64;
   }
-  uintptr_t tag = v->long_value.lv_tag;
-  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
+  __uint128_t acc;
+  int negative;
+  if (INTJ_UNLIKELY(intj_long_magnitude(v, &acc, &negative) != 0))
     return INTJ_INT_TOO_BIG;
-  __uint128_t acc = 0;
-  for (size_t i = nd; i-- > 0;)
-    acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & _PyLong_SIGN_MASK) == 2) { /* negative: int64 or nothing */
+  if (negative) { /* negative: int64 or nothing */
     if (acc > ((__uint128_t)1 << 63))
       return INTJ_INT_TOO_BIG;
     *out = (uint64_t)(int64_t)(-(__int128_t)acc);
@@ -851,6 +985,10 @@ typedef struct intj_bound_launcher {
   vectorcallfunc vectorcall;
   PyObject *module;
   PyObject *signature;
+#ifdef INTJ_GRID_PY
+  PyObject *grid_py;
+  PyObject *grid_hidden;
+#endif
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
   intj_cache cache;

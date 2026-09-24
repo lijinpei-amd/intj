@@ -16,12 +16,15 @@ launcher = make_launcher(
     no_gpu=False,          # host decode/cache path, without GPU work
     verify_annotation=False,
     bind_device=False,
+    grid_arg=None,         # keyword-only: 1, 2, or 3 separate grid dimensions
+    grid_cpp=None,         # keyword-only: annotated def compiled into the extension
+    grid_py=None,          # keyword-only: Python callback evaluated on each launch
 )
 ```
 
-`make_launcher` renders a C python extension for `jit_func`, compiles it (through
-triton's build + on-disk cache, so it is free after the first time), loads it, and
-returns its `entry` function when no value or device binding requires a factory.
+`make_launcher` renders a C python extension for `jit_func`, builds it once with
+a local compiler, caches it on disk under intj's module digest, loads it, and
+returns a callable launcher when no value or device binding requires a factory.
 With bindings, the factory materializes the extension when bound. Construction
 is slow; call it once, outside any hot loop.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
@@ -40,8 +43,9 @@ is an error here rather than a silent fall back to the default.
 They are canonicalized through the compiler backend's `parse_options`, so spellings
 that mean the same thing — `{}` and `{"num_warps": 4}` on AMD — share one rendered
 module instead of building it twice. The canonical options are passed directly to
-`triton.compiler.compile` with the annotated `triton.compiler.ASTSource` on a cache
-miss. An explicit `debug` option overrides the JIT function's debug default;
+`triton.compiler.compile` with an annotated `triton.compiler.ASTSource` (or
+`GluonASTSource` for a Gluon JIT function) on a cache miss. An explicit `debug`
+option overrides the JIT function's debug default;
 Triton's runtime debug flag can still enable it. Instrumentation mode comes from
 Triton's compilation knob. These effective options also determine module identity.
 
@@ -52,18 +56,73 @@ the cache. An unsupported *argument* raises `TypeError` at the launch that passe
 
 ## Calling the launcher
 
-```python
-launcher(device, stream, grid, arg0, arg1, ...)
-```
+Choose at most one grid option in `make_launcher`:
+
+| grid option | launcher call after `device, stream` |
+|---|---|
+| omitted or `grid_arg=None` | `grid, *kernel_args` — `grid` is an `int` or a 1–3 element tuple/list of ints |
+| `grid_arg=1`, `2`, or `3` | `gx[, gy[, gz]], *kernel_args` — one positional int per dimension |
+| `grid_cpp=grid_fn` | `*extra_args, *kernel_args` — native code computes the grid |
+| `grid_py=grid_fn` | `*kernel_args` — Python computes the grid on each launch |
 
 | argument | type |
 |---|---|
 | `device` | device index, `int` in `[0, 256)` (e.g. `torch.cuda.current_device()`) |
 | `stream` | raw stream handle, `int` (e.g. `torch.cuda.current_stream().cuda_stream`) |
-| `grid` | `int`, or a `tuple`/`list` of 1-3 ints |
-| `arg0...` | public kernel parameters, positionally and in declaration order; baked and bound values are omitted |
+| `kernel_args` | public kernel parameters in declaration order; baked and bound values are omitted |
 
-Returns `None`. A grid whose volume is zero returns without launching.
+All launch arguments are positional. With `bind_device=True`, omit `device` from
+each call. Grid dimensions must be exact ints in `[0, 2**32)`; omitted dimensions
+are 1. The launcher returns `None`, and a zero-volume grid skips the launch.
+
+### Compiled grid: `grid_cpp`
+
+Define an undecorated, source-backed Python `def` whose parameters all have
+`int` or `bool` annotations. Python lambda parameters cannot be annotated. Its
+positional parameter names reuse the corresponding JIT kernel values;
+keyword-only names must be distinct from JIT parameters and become extra
+launcher arguments, passed before the public kernel arguments in their declared
+order:
+
+```python
+import triton
+
+# kernel parameters: (out, n, BLOCK)
+def grid(n: int, BLOCK: int, *, cap: int):
+    return (min(cap, triton.cdiv(n, BLOCK)),)
+
+launcher = make_launcher(kernel, grid_cpp=grid)
+launcher(device, stream, cap, out, n, BLOCK)
+```
+
+The function is translated at `make_launcher` time and is never called by the
+launcher. It can use integer/bool literals and names, simple local assignments,
+unary `+`/`-`, `+`, `-`, `*`, `//`, `triton.cdiv`, two-argument builtin `min`, and
+conditional expressions. It must end with a literal tuple/list of 1–3 integer
+expressions. Reused parameters may be public scalar values or baked `int`/`bool`
+values; bound pointer/tensor parameters cannot be read. Defaults, `*args`,
+`**kwargs`, free variables, other globals, and other Python syntax are refused
+with `UnsupportedKernel`. Intermediate arithmetic is checked signed 64-bit;
+`//` follows Python floor division. Wrong input types, division by zero,
+overflow, and out-of-range final dimensions raise before the GPU launch.
+
+### Python grid: `grid_py`
+
+`grid_py` accepts a callable of one `meta` dict argument. The dict is fresh on
+every launch and contains every original JIT parameter by name, including baked
+and bound values. Return an int or a 1–3 element tuple/list of grid dimensions:
+
+```python
+launcher = make_launcher(
+    kernel,
+    grid_py=lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),),
+)
+launcher(device, stream, out, n, BLOCK)
+```
+
+The callback runs on every launch, including kernel-cache hits; its exceptions
+propagate. Each launcher handle keeps its own callback, even when handles share
+one compiled extension. Grid controls do not enter the kernel specialization key.
 
 `device` must be the device `stream` belongs to, and it must be the current device
 the first time a given specialization is launched — triton compiles and loads the
@@ -74,6 +133,29 @@ different keys, so one launcher serves all of them.
 Keyword arguments are not accepted, defaults are not filled in, and the launcher does
 not read the current device or stream for you — that is where the launch overhead of
 `JITFunction` goes.
+
+## Triton-style migration bridge
+
+`intj.compat.launch(kernel, grid, /, *args, **kwargs)` accepts a direct
+`@triton.jit` function, positional or named kernel arguments, defaults, and
+compile options. Its grid can be an int, a tuple/list, or a callable receiving
+the bound kernel values as a `meta` dict:
+
+```python
+from intj.compat import launch
+
+launch(kernel, (triton.cdiv(n, BLOCK),), out, n=n, BLOCK=BLOCK,
+       num_warps=4)
+```
+
+The bridge binds Python arguments and reads the current device and stream on
+every call. Construct a `make_launcher` handle once for hot loops. Unsupported
+kernels and options still raise instead of falling back to Triton.
+The bridge also raises `UnsupportedKernel` while Triton launch enter or exit
+hooks are registered, including profiler hooks. It checks on every call, even
+when reusing a cached launcher.
+Direct `make_launcher` handles do not run Triton's global launch hooks; leave
+hook-sensitive launches on Triton.
 
 ## Argument annotations
 
@@ -206,7 +288,8 @@ hits it:
   range) and calling `register()`. **CUDA is compile-checked but runtime-untested** --
   there is no NVIDIA GPU on the development machine.
 - `@triton.autotune` / `@triton.heuristics` wrappers, and `TRITON_INTERPRET=1`.
-- Callable grids (`dynamic_grid`) and per-launch options (`dynamic_options`).
+- `dynamic_grid=True` and per-launch options (`dynamic_options`). Use `grid_cpp`
+  or `grid_py` for a callable grid.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
 - Tuple, `tl.constexpr` object, `TensorDescriptor`, JIT-function and string arguments.
 - Tensor subclasses other than `torch.nn.Parameter` — the fast path gates on exact
@@ -319,7 +402,8 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 
 ## How a launch works
 
-1. Parse `device`, `stream` and `grid`; return early on a zero-volume grid.
+1. Parse `device` and `stream`, compute the selected grid, and return early on a
+   zero-volume grid.
 2. Decode each public or bound argument, checking annotations if requested, and
    pack the dynamic key fields. How tensor fields are read is `torch_access`'s
    choice; no mode calls an `aoti_torch_*` shim.
@@ -328,7 +412,8 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
    reads its one nullable kernel directly, without hashing or a map.
 4. On a miss, call back into Python: build the annotated `CompilerInput`, compare
    it with any input previously recorded for that key, and pass its
-   `triton.compiler.ASTSource` and canonical options to `triton.compiler.compile`.
+   `triton.compiler.ASTSource` (or `GluonASTSource`) and canonical options to
+   `triton.compiler.compile`.
    `_init_handles` loads the GPU module; the entry records the function handle,
    block dim and LDS size.
 5. Pack the param array (plus the two mandatory trailing scratch slots) and call
@@ -386,7 +471,7 @@ compile-checked but runtime-untested on the development machine.
 Artifacts land at
 
     $TRITON_HOME/.triton/intj/<digest>/<module>/<kernel><EXT_SUFFIX>
-    $TRITON_HOME/.triton/intj/<digest>/<module>/<kernel>.c
+    $TRITON_HOME/.triton/intj/<digest>/<module>/<kernel>.c or .cpp
 
 next to triton's own caches. The rendered source is kept beside the binary: it is what
 you read when a launch misbehaves. The symbol is the kernel's own name

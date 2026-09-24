@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import triton.language as tl
+from triton.runtime.jit import JITFunction
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,7 +146,7 @@ class KeyField:
     offset: int = -1
 
 
-class DeviceBinding(enum.StrEnum):
+class DeviceBinding(str, enum.Enum):
     FIXED = "fixed"
     NOT_FIXED = "not_fixed"
 
@@ -200,6 +201,12 @@ class ResolvedParam:
 
 
 def _canonical_value(value: object) -> tuple[object, ...]:
+    if isinstance(value, tl.dtype):
+        return ("dtype", value.name)
+    if type(value) is str:
+        return ("str", value)
+    if isinstance(value, JITFunction):
+        return ("jit", value.module, value.fn.__qualname__, value.cache_key)
     if value is None:
         return ("none",)
     if type(value) is bool:
@@ -218,6 +225,8 @@ def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
         return value
     if value is tl.constexpr:
         return Constexpr()
+    if value is int or (type(value) is str and value == "int"):
+        return Argument(type=tl.int32)
     if value is None or isinstance(value, tl.dtype):
         return Argument(type=value)
     raise ValueError(f"intj: parameter {name!r} has unsupported annotation {value!r}")
@@ -278,7 +287,7 @@ def _type_name(value: object, kind: str, *, element: bool = False) -> str | None
     if value is None:
         return None
     if type(value) is tl.pointer_type and kind == "argument":
-        if value.address_space != 1 or value.const:
+        if value.address_space not in (1, "global") or value.const:
             raise ValueError("intj: unsupported pointer type")
         item = _type_name(value.element_ty, kind, element=True)
         if item is None:
@@ -434,8 +443,9 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             modes = tuple(_merge_field(name, field, a, b)
                           for field, a, b in zip(_FACT_NAMES, left_modes, right_modes))
             if param.do_not_specialize:
-                modes = tuple(_merge_field(name, field, mode, "never") if i < 2 else mode
-                              for i, (field, mode) in enumerate(zip(_FACT_NAMES, modes)))
+                # Triton's specialize=False suppresses the pointer-range attribute too.
+                modes = tuple(_merge_field(name, field, mode, "never")
+                              for field, mode in zip(_FACT_NAMES, modes))
             if param.do_not_specialize_on_alignment:
                 modes = (modes[0], _merge_field(name, "aligned_16", modes[1], "never"), modes[2])
             modes = tuple("auto" if mode is UNSET else mode for mode in modes)
@@ -447,7 +457,8 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             raise ValueError(f"intj: parameter {name!r} power_of_two_or_zero needs an integer type")
         tag = () if baked is UNSET else _canonical_value(baked)
         if baked is not UNSET:
-            if kind == "constexpr" and types is None:
+            if (kind == "constexpr" and types is None and
+                    not isinstance(baked, (tl.dtype, JITFunction)) and type(baked) is not str):
                 _inferred_scalar_type(baked)  # Enforce Triton's scalar integer domain.
             if kind == "argument":
                 inferred = _inferred_scalar_type(baked)

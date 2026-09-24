@@ -8,7 +8,15 @@ INTJ (INcompatible Triton Jit) is a host side python launcher for triton kernel,
 
 INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunction` has a launch overhead of ~14us, while INTJ has a launch overhead of ~0.3us (overhead defined as the time excluding cuLaunchKernel/hipLaunchKernel).
 
-This is the initial version: torch tensors only, static grid. Anything outside that is refused, see `docs/Usage.md`. AMD is tested on gfx942; the NVIDIA path is implemented (`cuLaunchKernel`) but untested, no NVIDIA GPU here.
+This is an early version with limited argument types and grid expressions. Unsupported cases are refused; see `docs/Usage.md`. AMD is tested on gfx942; the NVIDIA path is implemented (`cuLaunchKernel`) but untested, no NVIDIA GPU here.
+
+INTJ requires Python 3.10+ and Triton 3.7+. Tested combinations:
+
+| Python | Triton | Torch | Coverage |
+|---|---|---|---|
+| 3.12 | 3.8.0 | 2.14.0+rocm7.2 | Full GPU test suite on gfx942 |
+| 3.12 | 3.7.1 | 2.14.0+rocm7.2 | Full GPU test suite on gfx942 |
+| 3.10 | 3.7.1 | 2.10.0+cpu | Selected host/grid and native argument tests; GPU untested |
 
 ## Usage
 
@@ -32,7 +40,24 @@ launcher(torch.cuda.current_device(),
          x, y, o, n, 128)
 ```
 
-For complete reference manual, see `docs/Usage.md`
+To compute the grid in the extension from launch values, use an annotated
+Python `def` with `grid_cpp`:
+
+```python
+def grid(n: int, BLOCK: int):
+    return (triton.cdiv(n, BLOCK),)
+
+launcher = make_launcher(my_kernel, grid_cpp=grid)
+launcher(torch.cuda.current_device(),
+         torch.cuda.current_stream().cuda_stream,
+         x, y, o, n, 128)
+```
+
+`grid_arg=1`, `2`, or `3` accepts that many dimensions before the kernel
+arguments. `grid_py=lambda meta: ...` calls Python on every launch with a dict
+of the kernel's named arguments. Omitting all three options keeps the original
+single-grid-object call shown above. See [the usage guide](docs/Usage.md) for
+the supported native expressions and exact signatures.
 
 ## How does it work?
 
@@ -61,7 +86,8 @@ In the usage example above, line `#1` will render a python C extension, and load
 Some of the user facing features of triton `JitFunction` incurs launch overhead, which can be avoid if the user interface is changed. For example:
 
 - AMDGPU 'S' spec-key can depends on per object "ptr_range".
-- Grid can be a callable.
+- Arbitrary Python grid functions cannot be compiled; `grid_py` calls them on
+  every launch, while `grid_cpp` compiles a restricted annotated `def`.
 - Polimophic type.
 
 Perhaps some of the feature may not contribute much to the overhead, but, I don't have time to gauge and give verdict to each one, and 

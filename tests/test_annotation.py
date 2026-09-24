@@ -6,6 +6,7 @@ import json
 from typing import Any, cast
 
 import pytest
+import triton
 import triton.language as tl
 
 import intj
@@ -28,6 +29,14 @@ def kernel_with_params(tmp_path, params, decorator="@triton.jit"):
         f"import intj\nimport triton\nimport triton.language as tl\n\n"
         f"{decorator}\ndef kernel({params}):\n    pass\n",
     )
+
+
+@triton.jit(do_not_specialize=["base"])
+def large_pointer_offset(base, out, first, second):
+    first_offset = tl.cast(first, tl.int32) * (2**30 - 512)
+    second_offset = tl.cast(second, tl.int32) * 512
+    ptr = base + first_offset + second_offset
+    tl.store(out, ptr.to(tl.int64) - base.to(tl.int64))
 
 
 def test_public_annotation_exports_and_presets():
@@ -132,11 +141,28 @@ def test_raw_inline_shorthands_and_decorator_modes(tmp_path):
     )
     x, y, z = (param.annotation for param in _resolve_annotations(kernel, None))
     assert (x.kind, x.types) == ("argument", ("i32",))
-    assert (x.equal_to_one, x.aligned_16, x.pointer_range_32) == ("never", "never", "auto")
+    assert (x.equal_to_one, x.aligned_16, x.pointer_range_32) == ("never", "never", "never")
     assert (y.kind, y.types) == ("constexpr", None)
     assert (z.types, z.equal_to_one, z.aligned_16, z.pointer_range_32) == (
         (None,), "auto", "never", "auto"
     )
+
+
+def test_do_not_specialize_pointer_keeps_large_offset():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required for pointer-offset regression")
+    base = torch.empty(1, dtype=torch.uint8, device="cuda")
+    out = torch.empty((), dtype=torch.int64, device="cuda")
+
+    large_pointer_offset[(1,)](base, out, 2, 2)
+    assert out.item() == 2**31
+
+    out.zero_()
+    launcher = intj.make_launcher(large_pointer_offset)
+    launcher(torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream,
+             (1,), base, out, 2, 2)
+    assert out.item() == 2**31
 
 
 @pytest.mark.parametrize("future", ["", "from __future__ import annotations\n"],
@@ -396,6 +422,15 @@ def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path
     assert source.signature == (("x", "*fp32"), ("n", "i32"), ("BLOCK", "constexpr"))
     assert source.constants == (((2,), ("int", "128")),)
     assert source.attrs == (((0,), (("tt.divisibility", 16), ("tt.pointer_range", 32))),)
+
+
+def test_global_pointer_annotation_accepts_both_triton_address_space_abis():
+    from intj.annotation import _type_name
+
+    for address_space in (1, "global"):
+        assert _type_name(tl.pointer_type(tl.int32, address_space=cast(Any, address_space)), "argument") == "*i32"
+    with pytest.raises(ValueError, match="unsupported pointer type"):
+        _type_name(tl.pointer_type(tl.int32, address_space=0), "argument")
 
 
 @pytest.mark.parametrize("annotation,value,inferred,signature,constant,attrs", [
