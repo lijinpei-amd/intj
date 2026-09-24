@@ -77,25 +77,25 @@ median of seven 20k-call batches. Each process used a separate empty
 
 | | triton `JitFunction` | INTJ |
 |---|---|---|
-| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.0 us) | 16.81 us | 3.16 us |
-| `grid=(0,)`, i.e. no driver call | 13.60 us | 0.15 us |
-| argument decoding + spec key only | — | 0.13 us |
+| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.0 us) | 17.42 us | 3.20 us |
+| `grid=(0,)`, i.e. no driver call | 13.47 us | 0.15 us |
+| argument decoding + spec key only | — | 0.12 us |
 
 Argument decoding depends on how the module reads a tensor (`torch_access`), for a
 kernel with three tensor arguments:
 
 | `TorchAccess` | decode + spec key | first build |
 |---|---|---|
-| `SHIM` — torch's structs, at offsets discovered at load | 126.7 ns | 1.11 s |
-| `CXX` — compiled against torch's headers | 127.2 ns | 2.25 s |
-| `CPYTHON` — through the interpreter | 913.7 ns | 0.82 s |
+| `SHIM` — torch's structs, at offsets discovered at load | 121.5 ns | 1.07 s |
+| `CXX` — compiled against torch's headers | 118.2 ns | 2.28 s |
+| `CPYTHON` — through the interpreter | 915.4 ns | 0.74 s |
 
-`SHIM` and `CXX` make the same loads and land within ~1 ns of each other; `CXX`
+`SHIM` and `CXX` make the same loads and land within ~4 ns of each other; `CXX`
 has the compiler supply the field offsets that `SHIM` probes for. `CXX` pays a little build time for that, and is the only mode whose `.so` must
 be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
-which is the third row's 0.13 us. Host overhead is therefore ~0.3 us against
+which is the third row's 0.12 us. Host overhead is therefore ~0.3 us against
 ~14 us.
 
 TODO: sweep the number of dynamic/constexpr arguments and the number of tensors.

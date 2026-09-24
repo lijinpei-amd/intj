@@ -9,6 +9,27 @@
 #include <Python.h>
 
 {% set bound_params = params | rejectattr('annotation.bind_value', 'none') | list %}
+{% set auto_decode = namespace(enabled=true) %}
+{% for p in params %}
+{% set a = p.annotation %}
+{% if a.types is not none or a.baked_value or a.bind_value is not none or a.power_of_two_or_zero or
+      (a.kind == 'argument' and (a.equal_to_one != 'auto' or a.aligned_16 != 'auto' or a.pointer_range_32 != 'auto')) %}
+{% set auto_decode.enabled = false %}
+{% endif %}
+{% endfor %}
+{% set auto_key_parts = [] %}
+{% if auto_decode.enabled %}
+{% for p in params %}
+{% for field in p.annotation.key_fields if field.width == 1 %}
+{% set part = field.offset // 4 %}
+{% if part not in auto_key_parts %}{% set _ = auto_key_parts.append(part) %}{% endif %}
+{% endfor %}
+{% endfor %}
+{% if device_offset is not none %}
+{% set part = device_offset // 4 %}
+{% if part not in auto_key_parts %}{% set _ = auto_key_parts.append(part) %}{% endif %}
+{% endif %}
+{% endif %}
 #define INTJ_NBOUND {{ bound_params | length }}
 #define INTJ_NWORDS {{ [nwords, 1] | max }}
 #define INTJ_HAS_KEY {{ 1 if nwords else 0 }}
@@ -74,17 +95,144 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
 {%- endif %}
 {%- endmacro %}
 
+{% macro key_accumulate(field, value) -%}
+  key_word_{{ field.offset // 8 }} |=
+      (uint64_t)(uint{{ field.width * 8 }}_t)({{ value }}){% if field.offset % 8 %} << {{ (field.offset % 8) * 8 }}{% endif %};
+{%- endmacro %}
+
+{% macro auto_key_accumulate(field, value) -%}
+  key_part_{{ field.offset // 4 }} |=
+      (uint32_t)(uint8_t)({{ value }}){% if field.offset % 4 %} << {{ (field.offset % 4) * 8 }}{% endif %};
+{%- endmacro %}
+
+{% macro decode_auto_argument(p) -%}
+{% set descriptor = p.annotation.key_fields | selectattr('kind', 'equalto', 'descriptor') | list %}
+  {
+    PyObject *o = args[{{ p.call_index }}];
+    PyTypeObject *type = Py_TYPE(o);
+    uint32_t code;
+    if (type == st->tensor_type || type == st->param_type) {
+      void *pointer = NULL;
+      int32_t dtype = -1;
+      int64_t storage_nbytes = 0;
+      if (INTJ_UNLIKELY(intj_read_tensor(&st->abi, o, &pointer, &dtype,
+                                         {{ spec_pointer_range }}, &storage_nbytes) != 0)) {
+        intj_note_param(intj_param_names[{{ p.index }}]);
+        return -1;
+      }
+      uint32_t index = (dtype >= 0 && dtype < INTJ_NDTYPES)
+                           ? st->abi.dtype_index[dtype] : 0xFFu;
+      if (INTJ_UNLIKELY(index == 0xFFu)) {
+        PyErr_Format(PyExc_RuntimeError,
+                     "intj: tensor argument '%s' has dtype code %d, which triton does not take",
+                     intj_param_names[{{ p.index }}], (int)dtype);
+        return -1;
+      }
+      code = INTJ_B_PTR(index, ((uintptr_t)pointer & 15u) == 0,
+                        {{ spec_pointer_range }} && storage_nbytes <= 2147483647LL);
+      vals[np++] = (uint64_t)(uintptr_t)pointer;
+    } else if (o == Py_True || o == Py_False) {
+      code = INTJ_B_U1;
+      vals[np++] = (uint64_t)(o == Py_True);
+    } else if (PyLong_CheckExact(o)) {
+      uint64_t bits;
+      int kind = intj_as_int(o, &bits);
+      if (INTJ_UNLIKELY(kind == INTJ_INT_TOO_BIG)) {
+        PyErr_Format(PyExc_OverflowError, "intj: integer argument '%s' is too large",
+                     intj_param_names[{{ p.index }}]);
+        return -1;
+      }
+      int64_t value = (int64_t)bits;
+      if (kind == INTJ_INT_I64 && value == 1) {
+        code = INTJ_B_ONE;
+      } else {
+        uint32_t aligned = (bits & 15u) == 0;
+        code = (kind == INTJ_INT_U64 ? INTJ_B_U64
+                : value >= INT32_MIN && value <= INT32_MAX ? INTJ_B_I32
+                                                            : INTJ_B_I64) + aligned;
+        vals[np++] = bits;
+      }
+    } else if (PyFloat_CheckExact(o)) {
+      float value = (float)((PyFloatObject *)o)->ob_fval;
+      uint32_t bits;
+      memcpy(&bits, &value, sizeof(bits));
+      code = INTJ_B_FP32;
+      vals[np++] = bits;
+    } else if (o == Py_None) {
+      code = INTJ_B_NONE;
+    } else {
+      PyErr_Format(PyExc_TypeError,
+                   "intj: unsupported argument '%s' of type %s; pass a "
+                   "scalar int, float, bool or None",
+                   intj_param_names[{{ p.index }}], Py_TYPE(o)->tp_name);
+      return -1;
+    }
+{{ auto_key_accumulate(descriptor[0], 'code') }}
+  }
+{%- endmacro %}
+
+{% macro decode_auto_constexpr(p) -%}
+{% set descriptor = p.annotation.key_fields | selectattr('kind', 'equalto', 'descriptor') | list %}
+{% set payload = p.annotation.key_fields | selectattr('kind', 'equalto', 'payload') | list %}
+  {
+    PyObject *o = args[{{ p.call_index }}];
+    uint32_t code;
+    uint64_t bits = 0;
+    if (o == Py_True || o == Py_False) {
+      code = INTJ_B_CX_BOOL;
+      bits = (uint64_t)(o == Py_True);
+    } else if (PyLong_CheckExact(o)) {
+      int kind = intj_as_int(o, &bits);
+      if (INTJ_UNLIKELY(kind == INTJ_INT_TOO_BIG)) {
+        PyErr_Format(PyExc_OverflowError, "intj: integer argument '%s' is too large",
+                     intj_param_names[{{ p.index }}]);
+        return -1;
+      }
+      code = kind == INTJ_INT_U64 ? INTJ_B_CX_UINT : INTJ_B_CX_INT;
+    } else if (PyFloat_CheckExact(o)) {
+      double value = ((PyFloatObject *)o)->ob_fval;
+      code = INTJ_B_CX_FLOAT;
+      memcpy(&bits, &value, sizeof(bits));
+    } else if (o == Py_None) {
+      code = INTJ_B_CX_NONE;
+    } else {
+      PyErr_Format(PyExc_TypeError,
+                   "intj: unsupported argument '%s' of type %s; pass a "
+                   "scalar int, float, bool or None",
+                   intj_param_names[{{ p.index }}], Py_TYPE(o)->tp_name);
+      return -1;
+    }
+{{ key_accumulate(payload[0], 'bits') }}
+{{ auto_key_accumulate(descriptor[0], 'code') }}
+  }
+{%- endmacro %}
+
 /* The launch and diagnostic entry points use exactly the same packing path. */
 static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
                                        uint64_t *key, uint64_t *vals, int *nparams,
-                                       intj_bound_launcher *bound) {
+                                       uint32_t device, intj_bound_launcher *bound) {
 {% if bound_params %}
   if (INTJ_UNLIKELY(!bound)) {
     PyErr_SetString(PyExc_TypeError, "intj: this module requires a bound launcher");
     return -1;
   }
 {% endif %}
+{% for word in range(nwords) %}  uint64_t key_word_{{ word }} = 0;
+{% endfor %}
+{% if auto_decode.enabled %}
+{% for part in auto_key_parts | sort %}  uint32_t key_part_{{ part }} = 0;
+{% endfor %}
+{% endif %}
   int np = 0;
+{% if auto_decode.enabled %}
+{% for p in params %}
+{% if p.annotation.kind == 'constexpr' %}
+{{ decode_auto_constexpr(p) }}
+{% else %}
+{{ decode_auto_argument(p) }}
+{% endif %}
+{% endfor %}
+{% else %}
 {% for p in params %}
 {% set a = p.annotation %}
 {% set i = p.index %}
@@ -207,11 +355,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% if a.kind == 'constexpr' %}
 {% if payload %}
 {% set value = 'intj_power_of_two_or_zero(magnitude_' ~ i ~ ', negative_' ~ i ~ ')' if a.power_of_two_or_zero else d ~ '.bits' %}
-{% if payload[0].width == 1 %}
-  ((uint8_t *)key)[{{ payload[0].offset }}] = (uint8_t){{ value }};
-{% else %}
-  intj_key_store{{ payload[0].width * 8 }}((uint8_t *)key + {{ payload[0].offset }}, {{ value }});
-{% endif %}
+{{ key_accumulate(payload[0], value) }}
 {% endif %}
 {% else %}
 {% if a.equal_to_one != 'never' %}
@@ -235,9 +379,25 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
   }
 {% endif %}
 {% if descriptor %}
-  ((uint8_t *)key)[{{ descriptor[0].offset }}] = (uint8_t)code_{{ i }};
+{{ key_accumulate(descriptor[0], 'code_' ~ i) }}
 {% endif %}
 {% endif %}
+{% endfor %}
+{% endif %}
+{% if device_offset is not none %}
+{% if auto_decode.enabled %}  key_part_{{ device_offset // 4 }} |=
+      (uint32_t)(uint8_t)device{% if device_offset % 4 %} << {{ (device_offset % 4) * 8 }}{% endif %};
+{% else %}  key_word_{{ device_offset // 8 }} |=
+      (uint64_t)(uint8_t)device{% if device_offset % 8 %} << {{ (device_offset % 8) * 8 }}{% endif %};
+{% endif %}
+{% else %}  (void)device;
+{% endif %}
+{% if auto_decode.enabled %}
+{% for part in auto_key_parts | sort %}  key_word_{{ part // 2 }} |=
+      (uint64_t)key_part_{{ part }}{% if part % 2 %} << 32{% endif %};
+{% endfor %}
+{% endif %}
+{% for word in range(nwords) %}  intj_key_store64(key + {{ word }}, key_word_{{ word }});
 {% endfor %}
   *nparams = np;
   return 0;
@@ -339,14 +499,12 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
   if (INTJ_UNLIKELY((uint64_t)gx * (uint64_t)gy * (uint64_t)gz == 0))
     Py_RETURN_NONE;
 
-  /* Key fields have render-time offsets; zero initialization also clears padding. */
-  uint64_t key[INTJ_NWORDS] = {0};
+  /* Key words are accumulated in registers and written once after decoding. */
+  uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
-  if (intj_pack(st, args + 1, key, vals, &np, bound) != 0)
+  if (intj_pack(st, args + 1, key, vals, &np, (uint32_t)device_ordinal, bound) != 0)
     return NULL;
-{% if device_offset is not none %}  ((uint8_t *)key)[{{ device_offset }}] = (uint8_t)device_ordinal;
-{% endif %}
 
 {% if nwords %}
   uint64_t hash = intj_hash(key);
@@ -714,14 +872,12 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
                  INTJ_NPARAMS, nargs);
     return NULL;
   }
-  uint64_t key[INTJ_NWORDS] = {0};
+  uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   uint32_t device = 0; /* no launch, so no device to key on */
-  if (intj_pack(st, args, key, vals, &np, NULL) != 0)
+  if (intj_pack(st, args, key, vals, &np, device, NULL) != 0)
     return NULL;
-{% if device_offset is not none %}  ((uint8_t *)key)[{{ device_offset }}] = (uint8_t)device;
-{% endif %}
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)INTJ_KEY_BYTES, np);
 }
 

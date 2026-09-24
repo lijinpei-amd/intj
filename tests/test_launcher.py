@@ -2776,6 +2776,13 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     }
     module = getattr(make_launcher(kernel.k, extra_annotation=annotation), "__self__")
     context = next(key.context for key, loaded in launcher_module._LOADED.items() if loaded is module)
+    suffix = ".cpp" if context.torch_access == TorchAccess.CXX.value else ".c"
+    source = pathlib.Path(module.__file__).with_name(f"k{suffix}").read_text()
+    pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
+    assert "((uint8_t *)key)" not in pack
+    assert "intj_key_store16" not in pack and "intj_key_store32" not in pack
+    for word in range(context.nwords):
+        assert pack.count(f"intj_key_store64(key + {word}, key_word_{word});") == 1
 
     b_i32 = 128  # INTJ_B_I32, +1 when the value is divisible by 16
     args = [3 + 2 * i for i in range(nparams)] + [
@@ -2805,6 +2812,30 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
         assert [b for j, b in enumerate(other) if j != offset] == [
             b for j, b in enumerate(blob) if j != offset
         ]
+
+
+@pytest.mark.parametrize("mode", [TorchAccess.SHIM, TorchAccess.CXX])
+def test_unannotated_key_decode_stays_direct(mode):
+    suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+    modules = [
+        getattr(make_launcher(
+            scale, torch_access=mode, no_gpu=True, verify_annotation=verify
+        ), "__self__")
+        for verify in (False, True)
+    ]
+    for module in modules:
+        source = pathlib.Path(module.__file__).with_name(f"scale{suffix}").read_text()
+        pack = source[
+            source.index("static INTJ_ALWAYS_INLINE int intj_pack"):
+            source.index("/* Parse one grid")
+        ]
+
+        assert "intj_decoded decoded_" not in pack
+        assert "intj_decode_argument" not in pack
+        assert "intj_decode_constexpr" not in pack
+
+    args = (torch.empty(8), torch.empty(8), 8, 2.0, 16)
+    assert modules[0].spec_key(*args) == modules[1].spec_key(*args)
 
 
 def test_unsupported_dtype_is_refused_in_every_mode():
