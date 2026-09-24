@@ -52,6 +52,10 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Performance
 
+- Benchmark `hipModuleLaunchKernel` with `extra` parameter-buffer passing against
+  the current `kernelParams` pointer array; use it if faster.
+- Benchmark CUDA driver `cuLaunchKernel` with `extra` parameter-buffer passing
+  against the current `kernelParams` pointer array; use it if faster.
 - Benchmark sweep promised in the README: dynamic vs constexpr argument counts and
   tensor counts.
 - Single-entry inline cache in front of the hash map (~2-3 ns, ~100% hit in a
