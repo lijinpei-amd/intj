@@ -10,7 +10,7 @@ module loads. This mixes a CPython fact into the Torch ABI table and prevents
 `abi_detect` from generating entries on a free-threaded build, whose header is
 32 bytes on supported x86-64 CPython.
 
-The interfaces already have separate owners: `python_intf.pyobject_size()`
+The interfaces already have separate owners: `python_intf.cpython_abi.pyobject_size()`
 reports the detecting interpreter's header size, while each generated module
 is compiled against the running interpreter's `Python.h`. Its compiled
 `sizeof(PyObject)` is therefore the header size that must be used for the
@@ -50,7 +50,7 @@ integer and float readers in `python_intf` do not change.
 ## Detection and table migration
 
 The Python detector receives `header_size` from
-`python_intf.pyobject_size()`. It searches the live tensor object for an
+`python_intf.cpython_abi.pyobject_size()`. It searches the live tensor object for an
 **absolute** pointer slot, as it does today, and uses that absolute address
 for its safety-bounded probe. Once a unique slot is pinned, it refuses a slot
 before `header_size`, subtracts `header_size`, and self-checks by adding the
@@ -66,10 +66,11 @@ nested `MaybeOwned<Tensor>` field on PyTorch before 2.10; subtracting only from
 
 The existing rows were all measured with a documented 16-byte header. Their
 schema migration is exact arithmetic: the eight PyTorch 2.2–2.9 rows change
-`24 → 8`, and the five 2.10–2.14 rows change `16 → 0`. All other offsets,
-dtype lists, version keys, and strict parser rules stay as they are. Future
-entries come from the updated detector, with the C++ detector as an
-independent check.
+`24 → 8`, and the five 2.10–2.14 rows change `16 → 0`. Regenerate each row with
+the updated detector, assert that arithmetic and every other recorded field
+against the old row, then install the generated output. Dtype lists, version
+keys, and strict parser rules stay as they are. The C++ detector independently
+checks the new rows.
 
 ## Refusal and installation
 
