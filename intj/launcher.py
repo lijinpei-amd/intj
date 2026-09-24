@@ -171,6 +171,16 @@ def make_launcher(
     if extra_annotation:
         raise UnsupportedKernel("intj: extra_annotation is not implemented")
 
+    triton_hint = "intj: Triton >=3.8 is required; install `intj[launcher]`"
+    try:
+        import triton
+    except ModuleNotFoundError as e:
+        if e.name != "triton":
+            raise
+        raise UnsupportedKernel(triton_hint) from e
+    if tuple(map(int, triton.__version__.split(".")[:2])) < (3, 8):
+        raise UnsupportedKernel(f"{triton_hint} (found {triton.__version__})")
+
     options = dict(sorted((options or {}).items()))
     jit_func = _check_kernel(jit_func, options)
     params, nwords = _render_params(jit_func)

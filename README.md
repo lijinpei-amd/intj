@@ -10,6 +10,20 @@ INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunct
 
 This is the initial version: torch tensors only, static grid. Anything outside that is refused, see `docs/Usage.md`. AMD is tested on gfx942; the NVIDIA path is implemented (`cuLaunchKernel`) but untested, no NVIDIA GPU here.
 
+## Install
+
+From this checkout, install the launcher on a CPython build with a Triton 3.8 wheel:
+
+```sh
+python -m pip install '.[launcher]'
+```
+
+On x86-64 Linux, Triton 3.8 wheels are available for CPython 3.10–3.14 with
+the GIL and free-threaded 3.14, but not 3.8, 3.9, or free-threaded 3.13. On
+those builds, `python -m pip install .` installs the base package. Torch may
+bring in an older Triton as a dependency; that does not satisfy the launcher's
+Triton 3.8 requirement.
+
 ## Usage
 
 ```python

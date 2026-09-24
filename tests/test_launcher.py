@@ -11,6 +11,7 @@ import dataclasses
 import json
 import pathlib
 import subprocess
+import sys
 import sysconfig
 import types
 
@@ -649,6 +650,16 @@ def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
 def test_refuses_non_jit_function():
     with pytest.raises(UnsupportedKernel):
         make_launcher(lambda: None)
+
+
+@pytest.mark.parametrize("version", [None, "3.7.0"])
+def test_launcher_requires_triton_extra(monkeypatch, version):
+    installed = types.ModuleType("triton")
+    setattr(installed, "__version__", version)
+    monkeypatch.setitem(sys.modules, "triton", installed if version else None)
+
+    with pytest.raises(UnsupportedKernel, match=r"Triton >=3\.8.*intj\[launcher\]"):
+        make_launcher(object())
 
 
 def test_refuses_kernel_reading_globals():
