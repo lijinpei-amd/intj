@@ -12,10 +12,22 @@ import subprocess
 import sysconfig
 import threading
 import types
+import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from ._version import __version__
+from .annotation import (
+    CanonicalAnnotation,
+    DeviceBinding,
+    ResolvedParam,
+    _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
+    _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
+    _key_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
+    _layout_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
+    _resolve_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
+)
 from .kernel_cache import (
     INSTALL_ERRORS,
     KernelCache,
@@ -28,6 +40,7 @@ from .torch_abi import (
     TorchAccess,
     dtype_index_table,
     layout_for,
+    live_dtypes,
     supported_versions,
     torch_version,
 )
@@ -36,8 +49,6 @@ from .torch_abi import (
 # typed `Any` on purpose.
 JitFunction = Any
 CompiledKernel = Any
-
-SCHEMA_VERSION = 1
 
 _RUNTIME = Path(__file__).parent / "runtime"
 _ENTRY_TEMPLATE = _RUNTIME / "entry.c.jinja"
@@ -48,17 +59,39 @@ class UnsupportedKernel(NotImplementedError):
     """Raised for kernels or options outside intj's (deliberately small) scope."""
 
 
+def _cache_version() -> tuple[int, int]:
+    major, minor, *_ = __version__.split(".")
+    return int(major), int(minor)
+
+
 @dataclasses.dataclass(frozen=True)
 class Param:
     """One declared kernel parameter, as the template needs it."""
 
     name: str
-    is_constexpr: bool
-    spec: int  # 0 when do_not_specialize
-    align: int  # 0 when do_not_specialize_on_alignment
-    # Its code byte is at its declaration position, which the template already
-    # has as `loop.index0`; only the value word needs carrying.
-    cx_word: int | None  # value-word index, None unless is_constexpr
+    index: int
+    call_index: int | None
+    annotation: CanonicalAnnotation
+
+
+@dataclasses.dataclass(frozen=True)
+class CompilerInput:
+    """The final annotated ASTSource identity, with its original Python constants."""
+
+    signature: tuple[tuple[str, str], ...]
+    constants: tuple[tuple[tuple[int, ...], tuple[object, ...]], ...]
+    attrs: tuple[tuple[tuple[int, ...], tuple[tuple[str, int], ...]], ...]
+    values: tuple[tuple[tuple[int, ...], object], ...] = dataclasses.field(
+        compare=False, hash=False, repr=False
+    )
+
+    def ast_source(self, jit_func: JitFunction) -> Any:
+        from triton.compiler import ASTSource
+
+        return ASTSource(
+            jit_func, dict(self.signature), dict(self.values),
+            {path: [list(attr) for attr in attrs] for path, attrs in self.attrs},
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,11 +106,15 @@ class RenderContext:
     kernel_repr: str
     params: tuple[Param, ...]
     nwords: int  # spec-key length, in uint64 words
-    header_words: int  # words the code bytes and the device byte occupy
+    device_binding: DeviceBinding
+    device_offset: int | None
+    verify_annotation: bool
+    no_gpu: bool
     max_slots: int  # kernel param slots, upper bound
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
     driver_path: str
     launch_symbol: str
+    device_symbol: str
     error_symbol: str
     error_style: str  # "return" | "outparam"
     torch_access: str  # TorchAccess value; never "auto" by this point
@@ -91,6 +128,9 @@ class RenderContext:
     #: and these stay None -- which is what keeps them out of the digest.
     torch_version: tuple[int, int] | None
     cxx_abi: int | None
+    # Explicit pointer names -> live torch ScalarType codes. Their compact key
+    # indices still come from the runtime ABI table, in every access mode.
+    pointer_types: tuple[tuple[str, int], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,13 +146,12 @@ class ModuleKey:
     runtime_header: str  # intj_runtime.h bytes, hex
     context: RenderContext  # the render is a pure function of this and the template
     cache_key: str  # jit_func.cache_key: the kernel source and its callees
-    params: tuple[tuple[Any, ...], ...]  # per-parameter decorator state, which cache_key misses
     target: tuple[Any, ...]  # backend, arch, warp size
     options: str  # canonicalized compile options, hashed by triton
     triton: tuple[Any, ...]  # triton version and libtriton identity
     compiler: tuple[str, ...]  # the C compiler triton would invoke
     ext_suffix: str | None
-    schema: int = SCHEMA_VERSION
+    intj_version: tuple[int, int]
 
     def digest(self) -> str:
         # sort_keys so the digest does not depend on field order
@@ -120,47 +159,177 @@ class ModuleKey:
         return hashlib.sha256(blob.encode()).hexdigest()
 
 
+@dataclasses.dataclass(frozen=True)
+class LauncherFactory:
+    jit_func: JitFunction
+    params: tuple[ResolvedParam, ...]
+    options: tuple[tuple[str, Any], ...]
+    torch_access: TorchAccess
+    kernel_cache: KernelCache
+    verify_annotation: bool
+    no_gpu: bool
+    bind_device_requested: bool
+
+    def bind(self, /, **values: object) -> Callable[..., None]:
+        if self.bind_device_requested:
+            raise TypeError("intj: use bind_device(device_ordinal, **values)")
+        return self._bind(None, values)
+
+    def bind_device(self, /, *args: object, **values: object) -> Callable[..., None]:
+        if not self.bind_device_requested:
+            raise TypeError("intj: bind_device was not requested")
+        if len(args) != 1:
+            raise TypeError("intj: bind_device requires exactly one positional device ordinal")
+        return self._bind(args[0], values)
+
+    def _bind(self, device: object, values: Mapping[str, object]) -> Callable[..., None]:
+        names = {p.name for p in self.params if p.annotation.bind_value is not None}
+        unknown = values.keys() - names
+        if unknown:
+            raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
+        missing = names - values.keys()
+        if missing:
+            raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
+        import torch
+        from triton._utils import type_canonicalisation_dict
+
+        resolved: list[ResolvedParam] = []
+        for p in self.params:
+            annotation = p.annotation
+            if annotation.bind_value == "tensor":
+                value = values[p.name]
+                if value is not None and type(value) not in (torch.Tensor, torch.nn.Parameter):
+                    raise TypeError(f"intj: bound tensor {p.name!r} must be a tensor or None")
+                if annotation.types == (None,) and value is not None:
+                    raise TypeError(f"intj: bound tensor {p.name!r} must match declared None type")
+                if annotation.types is None:
+                    ty = None
+                    if value is not None:
+                        tensor = cast(torch.Tensor, value)
+                        dtype = type_canonicalisation_dict.get(str(tensor.dtype).split(".")[-1])
+                        if dtype is None:
+                            raise TypeError(f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}")
+                        ty = "*" + dtype
+                    annotation = dataclasses.replace(annotation, types=(ty,))
+            resolved.append(dataclasses.replace(p, annotation=annotation))
+        module = _materialize_module(
+            self.jit_func, tuple(resolved), dict(self.options), self.torch_access,
+            self.kernel_cache, self.no_gpu, self.verify_annotation,
+            DeviceBinding.FIXED if self.bind_device_requested else DeviceBinding.NOT_FIXED,
+        )
+        public_names = tuple(
+            p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
+        )
+        control_names: list[str] = []
+        for name in (("stream", "grid") if self.bind_device_requested else ("device", "stream", "grid")):
+            while name in public_names:
+                name += "_"
+            control_names.append(name)
+        signature = inspect.Signature(tuple(
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
+            for name in (*control_names, *public_names)
+        ))
+        return module.make_bound(signature, *((device,) if self.bind_device_requested else ()),
+                                 *(values[p.name] for p in resolved if p.name in names))
+
+
 def make_launcher(
     jit_func: JitFunction,
     dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
-    extra_annotation: Mapping[str, str] | None = None,
+    extra_annotation: Mapping[str, object] | None = None,
     options: Mapping[str, Any] | None = None,
     torch_access: TorchAccess = TorchAccess.AUTO,
     kernel_cache: KernelCache = KernelCache.INTJ,
-) -> Callable[..., None]:
+    no_gpu: bool = False,
+    verify_annotation: bool = False,
+    bind_device: bool = False,
+) -> Any:
     """Build a fast launcher for `jit_func`.
 
-    The returned callable is a C function:
+    Without bindings, the returned callable is a C function:
 
         launcher(device, stream, grid, arg0, arg1, ...)
 
     `device` is a device index in `[0, 256)` -- one byte of the spec key holds
     it -- `stream` a raw stream handle (both ints), `grid` an int or a
     tuple/list of up to 3 ints, and the remaining arguments are the kernel's
-    parameters, positionally, in declaration order.
+    public parameters, positionally, in declaration order. Baked Argument and
+    Constexpr values are omitted from the call. With bound parameters this
+    returns a non-callable factory; `.bind(**values)` creates the native callable
+    and removes those parameters from its signature. `bind_device=True` also
+    returns a factory: `.bind_device(ordinal, **values)` fixes a non-negative
+    int32 device ordinal and returns `(stream, grid, ...)`. It owns a separate
+    kernel cache, or one kernel when no dynamic specialization key remains.
+    The return shape depends on this flag and annotations on the JITFunction.
 
     `options` are triton compile options (`num_warps`, `num_stages`, ...) baked
     into every launch.  `torch_access` picks how the module reads a tensor; see
     `TorchAccess`.  `kernel_cache` picks the hash map behind the kernel cache;
-    see `KernelCache`.  `dynamic_grid`, `dynamic_options` and `extra_annotation`
-    are reserved and currently unsupported.
+    see `KernelCache`.  `no_gpu=True` decodes and caches on the host without
+    compiling or launching a GPU kernel. `dynamic_grid` and `dynamic_options`
+    are reserved and currently unsupported. `verify_annotation=True` checks
+    declared types, ranges and assumed facts; otherwise these are caller promises.
     """
     if dynamic_grid:
         raise UnsupportedKernel("intj: dynamic_grid is not implemented; pass an int or tuple grid")
     if dynamic_options:
         raise UnsupportedKernel("intj: dynamic_options is not implemented; pass options=... instead")
-    if extra_annotation:
-        raise UnsupportedKernel("intj: extra_annotation is not implemented")
-
     options = dict(sorted((options or {}).items()))
+    if no_gpu and options:
+        raise UnsupportedKernel("intj: no_gpu=True supports only default compile options")
     jit_func = _check_kernel(jit_func, options)
-    params, nwords = _render_params(jit_func)
+    resolved = _resolve_annotations(jit_func, extra_annotation)
+    for p in jit_func.params:
+        kind = p._param.kind
+        if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            raise UnsupportedKernel(
+                f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
+            )
+    if not no_gpu:
+        from triton import knobs
 
+        options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
+        options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
     access = _resolve_access(torch_access)
-    target = _current_target()
-    backend = BACKENDS[target.backend]
-    canonical_options = _canonical_options(target, options)
+    if bind_device or any(p.annotation.bind_value is not None for p in resolved):
+        if not no_gpu:
+            _canonical_options(_current_target(), options)
+        if verify_annotation:
+            for p in resolved:
+                if p.annotation.bind_value == "pointer" and p.annotation.pointer_range_32 == "assume":
+                    warnings.warn(
+                        f"intj: pointer-range assumption for bound pointer {p.name!r} "
+                        "cannot be verified from an address and will be trusted",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        return LauncherFactory(jit_func, resolved, tuple(options.items()), access, kernel_cache,
+                               bool(verify_annotation), no_gpu, bool(bind_device))
+    return _materialize_module(jit_func, resolved, options, access, kernel_cache,
+                               no_gpu, bool(verify_annotation)).entry
+
+
+def _materialize_module(
+    jit_func: JitFunction, resolved: tuple[ResolvedParam, ...], options: Mapping[str, Any],
+    access: TorchAccess, kernel_cache: KernelCache, no_gpu: bool, verify_annotation: bool,
+    device_binding: DeviceBinding = DeviceBinding.NOT_FIXED,
+) -> types.ModuleType:
+    if no_gpu:
+        target = None
+        backend = None
+        canonical_options = None
+    else:
+        target = _current_target()
+        backend = BACKENDS.get(target.backend)
+        if backend is None:
+            raise UnsupportedKernel(
+                f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
+                f"register() it (have: {', '.join(sorted(BACKENDS))})"
+            )
+        canonical_options = _canonical_options(target, options)
+    params, device_offset, nwords = _render_params(resolved, device_binding)
+
     # last, after every refusal above it: a kernel that is going to be rejected
     # anyway must not pay for a download and an abseil build first
     cache_toolchain = _provision(kernel_cache)
@@ -173,17 +342,21 @@ def make_launcher(
         kernel_repr=get_full_name(jit_func),
         params=params,
         nwords=nwords,
-        header_words=-(-(len(params) + 1) // 8),
-        max_slots=sum(0 if p.is_constexpr else 1 for p in params),
+        device_binding=device_binding,
+        device_offset=device_offset,
+        verify_annotation=bool(verify_annotation),
+        no_gpu=no_gpu,
+        max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
         # after the knob is flipped back on.
-        spec_pointer_range=1 if backend.pointer_range else 0,
-        driver_path=backend.library_path(),
-        launch_symbol=backend.launch_symbol,
-        error_symbol=backend.error_symbol,
-        error_style=backend.error_style,
+        spec_pointer_range=1 if backend is not None and backend.pointer_range else 0,
+        driver_path=backend.library_path() if backend is not None else "",
+        launch_symbol=backend.launch_symbol if backend is not None else "",
+        device_symbol=backend.device_symbol if backend is not None else "",
+        error_symbol=backend.error_symbol if backend is not None else "",
+        error_style=backend.error_style if backend is not None else "return",
         torch_access=access.value,
         kernel_cache=kernel_cache.value,
         cache_include_dirs=cache_toolchain["include_dirs"],
@@ -194,6 +367,7 @@ def make_launcher(
         # across torch versions.
         torch_version=torch_version() if access is TorchAccess.CXX else None,
         cxx_abi=_cxx_abi() if access is TorchAccess.CXX else None,
+        pointer_types=_pointer_types(params),
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -203,21 +377,18 @@ def make_launcher(
         runtime_header=_RUNTIME_HEADER.read_bytes().hex(),
         context=context,
         cache_key=jit_func.cache_key,
-        params=tuple(
-            (p.name, p.annotation, p.is_constexpr, p.is_const, p.do_not_specialize,
-             p.do_not_specialize_on_alignment, p.has_default, repr(p.default))
-            for p in jit_func.params
-        ),
-        target=(target.backend, target.arch, target.warp_size),
-        options=canonical_options.hash(),
+        target=(target.backend, target.arch, target.warp_size) if target is not None else ("host-only",),
+        options=canonical_options.hash() if canonical_options is not None else "host-defaults",
         triton=_triton_identity(),
         compiler=_compiler_identity("c++" if access is TorchAccess.CXX else "c"),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
+        intj_version=_cache_version(),
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
     layout = layout_for() if access in (TorchAccess.SHIM, TorchAccess.CXX) else None
-    return _loaded_module(key, jit_func, context, params, options, layout).entry
+    baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
+    return _loaded_module(key, jit_func, context, params, options, layout, baked_values)
 
 
 _INSTALL_FAILED: dict[KernelCache, Exception] = {}
@@ -333,6 +504,7 @@ def _loaded_module(
     params: Sequence[Param],
     options: Mapping[str, Any],
     layout: TensorABI | None,
+    baked_values: Mapping[int, object],
 ) -> types.ModuleType:
     """One module per `ModuleKey`, for the life of the process.
 
@@ -348,7 +520,10 @@ def _loaded_module(
         module = _LOADED.get(key)
         if module is None:
             module = _load(key, jit_func, context)
-            module.set_compile_callback(_make_compile_callback(jit_func, params, options))
+            module.set_compile_callback(
+                _make_host_compile_callback() if context.no_gpu
+                else _make_compile_callback(jit_func, params, options, baked_values)
+            )
             # The tensor layout is installed, not compiled in, so it describes the
             # torch running now rather than the one this `.so` was built against.
             module.set_torch_version(
@@ -494,6 +669,8 @@ class Backend(abc.ABC):
     name: str
     #: f(fn, gx,gy,gz, bx,by,bz, shared, stream, params, extra) -> error code
     launch_symbol: str
+    #: f(int32_t *device, int32_t ordinal) -> error code
+    device_symbol: str
     #: error-string lookup, called as `error_style` says
     error_symbol: str
     #: "return"   const char *f(int)
@@ -510,6 +687,7 @@ class Backend(abc.ABC):
 class HipBackend(Backend):
     name = "hip"
     launch_symbol = "hipModuleLaunchKernel"
+    device_symbol = "hipDeviceGet"
     error_symbol = "hipGetErrorString"
     error_style = "return"
     pointer_range = True
@@ -524,6 +702,7 @@ class HipBackend(Backend):
 class CudaBackend(Backend):
     name = "cuda"
     launch_symbol = "cuLaunchKernel"
+    device_symbol = "cuDeviceGet"
     error_symbol = "cuGetErrorString"
     error_style = "outparam"
     pointer_range = False
@@ -593,12 +772,6 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
             f"intj: expected a @triton.jit function, got {type(jit_func).__name__}; "
             "autotuned and heuristic kernels are not supported"
         )
-    target = _current_target()
-    if target.backend not in BACKENDS:
-        raise UnsupportedKernel(
-            f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
-            f"register() it (have: {', '.join(sorted(BACKENDS))})"
-        )
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")
     jit_func.cache_key  # populates used_global_vals
@@ -614,39 +787,44 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
     return jit_func
 
 
-def _render_params(jit_func: JitFunction) -> tuple[tuple[Param, ...], int]:
-    """One render-time descriptor per declared kernel parameter, and the key length.
-
-    Byte `i` of the key is parameter `i`, the device byte follows them, and the
-    constexpr value words follow the padding.  `nwords` comes back alongside the
-    params because it is the same arithmetic: computing it somewhere else is how
-    the two drift.
-    """
-    declared = list(jit_func.params)
-    header_words = -(-(len(declared) + 1) // 8)
+def _render_params(
+    resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
+) -> tuple[tuple[Param, ...], int | None, int]:
+    """Place canonical key fields and number the arguments in the public call."""
+    fields = tuple(
+        (p.index, field) for p in resolved for field in _key_fields(p.annotation)
+    )
+    layout = _layout_fields(fields, device_binding)
     params: list[Param] = []
-    word = header_words
-    for p in declared:
-        kind = p._param.kind
-        if kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            raise UnsupportedKernel(f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported")
-        if not p.is_constexpr and p.annotation:
-            raise UnsupportedKernel(
-                f"intj: parameter {p.name!r} has annotation {p.annotation!r}; only tl.constexpr annotations "
-                "are supported"
-            )
-        params.append(
-            Param(
-                name=p.name,
-                is_constexpr=p.is_constexpr,
-                spec=0 if p.do_not_specialize else 1,
-                align=0 if p.do_not_specialize_on_alignment else 1,
-                cx_word=word if p.is_constexpr else None,
-            )
+    call_index = 0
+    for p in resolved:
+        annotation = dataclasses.replace(
+            p.annotation,
+            key_fields=tuple(sorted(
+                (field for index, field in layout.fields if index == p.index),
+                key=lambda field: field.offset,
+            )),
         )
-        if p.is_constexpr:
-            word += 1
-    return tuple(params), word
+        public = not annotation.baked_value and annotation.bind_value is None
+        params.append(Param(p.name, p.index, call_index if public else None, annotation))
+        if public:
+            call_index += 1
+    return tuple(params), layout.device_offset, layout.nwords
+
+
+def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:
+    """Resolve explicit pointer names through the same live dtypes as the ABI table."""
+    from triton._utils import type_canonicalisation_dict
+
+    wanted = {ty[1:] for p in params for ty in p.annotation.types or ()
+              if ty is not None and ty.startswith("*")}
+    if not wanted:
+        return ()
+    return tuple(sorted(
+        ("*" + canonical, code)
+        for code, (name, _) in live_dtypes().items()
+        if (canonical := type_canonicalisation_dict.get(name)) in wanted
+    ))
 
 
 @functools.lru_cache(maxsize=1)
@@ -671,28 +849,130 @@ def _compiler_identity(language: str = "c") -> tuple[str, ...]:
     return (str(cc), version)
 
 
+def _triton_specialize(
+    value: object, *, backend: Any, is_const: bool, specialize: bool, align: bool
+) -> tuple[str, Any]:
+    from triton._C.libtriton import native_specialize_impl
+
+    return native_specialize_impl(backend, value, is_const, specialize, align)
+
+
+def _compiler_input(
+    jit_func: JitFunction, params: Sequence[Param], public_args: Sequence[object], backend: Any,
+    *, baked_values: Mapping[int, object] | None = None,
+) -> CompilerInput:
+    signature: list[tuple[str, str]] = []
+    constants: list[tuple[tuple[int, ...], tuple[object, ...]]] = []
+    attrs: list[tuple[tuple[int, ...], tuple[tuple[str, int], ...]]] = []
+    values: list[tuple[tuple[int, ...], object]] = []
+    for param in params:
+        annotation = param.annotation
+        if annotation.bind_value is not None:
+            # Bound type/facts are fixed in this module. Only inferred None
+            # becomes a compiler constant; no callback owns a bound value.
+            value = None
+        elif param.call_index is None:
+            assert baked_values is not None, "fixed values must accompany their canonical annotations"
+            value = baked_values[param.index]
+        else:
+            value = public_args[param.call_index]
+        ty = "constexpr"
+        desc = ""
+        if annotation.kind == "argument":
+            fixed_type = annotation.types is not None and len(annotation.types) == 1
+            effective = annotation.types[0] if fixed_type and annotation.types else None
+            modes = (("equal_to_one", annotation.equal_to_one),
+                     ("aligned_16", annotation.aligned_16),
+                     ("pointer_range_32", annotation.pointer_range_32))
+            assumed_one = annotation.equal_to_one == "assume" and _applicable(effective, "equal_to_one")
+            inferred_desc = None
+            if not assumed_one and (not fixed_type or any(
+                mode == "auto" and _applicable(effective, field) for field, mode in modes
+            )):
+                inference_value = value
+                if effective is not None and effective.startswith("*") and (
+                    value is None or type(value) is int and value == 0
+                ):
+                    from triton.runtime.jit import MockTensor
+
+                    # Both public null spellings have pointer 0 and storage range 0.
+                    inference_value = MockTensor(effective[1:])
+                inferred, inferred_desc = _triton_specialize(
+                    inference_value, backend=backend, is_const=jit_func.params[param.index].is_const,
+                    specialize=any(mode == "auto" for _, mode in modes),
+                    align=annotation.aligned_16 == "auto",
+                )
+                if not fixed_type:
+                    # The native primitive folds only None and integer 1.
+                    effective = (None if value is None else "i32") if inferred == "constexpr" else inferred
+            ty = effective or "constexpr"
+            if _applicable(effective, "equal_to_one") and (
+                annotation.equal_to_one == "assume" or
+                annotation.equal_to_one == "auto" and value == 1
+            ):
+                ty = "constexpr"
+                if annotation.equal_to_one == "assume":
+                    value = 1
+            if ty != "constexpr":
+                desc = "".join(char for field, mode, char in (
+                    ("aligned_16", annotation.aligned_16, "D"),
+                    ("pointer_range_32", annotation.pointer_range_32, "S"),
+                ) if _applicable(effective, field) and (
+                    mode == "assume" or mode == "auto" and
+                    isinstance(inferred_desc, str) and char in inferred_desc
+                ))
+        path = (param.index,)
+        signature.append((param.name, ty))
+        if ty == "constexpr":
+            constants.append((path, _canonical_value(value)))
+            values.append((path, value))
+        if desc:
+            parsed = tuple((name, amount) for name, amount in backend.parse_attr(desc))
+            if parsed:
+                attrs.append((path, parsed))
+    return CompilerInput(tuple(signature), tuple(constants), tuple(attrs), tuple(values))
+
+
 def _make_compile_callback(
-    jit_func: JitFunction, params: Sequence[Param], options: Mapping[str, Any]
+    jit_func: JitFunction, params: Sequence[Param], options: Mapping[str, Any],
+    baked_values: Mapping[int, object] | None = None,
 ) -> Callable[..., tuple[int, int, int, int]]:
     """Called from C on a spec-key miss, with the key blob and the original args."""
+    from triton.compiler import compile as triton_compile, make_backend
+
+    target = _current_target()
+    backend = make_backend(target)
+    canonical_options = _canonical_options(target, options)
     kernels: list[CompiledKernel] = []  # keeps every CompiledKernel, and so its GPU module, alive
-    seen: dict[tuple[int, tuple[int, ...]], str] = {}  # key words -> triton's specialization entry
+    seen: dict[bytes, CompilerInput] = {}
+    no_key_input: CompilerInput | None = None
 
     def compile_callback(
         keyblob: bytes, nparams: int, device: int, *args: Any
     ) -> tuple[int, int, int, int]:
+        nonlocal no_key_input
         current = _current_device()
         if device != current:
-            # warmup() and _init_handles() both load the binary on the *current*
+            # _init_handles() loads the binary on the *current*
             # device; launching that function on another device's stream is a
             # wrong-context launch, so refuse instead.
             raise UnsupportedKernel(
                 f"intj: launching on device {device} while device {current} is current; "
                 "make the target device current before the first launch"
             )
-        kernel = jit_func.warmup(*args, grid=None, **options)
-        if kernel is None:
-            raise RuntimeError("intj: triton returned no kernel (a jit_cache_hook is installed?)")
+        compiler_input = _compiler_input(jit_func, params, args, backend, baked_values=baked_values)
+        if keyblob:
+            previous = seen.setdefault(keyblob, compiler_input)
+        else:
+            if no_key_input is None:
+                no_key_input = compiler_input
+            previous = no_key_input
+        if previous != compiler_input:
+            raise RuntimeError(
+                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
+            )
+        kernel = triton_compile(compiler_input.ast_source(jit_func), target=target,
+                                options=canonical_options.__dict__)
         kernel._init_handles()
 
         md = kernel.metadata
@@ -711,10 +991,18 @@ def _make_compile_callback(
                 f"intj: packed {nparams} kernel arguments but triton compiled {expected}; "
                 "this is an intj bug"
             )
-        _validate_spec_key(jit_func, params, options, keyblob, args, seen)
-
         kernels.append(kernel)
         return (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
+
+    return compile_callback
+
+
+def _make_host_compile_callback() -> Callable[..., tuple[int, int, int, int]]:
+    def compile_callback(
+        keyblob: bytes, nparams: int, device: int, *args: Any
+    ) -> tuple[int, int, int, int]:
+        del keyblob, device, args
+        return 0, 1, 0, nparams
 
     return compile_callback
 
@@ -727,39 +1015,6 @@ def triton_specialization(
 
     binder = jit_func.device_caches[_current_device()][4]
     kwargs = dict(options or {})
-    kwargs["debug"] = jit_func.debug or knobs.runtime.debug
+    kwargs["debug"] = kwargs.get("debug", jit_func.debug) or knobs.runtime.debug
     kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
     return binder(*args, **kwargs)[1]
-
-
-def _validate_spec_key(
-    jit_func: JitFunction,
-    params: Sequence[Param],
-    options: Mapping[str, Any],
-    keyblob: bytes,
-    args: Sequence[Any],
-    seen: dict[tuple[int, tuple[int, ...]], str],
-) -> None:
-    """Assert intj's key is no coarser than triton's specialization.
-
-    Cheap (the miss path is milliseconds) and it turns a classifier drift from a
-    silently wrong kernel launch into a loud failure: if the same intj key word
-    ever maps to two different triton specializations, the key is too coarse.
-    A key that is coarse in *both* directions never misses and so never reaches
-    this check -- `tests/test_launcher.py` covers that case with `spec_key`.
-    """
-    specialization = triton_specialization(jit_func, args, options)
-
-    for i, param in enumerate(params):
-        # byte i is parameter i; a constexpr adds its value word
-        mine: tuple[int, ...] = (keyblob[i],)
-        if param.cx_word is not None:
-            at = param.cx_word * 8
-            mine += (int.from_bytes(keyblob[at:at + 8], "little"),)
-        theirs = repr(specialization[i])
-        previous = seen.setdefault((i, mine), theirs)
-        if previous != theirs:
-            raise RuntimeError(
-                f"intj: spec key for parameter {param.name!r} is too coarse: it maps both "
-                f"{previous} and {theirs} to the same key; this is an intj bug"
-            )

@@ -3,30 +3,47 @@
 ## `make_launcher`
 
 ```python
-from intj import make_launcher
+from intj import KernelCache, TorchAccess, make_launcher
 
 launcher = make_launcher(
     jit_func,              # a @triton.jit function
     dynamic_grid=False,    # reserved, must be False
     dynamic_options=(),    # reserved, must be empty
-    extra_annotation=None, # reserved, must be None
+    extra_annotation=None, # parameter name -> annotation or shorthand
     options=None,          # triton compile options, e.g. {"num_warps": 8}
+    torch_access=TorchAccess.AUTO,
+    kernel_cache=KernelCache.INTJ,
+    no_gpu=False,          # host decode/cache path, without GPU work
+    verify_annotation=False,
+    bind_device=False,
 )
 ```
 
 `make_launcher` renders a C python extension for `jit_func`, compiles it (through
 triton's build + on-disk cache, so it is free after the first time), loads it, and
-returns its `entry` function. It is slow; call it once, outside any hot loop.
+returns its `entry` function when no value or device binding requires a factory.
+With bindings, the factory materializes the extension when bound. Construction
+is slow; call it once, outside any hot loop.
+`extra_annotation` can fix types or specialization facts, bake values, or mark
+values for binding. `verify_annotation=True` checks declared promises before
+cache lookup; the default trusts them. `bind_device=True` fixes a device on a
+bound handle. `no_gpu=True` renders and times host decoding and cache lookup
+without querying a GPU target or driver, compiling a kernel, or launching one.
+It accepts only default compile options. The `torch_access` and `kernel_cache`
+choices are described below.
 
-`options` are forwarded verbatim to `JITFunction.warmup` on every compile, so they
-must be valid triton options (`num_warps`, `num_stages`, `waves_per_eu`, ...) and are
-fixed for the lifetime of the launcher. `device`, `stream`, `device_type` and
-`warp_size` are rejected, and an unknown option name is an error here rather than a
-silent fall back to the default.
+`options` must be valid triton compile options (`num_warps`, `num_stages`,
+`waves_per_eu`, ...) and are fixed for the lifetime of the launcher. `device`,
+`stream`, `device_type` and `warp_size` are rejected, and an unknown option name
+is an error here rather than a silent fall back to the default.
 
 They are canonicalized through the compiler backend's `parse_options`, so spellings
 that mean the same thing — `{}` and `{"num_warps": 4}` on AMD — share one rendered
-module instead of building it twice.
+module instead of building it twice. The canonical options are passed directly to
+`triton.compiler.compile` with the annotated `triton.compiler.ASTSource` on a cache
+miss. An explicit `debug` option overrides the JIT function's debug default;
+Triton's runtime debug flag can still enable it. Instrumentation mode comes from
+Triton's compilation knob. These effective options also determine module identity.
 
 Most things intj cannot handle raise `intj.launcher.UnsupportedKernel` here. The
 rest — `num_ctas > 1`, a cooperative launch, a kernel needing scratch memory — can
@@ -44,7 +61,7 @@ launcher(device, stream, grid, arg0, arg1, ...)
 | `device` | device index, `int` in `[0, 256)` (e.g. `torch.cuda.current_device()`) |
 | `stream` | raw stream handle, `int` (e.g. `torch.cuda.current_stream().cuda_stream`) |
 | `grid` | `int`, or a `tuple`/`list` of 1-3 ints |
-| `arg0...` | the kernel parameters, **positionally, all of them, in declaration order** |
+| `arg0...` | public kernel parameters, positionally and in declaration order; baked and bound values are omitted |
 
 Returns `None`. A grid whose volume is zero returns without launching.
 
@@ -58,11 +75,114 @@ Keyword arguments are not accepted, defaults are not filled in, and the launcher
 not read the current device or stream for you — that is where the launch overhead of
 `JITFunction` goes.
 
+## Argument annotations
+
+Import `Argument`, `Constexpr`, `AUTO`, `NEVER`, `Assume`, `EqualTo`, `Aligned`,
+`PointerRange`, `BindValue`, `INT_TYPES`, and `FLOAT_TYPES` from `intj`.
+`Annotation`, `Specialization`, and `Fact` are their public base classes.
+`Argument(type=..., specialize=..., value=..., bind_value=...)` describes an
+ordinary parameter. `Constexpr(type=..., power_of_two_or_zero=False,
+value=...)` describes a constexpr parameter. Every field is optional.
+`INT_TYPES` is `(tl.int32, tl.int64, tl.uint64)` and `FLOAT_TYPES` is
+`(tl.float32,)`; either can be used as a type allowlist. A single dtype or a
+nonempty tuple of dtypes is accepted. A missing type or `type=AUTO` retains
+Triton's inference. An ordinary type allowlist checks the inferred type;
+a typed constexpr selects the smallest fitting type, then the name. Neither
+coerces the Python value.
+
+Annotations may appear inline on the JIT function or in `extra_annotation`
+under the parameter name. Inline `tl.constexpr` means `Constexpr()`; an inline
+Triton dtype or `None` is shorthand for `Argument(type=...)`. The same
+shorthands work in `extra_annotation`. The two sources merge field by field:
+unspecified fields come from the other source, equal fields agree, and
+conflicting explicit fields raise at `make_launcher`. Triton's
+`do_not_specialize` and `do_not_specialize_on_alignment` are merged into the
+corresponding `NEVER` facts; a conflicting explicit fact raises.
+
+`AUTO` retains the applicable Triton specialization: integer equality to 1,
+16-byte alignment for integers and pointers, and AMD's <2 GiB pointer-storage
+range. `NEVER` omits those facts. `Assume(EqualTo(1), Aligned(16),
+PointerRange(32))` fixes selected facts; use only facts applicable to the
+parameter, and only the exact values shown. Omitted facts in `Assume` stay
+`AUTO`. The aligned and equal-to-one facts cannot both hold for one integer.
+An assumed fact is a caller promise unless `verify_annotation=True`.
+
+Ordinary scalar types include `tl.int1` (canonical key name `u1`), signed and
+unsigned 8/16/32/64-bit integers, and `tl.float32`/`tl.float64`; pointers use
+`tl.pointer_type(element_dtype)` for supported tensor element dtypes.
+Constexpr types include `tl.int1`, signed and unsigned 8/16/32/64-bit integers,
+`tl.float64`, and exact `None`. A bare constexpr preserves Triton's original
+Python value; a checked typed constexpr verifies that the value fits its chosen type.
+`tl.float32` is not a supported constexpr type. With
+`power_of_two_or_zero=True`, an integer constexpr key uses one byte: zero is
+0, positive `2**k` is `k+1`, and negative `-2**k` is `0x80 | (k+1)`.
+Verification rejects values outside that set; the unchecked mode trusts the
+promise and may alias distinct invalid inputs to one binary.
+
+`None` is exact and distinct from an omitted field: `Argument(type=None)`
+requires a dynamic `None`; `Constexpr(type=None)` has a fixed None type and no
+dynamic value key. `Argument(value=None)` and `Constexpr(value=None)` bake
+`None`, removing that parameter from the public call. A typed pointer can
+receive a null `None` or integer 0; an untyped ordinary `None` follows Triton's
+constexpr behavior. Baked scalar `int`, `float`, `bool`, or `None` values must
+have one effective type, fit it, and cannot also be bound.
+
+### Bound values and fixed devices
+
+`Argument(bind_value=BindValue.TENSOR)` binds an exact `torch.Tensor` or
+`torch.nn.Parameter` (or `None`), keeps the owner alive, and reads its current
+pointer and storage on every call. Without an explicit pointer type, the
+bound tensor fixes its effective dtype at binding; untyped `None` becomes a
+constexpr None. Explicit `type=None` accepts only a bound `None` and also compiles
+as constexpr None. `BindValue.POINTER` requires one explicit pointer type and
+accepts an integer address, `None`, a tensor, or an object with `data_ptr()`.
+Its address is captured once at binding, and object owners are retained.
+
+For tensor binding, `TorchAccess.CXX` owns an `at::Tensor` copy; `SHIM` and
+`CPYTHON` retain the Python object. Torch can preserve the Python wrapper while
+the native copy owns its `TensorImpl`. If that wrapper refers back to the bound
+handle, the resulting cycle can retain both until the tensor's back-reference
+is cleared (for example, `tensor.bound = None`).
+
+Binding annotations return a factory, not a callable launcher:
+
+```python
+factory = make_launcher(kernel, extra_annotation={
+    "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
+                  bind_value=BindValue.TENSOR),
+})
+bound = factory.bind(x=tensor)
+bound(device, stream, grid, *remaining_public_args)
+
+fixed = make_launcher(kernel, bind_device=True, extra_annotation={
+    "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
+                  bind_value=BindValue.TENSOR),
+}).bind_device(device, x=tensor)
+fixed(stream, grid, *remaining_public_args)
+```
+
+`bind()` and `bind_device()` take bound values by keyword; the latter takes one
+positional nonnegative int32 device ordinal. Baked and bound values disappear
+from the native vectorcall signature, whose remaining arguments are positional
+only. Each bound handle owns its bound objects and keeps its extension alive.
+Each fixed-device handle has its own kernel cache. With no dynamic key fields,
+it stores one nullable kernel directly: no hash or map operation occurs.
+
+With `verify_annotation=True`, intj checks declared types, ranges, and assumed
+facts before a cold or hot lookup. Bound pointer checks happen once when the
+address is captured; bound tensor checks use its current storage on each call.
+With verification off, declarations are promises, but call shape, value
+categories, null handling, and address width remain checked. A false promise
+can select the wrong cached binary. `PointerRange(32)` means the entire
+underlying storage is at most 2**31 - 1 bytes, not just a tensor view. A raw pointer
+address cannot prove that range: even checked `BindValue.POINTER` warns once
+at factory creation and trusts the range promise.
+
 ## Supported arguments
 
 | passed value | triton type | key |
 |---|---|---|
-| `torch.Tensor` / `torch.nn.Parameter` (exact type) | `*<dtype>` | `D` when the data pointer is 16B-aligned, `S` (AMD) when the storage is ≤ 2 GiB |
+| `torch.Tensor` / `torch.nn.Parameter` (exact type) | `*<dtype>` | `D` when the data pointer is 16B-aligned, `S` (AMD) when the storage is < 2 GiB |
 | `int` | `constexpr` when the value is 1, else `i32`/`i64`/`u64` | `D` when divisible by 16 |
 | `float` | `fp32` | — |
 | `bool` | `u1` | — |
@@ -83,12 +203,11 @@ hits it:
   `CudaBackend` ship; any triton backend whose driver exposes a
   `cuLaunchKernel`-shaped entry point is supported by subclassing `Backend` (dylib,
   launch symbol, error-string convention, whether it specializes pointers on a 2 GiB
-  range) and calling `register()`. **NVIDIA is untested** -- there is no NVIDIA GPU
-  on the development machine.
+  range) and calling `register()`. **CUDA is compile-checked but runtime-untested** --
+  there is no NVIDIA GPU on the development machine.
 - `@triton.autotune` / `@triton.heuristics` wrappers, and `TRITON_INTERPRET=1`.
-- Callable grids (`dynamic_grid`), per-launch options (`dynamic_options`), and
-  argument annotations (`extra_annotation`).
-- Non-constexpr parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
+- Callable grids (`dynamic_grid`) and per-launch options (`dynamic_options`).
+- Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
 - Tuple, `tl.constexpr` object, `TensorDescriptor`, JIT-function and string arguments.
 - Tensor subclasses other than `torch.nn.Parameter` — the fast path gates on exact
   type, because a subclass can redefine what `data_ptr()` means.
@@ -201,14 +320,17 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 ## How a launch works
 
 1. Parse `device`, `stream` and `grid`; return early on a zero-volume grid.
-2. Decode every argument into one spec-key *byte* and at most one param slot,
-   accumulating the key's header in 32-bit registers. How the tensor fields are read
-   is `torch_access`'s choice; no mode calls an `aoti_torch_*` shim.
-3. Hash the key and look it up in the module's open-addressed kernel cache.
-4. On a miss, call back into python: `JITFunction.warmup` compiles, `_init_handles`
-   loads the module, and the entry records the function handle, block dim and LDS
-   size. The callback also asserts that intj's key agrees with triton's
-   specialization for these arguments.
+2. Decode each public or bound argument, checking annotations if requested, and
+   pack the dynamic key fields. How tensor fields are read is `torch_access`'s
+   choice; no mode calls an `aoti_torch_*` shim.
+3. Hash and look up the key in the module cache, or in the bound handle's cache
+   when the device is fixed. A fixed-device handle with no dynamic key fields
+   reads its one nullable kernel directly, without hashing or a map.
+4. On a miss, call back into Python: build the annotated `CompilerInput`, compare
+   it with any input previously recorded for that key, and pass its
+   `triton.compiler.ASTSource` and canonical options to `triton.compiler.compile`.
+   `_init_handles` loads the GPU module; the entry records the function handle,
+   block dim and LDS size.
 5. Pack the param array (plus the two mandatory trailing scratch slots) and call
    `hipModuleLaunchKernel` / `cuLaunchKernel` (identical argument lists).
 
@@ -217,31 +339,47 @@ loaded for the lifetime of the process.
 
 ## Correctness
 
-The spec key is a flat byte array:
-
-```
-bytes 0 .. nparams-1    one code byte per declared parameter, in declaration order
-byte nparams            the device ordinal, hence its [0, 256) bound
-pad to a word boundary, zeroed
-then                    one 64-bit value word per tl.constexpr parameter
-```
-
-A parameter's byte is `(dtype << 2) | divisibility << 1 | pointer_range` for a
-pointer, which leaves `128..142` for the scalar and constexpr tags. `dtype` is a
-5-bit index over triton's *element types*, not torch's `ScalarType` codes: `bool`,
-`uint1` and `int1` all canonicalize to `u1`, so they share an index, and the key
-ends up exactly as fine as triton's specialization. The table is built from the
-running torch and triton and installed at load, never compiled in.
+The spec key packs only dynamic fields: type and applicable specialization
+descriptors, constexpr payloads, and the device ordinal unless it is fixed.
+Fields are laid out by descending alignment (8-, 4-, 2-, then 1-byte widths),
+with stable declaration order among equal widths, and padded to a zeroed
+64-bit word boundary. Baked values, bound values, and fixed facts contribute
+no runtime field. The dtype index for pointers comes from the running torch
+and Triton; `tl.int1` canonicalizes to `u1`. A fixed-device handle with no
+fields has an empty key and uses its nullable-kernel path.
 
 The invariant intj must not break is:
 
-> if two argument tuples produce the same intj key, triton produces the same
-> specialization for them
+> if two argument tuples produce the same intj key, their annotated compiler
+> inputs have the same signature, constexpr values, and specialization attributes
 
 A coarser key does not crash — it launches, say, a `tt.divisibility = 16` binary on an
 unaligned pointer. `tests/test_launcher.py::test_spec_key_is_never_coarser_than_triton`
 checks it directly through the module's `spec_key(*args)` debug entry point, and every
-cache miss re-checks it against triton's own binder.
+GPU cache miss builds a `CompilerInput` containing the final annotated
+`ASTSource` signature, tagged constexpr values, and attributes. The callback
+compares it with any input previously recorded for the same key and rejects a
+mismatch. Compilation uses that source directly without the JIT function's
+warmup, binder, or device cache.
+
+## Launch benchmark
+
+```bash
+PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py --no-gpu --iters 20000 --batches 7
+PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py --iters 20000 --batches 7
+```
+
+The first command uses CPU tensors and intj's existing host compile callback;
+it measures decoding, key/cache work, and vectorcall overhead only. It does
+not query a GPU target or driver, compile a GPU kernel, or launch one. The
+second uses GPU tensors and includes driver launch overhead. Each row warms
+its launcher, then reports the median nanoseconds per call across repeated
+batches, absolute and percentage deltas against the same kernel's `auto map`
+baseline, and separate factory construction and binding times in milliseconds.
+The matrix covers reduced keys, checked and unchecked facts, baked values,
+bound tensor and pointer handles, fixed-device map, and fixed-device no-map.
+These are measurements, not pytest performance limits. CUDA remains
+compile-checked but runtime-untested on the development machine.
 
 ## Cache
 
