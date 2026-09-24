@@ -101,6 +101,17 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
       if (intj_grid_dim(g, &gx) != 0)
         return NULL;
     } else if (PyTuple_CheckExact(g) || PyList_CheckExact(g)) {
+{% if free_threaded %}
+      /* Own a coherent snapshot: another thread can resize a list or replace
+       * its elements while the dimensions are being parsed. */
+      PyObject *snapshot = NULL;
+      if (PyList_CheckExact(g)) {
+        snapshot = PyList_AsTuple(g);
+        if (!snapshot)
+          return NULL;
+        g = snapshot;
+      }
+{% endif %}
       PyObject **items;
       Py_ssize_t n;
       if (PyTuple_CheckExact(g)) {
@@ -111,14 +122,21 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
         items = &PyList_GET_ITEM(g, 0);
       }
       if (n < 1 || n > 3) {
+{% if free_threaded %}        Py_XDECREF(snapshot);
+{% endif %}
         PyErr_SetString(PyExc_ValueError,
                         "intj: grid must have between 1 and 3 dimensions");
         return NULL;
       }
       uint32_t *dims[3] = {&gx, &gy, &gz};
       for (Py_ssize_t i = 0; i < n; i++)
-        if (intj_grid_dim(items[i], dims[i]) != 0)
+        if (intj_grid_dim(items[i], dims[i]) != 0) {
+{% if free_threaded %}          Py_XDECREF(snapshot);
+{% endif %}
           return NULL;
+        }
+{% if free_threaded %}      Py_XDECREF(snapshot);
+{% endif %}
     } else {
       PyErr_SetString(PyExc_TypeError,
                       "intj: grid must be an int, tuple or list of ints");

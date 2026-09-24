@@ -263,10 +263,11 @@ def test_gil_stays_off_on_a_free_threaded_build(built):
     assert not sys._is_gil_enabled()  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def test_arguments_reach_the_launch(built):
+@pytest.mark.parametrize("grid", [(2, 3), [2, 3]])
+def test_arguments_reach_the_launch(built, grid):
     module, stub, compiles = built
     x = torch.arange(8, dtype=torch.float32)
-    module.entry(0, 77, (2, 3), x, 5, -7, 1.5, True, 64)
+    module.entry(0, 77, grid, x, 5, -7, 1.5, True, 64)
     grid, block, stream, params = stub.last(5)
     assert (grid, block, stream) == ((2, 3, 1), 128, 77)
     assert params == [x.data_ptr(), 5, 2**64 - 7, _f32(1.5), 1]
@@ -324,11 +325,56 @@ def test_bad_arguments(built):
         module.entry(0, 0, 1, x, "5", 0, 0.0, False, 64)
     with pytest.raises(TypeError, match="device"):
         module.entry(256, 0, 1, x, 5, 0, 0.0, False, 64)
-    with pytest.raises(ValueError, match="grid"):
-        module.entry(0, 0, (1, 1, 1, 1), x, 5, 0, 0.0, False, 64)
+    for grid in ((1, 1, 1, 1), [], [1, 1, 1, 1], [-1], [2**32], [None]):
+        with pytest.raises(ValueError, match="grid"):
+            module.entry(0, 0, grid, x, 5, 0, 0.0, False, 64)
     calls = stub.calls()
     assert module.entry(0, 0, (4, 0), x, 5, 0, 0.0, False, 64) is None
     assert stub.calls() == calls  # an empty grid launches nothing
+
+
+@pytest.mark.skipif(not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="requires free threading")
+def test_list_grid_survives_concurrent_resize(built):
+    """A list resize must not invalidate the grid parser's borrowed item array."""
+    module, _, _ = built
+    layout = layout_for() if module.__name__ == "rt_runtime_shim" else None
+    # Isolate a potential native crash from the rest of the suite.
+    code = f"""
+import importlib.util
+import sys
+import threading
+import torch
+spec = importlib.util.spec_from_file_location({module.__name__!r}, {module.__file__!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.set_torch_version({torch_version()!r}, {layout.as_args() if layout else None!r},
+                         {bytes(c if c < 32 else 0xFF for c in range(NDTYPES))!r})
+assert not sys._is_gil_enabled()
+grid = [0, 1000, 1000]
+stop = threading.Event()
+started = threading.Event()
+def resize():
+    started.set()
+    while not stop.is_set():
+        grid[:] = []
+        grid[:] = [0, 1000, 1000]
+thread = threading.Thread(target=resize)
+thread.start()
+started.wait()
+try:
+    for _ in range(200_000):
+        try:
+            # Every valid snapshot has zero volume, so no kernel is needed.
+            assert module.entry(0, 0, grid, None, 5, 0, 0.0, False, 64) is None
+        except ValueError as error:
+            assert "between 1 and 3 dimensions" in str(error)
+finally:
+    stop.set()
+    thread.join()
+"""
+    result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", code],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
 
 
 def test_launch_failure_is_reported(built):
