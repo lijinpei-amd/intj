@@ -6,6 +6,7 @@ Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 
 import ctypes
 import dataclasses
+import dis
 import gc
 import inspect
 import json
@@ -143,6 +144,11 @@ def _kernel_from_source(tmp_path, name, signature):
     return getattr(module, name)
 
 
+def _launcher_module(launcher):
+    owner = launcher.__self__
+    return owner if isinstance(owner, types.ModuleType) else owner.__self__
+
+
 @pytest.fixture
 def scalar_kernel(tmp_path):
     return _kernel_from_source(tmp_path, "scalar_kernel", "x")
@@ -188,7 +194,7 @@ def test_bind_device_requires_one_positional_ordinal(device_kernel):
     with pytest.raises(TypeError, match="keyword"):
         launch(0, 1, x=7)
     with pytest.raises(TypeError, match="bound launcher"):
-        launch.__self__.entry(0, 1, 7)
+        launch.__self__.__self__.entry(0, 1, 7)
 
 
 def test_bind_device_validates_exact_nonnegative_int32(device_kernel):
@@ -202,7 +208,7 @@ def test_bind_device_validates_exact_nonnegative_int32(device_kernel):
         with pytest.raises(TypeError, match="device.*int"):
             factory.bind_device(value)
         with pytest.raises(TypeError, match="device.*int"):
-            launch.__self__.make_bound(inspect.signature(launch), value)
+            launch.__self__.__self__.make_bound(value)
 
 
 def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(device_kernel, monkeypatch):
@@ -218,8 +224,8 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(device_kern
                             extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
                             torch_access=TorchAccess.CPYTHON)
     handles = [factory.bind_device(ordinal) for ordinal in (0, 255, 256, 2**31 - 1)]
-    module = handles[0].__self__
-    assert all(handle.__self__ is module for handle in handles)
+    module = handles[0].__self__.__self__
+    assert all(handle.__self__.__self__ is module for handle in handles)
     context = next(key.context for key, loaded in _LOADED.items() if loaded is module)
     assert context.device_binding is DeviceBinding.FIXED
     assert context.device_offset is None and context.nwords == 0
@@ -253,14 +259,14 @@ def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
 
 
 def test_bind_device_signature_avoids_public_control_names(tmp_path):
-    names = ("device", "stream", "stream_", "grid", "grid_")
+    names = ("self", "device", "stream", "stream_", "grid", "grid_")
     kernel = _kernel_from_source(tmp_path, "fixed_control_names", ", ".join(names))
     launch = make_launcher(kernel, bind_device=True, no_gpu=True,
                            torch_access=TorchAccess.CPYTHON).bind_device(0)
     signature = inspect.signature(launch)
     assert tuple(signature.parameters) == ("stream__", "grid__", *names)
     assert all(p.kind is inspect.Parameter.POSITIONAL_ONLY for p in signature.parameters.values())
-    assert launch(0, 1, 4, 5, 6, 7, 8) is None
+    assert launch(0, 1, 4, 5, 6, 7, 8, 9) is None
 
 
 def test_fixed_device_handles_own_independent_caches(device_kernel):
@@ -273,7 +279,7 @@ def test_fixed_device_handles_own_independent_caches(device_kernel):
         calls.append((bytes(key), device))
         return 0, 1, 0, nparams
 
-    first.__self__.set_compile_callback(compile_once_per_handle)
+    first.__self__.__self__.set_compile_callback(compile_once_per_handle)
     first(0, 1, 7)
     first(0, 1, 7)
     second(0, 1, 7)
@@ -292,12 +298,12 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
         calls.append((bytes(key), nparams, device, value))
         return 0, 1, 0, nparams
 
-    first.__self__.set_compile_callback(compile_each_constant)
+    first.__self__.__self__.set_compile_callback(compile_each_constant)
     for handle, value in ((first, 7), (first, 9), (first, 7), (second, 7), (second, 7)):
         handle(0, 1, value)
     assert calls == [(struct.pack("<Q", value), 0, 0, value) for value in (7, 9, 7)], \
         "each fixed-device handle must own its specialization map"
-    source = pathlib.Path(first.__self__.__file__).with_name("device_kernel.c").read_text()
+    source = pathlib.Path(first.__self__.__self__.__file__).with_name("device_kernel.c").read_text()
     assert "intj_cache_init(&bound->cache)" in source
     assert "intj_cache_init(&st->cache)" not in source
 
@@ -317,7 +323,7 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(device_kernel, 
         calls.append((bytes(key), nparams, device, value))
         return 0, 1, 0, nparams
 
-    launch.__self__.set_compile_callback(compile_once)
+    launch.__self__.__self__.set_compile_callback(compile_once)
     launch(0, 1, 7)
     launch(0, 1, 9)
     assert calls == [(b"", 1, 0, 7)]
@@ -325,7 +331,7 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(device_kernel, 
     other(0, 1, 9)
     assert calls == [(b"", 1, 0, 7), (b"", 1, 0, 9)], \
         "each no-map handle must own its fixed kernel"
-    source_path = pathlib.Path(launch.__self__.__file__)
+    source_path = pathlib.Path(launch.__self__.__self__.__file__)
     cpp_path = source_path.with_name("device_kernel.cpp")
     source = (cpp_path if cpp_path.exists() else source_path.with_name("device_kernel.c")).read_text()
     call_body = source[source.index("static PyObject *intj_call"):source.index("static PyObject *entry")]
@@ -354,7 +360,7 @@ def test_bind_device_retry_and_reentrant_miss(device_kernel, has_key):
             launch(0, 1, value)
         return 0, 1, 0, nparams
 
-    launch.__self__.set_compile_callback(compile_reentrant)
+    launch.__self__.__self__.set_compile_callback(compile_reentrant)
     assert launch(0, 0, 7) is None
     assert calls == []
     with pytest.raises(ValueError, match="compile failed"):
@@ -377,7 +383,7 @@ def test_bind_device_keeps_dynamic_bound_handles_on_module_cache(pointer_kernel)
         calls.append((bytes(key), device))
         return 0, 1, 0, nparams
 
-    first.__self__.set_compile_callback(compile_for_device)
+    first.__self__.__self__.set_compile_callback(compile_for_device)
     first(0, 0, 1)
     second(0, 0, 1)
     second(1, 0, 1)
@@ -396,7 +402,7 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
     }, torch_access=mode)
     owner = _BoundPointer(4096)
     bound = factory.bind_device(0, x=owner, p=0)
-    module = bound.__self__
+    module = bound.__self__.__self__
     owner_refs = sys.getrefcount(owner)
     for _ in range(3):
         with pytest.raises(OverflowError, match="p"):
@@ -515,7 +521,7 @@ def test_bind_requires_every_bound_name_once(bound_kernel):
         factory.bind(x=torch.ones(4), p=0, other=1)
 
 
-def test_bound_launcher_is_vectorcall_and_hides_bound_parameters(bound_kernel):
+def test_bound_launcher_is_fastcall_and_hides_bound_parameters(bound_kernel):
     factory = make_launcher(
         bound_kernel,
         extra_annotation={
@@ -538,6 +544,27 @@ def test_bound_launcher_is_vectorcall_and_hides_bound_parameters(bound_kernel):
     )
     assert type(launch).__flags__ & (1 << 11)  # Py_TPFLAGS_HAVE_VECTORCALL
     assert launch(0, 0, 1, 4) is None
+
+
+@pytest.mark.parametrize("bind_device", [False, True], ids=["bind", "bind_device"])
+def test_bound_launchers_are_fastcall_builtins(bound_kernel, bind_device):
+    factory = make_launcher(bound_kernel, extra_annotation={
+        name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
+                       bind_value=BindValue.POINTER) for name in ("x", "p")
+    }, no_gpu=True, bind_device=bind_device, torch_access=TorchAccess.CPYTHON)
+    launch = factory.bind_device(0, x=0, p=0) if bind_device else factory.bind(x=0, p=0)
+    assert isinstance(launch, types.BuiltinFunctionType)
+    flags = ctypes.pythonapi.PyCFunction_GetFlags
+    flags.argtypes = [ctypes.py_object]
+    flags.restype = ctypes.c_int
+    assert flags(launch) == 0x80  # METH_FASTCALL without METH_KEYWORDS.
+    call = (lambda: launch(0, 1, 7)) if bind_device else (lambda: launch(0, 0, 1, 7))
+    for _ in range(100):
+        assert call() is None
+    if sys.version_info[:2] == (3, 12):
+        assert "CALL_NO_KW_BUILTIN_FAST" in {
+            instruction.opname for instruction in dis.get_instructions(call, adaptive=True)
+        }
 
 
 def test_bind_validates_names_before_loading(bound_kernel, monkeypatch):
@@ -584,6 +611,7 @@ def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path
 
 
 @pytest.mark.parametrize("public_names,control_names", [
+    (("self",), ("device", "stream", "grid")),
     (("device",), ("device_", "stream", "grid")),
     (("stream",), ("device", "stream_", "grid")),
     (("grid",), ("device", "stream", "grid_")),
@@ -615,10 +643,11 @@ def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mo
     second = factory.bind(x=torch.empty(16))
     wide = factory.bind(x=torch.empty(4, dtype=torch.float64))
     assert first is not second
-    assert first.__self__ is second.__self__
-    assert first.__self__ is not wide.__self__
+    assert first.__self__ is not second.__self__
+    assert first.__self__.__self__ is second.__self__.__self__
+    assert first.__self__.__self__ is not wide.__self__.__self__
     for bound, ty in ((first, "*fp32"), (wide, "*fp64")):
-        key = next(key for key, module in _LOADED.items() if module is bound.__self__)
+        key = next(key for key, module in _LOADED.items() if module is bound.__self__.__self__)
         assert key.context.params[0].annotation.types == (ty,)
         assert key.context.params[0].annotation.bind_value == "tensor"
         assert key.context.params[0].annotation.key_fields == ()
@@ -643,7 +672,7 @@ def test_bind_none_materializes_triton_constexpr(pointer_kernel, annotation, bin
        bind_device=bind_device)
     bind = (lambda **values: factory.bind_device(0, **values)) if bind_device else factory.bind
     bound = bind(x=None)
-    key = next(key for key, module in _LOADED.items() if module is bound.__self__)
+    key = next(key for key, module in _LOADED.items() if module is bound.__self__.__self__)
     assert key.context.params[0].annotation.types == (None,)
     source = _compiler_input(pointer_kernel, key.context.params, (), make_backend(_current_target()))
     assert source.signature == (("x", "constexpr"),)
@@ -750,7 +779,7 @@ def test_bind_tensor_rechecks_storage_after_set(pointer_kernel, mode, no_gpu, bi
         def record(key, slots, device, *args):
             calls.append(key)
             return 0, 1, 0, slots
-        bound.__self__.set_compile_callback(record)
+        bound.__self__.__self__.set_compile_callback(record)
     controls = (0, 1) if bind_device else (0, 0, 1)
     assert bound(*controls) is None
     tensor.set_(torch.empty(8, device=device).untyped_storage(), 1, (7,), (1,))
@@ -858,7 +887,7 @@ def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mo
             bound = (factory.bind(x=None, p=0) if cache_owner == "module"
                      else factory.bind_device(0, x=None, p=0))
         suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
-        source = pathlib.Path(bound.__self__.__file__).with_name(f"bound_kernel{suffix}").read_text()
+        source = pathlib.Path(bound.__self__.__self__.__file__).with_name(f"bound_kernel{suffix}").read_text()
         pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
         bind = source[source.index("static PyObject *make_bound"):source.index("/* Debug/test entry")]
         call = source[source.index("static PyObject *intj_call"):source.index("static PyObject *entry")]
@@ -899,7 +928,7 @@ def test_checked_failures_precede_cold_and_hot_lookup(
     def record(key, slots, device, value):
         calls.append(key)
         return 0, 1, 0, slots
-    bound.__self__.set_compile_callback(record)
+    _launcher_module(bound).set_compile_callback(record)
     controls = (0, 1) if bind_device else (0, 0, 1)
     good = 16 if constraint == "aligned_16" else 1
     for warm in (False, True):
@@ -939,7 +968,7 @@ def test_bind_gpu_storage_and_owner_lifetime(mode, binding):
     bound = factory.bind(x=tensor)
     owns_native_tensor = mode is TorchAccess.CXX and binding is BindValue.TENSOR
     assert getattr(tensor, "_use_count")() == native_references + int(owns_native_tensor)
-    assert any(obj is tensor for obj in gc.get_referents(bound)) != owns_native_tensor
+    assert any(obj is tensor for obj in gc.get_referents(bound.__self__)) != owns_native_tensor
     launch(bound, (1,), out, 16, 2.0, 16)
     torch.testing.assert_close(out, original * 2)
     tensor.set_(torch.full_like(original, 7).untyped_storage(), 0, (16,), (1,))
@@ -1043,14 +1072,15 @@ def test_bind_retains_extension_and_collects_owner_cycles(pointer_kernel, mode, 
     owner = torch.empty(4) if binding is BindValue.TENSOR else _BoundPointer(4096)
     bound = factory.bind(x=owner)
     other = factory.bind(x=torch.empty(4) if binding is BindValue.TENSOR else 8192)
-    assert bound is not other and bound.__self__ is other.__self__
-    module = bound.__self__
+    assert bound is not other and bound.__self__ is not other.__self__
+    assert bound.__self__.__self__ is other.__self__.__self__
+    module = bound.__self__.__self__
     module_ref, owner_ref = weakref.ref(module), weakref.ref(owner)
     key = next(key for key, loaded in _LOADED.items() if loaded is module)
     _LOADED.pop(key)
     del factory, module, other
     gc.collect()
-    assert module_ref() is bound.__self__
+    assert module_ref() is bound.__self__.__self__
     assert bound(0, 0, 1) is None
     setattr(owner, "bound", bound)
     del owner, bound
@@ -1070,18 +1100,18 @@ def test_bind_native_failure_releases_partial_owners(bound_kernel, mode):
     references, native_references = sys.getrefcount(tensor), getattr(tensor, "_use_count")()
     for _ in range(3):
         with pytest.raises(OverflowError, match="p"):
-            bound.__self__.make_bound(inspect.signature(bound), tensor, 2**64)
+            bound.__self__.__self__.make_bound(tensor, 2**64)
     assert sys.getrefcount(tensor) == references
     assert getattr(tensor, "_use_count")() == native_references
     with pytest.raises(TypeError, match="arguments"):
-        bound.__self__.make_bound(inspect.signature(bound), tensor)
+        bound.__self__.__self__.make_bound(tensor)
     with pytest.raises(TypeError, match="bound"):
-        bound.__self__.entry(0, 0, 1, 4)
+        bound.__self__.__self__.entry(0, 0, 1, 4)
     with pytest.raises(TypeError, match="bound"):
-        bound.__self__.spec_key(4)
+        bound.__self__.__self__.spec_key(4)
 
 
-def test_bind_hot_vectorcall_creates_no_python_frame(pointer_kernel):
+def test_bind_hot_fastcall_creates_no_python_frame(pointer_kernel):
     bound = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
     }, no_gpu=True, torch_access=TorchAccess.CPYTHON).bind(x=4096)
@@ -2015,7 +2045,7 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device):
     A coarser key is the failure mode that does not crash -- it launches, say, a
     tt.divisibility=16 binary on an unaligned pointer.
     """
-    module = (make_launcher(axpy, bind_device=True).bind_device(torch.cuda.current_device()).__self__
+    module = (make_launcher(axpy, bind_device=True).bind_device(torch.cuda.current_device()).__self__.__self__
               if bind_device else axpy_launcher.__self__)
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input, _current_target, _render_params
@@ -2256,7 +2286,7 @@ def _recording_input_launcher(kernel, annotation, *, no_gpu, bind_device, monkey
                             bind_device=bind_device, verify_annotation=True,
                             torch_access=TorchAccess.CPYTHON)
     native = factory.bind_device(0, **bound_values) if bind_device else factory
-    module = native.__self__
+    module = _launcher_module(native)
     # Use the placed, resolved annotations, including the inferred bound dtype.
     from intj.launcher import _LOADED
     params = next(key.context.params for key, value in _LOADED.items() if value is module)
@@ -2302,7 +2332,7 @@ def test_runtime_compiler_input_invariant(
     for group_index, group in enumerate(groups):
         for value in group:
             source = compiler_input(value)
-            blob, slots = native.__self__.spec_key(value)
+            blob, slots = _launcher_module(native).spec_key(value)
             assert slots == sum(ty != "constexpr" for _, ty in source.signature)
             assert native(*controls, value) is None
             assert saved.setdefault(blob, source) == source, "cached key has different CompilerInput"

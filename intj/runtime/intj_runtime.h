@@ -848,9 +848,7 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
 
 typedef struct intj_bound_launcher {
   PyObject_HEAD
-  vectorcallfunc vectorcall;
   PyObject *module;
-  PyObject *signature;
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
   intj_cache cache;

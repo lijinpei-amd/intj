@@ -163,8 +163,14 @@ fixed(stream, grid, *remaining_public_args)
 
 `bind()` and `bind_device()` take bound values by keyword; the latter takes one
 positional nonnegative int32 device ordinal. Baked and bound values disappear
-from the native vectorcall signature, whose remaining arguments are positional
-only. Each bound handle owns its bound objects and keeps its extension alive.
+from the native callable's signature, whose remaining arguments are positional
+only. Both methods return a `METH_FASTCALL` builtin, allowing CPython to specialize
+explicit positional calls. `inspect.signature(handle)` reads its generated
+`__text_signature__`. Each handle keeps its bound objects and extension alive
+through its private state at `handle.__self__`; the extension module is
+`handle.__self__.__self__` (an unbound launcher's module is `launcher.__self__`).
+Kernel calls support Unicode parameter names, but CPython 3.12's builtin signature
+parser limits `inspect.signature(handle)` to ASCII parameter names.
 Each fixed-device handle has its own kernel cache. With no dynamic key fields,
 it stores one nullable kernel directly: no hash or map operation occurs.
 

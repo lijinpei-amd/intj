@@ -217,19 +217,7 @@ class LauncherFactory:
             self.kernel_cache, self.no_gpu, self.verify_annotation,
             DeviceBinding.FIXED if self.bind_device_requested else DeviceBinding.NOT_FIXED,
         )
-        public_names = tuple(
-            p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
-        )
-        control_names: list[str] = []
-        for name in (("stream", "grid") if self.bind_device_requested else ("device", "stream", "grid")):
-            while name in public_names:
-                name += "_"
-            control_names.append(name)
-        signature = inspect.Signature(tuple(
-            inspect.Parameter(name, inspect.Parameter.POSITIONAL_ONLY)
-            for name in (*control_names, *public_names)
-        ))
-        return module.make_bound(signature, *((device,) if self.bind_device_requested else ()),
+        return module.make_bound(*((device,) if self.bind_device_requested else ()),
                                  *(values[p.name] for p in resolved if p.name in names))
 
 
