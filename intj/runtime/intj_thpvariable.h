@@ -5,9 +5,9 @@
  * pybind11 -- 79% of the resulting .text, none of it reachable, and 9.5 s of
  * the 11 s build.
  *
- * Nothing checks this declaration at load.  intj/torch_intf/cpp_detect.py
- * compiles it beside torch's own and refuses a torch where the two disagree, so
- * it is verified for every torch the ABI table covers.
+ * The module checks the cdata offset at load when a verified runtime layout is
+ * available. intj/torch_intf/cpp_detect.py also compiles this declaration beside
+ * torch's own for every torch in the ABI table.
  */
 #pragma once
 

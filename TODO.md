@@ -48,6 +48,17 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Performance
 
+- **ROCm zero-user-argument launches.** Triton still declares two implicit
+  scratch-pointer arguments (16-byte kernarg segment) when neither scratch
+  buffer is needed. On gfx942, `hipModuleLaunchKernel` took ~1.55 us with no
+  ABI arguments versus ~3.03 us with one or two; TVM FFI launching the same
+  Triton kernel took ~3.01 us versus INTJ's ~2.77 us. Investigate whether
+  Triton can omit unused scratch arguments or HIP can launch argument-bearing
+  kernels faster; packed `extra` arguments did not help in this case.
+- Benchmark `hipModuleLaunchKernel` with `extra` parameter-buffer passing against
+  the current `kernelParams` pointer array; use it if faster.
+- Benchmark CUDA driver `cuLaunchKernel` with `extra` parameter-buffer passing
+  against the current `kernelParams` pointer array; use it if faster.
 - Benchmark sweep promised in the README: dynamic vs constexpr argument counts and
   tensor counts.
 - **Measure compact-int decoding.** Compare the existing inline CPython helpers

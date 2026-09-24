@@ -26,7 +26,8 @@ import pytest
 import torch
 
 from intj import launcher
-from intj.launcher import Param, RenderContext
+from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
+from intj.launcher import RenderContext
 from intj.python_intf import cpython_abi
 from intj.torch_intf.torch_abi import NDTYPES, TorchAccessMode, layout_for, torch_version
 
@@ -56,13 +57,19 @@ const char *stub_error(int32_t status) { return "stub failure"; }
 """
 
 #: x: tensor, n: int, m: do_not_specialize int, f: float, flag: bool, BLOCK: constexpr
-_PARAMS = (
-    Param("x", False, 1, 1, None),
-    Param("n", False, 1, 1, None),
-    Param("m", False, 0, 0, None),
-    Param("f", False, 1, 1, None),
-    Param("flag", False, 1, 1, None),
-    Param("BLOCK", True, 1, 1, 1),
+_AUTO = CanonicalAnnotation("argument", None, "auto", "auto", "auto", (), False, None, ())
+_NEVER = dataclasses.replace(_AUTO, equal_to_one="never", aligned_16="never")
+_CONSTEXPR = dataclasses.replace(_AUTO, kind="constexpr")
+_PARAMS, _DEVICE_OFFSET, _NWORDS = launcher._render_params(
+    (
+        ResolvedParam("x", 0, _AUTO),
+        ResolvedParam("n", 1, _AUTO),
+        ResolvedParam("m", 2, _NEVER),
+        ResolvedParam("f", 3, _AUTO),
+        ResolvedParam("flag", 4, _AUTO),
+        ResolvedParam("BLOCK", 5, _CONSTEXPR),
+    ),
+    DeviceBinding.NOT_FIXED,
 )
 
 _MODES = [TorchAccessMode.INTERPRETER] + ([TorchAccessMode.RUNTIME_SHIM] if layout_for() else [])
@@ -102,8 +109,10 @@ def built(request, stub, tmp_path_factory):
     mode = request.param
     context = RenderContext(
         module_name=f"rt_{mode.value}", kernel_repr="test_runtime.kernel", params=_PARAMS,
-        nwords=2, header_words=1, max_slots=5, spec_pointer_range=1, driver_path=lib_path,
-        launch_symbol="stub_launch", error_symbol="stub_error", error_style="return",
+        nwords=_NWORDS, device_binding=DeviceBinding.NOT_FIXED, device_offset=_DEVICE_OFFSET,
+        verify_annotation=False, no_gpu=False,
+        max_slots=5, spec_pointer_range=1, driver_path=lib_path,
+        launch_symbol="stub_launch", device_symbol="", error_symbol="stub_error", error_style="return",
         torch_access_mode=mode.value, kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
         torch_version=None, cxx_abi=None,
         python_version=cpython_abi.python_version(),

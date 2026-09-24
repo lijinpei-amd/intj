@@ -83,17 +83,21 @@ Perhaps some of the feature may not contribute much to the overhead, but, I don'
 
 ## Benchmark results
 
-`python benchmarks/bench_launch.py`, 5-argument kernel, MI300X (gfx942), triton 3.8.0,
-torch 2.14+rocm7.2, 20k iterations:
+`taskset -c 0 python benchmarks/bench_launch.py --readme --iters 20000 --batches 7`,
+5-argument kernel, MI308X (gfx942), triton 3.8.0, torch 2.14+rocm7.2. The
+numbers below are the median of five fresh-cache runs; each run reports the
+median of seven 20k-call batches. Each process used a separate empty
+`TRITON_HOME` for the cold-build column.
 
 | | triton `JitFunction` | INTJ |
 |---|---|---|
-| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.4 us) | 18.7 us | 3.8 us |
-| `grid=(0,)`, i.e. no driver call | 14.0 us | 0.15 us |
-| argument decoding + spec key only | — | 0.11 us |
+| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.0 us) | 17.42 us | 3.20 us |
+| `grid=(0,)`, i.e. no driver call | 13.47 us | 0.15 us |
+| argument decoding + spec key only | — | 0.12 us |
 
 Argument decoding depends on how the module reads a tensor (`torch_access_mode`), for a
-kernel with three tensor arguments:
+kernel with three tensor arguments. These access-mode measurements came from a
+separate 20k-iteration MI300X run:
 
 | `TorchAccessMode` | decode + spec key | first build |
 |---|---|---|
@@ -114,7 +118,11 @@ each other; `STATIC_COMPILE` has the compiler supply the field offsets that
 that and is the only mode whose `.so` must be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
-which is the third row's 0.15 us. Host overhead is therefore ~0.3 us against
+which is the third row's 0.12 us. Host overhead is therefore ~0.3 us against
 ~14 us.
 
-TODO: sweep the number of dynamic/constexpr arguments and the number of tensors.
+Run `python benchmarks/bench_launch.py --sweep --iters 100000 --batches 9` for
+host-only timings with 4, 16, and 32 integer or tensor arguments. See the
+[2026-09-24 optimization measurements](docs/benchmark-2026-09-24.md) for before/after results.
+
+TODO: sweep constexpr argument counts independently.
