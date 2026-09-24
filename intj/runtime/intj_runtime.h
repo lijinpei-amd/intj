@@ -534,7 +534,7 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
   }
   c10::StorageImpl *si = storage.unsafeGetStorageImpl();
 
-  const caffe2::TypeMeta meta = ti->*get(ti_data_type());
+  caffe2::TypeMeta meta = ti->*get(ti_data_type());
   if (INTJ_UNLIKELY(!meta.isScalarType())) { /* also stops toScalarType() throwing */
     PyErr_SetString(PyExc_RuntimeError, "intj: tensor has no scalar dtype");
     return -1;
