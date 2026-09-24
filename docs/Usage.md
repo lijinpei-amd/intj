@@ -19,6 +19,7 @@ launcher = make_launcher(
     grid_arg=None,         # keyword-only: 1, 2, or 3 separate grid dimensions
     grid_cpp=None,         # keyword-only: annotated def compiled into the extension
     grid_py=None,          # keyword-only: Python callback evaluated on each launch
+    return_compiled=False, # keyword-only: return the cached Triton CompiledKernel
 )
 ```
 
@@ -73,7 +74,11 @@ Choose at most one grid option in `make_launcher`:
 
 All launch arguments are positional. With `bind_device=True`, omit `device` from
 each call. Grid dimensions must be exact ints in `[0, 2**32)`; omitted dimensions
-are 1. The launcher returns `None`, and a zero-volume grid skips the launch.
+are 1. By default the launcher returns `None`, and a zero-volume grid skips the
+launch. With `return_compiled=True`, it returns the cached Triton
+`CompiledKernel`; a zero-volume grid still compiles or finds that kernel, but
+does not dispatch it. Repeated calls for the same specialization return the
+same object. This mode requires GPU compilation and rejects `no_gpu=True`.
 
 ### Compiled grid: `grid_cpp`
 
@@ -136,7 +141,7 @@ not read the current device or stream for you — that is where the launch overh
 
 ## Triton-style migration bridge
 
-`intj.compat.launch(kernel, grid, /, *args, **kwargs)` accepts a direct
+`intj.compat.launch(kernel, grid, /, *args, return_compiled=False, **kwargs)` accepts a direct
 `@triton.jit` function, positional or named kernel arguments, defaults, and
 compile options. Its grid can be an int, a tuple/list, or a callable receiving
 the bound kernel values as a `meta` dict:
@@ -151,6 +156,11 @@ launch(kernel, (triton.cdiv(n, BLOCK),), out, n=n, BLOCK=BLOCK,
 The bridge binds Python arguments and reads the current device and stream on
 every call. Construct a `make_launcher` handle once for hot loops. Unsupported
 kernels and options still raise instead of falling back to Triton.
+Pass `return_compiled=True` when the caller needs the cached Triton
+`CompiledKernel`. `intj.compat.launch_or_interpret` accepts the same flag and
+uses Triton's original launcher in interpreter mode.
+When Triton's compile-warmup test mode is active, the bridge uses its indexed
+launcher so the test runtime can compile fake-pointer inputs without GPU dispatch.
 The bridge also raises `UnsupportedKernel` while Triton launch enter or exit
 hooks are registered, including profiler hooks. It checks on every call, even
 when reusing a cached launcher.

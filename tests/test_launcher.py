@@ -423,8 +423,10 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
 
 
 @pytest.mark.parametrize("backend_name", ["hip", "cuda"])
-@pytest.mark.parametrize("no_gpu", [True, False])
-def test_bind_device_cuda_template_backend_branches_compile(tmp_path, device_kernel, backend_name, no_gpu):
+@pytest.mark.parametrize("no_gpu,return_compiled", [(True, False), (False, False), (False, True)])
+def test_bind_device_cuda_template_backend_branches_compile(
+    tmp_path, device_kernel, backend_name, no_gpu, return_compiled
+):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import BACKENDS, _build, _render_params
 
@@ -438,6 +440,7 @@ def test_bind_device_cuda_template_backend_branches_compile(tmp_path, device_ker
         torch_access="cpython", no_gpu=no_gpu, driver_path="/intj-test-no-driver.so",
         launch_symbol=backend.launch_symbol, device_symbol=backend.device_symbol,
         error_symbol=backend.error_symbol, error_style=backend.error_style,
+        return_compiled=return_compiled,
     )
     binary = tmp_path / "m.so"
     _build(binary, context)  # Build both real-driver branches, but load neither driver.

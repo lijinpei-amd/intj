@@ -143,6 +143,7 @@ class RenderContext:
     grid_py_mode: bool = False
     grid_cpp_source: str = ""
     grid_extra: tuple[str, ...] = ()
+    return_compiled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,20 +185,21 @@ class LauncherFactory:
     grid_arg: int | None = None
     grid_py: Callable[[dict[str, object]], object] | None = None
     grid_cpp: GridCode | None = None
+    return_compiled: bool = False
 
-    def bind(self, /, **values: object) -> Callable[..., None]:
+    def bind(self, /, **values: object) -> Callable[..., Any]:
         if self.bind_device_requested:
             raise TypeError("intj: use bind_device(device_ordinal, **values)")
         return self._bind(None, values)
 
-    def bind_device(self, /, *args: object, **values: object) -> Callable[..., None]:
+    def bind_device(self, /, *args: object, **values: object) -> Callable[..., Any]:
         if not self.bind_device_requested:
             raise TypeError("intj: bind_device was not requested")
         if len(args) != 1:
             raise TypeError("intj: bind_device requires exactly one positional device ordinal")
         return self._bind(args[0], values)
 
-    def _bind(self, device: object, values: Mapping[str, object]) -> Callable[..., None]:
+    def _bind(self, device: object, values: Mapping[str, object]) -> Callable[..., Any]:
         names = {p.name for p in self.params if p.annotation.bind_value is not None}
         unknown = values.keys() - names
         if unknown:
@@ -234,6 +236,7 @@ class LauncherFactory:
             grid_arg=self.grid_arg,
             grid_py_mode=self.grid_py is not None,
             grid_cpp=self.grid_cpp,
+            return_compiled=self.return_compiled,
         )
         public_names = tuple(
             p.name for p in resolved if p.annotation.bind_value is None and not p.annotation.baked_value
@@ -280,6 +283,7 @@ def make_launcher(
     grid_arg: int | None = None,
     grid_cpp: object | None = None,
     grid_py: Callable[[dict[str, object]], object] | None = None,
+    return_compiled: bool = False,
 ) -> Any:
     """Build a fast launcher for `jit_func`.
 
@@ -310,6 +314,8 @@ def make_launcher(
     compiling or launching a GPU kernel. `dynamic_grid` and `dynamic_options`
     are reserved and currently unsupported. `verify_annotation=True` checks
     declared types, ranges and assumed facts; otherwise these are caller promises.
+    `return_compiled=True` returns the cached Triton CompiledKernel after a
+    successful launch, including on a zero-volume grid, and requires GPU mode.
     """
     if dynamic_grid:
         raise UnsupportedKernel("intj: dynamic_grid is not implemented; pass an int or tuple grid")
@@ -321,6 +327,8 @@ def make_launcher(
         raise TypeError("intj: grid_py must be callable")
     if dynamic_options:
         raise UnsupportedKernel("intj: dynamic_options is not implemented; pass options=... instead")
+    if return_compiled and no_gpu:
+        raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
     options = dict(sorted((options or {}).items()))
     if no_gpu and options:
         raise UnsupportedKernel("intj: no_gpu=True supports only default compile options")
@@ -365,11 +373,11 @@ def make_launcher(
                     )
         factory = LauncherFactory(jit_func, resolved, tuple(options.items()), access, kernel_cache,
                                   bool(verify_annotation), no_gpu, bool(bind_device),
-                                  grid_arg, grid_py, compiled_grid)
+                                  grid_arg, grid_py, compiled_grid, bool(return_compiled))
         return factory if needs_binding else factory.bind()
     return _materialize_module(jit_func, resolved, options, access, kernel_cache,
                                no_gpu, bool(verify_annotation), grid_arg=grid_arg,
-                               grid_cpp=compiled_grid).entry
+                               grid_cpp=compiled_grid, return_compiled=bool(return_compiled)).entry
 
 
 def _materialize_module(
@@ -379,6 +387,7 @@ def _materialize_module(
     grid_arg: int | None = None,
     grid_py_mode: bool = False,
     grid_cpp: GridCode | None = None,
+    return_compiled: bool = False,
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -437,6 +446,7 @@ def _materialize_module(
         grid_py_mode=grid_py_mode,
         grid_cpp_source=grid_cpp.source if grid_cpp else "",
         grid_extra=grid_cpp.extras if grid_cpp else (),
+        return_compiled=return_compiled,
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -589,7 +599,10 @@ def _loaded_module(
             module = _load(key, jit_func, context)
             module.set_compile_callback(
                 _make_host_compile_callback() if context.no_gpu
-                else _make_compile_callback(jit_func, params, options, baked_values)
+                else _make_compile_callback(
+                    jit_func, params, options, baked_values,
+                    return_compiled=context.return_compiled,
+                )
             )
             # The tensor layout is installed, not compiled in, so it describes the
             # torch running now rather than the one this `.so` was built against.
@@ -1046,7 +1059,8 @@ def _compiler_input(
 def _make_compile_callback(
     jit_func: JitFunction, params: Sequence[Param], options: Mapping[str, Any],
     baked_values: Mapping[int, object] | None = None,
-) -> Callable[..., tuple[int, int, int, int]]:
+    *, return_compiled: bool = False,
+) -> Callable[..., tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]]:
     """Called from C on a spec-key miss, with the key blob and the original args."""
     from triton.compiler import compile as triton_compile, make_backend
 
@@ -1059,7 +1073,7 @@ def _make_compile_callback(
 
     def compile_callback(
         keyblob: bytes, nparams: int, device: int, *args: Any
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]:
         nonlocal no_key_input
         current = _current_device()
         if device != current:
@@ -1101,8 +1115,11 @@ def _make_compile_callback(
                 f"intj: packed {nparams} kernel arguments but triton compiled {expected}; "
                 "this is an intj bug"
             )
+        result = (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
+        if return_compiled:
+            return (*result, kernel)
         kernels.append(kernel)
-        return (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
+        return result
 
     return compile_callback
 

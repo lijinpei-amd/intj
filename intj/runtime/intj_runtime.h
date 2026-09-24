@@ -297,7 +297,19 @@ typedef struct {
   uint32_t block_dim; /* warp_size * num_warps */
   uint32_t shared;    /* dynamic LDS bytes */
   uint32_t nparams;   /* kernel params, scratch slots excluded */
+#ifdef INTJ_RETURN_COMPILED
+  PyObject *compiled;  /* owns the CompiledKernel behind function */
+#endif
 } intj_kernel;
+
+static inline void intj_kernel_free(intj_kernel *kernel) {
+  if (!kernel)
+    return;
+#ifdef INTJ_RETURN_COMPILED
+  Py_XDECREF(kernel->compiled);
+#endif
+  PyMem_RawFree(kernel);
+}
 
 /* At one word `intj_hash` is a bijection, so `hash == h` IS key equality and the
  * slot has no reason to carry the key: 16 bytes, four to a cache line, against
@@ -495,15 +507,26 @@ static inline int intj_cache_put(intj_cache *c, const uint64_t *k, uint64_t h,
   return 0;
 }
 
-/* Frees intj's own allocations only -- the same contract as the intj backend:
- * the cache owns the kernel records, triton owns the kernels behind them. */
-static inline void intj_cache_free(intj_cache *c) {
+#ifdef INTJ_RETURN_COMPILED
+static inline int intj_cache_traverse(const intj_cache *c, visitproc visit,
+                                      void *arg) {
   if (!c->map)
-    return;
-  for (auto &entry : *c->map)
-    PyMem_RawFree(entry.second);
-  delete c->map;
+    return 0;
+  for (const auto &entry : *c->map)
+    Py_VISIT(entry.second->compiled);
+  return 0;
+}
+#endif
+
+/* Detach before DECREF: a CompiledKernel finalizer may reenter GC. */
+static inline void intj_cache_free(intj_cache *c) {
+  intj_cache_map *map = c->map;
   c->map = NULL;
+  if (!map)
+    return;
+  for (auto &entry : *map)
+    intj_kernel_free(entry.second);
+  delete map;
 }
 
 #else /* INTJ_CACHE_INTJ */
@@ -522,15 +545,29 @@ static inline int intj_cache_put(intj_cache *c, const uint64_t *k, uint64_t h,
   return intj_map_put(c, k, h, val);
 }
 
-/* Frees intj's own allocations only.  The kernel records are the cache's; the
- * kernels behind them belong to the callback's CompiledKernels. */
-static inline void intj_cache_free(intj_cache *c) {
+#ifdef INTJ_RETURN_COMPILED
+static inline int intj_cache_traverse(const intj_cache *c, visitproc visit,
+                                      void *arg) {
   if (!c->slots)
+    return 0;
+  for (uint32_t i = 0; i <= c->mask; i++) {
+    intj_kernel *kernel = c->slots[i].val;
+    if (kernel)
+      Py_VISIT(kernel->compiled);
+  }
+  return 0;
+}
+#endif
+
+/* Detach before DECREF: a CompiledKernel finalizer may reenter GC. */
+static inline void intj_cache_free(intj_cache *c) {
+  intj_slot *slots = c->slots;
+  c->slots = NULL;
+  if (!slots)
     return;
   for (uint32_t i = 0; i <= c->mask; i++)
-    PyMem_RawFree(c->slots[i].val);
-  PyMem_RawFree(c->slots);
-  c->slots = NULL;
+    intj_kernel_free(slots[i].val);
+  PyMem_RawFree(slots);
 }
 
 #endif

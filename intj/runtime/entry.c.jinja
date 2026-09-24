@@ -40,6 +40,8 @@
 #define INTJ_ACCESS_{{ torch_access | upper }} 1
 {% if grid_py_mode %}#define INTJ_GRID_PY 1
 {% endif %}
+{% if return_compiled %}#define INTJ_RETURN_COMPILED 1
+{% endif %}
 #include "intj_runtime.h"
 
 #define INTJ_NPARAMS {{ params | rejectattr('call_index', 'none') | list | length }}
@@ -537,8 +539,10 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
   if (intj_grid_object(args[0], &gx, &gy, &gz) != 0)
     return NULL;
 {% endif %}
+{% if not return_compiled %}
   if (INTJ_UNLIKELY((uint64_t)gx * (uint64_t)gy * (uint64_t)gz == 0))
     Py_RETURN_NONE;
+{% endif %}
 
   /* Key words are accumulated in registers and written once after decoding. */
   uint64_t key[INTJ_NWORDS];
@@ -591,12 +595,17 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
       return NULL;
     unsigned long long function;
     unsigned int block_dim, shared, nparams;
+{% if return_compiled %}
+    PyObject *compiled;
+    if (!PyArg_ParseTuple(res, "KIIIO", &function, &block_dim, &shared,
+                          &nparams, &compiled)) {
+{% else %}
     if (!PyArg_ParseTuple(res, "KIII", &function, &block_dim, &shared,
                           &nparams)) {
+{% endif %}
       Py_DECREF(res);
       return NULL;
     }
-    Py_DECREF(res);
     /* The callback ran python, so another thread may have filled this key. */
 {% if nwords %}
     kernel = intj_cache_get(cache, key, hash);
@@ -605,21 +614,28 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 {% endif %}
     if (!kernel) {
       kernel = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
-      if (!kernel)
+      if (!kernel) {
+        Py_DECREF(res);
         return PyErr_NoMemory();
+      }
       kernel->function = (void *)(uintptr_t)function;
       kernel->block_dim = block_dim;
       kernel->shared = shared;
       kernel->nparams = nparams;
+{% if return_compiled %}
+      kernel->compiled = Py_NewRef(compiled);
+{% endif %}
 {% if nwords %}
       if (intj_cache_put(cache, key, hash, kernel) != 0) {
-        PyMem_RawFree(kernel);
+        intj_kernel_free(kernel);
+        Py_DECREF(res);
         return PyErr_NoMemory();
       }
 {% else %}
       bound->fixed_kernel = kernel;
 {% endif %}
     }
+    Py_DECREF(res);
   }
 
   if (INTJ_UNLIKELY((uint32_t)np != kernel->nparams)) {
@@ -629,6 +645,11 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
                  np, kernel->nparams);
     return NULL;
   }
+
+{% if return_compiled %}
+  if (INTJ_UNLIKELY(!gx || !gy || !gz))
+    return Py_NewRef(kernel->compiled);
+{% endif %}
 
 {% if not no_gpu %}
   /* Launch. Two trailing scratch slots are mandatory on AMD; intj refuses
@@ -657,7 +678,11 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
     return NULL;
   }
 {% endif %}
+{% if return_compiled %}
+  return Py_NewRef(kernel->compiled);
+{% else %}
   Py_RETURN_NONE;
+{% endif %}
 }
 
 static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
@@ -727,6 +752,13 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
 {% endif %}
   for (int i = 0; i < INTJ_NBOUND; i++)
     Py_VISIT(bound->owners[i]);
+{% if return_compiled and fixed_device and nwords %}
+  if (bound->cache_ready)
+    return intj_cache_traverse(&bound->cache, visit, arg);
+{% elif return_compiled and fixed_device %}
+  if (bound->fixed_kernel)
+    Py_VISIT(bound->fixed_kernel->compiled);
+{% endif %}
   return 0;
 }
 
@@ -748,12 +780,13 @@ static int intj_bound_clear(PyObject *self) {
   }
 {% if fixed_device and nwords %}
   if (bound->cache_ready) {
-    intj_cache_free(&bound->cache);
     bound->cache_ready = 0;
+    intj_cache_free(&bound->cache);
   }
 {% elif fixed_device %}
-  PyMem_RawFree(bound->fixed_kernel);
+  intj_kernel *kernel = bound->fixed_kernel;
   bound->fixed_kernel = NULL;
+  intj_kernel_free(kernel);
 {% endif %}
   return 0;
 }
@@ -1165,23 +1198,36 @@ static int intj_traverse(PyObject *m, visitproc visit, void *arg) {
   Py_VISIT(st->tensor_type);
   Py_VISIT(st->param_type);
   Py_VISIT(st->bound_type);
+{% if return_compiled and not fixed_device %}
+  return intj_cache_traverse(&st->cache, visit, arg);
+{% else %}
   return 0;
+{% endif %}
 }
 
 static int intj_clear(PyObject *m) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
+{% if return_compiled %}
+  st->abi.ready = 0; /* reject calls from finalizers while releasing kernels */
+{% endif %}
   Py_CLEAR(st->compile_cb);
   Py_CLEAR(st->tensor_type);
   Py_CLEAR(st->param_type);
   Py_CLEAR(st->bound_type);
+{% if return_compiled and not fixed_device %}
+  intj_cache_free(&st->cache);
+{% endif %}
   return 0;
 }
 
-/* Frees only intj's own allocations. The hipFunction_t handles are owned by the
- * CompiledKernels the compile callback keeps alive, and are unloaded by triton. */
+/* Cache records release their CompiledKernels when return_compiled is enabled.
+ * Triton unloads the function handles when the last owner goes away. */
 static void intj_free(void *module) {
 {% if not fixed_device %}
   intj_state *st = (intj_state *)PyModule_GetState((PyObject *)module);
+{% if return_compiled %}
+  st->abi.ready = 0;
+{% endif %}
   intj_cache_free(&st->cache);
 {% endif %}
 }

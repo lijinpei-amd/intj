@@ -151,9 +151,24 @@ def test_launch_or_interpret_only_calls_triton_in_interpreter_mode():
     with knobs.runtime.scope():
         knobs.runtime.interpret = True
         assert compat.launch_or_interpret(kernel, grid, 7, n=3) == ((7,), {"n": 3})
+        assert compat.launch_or_interpret(kernel, grid, 7, n=3, return_compiled=True) == ((7,), {"n": 3})
         knobs.runtime.interpret = False
         with pytest.raises(UnsupportedKernel, match="expected a @triton.jit function"):
             compat.launch_or_interpret(kernel, grid, 7, n=3)
+
+
+def test_launch_uses_triton_dispatch_during_compile_warmup(monkeypatch):
+    import intj.compat as compat
+
+    monkeypatch.setattr(compat, "_is_compile_warmup", lambda: True)
+    grid = (1,)
+
+    class TritonOnly:
+        def __getitem__(self, actual_grid):
+            assert actual_grid is grid
+            return lambda *args, **kwargs: (args, kwargs)
+
+    assert compat.launch(TritonOnly(), grid, 7, n=3, return_compiled=True) == ((7,), {"n": 3})
 
 
 def test_launch_or_interpret_runs_real_triton_interpreter():
@@ -185,6 +200,27 @@ def test_launch_or_interpret_uses_native_launcher_in_compiled_mode():
     with knobs.runtime.scope():
         knobs.runtime.interpret = False
         assert compat.launch_or_interpret(add_one, (1,), x, out=out, n=x.numel()) is None
+    torch.testing.assert_close(out, x + 1)
+
+
+def test_launch_returns_cached_compiled_kernel_when_requested():
+    x = torch.arange(32, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(x)
+    assert launch(add_one, (1,), x, out=out, n=x.numel()) is None
+
+    kernel = launch(add_one, (1,), x, out=out, n=x.numel(), return_compiled=True)
+    assert kernel.asm["ttir"]
+    assert launch(add_one, (1,), x, out=out, n=x.numel(), return_compiled=True) is kernel
+    torch.testing.assert_close(out, x + 1)
+
+
+def test_launch_returns_compiled_kernel_for_python_grid():
+    x = torch.arange(32, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(x)
+    grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
+
+    kernel = launch(add_one, grid, x, out=out, n=x.numel(), return_compiled=True)
+    assert kernel.asm["ttir"]
     torch.testing.assert_close(out, x + 1)
 
 
