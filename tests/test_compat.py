@@ -184,7 +184,7 @@ def test_launch_or_interpret_uses_native_launcher_in_compiled_mode():
     out = torch.empty_like(x)
     with knobs.runtime.scope():
         knobs.runtime.interpret = False
-        assert compat.launch_or_interpret(add_one, (1,), x, out, x.numel()) is None
+        assert compat.launch_or_interpret(add_one, (1,), x, out=out, n=x.numel()) is None
     torch.testing.assert_close(out, x + 1)
 
 
