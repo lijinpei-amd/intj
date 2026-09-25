@@ -40,6 +40,8 @@ machine that will later be offline:
     python -m intj.kernel_cache --force absl   # discard a half-written tree
 """
 
+from __future__ import annotations
+
 import contextlib
 import dataclasses
 import enum
@@ -179,7 +181,9 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
 
     toolchain = toolchain_for(cache)
     if toolchain is None:  # pragma: no cover - a build that produced nothing
-        raise RuntimeError(f"intj: {cache.value} is still unusable after installing it into {root}")
+        raise RuntimeError(
+            f"intj: {cache.value} is still unusable after installing it into {root}"
+        )
     return toolchain
 
 
@@ -272,7 +276,11 @@ def _unpack(source: Dependency, root: Path) -> None:
 def _cmake_build(root: Path) -> None:
     build = root / "build"
     configure = [
-        "cmake", "-S", str(root), "-B", str(build),
+        "cmake",
+        "-S",
+        str(root),
+        "-B",
+        str(build),
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_TESTING=OFF",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
@@ -281,7 +289,10 @@ def _cmake_build(root: Path) -> None:
         "-DABSL_PROPAGATE_CXX_STD=ON",
         "-DCMAKE_CXX_STANDARD=20",
     ]
-    for command in (configure, ["cmake", "--build", str(build), "-j", str(os.cpu_count() or 8)]):
+    for command in (
+        configure,
+        ["cmake", "--build", str(build), "-j", str(os.cpu_count() or 8)],
+    ):
         done = subprocess.run(command, capture_output=True, text=True)
         if done.returncode != 0:
             raise RuntimeError(
@@ -299,7 +310,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             wanted = [KernelCache(name) for name in argv]
         except ValueError:
-            print("usage: python -m intj.kernel_cache [--force] [tsl|absl|all]", file=sys.stderr)
+            print(
+                "usage: python -m intj.kernel_cache [--force] [tsl|absl|all]",
+                file=sys.stderr,
+            )
             return 2
     for cache in wanted:
         if cache is KernelCache.INTJ:
@@ -314,7 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"intj: {cache.value} {_SOURCES[cache].version} in {_source_root(cache)}")
         print(f"  include {toolchain['include_dirs'][0]}")
         if toolchain["archives"]:
-            print(f"  {len(toolchain['archives'])} libraries in {toolchain['library_dirs'][0]}")
+            print(
+                f"  {len(toolchain['archives'])} libraries in {toolchain['library_dirs'][0]}"
+            )
     return 0
 
 

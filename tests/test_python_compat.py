@@ -9,6 +9,8 @@ import sysconfig
 
 import pytest
 
+from intj.python_intf import cpython_abi
+
 
 def test_integer_decoder_matches_python_on_this_interpreter(tmp_path):
     compiler = shutil.which("cc")
@@ -18,7 +20,7 @@ def test_integer_decoder_matches_python_on_this_interpreter(tmp_path):
     source = tmp_path / "_intj_int_probe.c"
     source.write_text(r"""
 #define INTJ_NWORDS 1
-#define INTJ_ACCESS_SHIM
+#define INTJ_TORCH_ACCESS_INTERPRETER 1
 #include "intj_runtime.h"
 
 static PyObject *decode(PyObject *self, PyObject *value) {
@@ -52,22 +54,37 @@ PyMODINIT_FUNC PyInit__intj_int_probe(void) {
     assert isinstance(suffix, str)
     built = tmp_path / f"_intj_int_probe{suffix}"
     runtime = pathlib.Path(__file__).parents[1] / "intj" / "runtime"
+    python_intf = runtime.parent / "python_intf"
+    header = cpython_abi.header_for()
+    assert header is not None
     result = subprocess.run(
-        [compiler, "-O2", "-shared", "-fPIC", f"-I{sysconfig.get_paths()['include']}",
-         f"-I{runtime}", str(source), "-o", str(built)],
-        capture_output=True, text=True,
+        [
+            compiler,
+            "-O2",
+            "-shared",
+            "-fPIC",
+            f"-I{sysconfig.get_paths()['include']}",
+            f"-I{runtime}",
+            f"-I{python_intf}",
+            f'-DINTJ_CPYTHON_STATIC_COMPILE_HEADER="{header}"',
+            str(source),
+            "-o",
+            str(built),
+        ],
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
 
     spec = importlib.util.spec_from_file_location("_intj_int_probe", built)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # Loader stubs lack exec_module
     for value, expected in (
-        (-2**100, (0, None, None)),
-        (-2**63 - 1, (0, None, None)),
-        (-2**63, (1, 2**63, -2**63)),
-        (-2**30, (1, 2**64 - 2**30, -2**30)),
+        (-(2**100), (0, None, None)),
+        (-(2**63) - 1, (0, None, None)),
+        (-(2**63), (1, 2**63, -(2**63))),
+        (-(2**30), (1, 2**64 - 2**30, -(2**30))),
         (-1, (1, 2**64 - 1, -1)),
         (0, (1, 0, 0)),
         (1, (1, 1, 1)),
@@ -85,16 +102,18 @@ PyMODINIT_FUNC PyInit__intj_int_probe(void) {
 def test_host_launcher_builds_with_installed_triton(tmp_path):
     import torch
 
-    from intj import TorchAccess, make_launcher
+    from intj import TorchAccessMode, make_launcher
 
     source = tmp_path / "compat_kernel.py"
     source.write_text("import triton\n\n@triton.jit\ndef kernel(x):\n    pass\n")
     spec = importlib.util.spec_from_file_location("compat_kernel", source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # Loader stubs lack exec_module
 
-    launch = make_launcher(module.kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    launch = make_launcher(
+        module.kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
+    )
     assert launch(0, 0, 1, 7) is None
     assert launch(0, 0, 1, torch.arange(4)) is None
     with pytest.raises(RuntimeError, match="cannot read tensor argument 'x'") as error:

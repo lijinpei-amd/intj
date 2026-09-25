@@ -4,35 +4,31 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Correctness
 
+- **Support non-x86-64 hosts.** `torch_abi.toml` contains x86-64 tensor offsets,
+  but `layout_for()` selects them by torch version and `PyObject` size on every
+  host. Refuse RUNTIME_SHIM on other host ABIs until their offsets are measured and
+  independently checked; add ARM64 layouts and run launcher tests there.
 - **Fork safety.** The C kernel cache keeps parent handles across `fork(2)`; a child
   that launches uses a dead context. Triton guards this by pid. Fix with a
   `pthread_atfork` child handler that repoints the cache at an empty sentinel.
-- **Free-threaded builds.** The kernel cache and the borrow-on-hit discipline assume
-  the GIL. Refuse on `Py_GIL_DISABLED`, or lock it.
 - **`knobs.runtime.debug` / `knobs.compilation.instrumentation_mode`** are in triton's
   cache key but neither in intj's module digest nor its spec key: flipping one after
   `make_launcher` keeps launching the old binary. Same for `use_buffer_ops`, which
   is only stale-but-valid since the `S` bit is unconditionally keyed.
 - **Run the NVIDIA path on an NVIDIA GPU.** It is compile-checked only.
-- **`noexcept` at the CPython boundary**, once the C++ access mode lands. An
+- **`noexcept` at the CPython boundary in C++ builds.** STATIC_COMPILE tensor
+  access and non-intj cache backends compile the extension as C++. An
   exception escaping `entry` into CPython's C frames is UB; `INTJ_NOEXCEPT` on the
-  functions CPython calls turns that into a deterministic `std::terminate`. Not a
-  gap today (the extension is C, nothing can throw), and *not* a performance item:
+  functions CPython calls turns that into a deterministic `std::terminate`. This is
+  *not* a performance item:
   measured identical codegen with and without, because intj has no non-trivial
   destructors and so no landing pads to elide.
-- **Python versions other than 3.12.** The runtime is written against one
-  interpreter and refuses the rest at compile time (`#error` below `0x030C0000`),
-  which is honest but narrow. What is version-dependent today:
-  - the non-compact int decode walks `ob_digit` with CPython's layout macros. The
-    compact case already uses `PyUnstable_Long_*`; 3.13 adds `PyLong_AsNativeBytes`
-    and `PyLong_AsInt64`, which would retire the digit walk entirely.
-  - `PyFloat_CheckExact` + a direct `ob_fval` read, and the `PyLongObject` /
-    `PyFloatObject` layouts behind both.
-  - `PyErr_GetRaisedException` / `PyErr_SetRaisedException` (3.12+).
-  - 3.13+ also needs `Py_mod_gil` in the module slots, and free-threaded builds
-    need the kernel cache locked (see above).
-  A version's layout bets want the same treatment torch's got: a table per
-  supported version plus a self-check at load, not an `#if` thicket.
+- **The triton half below 3.10.** `tests/run_python_matrix.sh` runs the rendered
+  module on 3.8 through 3.14t, but `triton>=3.8` ships no wheel below 3.10, so
+  `make_launcher` and the compile callback are only exercised from 3.10 up.
+- **Develop a Torch and CPython interface spec.** Define the binary data each
+  interface reads, supported versions and build variants, how those facts are
+  verified, and when intj refuses an unsupported combination.
 
 ## Coverage (all currently refused loudly)
 
@@ -52,12 +48,22 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Performance
 
+- **ROCm zero-user-argument launches.** Triton still declares two implicit
+  scratch-pointer arguments (16-byte kernarg segment) when neither scratch
+  buffer is needed. On gfx942, `hipModuleLaunchKernel` took ~1.55 us with no
+  ABI arguments versus ~3.03 us with one or two; TVM FFI launching the same
+  Triton kernel took ~3.01 us versus INTJ's ~2.77 us. Investigate whether
+  Triton can omit unused scratch arguments or HIP can launch argument-bearing
+  kernels faster; packed `extra` arguments did not help in this case.
 - Benchmark `hipModuleLaunchKernel` with `extra` parameter-buffer passing against
   the current `kernelParams` pointer array; use it if faster.
 - Benchmark CUDA driver `cuLaunchKernel` with `extra` parameter-buffer passing
   against the current `kernelParams` pointer array; use it if faster.
 - Benchmark sweep promised in the README: dynamic vs constexpr argument counts and
   tensor counts.
+- **Measure compact-int decoding.** Compare the existing inline CPython helpers
+  with a direct `lv_tag`/`ob_digit[0]` path on supported builds; use custom
+  decoding only if it is faster and passes `check.py`.
 - Single-entry inline cache in front of the hash map (~2-3 ns, ~100% hit in a
   steady-state loop).
 - Annotated fast paths: pinning a parameter's type skips the generic classifier

@@ -16,16 +16,24 @@ def read_reinterpreted(x, out, n):
 
 
 def test_reinterpret_matches_triton_and_separates_dtype_cache_keys():
-    base = torch.tensor([0x3F800000, 0x40000000, 0x40400000],
-                        device="cuda", dtype=torch.int32)
+    base = torch.tensor(
+        [0x3F800000, 0x40000000, 0x40400000], device="cuda", dtype=torch.int32
+    )
     results = []
     for dtype in (tl.int32, torch.float32, tl.float32, torch.int32):
         wrapped = triton.reinterpret(base, dtype)
         expected = torch.empty_like(base)
         actual = torch.empty_like(expected)
-        read_reinterpreted[(1,)](wrapped, triton.reinterpret(expected, tl.float32), base.numel())
-        launch(read_reinterpreted, (1,), wrapped,
-               triton.reinterpret(actual, tl.float32), base.numel())
+        read_reinterpreted[(1,)](
+            wrapped, triton.reinterpret(expected, tl.float32), base.numel()
+        )
+        launch(
+            read_reinterpreted,
+            (1,),
+            wrapped,
+            triton.reinterpret(actual, tl.float32),
+            base.numel(),
+        )
         torch.testing.assert_close(actual, expected)
         results.append(actual)
     assert not torch.equal(results[0], results[1])

@@ -4,8 +4,9 @@
  * compile time and all three define `intj_cache`.  `tests/test_kernel_cache.py`
  * does the building and runs whichever backends are available.
  *
- *   g++ -O3 -DNDEBUG -DINTJ_CACHE_INTJ -DINTJ_ACCESS_SHIM -DINTJ_NWORDS=5 \
- *       -I intj/runtime -I $(python3-config --includes) tests/bench_kernel_cache.cpp \
+ *   g++ -O3 -DNDEBUG -DINTJ_CACHE_INTJ -DINTJ_TORCH_ACCESS_RUNTIME_SHIM -DINTJ_NWORDS=5 \
+ *       -DINTJ_CPYTHON_STATIC_COMPILE_HEADER='"cpython_abi.h"' -I intj/python_intf \
+ *       -I intj/runtime $(python3-config --includes) tests/bench_kernel_cache.cpp \
  *       -lbenchmark -lpython3.12 -o bench
  *
  * The workload is intj's: a key of INTJ_NWORDS uint64 words, insert-only,
@@ -40,7 +41,7 @@
 #include <random>
 #include <vector>
 
-#define INTJ_ACCESS_SHIM /* the cache does not touch the tensor reader */
+#define INTJ_TORCH_ACCESS_RUNTIME_SHIM /* the cache does not touch the tensor reader */
 #include "intj_runtime.h"
 
 #ifndef INTJ_CACHE_NAME
@@ -51,7 +52,8 @@ namespace {
 
 std::vector<std::vector<uint64_t>> make_keys(int n) {
   std::mt19937_64 rng(20260923);
-  std::vector<std::vector<uint64_t>> keys(n, std::vector<uint64_t>(INTJ_NWORDS));
+  std::vector<std::vector<uint64_t>> keys(n,
+                                          std::vector<uint64_t>(INTJ_NWORDS));
   for (auto &key : keys)
     for (auto &word : key)
       word = rng();
@@ -118,7 +120,8 @@ void miss(benchmark::State &state) {
   int i = 0;
   for (auto _ : state) {
     const int j = i++ & (n - 1);
-    intj_kernel *found = intj_cache_get(&cache, absent[j].data(), absent_hashes[j]);
+    intj_kernel *found =
+        intj_cache_get(&cache, absent[j].data(), absent_hashes[j]);
     benchmark::DoNotOptimize(found);
     if (found != NULL)
       state.SkipWithError("a key that was never inserted was found");
@@ -139,7 +142,7 @@ void hash_only(benchmark::State &state) {
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
-}  // namespace
+} // namespace
 
 BENCHMARK(hit)->Arg(1)->Arg(8)->Arg(64)->Arg(512);
 BENCHMARK(miss)->Arg(1)->Arg(8)->Arg(64)->Arg(512);

@@ -11,8 +11,14 @@ from intj.compat import launch
 @triton.heuristics({"EVEN_N": lambda meta: meta["N"] % 2 == 0})
 @triton.heuristics({"SHIFT": lambda meta: meta["x"].numel() + int(meta["EVEN_N"])})
 @triton.jit
-def heuristic_add(x, out, N, EVEN_N: tl.constexpr, SHIFT: tl.constexpr,
-                  BLOCK: tl.constexpr = 32):  # pyright: ignore[reportArgumentType]  # Triton permits constexpr defaults
+def heuristic_add(
+    x,
+    out,
+    N,
+    EVEN_N: tl.constexpr,
+    SHIFT: tl.constexpr,
+    BLOCK: tl.constexpr = 32,  # pyright: ignore[reportArgumentType]  # Triton permits constexpr defaults
+):
     i = tl.arange(0, BLOCK)
     tl.store(out + i, tl.load(x + i, i < N, other=0) + SHIFT, i < N)
 

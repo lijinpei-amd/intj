@@ -72,8 +72,7 @@ def autotuned_tag(out, n, TAG: tl.constexpr, BLOCK: tl.constexpr):
 def test_launch_binds_keywords_default_and_compile_option():
     x = torch.arange(129, device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
-    launch(add_one, (triton.cdiv(x.numel(), 64),), x, n=x.numel(), out=out,
-           num_warps=4)
+    launch(add_one, (triton.cdiv(x.numel(), 64),), x, n=x.numel(), out=out, num_warps=4)
     torch.testing.assert_close(out, x + 1)
 
 
@@ -151,7 +150,9 @@ def test_launch_or_interpret_only_calls_triton_in_interpreter_mode():
     with knobs.runtime.scope():
         knobs.runtime.interpret = True
         assert compat.launch_or_interpret(kernel, grid, 7, n=3) == ((7,), {"n": 3})
-        assert compat.launch_or_interpret(kernel, grid, 7, n=3, return_compiled=True) == ((7,), {"n": 3})
+        assert compat.launch_or_interpret(
+            kernel, grid, 7, n=3, return_compiled=True
+        ) == ((7,), {"n": 3})
         knobs.runtime.interpret = False
         with pytest.raises(UnsupportedKernel, match="expected a @triton.jit function"):
             compat.launch_or_interpret(kernel, grid, 7, n=3)
@@ -168,7 +169,10 @@ def test_launch_uses_triton_dispatch_during_compile_warmup(monkeypatch):
             assert actual_grid is grid
             return lambda *args, **kwargs: (args, kwargs)
 
-    assert compat.launch(TritonOnly(), grid, 7, n=3, return_compiled=True) == ((7,), {"n": 3})
+    assert compat.launch(TritonOnly(), grid, 7, n=3, return_compiled=True) == (
+        (7,),
+        {"n": 3},
+    )
 
 
 def test_launch_or_interpret_runs_real_triton_interpreter():
@@ -187,7 +191,9 @@ def test_launch_or_interpret_runs_real_triton_interpreter():
         assert isinstance(interpreted_add_one, InterpretedFunction)
         x = torch.arange(32, dtype=torch.int32)
         out = torch.empty_like(x)
-        compat.launch_or_interpret(interpreted_add_one, (1,), x, out=out, n=x.numel(), BLOCK=32)
+        compat.launch_or_interpret(
+            interpreted_add_one, (1,), x, out=out, n=x.numel(), BLOCK=32
+        )
         torch.testing.assert_close(out, x + 1)
 
 
@@ -199,7 +205,9 @@ def test_launch_or_interpret_uses_native_launcher_in_compiled_mode():
     out = torch.empty_like(x)
     with knobs.runtime.scope():
         knobs.runtime.interpret = False
-        assert compat.launch_or_interpret(add_one, (1,), x, out=out, n=x.numel()) is None
+        assert (
+            compat.launch_or_interpret(add_one, (1,), x, out=out, n=x.numel()) is None
+        )
     torch.testing.assert_close(out, x + 1)
 
 
@@ -210,7 +218,9 @@ def test_launch_returns_cached_compiled_kernel_when_requested():
 
     kernel = launch(add_one, (1,), x, out=out, n=x.numel(), return_compiled=True)
     assert kernel.asm["ttir"]
-    assert launch(add_one, (1,), x, out=out, n=x.numel(), return_compiled=True) is kernel
+    assert (
+        launch(add_one, (1,), x, out=out, n=x.numel(), return_compiled=True) is kernel
+    )
     torch.testing.assert_close(out, x + 1)
 
 
@@ -227,25 +237,35 @@ def test_launch_returns_compiled_kernel_for_python_grid():
 def test_tensor_wrapper_pointer_annotation_uses_triton_global_default():
     from intj.compat import _pointer_type
 
-    assert _pointer_type(tl.int32).address_space == tl.pointer_type(tl.int32).address_space
+    assert (
+        _pointer_type(tl.int32).address_space == tl.pointer_type(tl.int32).address_space
+    )
 
 
 def test_callable_grid_bridge_reuses_kernel_cache(monkeypatch):
     import intj.compat as compat
     import intj.launcher as launcher_module
 
-    from intj import TorchAccess, make_launcher
+    from intj import TorchAccessMode, make_launcher
 
     real_make_launcher = make_launcher
 
     def host_launcher(kernel, **kwargs):
-        return real_make_launcher(kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON, **kwargs)
+        return real_make_launcher(
+            kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER, **kwargs
+        )
 
     monkeypatch.setattr(compat, "make_launcher", host_launcher)
-    monkeypatch.setattr(compat, "driver", SimpleNamespace(active=SimpleNamespace(
-        get_current_device=lambda: 0,
-        get_current_stream=lambda device: 0,
-    )))
+    monkeypatch.setattr(
+        compat,
+        "driver",
+        SimpleNamespace(
+            active=SimpleNamespace(
+                get_current_device=lambda: 0,
+                get_current_stream=lambda device: 0,
+            )
+        ),
+    )
     monkeypatch.setattr(launcher_module, "_LOADED", {})
 
     dimensions = [0]
@@ -279,14 +299,24 @@ def test_fpsan_knob_change_reselects_compat_launcher(monkeypatch):
         return lambda *_call_args: None
 
     monkeypatch.setattr(compat, "_make", make_native)
-    monkeypatch.setattr(compat, "driver", SimpleNamespace(active=SimpleNamespace(
-        get_current_device=lambda: 0,
-        get_current_stream=lambda device: 0,
-        get_current_target=lambda: SimpleNamespace(backend="hip", arch="gfx942", warp_size=64),
-    )))
+    monkeypatch.setattr(
+        compat,
+        "driver",
+        SimpleNamespace(
+            active=SimpleNamespace(
+                get_current_device=lambda: 0,
+                get_current_stream=lambda device: 0,
+                get_current_target=lambda: SimpleNamespace(
+                    backend="hip", arch="gfx942", warp_size=64
+                ),
+            )
+        ),
+    )
     compat._cached.cache_clear()
     try:
-        monkeypatch.setattr(knobs.compilation, "fpsan_homomorphic_casts", False, raising=False)
+        monkeypatch.setattr(
+            knobs.compilation, "fpsan_homomorphic_casts", False, raising=False
+        )
         compat.launch(unused_pointer, (1,), 7)
         monkeypatch.setattr(knobs.compilation, "fpsan_homomorphic_casts", True)
         compat.launch(unused_pointer, (1,), 7)
@@ -334,8 +364,10 @@ def test_launch_autotunes_through_native_launcher_and_reuses_choice():
         score = 2.0 if tag == 1 else 1.0
         return (score, score, score)
 
-    configs = [triton.Config({"TAG": 1, "BLOCK": 32}),
-               triton.Config({"TAG": 2, "BLOCK": 64})]
+    configs = [
+        triton.Config({"TAG": 1, "BLOCK": 32}),
+        triton.Config({"TAG": 2, "BLOCK": 64}),
+    ]
     tuned = triton.autotune(configs=configs, key=["n"], do_bench=bench)(autotuned_tag)
     launch(tuned, (1,), out, n=8)
     torch.testing.assert_close(out, torch.full_like(out, 2))

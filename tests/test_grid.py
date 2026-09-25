@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from intj import Argument, BindValue, Constexpr, NEVER, TorchAccess, make_launcher
+from intj import Argument, BindValue, Constexpr, NEVER, TorchAccessMode, make_launcher
 from intj.launcher import UnsupportedKernel
 
 
@@ -32,8 +32,14 @@ def write_programs(out, X, Y):
 def test_grid_arg_passes_each_requested_dimension(dimensions, shape):
     launcher = make_launcher(write_programs, grid_arg=dimensions)
     out = torch.zeros(24, device="cuda", dtype=torch.int32)
-    launcher(torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream,
-             *shape, out, 3, 2)
+    launcher(
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+        *shape,
+        out,
+        3,
+        2,
+    )
     torch.cuda.synchronize()
     count = 3 if dimensions == 1 else 6 if dimensions == 2 else 24
     torch.testing.assert_close(out[:count], torch.ones_like(out[:count]))
@@ -43,10 +49,17 @@ def test_grid_arg_passes_each_requested_dimension(dimensions, shape):
 def test_grid_arg_zero_skips_launch_and_argument_decode():
     launcher = make_launcher(write_programs, grid_arg=2, no_gpu=True)
     assert launcher(0, 0, 0, 3, object(), object(), object()) is None
-    fixed = make_launcher(write_programs, grid_arg=3, bind_device=True,
-                          no_gpu=True).bind_device(0)
+    fixed = make_launcher(
+        write_programs, grid_arg=3, bind_device=True, no_gpu=True
+    ).bind_device(0)
     assert tuple(inspect.signature(fixed).parameters) == (
-        "stream", "grid_x", "grid_y", "grid_z", "out", "X", "Y"
+        "stream",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+        "out",
+        "X",
+        "Y",
     )
     assert fixed(0, 1, 0, 3, object(), object(), object()) is None
 
@@ -78,7 +91,9 @@ def test_grid_modes_validate_options_and_keep_separate_modules():
     one_dim = make_launcher(write_programs, grid_arg=1, no_gpu=True)
     two_dim = make_launcher(write_programs, grid_arg=2, no_gpu=True)
     assert first.__self__ is again.__self__
-    assert len({id(launch.__self__) for launch in (first, second, one_dim, two_dim)}) == 4
+    assert (
+        len({id(launch.__self__) for launch in (first, second, one_dim, two_dim)}) == 4
+    )
 
 
 def test_grid_py_receives_current_meta_on_every_call_and_owns_callback():
@@ -95,14 +110,15 @@ def test_grid_py_receives_current_meta_on_every_call_and_owns_callback():
 
     first_launch = make_launcher(write_programs, grid_py=first, no_gpu=True)
     second_launch = make_launcher(write_programs, grid_py=second, no_gpu=True)
-    assert first_launch.__self__ is second_launch.__self__
+    assert first_launch.__self__ is not second_launch.__self__
+    assert first_launch.__self__.__self__ is second_launch.__self__.__self__
     compiled = []
 
     def compile_once(key, nparams, device, *args):
         compiled.append(bytes(key))
         return 0, 1, 0, nparams
 
-    first_launch.__self__.set_compile_callback(compile_once)
+    first_launch.__self__.__self__.set_compile_callback(compile_once)
     for x in (3, 4):
         assert first_launch(0, 0, 0, x, 2) is None
     misses = len(compiled)
@@ -140,12 +156,20 @@ def test_grid_py_receives_baked_and_bound_values():
         seen.append(dict(meta))
         return (0,)
 
-    factory = make_launcher(write_programs, grid_py=grid, bind_device=True,
-                            no_gpu=True, extra_annotation={
-        "out": Argument(type=tl.pointer_type(tl.int32), specialize=NEVER,
-                        bind_value=BindValue.POINTER),
-        "X": Constexpr(value=3),
-    })
+    factory = make_launcher(
+        write_programs,
+        grid_py=grid,
+        bind_device=True,
+        no_gpu=True,
+        extra_annotation={
+            "out": Argument(
+                type=tl.pointer_type(tl.int32),
+                specialize=NEVER,
+                bind_value=BindValue.POINTER,
+            ),
+            "X": Constexpr(value=3),
+        },
+    )
     launch = factory.bind_device(0, out=0)
     assert tuple(inspect.signature(launch).parameters) == ("stream", "Y")
     assert launch(0, 2) is None
@@ -161,13 +185,19 @@ def test_grid_py_gpu_dimensions_and_exception():
 
     launcher = make_launcher(write_programs, grid_py=grid)
     out = torch.zeros(24, device="cuda", dtype=torch.int32)
-    launcher(torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream,
-             out, 3, 2)
+    launcher(
+        torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream, out, 3, 2
+    )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, torch.ones_like(out))
     with pytest.raises(RuntimeError, match="grid error"):
-        launcher(torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream,
-                 out, -1, 2)
+        launcher(
+            torch.cuda.current_device(),
+            torch.cuda.current_stream().cuda_stream,
+            out,
+            -1,
+            2,
+        )
 
 
 def compiled_grid(X: int, Y: int, *, cap: int, active: bool):
@@ -243,12 +273,20 @@ def test_grid_cpp_fixed_device_reuses_baked_value_and_prepends_extra():
     def grid(X: int, Y: int, *, cap: int):
         return (X + Y - cap,)
 
-    factory = make_launcher(write_programs, grid_cpp=grid, bind_device=True,
-                            no_gpu=True, extra_annotation={
-        "out": Argument(type=tl.pointer_type(tl.int32), specialize=NEVER,
-                        bind_value=BindValue.POINTER),
-        "X": Constexpr(value=3),
-    })
+    factory = make_launcher(
+        write_programs,
+        grid_cpp=grid,
+        bind_device=True,
+        no_gpu=True,
+        extra_annotation={
+            "out": Argument(
+                type=tl.pointer_type(tl.int32),
+                specialize=NEVER,
+                bind_value=BindValue.POINTER,
+            ),
+            "X": Constexpr(value=3),
+        },
+    )
     launch = factory.bind_device(0, out=0)
     assert tuple(inspect.signature(launch).parameters) == ("stream", "cap", "Y")
     assert launch(0, 7, 4) is None  # 3 + 4 - 7 = 0
@@ -280,21 +318,37 @@ def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
     from intj.launcher import BACKENDS, _LOADED, _build
 
     launchers = {
-        "grid_arg": make_launcher(write_programs, grid_arg=2, no_gpu=True,
-                                   torch_access=TorchAccess.CPYTHON),
-        "grid_cpp": make_launcher(write_programs, grid_cpp=compiled_grid, no_gpu=True,
-                                   torch_access=TorchAccess.CPYTHON),
-        "grid_py": make_launcher(write_programs, grid_py=lambda meta: (1,), no_gpu=True,
-                                  torch_access=TorchAccess.CPYTHON),
+        "grid_arg": make_launcher(
+            write_programs,
+            grid_arg=2,
+            no_gpu=True,
+            torch_access_mode=TorchAccessMode.INTERPRETER,
+        ),
+        "grid_cpp": make_launcher(
+            write_programs,
+            grid_cpp=compiled_grid,
+            no_gpu=True,
+            torch_access_mode=TorchAccessMode.INTERPRETER,
+        ),
+        "grid_py": make_launcher(
+            write_programs,
+            grid_py=lambda meta: (1,),
+            no_gpu=True,
+            torch_access_mode=TorchAccessMode.INTERPRETER,
+        ),
     }
     backend = BACKENDS["cuda"]
     for name, launcher in launchers.items():
-        module = launcher.__self__
+        module = launcher.__self__.__self__ if name == "grid_py" else launcher.__self__
         context = next(key.context for key, value in _LOADED.items() if value is module)
         context = dataclasses.replace(
-            context, no_gpu=False, driver_path="/intj-test-no-driver.so",
-            launch_symbol=backend.launch_symbol, device_symbol=backend.device_symbol,
-            error_symbol=backend.error_symbol, error_style=backend.error_style,
+            context,
+            no_gpu=False,
+            driver_path="/intj-test-no-driver.so",
+            launch_symbol=backend.launch_symbol,
+            device_symbol=backend.device_symbol,
+            error_symbol=backend.error_symbol,
+            error_style=backend.error_style,
         )
         binary = tmp_path / f"{name}.so"
         _build(binary, context)
@@ -371,8 +425,11 @@ def test_grid_cpp_refuses_shadowed_helpers(tmp_path):
         triton = 1
         return (result,)
 
-    for grid, helper in ((local_min, "min"), (extra_triton, "triton"),
-                         (local_triton, "triton")):
+    for grid, helper in (
+        (local_min, "min"),
+        (extra_triton, "triton"),
+        (local_triton, "triton"),
+    ):
         with pytest.raises(UnsupportedKernel, match=helper):
             make_launcher(write_programs, grid_cpp=grid, no_gpu=True)
 
@@ -382,6 +439,6 @@ def test_grid_cpp_refuses_shadowed_helpers(tmp_path):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     module.__dict__["__builtins__"] = {**vars(builtins), "min": max}
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # Loader stubs lack exec_module
     with pytest.raises(UnsupportedKernel, match="min"):
         make_launcher(write_programs, grid_cpp=module.grid, no_gpu=True)
