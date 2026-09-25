@@ -6,6 +6,8 @@ Run from the INTJ root with PYTHONPATH=. python benchmarks/bench_intj_ffi_paths.
 all other rows measure warm host-only calls. No GPU kernel is launched.
 """
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import statistics

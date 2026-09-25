@@ -40,6 +40,8 @@ machine that will later be offline:
     python -m intj.kernel_cache --force absl   # discard a half-written tree
 """
 
+from __future__ import annotations
+
 import contextlib
 import dataclasses
 import enum

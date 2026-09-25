@@ -18,6 +18,17 @@
 #undef INTJ_RESTORE_DEBUG
 #endif
 
+/* The module reads CPython internals, so it is built for exactly one interpreter:
+ * the one that rendered it.  A different Python.h on the include path would
+ * compile cleanly and read the wrong layout. */
+#if PY_MAJOR_VERSION != {{ python_version[0] }} || PY_MINOR_VERSION != {{ python_version[1] }} || \
+    PY_MICRO_VERSION != {{ python_version[2] }}
+#error "intj: compiling against the headers of a different CPython than the one running intj"
+#endif
+#if defined(Py_GIL_DISABLED) != {{ 1 if free_threaded else 0 }}
+#error "intj: compiling against headers of the wrong GIL build"
+#endif
+
 {% set bound_params = params | rejectattr('annotation.bind_value', 'none') | list %}
 {% set auto_decode = namespace(enabled=true) %}
 {% for p in params %}
@@ -40,11 +51,12 @@
 {% if part not in auto_key_parts %}{% set _ = auto_key_parts.append(part) %}{% endif %}
 {% endif %}
 {% endif %}
+#define INTJ_CPYTHON_STATIC_COMPILE_HEADER "{{ cpython_static_compile_header }}"
 #define INTJ_NBOUND {{ bound_params | length }}
 #define INTJ_NWORDS {{ [nwords, 1] | max }}
 #define INTJ_HAS_KEY {{ 1 if nwords else 0 }}
 #define INTJ_KEY_BYTES {{ nwords * 8 }}
-#define INTJ_ACCESS_{{ torch_access | upper }} 1
+#define INTJ_TORCH_ACCESS_{{ torch_access_mode | upper }} 1
 #include "intj_runtime.h"
 
 #define INTJ_NPARAMS {{ params | rejectattr('call_index', 'none') | list | length }}
@@ -69,6 +81,7 @@ typedef struct {
 {% endif %}
 {% if not fixed_device %}  intj_cache cache;
 {% endif %}
+  intj_mutex mutex; /* every cache and compile_cb, on a free-threaded build */
 } intj_state;
 
 static const char *const intj_param_names[{{ params | length + 1 }}] = {
@@ -163,7 +176,7 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
         vals[np++] = bits;
       }
     } else if (PyFloat_CheckExact(o)) {
-      float value = (float)((PyFloatObject *)o)->ob_fval;
+      float value = (float)INTJ_FLOAT_VALUE(o);
       uint32_t bits;
       memcpy(&bits, &value, sizeof(bits));
       code = INTJ_B_FP32;
@@ -200,7 +213,7 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
       }
       code = kind == INTJ_INT_U64 ? INTJ_B_CX_UINT : INTJ_B_CX_INT;
     } else if (PyFloat_CheckExact(o)) {
-      double value = ((PyFloatObject *)o)->ob_fval;
+      double value = INTJ_FLOAT_VALUE(o);
       code = INTJ_B_CX_FLOAT;
       memcpy(&bits, &value, sizeof(bits));
     } else if (o == Py_None) {
@@ -482,6 +495,17 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
       if (intj_grid_dim(g, &gx) != 0)
         return NULL;
     } else if (PyTuple_CheckExact(g) || PyList_CheckExact(g)) {
+{% if free_threaded %}
+      /* Own a coherent snapshot: another thread can resize a list or replace
+       * its elements while the dimensions are being parsed. */
+      PyObject *snapshot = NULL;
+      if (PyList_CheckExact(g)) {
+        snapshot = PyList_AsTuple(g);
+        if (!snapshot)
+          return NULL;
+        g = snapshot;
+      }
+{% endif %}
       PyObject **items;
       Py_ssize_t n;
       if (PyTuple_CheckExact(g)) {
@@ -492,14 +516,21 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
         items = &PyList_GET_ITEM(g, 0);
       }
       if (n < 1 || n > 3) {
+{% if free_threaded %}        Py_XDECREF(snapshot);
+{% endif %}
         PyErr_SetString(PyExc_ValueError,
                         "intj: grid must have between 1 and 3 dimensions");
         return NULL;
       }
       uint32_t *dims[3] = {&gx, &gy, &gz};
       for (Py_ssize_t i = 0; i < n; i++)
-        if (intj_grid_dim(items[i], dims[i]) != 0)
+        if (intj_grid_dim(items[i], dims[i]) != 0) {
+{% if free_threaded %}          Py_XDECREF(snapshot);
+{% endif %}
           return NULL;
+        }
+{% if free_threaded %}      Py_XDECREF(snapshot);
+{% endif %}
     } else {
       PyErr_SetString(PyExc_TypeError,
                       "intj: grid must be an int, tuple or list of ints");
@@ -518,30 +549,38 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 
 {% if nwords %}
   uint64_t hash = intj_hash(key);
+  INTJ_LOCK(&st->mutex);
   intj_kernel *kernel = intj_cache_get(cache, key, hash);
-  if (INTJ_UNLIKELY(!kernel)) {
+  INTJ_UNLOCK(&st->mutex);
 {% else %}
+  INTJ_LOCK(&st->mutex);
   intj_kernel *kernel = bound->fixed_kernel;
-  if (INTJ_UNLIKELY(!bound->fixed_kernel)) {
+  INTJ_UNLOCK(&st->mutex);
 {% endif %}
+  if (INTJ_UNLIKELY(!kernel)) {
     /* Cold path: Python assembles the final canonical ASTSource from the
-     * public arguments and fixed annotations, without owning bound values. */
-    if (!st->compile_cb) {
+     * public arguments and fixed annotations. Never hold the mutex while
+     * invoking Python; another thread may fill this key meanwhile. */
+    INTJ_LOCK(&st->mutex);
+    PyObject *cb = st->compile_cb;
+    Py_XINCREF(cb);
+    INTJ_UNLOCK(&st->mutex);
+    if (!cb) {
       PyErr_SetString(PyExc_RuntimeError, "intj: compile callback is not set");
       return NULL;
     }
     PyObject *blob = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
-    if (!blob)
-      return NULL;
-    PyObject *nparams_obj = PyLong_FromLong(np);
+    PyObject *nparams_obj = blob ? PyLong_FromLong(np) : NULL;
     if (!nparams_obj) {
-      Py_DECREF(blob);
+      Py_XDECREF(blob);
+      Py_DECREF(cb);
       return NULL;
     }
     PyObject *device_obj = PyLong_FromLongLong(device_ordinal);
     if (!device_obj) {
       Py_DECREF(blob);
       Py_DECREF(nparams_obj);
+      Py_DECREF(cb);
       return NULL;
     }
     PyObject *cb_args[3 + INTJ_NPARAMS];
@@ -550,7 +589,6 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
     cb_args[2] = device_obj;
     for (int i = 0; i < INTJ_NPARAMS; i++)
       cb_args[3 + i] = args[1 + i];
-    PyObject *cb = Py_NewRef(st->compile_cb);
     PyObject *res = PyObject_Vectorcall(cb, cb_args, 3 + INTJ_NPARAMS, NULL);
     Py_DECREF(cb);
     Py_DECREF(blob);
@@ -566,29 +604,35 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
       return NULL;
     }
     Py_DECREF(res);
-    /* The callback ran python, so another thread may have filled this key. */
+    /* The callback ran Python, so another thread may have filled this key. */
+    INTJ_LOCK(&st->mutex);
 {% if nwords %}
     kernel = intj_cache_get(cache, key, hash);
 {% else %}
     kernel = bound->fixed_kernel;
 {% endif %}
     if (!kernel) {
-      kernel = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
-      if (!kernel)
+      intj_kernel *fresh = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
+      if (!fresh) {
+        INTJ_UNLOCK(&st->mutex);
         return PyErr_NoMemory();
-      kernel->function = (void *)(uintptr_t)function;
-      kernel->block_dim = block_dim;
-      kernel->shared = shared;
-      kernel->nparams = nparams;
+      }
+      fresh->function = (void *)(uintptr_t)function;
+      fresh->block_dim = block_dim;
+      fresh->shared = shared;
+      fresh->nparams = nparams;
 {% if nwords %}
-      if (intj_cache_put(cache, key, hash, kernel) != 0) {
-        PyMem_RawFree(kernel);
+      if (intj_cache_put(cache, key, hash, fresh) != 0) {
+        PyMem_RawFree(fresh);
+        INTJ_UNLOCK(&st->mutex);
         return PyErr_NoMemory();
       }
 {% else %}
-      bound->fixed_kernel = kernel;
+      bound->fixed_kernel = fresh;
 {% endif %}
+      kernel = fresh;
     }
+    INTJ_UNLOCK(&st->mutex);
   }
 
   if (INTJ_UNLIKELY((uint32_t)np != kernel->nparams)) {
@@ -706,7 +750,7 @@ static int intj_bound_clear(PyObject *self) {
   Py_CLEAR(bound->module);
   for (int i = 0; i < INTJ_NBOUND; i++) {
     Py_CLEAR(bound->owners[i]);
-#if defined(INTJ_ACCESS_CXX)
+#if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
     delete bound->tensors[i];
     bound->tensors[i] = NULL;
 #endif
@@ -750,8 +794,14 @@ static PyType_Slot intj_bound_slots[] = {
 
 static PyType_Spec intj_bound_spec = {
     "{{ module_name }}.BoundLauncher", sizeof(intj_bound_launcher), 0,
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
-        Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
+#ifdef Py_TPFLAGS_IMMUTABLETYPE
+        | Py_TPFLAGS_IMMUTABLETYPE
+#endif
+#ifdef Py_TPFLAGS_DISALLOW_INSTANTIATION
+        | Py_TPFLAGS_DISALLOW_INSTANTIATION
+#endif
+        ,
     intj_bound_slots};
 
 static PyObject *make_bound(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
@@ -861,7 +911,9 @@ static PyObject *make_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     PyErr_SetString(PyExc_RuntimeError, "intj: C++ exception while binding arguments");
   }
 #endif
+{% if fixed_device or bound_params %}
 fail:
+{% endif %}
   Py_XDECREF((PyObject *)bound);
   return NULL;
 }
@@ -894,21 +946,27 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
 static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   Py_INCREF(cb);
-  Py_XSETREF(st->compile_cb, cb);
+  INTJ_LOCK(&st->mutex);
+  PyObject *old = st->compile_cb;
+  st->compile_cb = cb;
+  INTJ_UNLOCK(&st->mutex);
+  Py_XDECREF(old); /* outside the lock: a finalizer runs python */
   Py_RETURN_NONE;
 }
 
 /* set_torch_version((major, minor), layout, dtype_index) -- install the torch ABI.
  *
- * Deliberately not baked into the binary: the offsets come from the torch that
- * is running now, so there is no window in which a cached .so built against one
- * torch is loaded against another.  `layout` is None in the cpython mode.
+ * RUNTIME_SHIM installs offsets from the torch running now. STATIC_COMPILE can
+ * check its compiled cdata offset against that layout when one is verified;
+ * INTERPRETER takes no layout.
  *
- * Nothing is written into `st->abi` until every argument has been checked.  The
- * method is reachable from python on a module that is already configured and
- * whose kernel cache already holds entries, so a call that failed halfway used
- * to leave it live with a half-installed table -- one key byte for every dtype,
- * which is a silently wrong kernel rather than an error.
+ * Nothing is written into `st->abi` until every argument has been checked, and
+ * a configured module cannot be configured again. The method is reachable from
+ * python after load, when its kernel cache may already hold entries.
+ *
+ * Launches read `st->abi` unlocked, so on a free-threaded build this must not
+ * race one.  The launcher calls it once, under its load lock, before the module
+ * is reachable.
  */
 static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                                    Py_ssize_t nargs) {
@@ -950,19 +1008,37 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
       }
   }
 
-{% if torch_access == 'shim' %}
-  unsigned int off[7];
-  PyObject *sizes;
+{% if torch_access_mode == 'runtime_shim' %}
+  uint16_t off[7];
   if (!PyTuple_Check(layout)) {
     PyErr_Format(PyExc_ValueError,
-                 "intj: this module was built with the shim access mode and needs "
+                 "intj: this module was built with RUNTIME_SHIM and needs "
                  "a tensor layout, got %s",
                  Py_TYPE(layout)->tp_name);
     return NULL;
   }
-  if (!PyArg_ParseTuple(layout, "IIIIIIIO", &off[0], &off[1], &off[2], &off[3],
-                        &off[4], &off[5], &off[6], &sizes))
+  if (PyTuple_GET_SIZE(layout) != 8) {
+    PyErr_SetString(PyExc_ValueError,
+                    "intj: tensor layout needs seven offsets and an itemsize table");
     return NULL;
+  }
+  for (int i = 0; i < 7; i++) {
+    PyObject *value = PyTuple_GET_ITEM(layout, i);
+    if (!PyLong_CheckExact(value)) {
+      PyErr_Format(PyExc_ValueError,
+                   "intj: tensor layout offset %d must be a 16-bit integer", i);
+      return NULL;
+    }
+    long v = PyLong_AsLong(value);
+    if (v < 0 || v > UINT16_MAX || PyErr_Occurred()) {
+      PyErr_Clear();
+      PyErr_Format(PyExc_ValueError,
+                   "intj: tensor layout offset %d must be a 16-bit integer", i);
+      return NULL;
+    }
+    off[i] = (uint16_t)v;
+  }
+  PyObject *sizes = PyTuple_GET_ITEM(layout, 7);
   Py_ssize_t n = PyBytes_Size(sizes);
   if (n < 0)
     return NULL;
@@ -971,49 +1047,60 @@ static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
                  INTJ_NDTYPES, n);
     return NULL;
   }
-  /* checks done; commit */
-  st->abi.cdata = (uint16_t)off[0];
-  st->abi.storage = (uint16_t)off[1];
-  st->abi.storage_offset = (uint16_t)off[2];
-  st->abi.numel = (uint16_t)off[3];
-  st->abi.data_type = (uint16_t)off[4];
-  st->abi.s_data = (uint16_t)off[5];
-  st->abi.s_nbytes = (uint16_t)off[6];
-  memcpy(st->abi.itemsize, PyBytes_AS_STRING(sizes), INTJ_NDTYPES);
-{% elif torch_access == 'cxx' %}
-  /* The compiler placed `cdata` for us; the probe found where it actually is.
-   * They must agree, or this module was compiled against a torch whose
-   * THPVariable no longer starts with the tensor. */
-  {
-    unsigned int off[7];
-    PyObject *sizes;
-    if (!PyTuple_Check(layout)) {
-      PyErr_Format(PyExc_ValueError,
-                   "intj: the c++ access mode needs the probed layout to check "
-                   "itself against, got %s",
-                   Py_TYPE(layout)->tp_name);
+  size_t absolute_cdata = (size_t)off[0] + sizeof(PyObject);
+  if (absolute_cdata > UINT16_MAX) {
+    PyErr_SetString(PyExc_ValueError,
+                    "intj: tensor layout cdata plus PyObject header must fit a 16-bit offset");
+    return NULL;
+  }
+{% elif torch_access_mode == 'static_compile' %}
+  if (layout != Py_None) {
+    if (!PyTuple_Check(layout) || PyTuple_GET_SIZE(layout) != 8 ||
+        !PyLong_CheckExact(PyTuple_GET_ITEM(layout, 0))) {
+      PyErr_SetString(PyExc_ValueError,
+                      "intj: STATIC_COMPILE layout must be eight entries with a cdata offset");
       return NULL;
     }
-    if (!PyArg_ParseTuple(layout, "IIIIIIIO", &off[0], &off[1], &off[2], &off[3],
-                          &off[4], &off[5], &off[6], &sizes))
+    long relative = PyLong_AsLong(PyTuple_GET_ITEM(layout, 0));
+    if (relative < 0 || relative > UINT16_MAX || PyErr_Occurred()) {
+      PyErr_Clear();
+      PyErr_SetString(PyExc_ValueError,
+                      "intj: STATIC_COMPILE cdata offset must be a 16-bit integer");
       return NULL;
-    if (off[0] != offsetof(intj_THPVariable, cdata)) {
+    }
+    size_t absolute = (size_t)relative + sizeof(PyObject);
+    if (absolute != offsetof(intj_THPVariable, cdata)) {
       PyErr_Format(PyExc_RuntimeError,
-                   "intj: this module was compiled expecting the tensor at "
-                   "offset %zu of THPVariable, but this torch has it at %u",
-                   (size_t)offsetof(intj_THPVariable, cdata), off[0]);
+                   "intj: STATIC_COMPILE expects tensor cdata at offset %zu, "
+                   "but this torch has it at %zu",
+                   (size_t)offsetof(intj_THPVariable, cdata), absolute);
       return NULL;
     }
   }
 {% else %}
   if (layout != Py_None) {
     PyErr_SetString(PyExc_ValueError,
-                    "intj: this module was built without the shim access mode, "
+                    "intj: this module was built without RUNTIME_SHIM, "
                     "so it takes no tensor layout");
     return NULL;
   }
 {% endif %}
 
+  if (st->abi.ready) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: torch ABI already installed");
+    return NULL;
+  }
+  /* checks done; commit */
+{% if torch_access_mode == 'runtime_shim' %}
+  st->abi.cdata = (uint16_t)absolute_cdata;
+  st->abi.storage = off[1];
+  st->abi.storage_offset = off[2];
+  st->abi.numel = off[3];
+  st->abi.data_type = off[4];
+  st->abi.s_data = off[5];
+  st->abi.s_nbytes = off[6];
+  memcpy(st->abi.itemsize, PyBytes_AS_STRING(sizes), INTJ_NDTYPES);
+{% endif %}
   memcpy(st->abi.dtype_index, index, INTJ_NDTYPES);
   st->abi.ready = 1;
   Py_RETURN_NONE;
@@ -1058,7 +1145,7 @@ static int intj_exec(PyObject *m) {
 
   if (intj_intern_names() != 0)
     return -1;
-{% if torch_access == 'cpython' %}
+{% if torch_access_mode == 'interpreter' %}
   /* The one layout bet this mode makes, and the only one that can check itself. */
   {
     PyObject *t = PyImport_ImportModule("torch");
@@ -1096,7 +1183,11 @@ static int intj_exec(PyObject *m) {
     return -1;
   }
 {% endif %}
+#if PY_VERSION_HEX >= 0x03090000
   st->bound_type = (PyTypeObject *)PyType_FromModuleAndSpec(m, &intj_bound_spec, NULL);
+#else
+  st->bound_type = (PyTypeObject *)PyType_FromSpec(&intj_bound_spec);
+#endif
   if (!st->bound_type)
     return -1;
   return 0;
@@ -1140,7 +1231,12 @@ static PyMethodDef intj_methods[] = {
 
 static PyModuleDef_Slot intj_slots[] = {
     {Py_mod_exec, (void *)intj_exec},
+#ifdef Py_mod_multiple_interpreters /* 3.12+; older CPython has no such slot */
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
+#ifdef Py_mod_gil /* 3.13+: a free-threaded build keeps the GIL off for it */
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
     {0, NULL}};
 
 static struct PyModuleDef intj_module = {

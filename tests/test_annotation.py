@@ -18,7 +18,7 @@ def kernel_from_source(tmp_path, source):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
     return module.kernel
 
 

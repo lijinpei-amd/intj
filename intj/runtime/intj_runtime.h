@@ -17,10 +17,6 @@
 #include <new>
 #endif
 
-#if PY_VERSION_HEX < 0x030C0000
-#error "intj requires CPython 3.12 or newer (PyLongObject layout)"
-#endif
-
 #if defined(__GNUC__) || defined(__clang__)
 #define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
 /* Only for branches whose outcome is a property of the design, not a guess
@@ -35,6 +31,12 @@
 #define INTJ_UNLIKELY(x) (x)
 #endif
 
+/* CPYTHON_ACCESS_MODE.STATIC_COMPILE selects its layout by PY_VERSION_HEX. */
+#ifndef INTJ_CPYTHON_STATIC_COMPILE_HEADER
+#error "define INTJ_CPYTHON_STATIC_COMPILE_HEADER to a header from intj/python_intf"
+#endif
+#include INTJ_CPYTHON_STATIC_COMPILE_HEADER
+
 #if defined(__clang__)
 #define INTJ_ASSUME(x) __builtin_assume(x)
 #elif defined(__GNUC__)
@@ -42,72 +44,6 @@
 #else
 #define INTJ_ASSUME(x) ((void)0)
 #endif
-
-static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
-
-/* The compact case has a public reader (`PyUnstable_Long_*`, 3.12+).  Above it
- * the digits have none before `PyLong_AsNativeBytes` in 3.13, so the rest walks
- * `ob_digit` with CPython's own layout macros from cpython/longintrepr.h.
- */
-
-/* 0 = ok, -1 = does not fit, 1 = not an exact int */
-static INTJ_ALWAYS_INLINE int intj_as_i64(PyObject *o, int64_t *out) {
-  PyLongObject *v = (PyLongObject *)o;
-  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
-    *out = (int64_t)PyUnstable_Long_CompactValue(v);
-    return 0;
-  }
-  uintptr_t tag = v->long_value.lv_tag;
-  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
-    return -1;
-  __uint128_t acc = 0;
-  for (size_t i = nd; i-- > 0;)
-    acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & _PyLong_SIGN_MASK) == 2) {
-    if (acc > ((__uint128_t)1 << 63))
-      return -1;
-    *out = (int64_t)(-(__int128_t)acc);
-  } else {
-    if (acc > (__uint128_t)INT64_MAX)
-      return -1;
-    *out = (int64_t)acc;
-  }
-  return 0;
-}
-
-/* Which of the two integer widths a python int lands in, if either.  Triton
- * buckets an int by what it fits (i32/i64, else u64), so a caller wants both
- * answers from one decode -- asking `intj_as_i64` and then `intj_as_u64` walks
- * the digits twice for every value above INT64_MAX. */
-#define INTJ_INT_TOO_BIG 0 /* fits neither: |value| is over 64 bits */
-#define INTJ_INT_I64 1     /* *out is the int64, cast back from the bits */
-#define INTJ_INT_U64 2     /* *out is the uint64: above INT64_MAX */
-
-static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
-  PyLongObject *v = (PyLongObject *)o;
-  if (INTJ_LIKELY(PyUnstable_Long_IsCompact(v))) { /* |value| < 2**30 */
-    *out = (uint64_t)(int64_t)PyUnstable_Long_CompactValue(v);
-    return INTJ_INT_I64;
-  }
-  uintptr_t tag = v->long_value.lv_tag;
-  size_t nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
-  if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */
-    return INTJ_INT_TOO_BIG;
-  __uint128_t acc = 0;
-  for (size_t i = nd; i-- > 0;)
-    acc = (acc << PyLong_SHIFT) | v->long_value.ob_digit[i];
-  if ((tag & _PyLong_SIGN_MASK) == 2) { /* negative: int64 or nothing */
-    if (acc > ((__uint128_t)1 << 63))
-      return INTJ_INT_TOO_BIG;
-    *out = (uint64_t)(int64_t)(-(__int128_t)acc);
-    return INTJ_INT_I64;
-  }
-  if (acc > (__uint128_t)UINT64_MAX)
-    return INTJ_INT_TOO_BIG;
-  *out = (uint64_t)acc;
-  return acc > (__uint128_t)INT64_MAX ? INTJ_INT_U64 : INTJ_INT_I64;
-}
 
 static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
   __uint128_t r = (__uint128_t)a * b;
@@ -405,9 +341,9 @@ static inline void intj_cache_free(intj_cache *c) {
  * opaque int32 discriminator) and, where the backend specializes on pointer
  * range, the storage size.  Exactly one of three strategies is compiled in.
  *
- *   INTJ_ACCESS_SHIM     read torch's structs at offsets installed at load
- *   INTJ_ACCESS_CPYTHON  call through the interpreter
- *   INTJ_ACCESS_CXX      C++, against torch's own headers
+ *   INTJ_TORCH_ACCESS_RUNTIME_SHIM    read structs at load-time offsets
+ *   INTJ_TORCH_ACCESS_INTERPRETER     call through the interpreter
+ *   INTJ_TORCH_ACCESS_STATIC_COMPILE C++, against torch's own headers
  *
  * No mode calls libtorch's aoti_torch_* shims, and no mode dlopens libtorch.
  */
@@ -415,7 +351,7 @@ static inline void intj_cache_free(intj_cache *c) {
 #define INTJ_NDTYPES 64
 
 typedef struct {
-  /* SHIM: byte offsets into THPVariable / TensorImpl / StorageImpl. Unused, and
+  /* RUNTIME_SHIM: byte offsets into THPVariable / TensorImpl / StorageImpl. Unused, and
    * left zero, in the other two modes. */
   uint16_t cdata;          /* PyObject*   -> TensorImpl**   */
   uint16_t storage;        /* TensorImpl* -> StorageImpl**  */
@@ -432,35 +368,21 @@ typedef struct {
   int ready;               /* set_torch_version has run */
 } intj_torch_abi;
 
-#ifdef INTJ_ACCESS_CXX
-/* Deliberately NOT torch/csrc/autograd/python_variable.h.  That header declares
- * the four-line struct below and nothing else intj needs, but it also pulls in
- * pybind11 -- 79% of the resulting .text, none of it reachable, and 9.5 s of
- * the 11 s build.  These three give byte-identical code for the reader.
- */
-#include <ATen/core/Tensor.h>
+#ifdef INTJ_TORCH_ACCESS_STATIC_COMPILE
 #include <c10/core/StorageImpl.h>
 #include <c10/core/TensorImpl.h>
 
-/* The head of THPVariable.  Declaring it here rather than including torch's
- * copy asserts one thing: that `cdata` is the first member after PyObject_HEAD.
- * That assertion is checked at load against the verified layout for this torch
- * -- see set_torch_version.
- */
-struct intj_THPVariable {
-  PyObject_HEAD
-  at::Tensor cdata;
-};
+#include "intj_thpvariable.h"
 #endif
 
-/* Interned method names, used only by the CPYTHON reader. Filled by
- * intj_abi_init; never released, like every other module-lifetime singleton. */
+/* Interned method names for INTERPRETER tensor reads and bound data_ptr().
+ * Filled by intj_intern_names; kept for the module's lifetime. */
 static PyObject *intj_str_dtype;
 static PyObject *intj_str_data_ptr;
 static PyObject *intj_str_untyped_storage;
 static PyObject *intj_str_nbytes;
 
-#if defined(INTJ_ACCESS_SHIM)
+#if defined(INTJ_TORCH_ACCESS_RUNTIME_SHIM)
 
 /* Reads torch's structs directly. `want_size` is a compile-time-ish flag: the
  * storage size is only needed where the backend specializes on pointer range.
@@ -514,7 +436,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   return 0;
 }
 
-#elif defined(INTJ_ACCESS_CPYTHON)
+#elif defined(INTJ_TORCH_ACCESS_INTERPRETER)
 
 /* Calls through the interpreter.  Slowest, but assumes nothing about torch's
  * layout beyond THPDtype, which self-checks at load. */
@@ -557,9 +479,9 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
   return 0;
 }
 
-#elif defined(INTJ_ACCESS_CXX)
+#elif defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
 
-/* Exactly the loads the shim mode makes, with the compiler supplying the field
+/* Exactly the loads RUNTIME_SHIM makes, with the compiler supplying the field
  * offsets instead of a probe.
  *
  * The fields are private, so they are reached through the
@@ -585,7 +507,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
  *
  * The cost is that a torch release renaming any of these fields breaks the
  * build.  That is the right failure: a compile error, not a wrong pointer --
- * which is what the shim mode would get, since it cannot see names at all.
+ * which is what RUNTIME_SHIM would get, since it cannot see names at all.
  */namespace intj_rob {
 template <typename Tag, typename Tag::type M>
 struct Rob {
@@ -626,7 +548,7 @@ static INTJ_ALWAYS_INLINE int intj_read_cxx_tensor(const intj_torch_abi *abi,
   }
   c10::StorageImpl *si = storage.unsafeGetStorageImpl();
 
-  const caffe2::TypeMeta meta = ti->*get(ti_data_type());
+  caffe2::TypeMeta meta = ti->*get(ti_data_type());
   if (INTJ_UNLIKELY(!meta.isScalarType())) { /* also stops toScalarType() throwing */
     PyErr_SetString(PyExc_RuntimeError, "intj: tensor has no scalar dtype");
     return -1;
@@ -637,8 +559,8 @@ static INTJ_ALWAYS_INLINE int intj_read_cxx_tensor(const intj_torch_abi *abi,
     *sz = (si->*get(si_size_bytes())).as_int_unchecked();
 
   /* torch returns null for every zero-element tensor, even one whose storage is
-   * live and whose storage_offset is not zero; see the shim reader.  Reading
-   * `numel_` rather than calling `numel()` also matches the shim mode on a
+   * live and whose storage_offset is not zero; see RUNTIME_SHIM. Reading
+   * `numel_` rather than calling `numel()` also matches RUNTIME_SHIM on a
    * tensor whose impl overrides it -- see docs/Usage.md. */
   const int64_t itemsize = (int64_t)meta.itemsize();
   *p = (ti->*get(ti_numel())) == 0
@@ -652,12 +574,11 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
                                                PyObject *o, void **p,
                                                int32_t *dt, int want_size,
                                                int64_t *sz) {
-  return intj_read_cxx_tensor(abi, ((intj_THPVariable *)o)->cdata,
-                              p, dt, want_size, sz);
+  return intj_read_cxx_tensor(abi, intj_cdata(o), p, dt, want_size, sz);
 }
 
 #else
-#error "intj: define one of INTJ_ACCESS_{SHIM,CPYTHON,CXX}"
+#error "intj: define one INTJ_TORCH_ACCESS_{INTERPRETER,RUNTIME_SHIM,STATIC_COMPILE}"
 #endif
 
 /* Re-raise the reader's error as "which argument", keeping torch's own message
@@ -675,9 +596,8 @@ static inline void intj_note_param(const char *pname) {
   }
 }
 
-/* Intern the method names the CPYTHON reader uses.  Interning once and holding
- * the references for the module's life keeps the reader down to a pointer
- * compare in the attribute lookup.  Returns -1 with a python error set. */
+/* Intern the method names used by tensor reads and bound data_ptr().
+ * Returns -1 with a python error set. */
 static inline int intj_intern_names(void) {
   intj_str_dtype = PyUnicode_InternFromString("dtype");
   intj_str_data_ptr = PyUnicode_InternFromString("data_ptr");
@@ -710,7 +630,7 @@ static inline int intj_dtype_selfcheck(PyObject *torch) {
     PyErr_SetString(PyExc_RuntimeError,
                     "intj: torch.dtype is not laid out as intj expects "
                     "(THPDtype { PyObject_HEAD ScalarType; char name[] }); "
-                    "this torch is too new or too old for the cpython mode");
+                    "this torch is too new or too old for INTERPRETER tensor access");
     return -1;
   }
   return 0;
@@ -792,8 +712,7 @@ intj_decode_constexpr(PyObject *o, const char *pname, intj_decoded *out) {
     out->kind = kind == INTJ_INT_U64 ? INTJ_VALUE_U64 : INTJ_VALUE_I64;
   } else if (PyFloat_CheckExact(o)) {
     out->kind = INTJ_VALUE_FP64;
-    /* Reading ob_fval directly keeps g++ from leaving an accessor call here. */
-    double value = ((PyFloatObject *)o)->ob_fval;
+    double value = INTJ_FLOAT_VALUE(o);
     memcpy(&out->bits, &value, sizeof(value));
   } else if (o == Py_None) {
     out->kind = INTJ_VALUE_NONE;
@@ -857,7 +776,7 @@ typedef struct intj_bound_launcher {
   int fixed_device;
   int64_t device_ordinal;
   int32_t device_handle;
-#if defined(INTJ_ACCESS_CXX)
+#if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   at::Tensor *tensors[INTJ_BOUND_SLOTS];
 #endif
 } intj_bound_launcher;
@@ -870,9 +789,9 @@ intj_bind_tensor(intj_bound_launcher *bound, int index, PyObject *value,
     PyErr_Format(PyExc_TypeError, "intj: bound tensor '%s' must be a tensor or None", pname);
     return -1;
   }
-#if defined(INTJ_ACCESS_CXX)
+#if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   if (value != Py_None) {
-    bound->tensors[index] = new (std::nothrow) at::Tensor(((intj_THPVariable *)value)->cdata);
+    bound->tensors[index] = new (std::nothrow) at::Tensor(intj_cdata(value));
     if (!bound->tensors[index]) {
       PyErr_NoMemory();
       return -1;
@@ -888,7 +807,7 @@ static INTJ_ALWAYS_INLINE int
 intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
                          PyTypeObject *param_type, intj_bound_launcher *bound,
                          int index, int want_size, const char *pname, intj_decoded *out) {
-#if defined(INTJ_ACCESS_CXX)
+#if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   memset(out, 0, sizeof(*out));
   if (!bound->tensors[index]) {
     out->kind = INTJ_VALUE_NONE;

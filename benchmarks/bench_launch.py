@@ -2,6 +2,15 @@
 """Repeated per-launch timings for argument annotations and README comparisons.
 
 Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep] [--iters N] [--batches N]
+
+The `--readme` rows report host time per launch for a trivial kernel:
+
+- `grid=(1,)` includes the driver launch call (`hipModuleLaunchKernel` on HIP).
+- `grid=(0,)` skips the driver call. intj also returns before decoding arguments,
+  so this row measures its early-out path, not its full host cost.
+- `spec_key` measures intj's argument decoding plus key computation, the work
+  the zero-volume row skips. Its tensor access modes only change how tensor
+  arguments are read.
 """
 
 import argparse
@@ -15,8 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from intj import Annotation, Argument, Assume, Aligned, BindValue, Constexpr, NEVER, PointerRange, make_launcher
-from intj.torch_abi import TorchAccess
+from intj import Annotation, Argument, Assume, Aligned, BindValue, Constexpr, NEVER, PointerRange, TorchAccessMode, make_launcher
 
 
 @triton.jit
@@ -51,9 +59,10 @@ def bench_readme(iters, batches):
     sync = torch.cuda.synchronize
 
     access_rows = []
-    for mode in (TorchAccess.SHIM, TorchAccess.CXX, TorchAccess.CPYTHON):
+    for mode in (TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE,
+                 TorchAccessMode.INTERPRETER):
         start = time.perf_counter_ns()
-        module = getattr(make_launcher(noop, torch_access=mode), "__self__")
+        module = getattr(make_launcher(noop, torch_access_mode=mode), "__self__")
         build_s = (time.perf_counter_ns() - start) / 1e9
         decode_ns = bench(module.spec_key, args, iters, batches, sync)
         access_rows.append((mode.name.lower(), decode_ns, build_s))
@@ -71,9 +80,9 @@ def bench_readme(iters, batches):
               f"{triton_ns / intj_ns:8.1f}x")
 
     print()
-    print(f"{'torch_access':>12} {'decode ns':>11} {'build s':>10}")
+    print(f"{'torch_access_mode':>17} {'decode ns':>11} {'build s':>10}")
     for mode, decode_ns, build_s in access_rows:
-        print(f"{mode:>12} {decode_ns:11.1f} {build_s:10.2f}")
+        print(f"{mode:>17} {decode_ns:11.1f} {build_s:10.2f}")
 
 
 def bench_sweep(iters, batches):
@@ -87,7 +96,7 @@ def bench_sweep(iters, batches):
             spec = importlib.util.spec_from_file_location(path.stem, path)
             assert spec is not None and spec.loader is not None
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
             launcher = make_launcher(module.noop, no_gpu=True)
             for kind, value in (("int", 17), ("tensor", torch.empty(4096))):
                 args = (0, 0, (1,)) + (value,) * count

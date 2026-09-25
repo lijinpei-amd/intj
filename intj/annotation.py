@@ -1,13 +1,19 @@
 """Argument annotations understood by intj launchers."""
 
+from __future__ import annotations
+
 import dataclasses
 import enum
 import inspect
 import struct
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import triton.language as tl
+if TYPE_CHECKING:
+    import triton.language as tl
+
+    INT_TYPES = (tl.int32, tl.int64, tl.uint64)
+    FLOAT_TYPES = (tl.float32,)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -134,8 +140,14 @@ class Constexpr(Annotation):
             hash(self.value)
 
 
-INT_TYPES = (tl.int32, tl.int64, tl.uint64)
-FLOAT_TYPES = (tl.float32,)
+def __getattr__(name: str) -> Any:
+    if name not in ("INT_TYPES", "FLOAT_TYPES"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import triton.language as tl
+
+    value = (tl.int32, tl.int64, tl.uint64) if name == "INT_TYPES" else (tl.float32,)
+    globals()[name] = value
+    return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,7 +157,7 @@ class KeyField:
     offset: int = -1
 
 
-class DeviceBinding(enum.StrEnum):
+class DeviceBinding(str, enum.Enum):
     FIXED = "fixed"
     NOT_FIXED = "not_fixed"
 
@@ -212,6 +224,8 @@ def _canonical_value(value: object) -> tuple[object, ...]:
 
 
 def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
+    import triton.language as tl
+
     if value is inspect.Parameter.empty:
         return None
     if type(value) is Argument or type(value) is Constexpr:
@@ -275,6 +289,8 @@ def _specialization_modes(value: object) -> tuple[object, object, object]:
 
 
 def _type_name(value: object, kind: str, *, element: bool = False) -> str | None:
+    import triton.language as tl
+
     if value is None:
         return None
     if type(value) is tl.pointer_type and kind == "argument":
@@ -391,6 +407,8 @@ def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launche
 def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     jit_func: Any, extra_annotation: Mapping[str, object] | None
 ) -> tuple[ResolvedParam, ...]:
+    import triton.language as tl
+
     extra = extra_annotation or {}
     unknown = set(extra) - {param.name for param in jit_func.params}
     if unknown:

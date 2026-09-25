@@ -4,8 +4,10 @@
 Requires apache-tvm-ffi in the same environment. Run from the INTJ root with
 PYTHONPATH=. /path/to/venv/bin/python benchmarks/bench_ffi_compare.py [--iters N]
 [--batches N]. All timings are host call/enqueue times, excluding synchronization.
-Use --sweep [--counts 0 3 5 8 16 32 64] for CXX/SHIM and preconverted FFI calls.
+Use --sweep [--counts 0 3 5 8 16 32 64] for static-compile/runtime-shim and preconverted FFI calls.
 """
+
+from __future__ import annotations
 
 import argparse
 import importlib.util
@@ -19,8 +21,7 @@ import triton.language as tl
 import tvm_ffi
 import tvm_ffi.cpp
 
-from intj import Argument, NEVER, make_launcher
-from intj.torch_abi import TorchAccess
+from intj import Argument, NEVER, TorchAccessMode, make_launcher
 from bench_launch import bench
 
 
@@ -140,7 +141,7 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
             spec = importlib.util.spec_from_file_location(path.stem, path)
             assert spec is not None and spec.loader is not None
             kernel_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(kernel_module)
+            spec.loader.exec_module(kernel_module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
             kernel = getattr(kernel_module, f"sweep_kernel_{count}")
             annotation = {
                 f"a{i}": Argument(
@@ -158,9 +159,9 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
                 (count, "FFI typed nop", getattr(mod, f"typed_{count}"), ffi_args),
                 (count, "FFI empty kernel", getattr(mod, f"launch_{count}"), ffi_args),
             ))
-            for mode in (TorchAccess.CXX, TorchAccess.SHIM):
+            for mode in (TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM):
                 launch = make_launcher(kernel, extra_annotation=annotation,
-                                       bind_device=True, torch_access=mode).bind_device(device)
+                                       bind_device=True, torch_access_mode=mode).bind_device(device)
                 assert launch.__self__.__self__.spec_key(*args) == (b"", count)
                 cases.append((count, f"INTJ {mode.value} kernel", launch, (stream, (1,), *args)))
 

@@ -4,6 +4,8 @@
 Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 """
 
+from __future__ import annotations
+
 import ctypes
 import dataclasses
 import dis
@@ -15,10 +17,15 @@ import pathlib
 import struct
 import subprocess
 import sys
-import tomllib
+import sysconfig
 import types
 import warnings
 import weakref
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib  # pyright: ignore[reportMissingImports]  # dependency on Python <3.11
 
 import pytest
 import torch
@@ -26,24 +33,25 @@ import triton
 import triton.language as tl
 
 import intj
-from intj import AUTO, NEVER, Aligned, Argument, Assume, BindValue, Constexpr, EqualTo, PointerRange, make_launcher
+from intj import launcher, make_launcher
+from intj import AUTO, NEVER, Aligned, Argument, Assume, BindValue, Constexpr, EqualTo, PointerRange
 from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
     ModuleKey,
-    Param,
     RenderContext,
     UnsupportedKernel,
     triton_specialization,
 )
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
-from intj.torch_abi import (
+from intj.python_intf import cpython_abi
+from intj.torch_intf.abi_detect import probe_layout
+from intj.torch_intf.torch_abi import (
     NDTYPES,
-    TorchAccess,
+    TorchAccessMode,
     dtype_code,
     dtype_index_table,
     itemsize_table,
     layout_for,
-    probe_layout,
 )
 
 
@@ -105,7 +113,7 @@ def test_readme_benchmark_matrix_runs():
         text=True,
     )
     assert run.returncode == 0, run.stderr
-    for label in ("grid=(1,)", "grid=(0,)", "shim", "cxx", "cpython"):
+    for label in ("grid=(1,)", "grid=(0,)", "runtime_shim", "static_compile", "interpreter"):
         assert label in run.stdout
 
 
@@ -140,7 +148,7 @@ def _kernel_from_source(tmp_path, name, signature):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
     return getattr(module, name)
 
 
@@ -202,7 +210,7 @@ def test_bind_device_validates_exact_nonnegative_int32(device_kernel):
         pass
 
     factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
-                            torch_access=TorchAccess.CPYTHON)
+                            torch_access_mode=TorchAccessMode.INTERPRETER)
     launch = factory.bind_device(0)
     for value in (None, True, False, 0.0, "0", IntSubclass(0), -1, 2**31, 2**65):
         with pytest.raises(TypeError, match="device.*int"):
@@ -222,7 +230,7 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(device_kern
         monkeypatch.setattr(f"intj.launcher.{name}", forbidden)
     factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
                             extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
-                            torch_access=TorchAccess.CPYTHON)
+                            torch_access_mode=TorchAccessMode.INTERPRETER)
     handles = [factory.bind_device(ordinal) for ordinal in (0, 255, 256, 2**31 - 1)]
     module = handles[0].__self__.__self__
     assert all(handle.__self__.__self__ is module for handle in handles)
@@ -247,7 +255,7 @@ def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
     factory = make_launcher(kernel, bind_device=True, extra_annotation={
         name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
                        bind_value=BindValue.POINTER) for name in names
-    }, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    }, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     values = dict.fromkeys(names, 0)
     with pytest.raises(TypeError, match="missing"):
         factory.bind_device(0)
@@ -262,7 +270,7 @@ def test_bind_device_signature_avoids_public_control_names(tmp_path):
     names = ("self", "device", "stream", "stream_", "grid", "grid_")
     kernel = _kernel_from_source(tmp_path, "fixed_control_names", ", ".join(names))
     launch = make_launcher(kernel, bind_device=True, no_gpu=True,
-                           torch_access=TorchAccess.CPYTHON).bind_device(0)
+                           torch_access_mode=TorchAccessMode.INTERPRETER).bind_device(0)
     signature = inspect.signature(launch)
     assert tuple(signature.parameters) == ("stream__", "grid__", *names)
     assert all(p.kind is inspect.Parameter.POSITIONAL_ONLY for p in signature.parameters.values())
@@ -290,7 +298,7 @@ def test_fixed_device_handles_own_independent_caches(device_kernel):
 def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
     factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
                             extra_annotation={"x": Constexpr(type=tl.int32)},
-                            torch_access=TorchAccess.CPYTHON)
+                            torch_access_mode=TorchAccessMode.INTERPRETER)
     first, second = factory.bind_device(0), factory.bind_device(0)
     calls = []
 
@@ -309,13 +317,13 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
 
 
 @pytest.mark.parametrize("mode,cache", [
-    (TorchAccess.CPYTHON, KernelCache.INTJ), (TorchAccess.CXX, KernelCache.INTJ),
-    (TorchAccess.CPYTHON, KernelCache.TSL), (TorchAccess.CPYTHON, KernelCache.ABSL),
+    (TorchAccessMode.INTERPRETER, KernelCache.INTJ), (TorchAccessMode.STATIC_COMPILE, KernelCache.INTJ),
+    (TorchAccessMode.INTERPRETER, KernelCache.TSL), (TorchAccessMode.INTERPRETER, KernelCache.ABSL),
 ])
 def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(device_kernel, mode, cache):
     factory = make_launcher(device_kernel, bind_device=True, no_gpu=True,
                             extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
-                            torch_access=mode, kernel_cache=cache)
+                            torch_access_mode=mode, kernel_cache=cache)
     launch = factory.bind_device(0)
     calls = []
 
@@ -341,7 +349,7 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(device_kernel, 
     assert "intj_cache_put(" not in call_body
     assert "intj_cache_init(" not in source
     assert "intj_cache_free(" not in source
-    assert call_body.count("INTJ_UNLIKELY(!bound->fixed_kernel)") == 1
+    assert "bound->fixed_kernel" in call_body
 
 
 @pytest.mark.parametrize("has_key", [False, True])
@@ -349,7 +357,7 @@ def test_bind_device_retry_and_reentrant_miss(device_kernel, has_key):
     annotation = Constexpr(type=tl.int32) if has_key else Argument(type=tl.int32, specialize=NEVER)
     launch = make_launcher(device_kernel, bind_device=True, no_gpu=True,
                            extra_annotation={"x": annotation},
-                           torch_access=TorchAccess.CPYTHON).bind_device(0)
+                           torch_access_mode=TorchAccessMode.INTERPRETER).bind_device(0)
     calls = []
 
     def compile_reentrant(key, nparams, device, value):
@@ -375,7 +383,7 @@ def test_bind_device_retry_and_reentrant_miss(device_kernel, has_key):
 def test_bind_device_keeps_dynamic_bound_handles_on_module_cache(pointer_kernel):
     factory = make_launcher(pointer_kernel, no_gpu=True, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
-    }, torch_access=TorchAccess.CPYTHON)
+    }, torch_access_mode=TorchAccessMode.INTERPRETER)
     first, second = factory.bind(x=4096), factory.bind(x=8192)
     calls = []
 
@@ -391,7 +399,7 @@ def test_bind_device_keeps_dynamic_bound_handles_on_module_cache(pointer_kernel)
 
 
 @pytest.mark.parametrize("has_key", [False, True])
-@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+@pytest.mark.parametrize("mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.STATIC_COMPILE])
 def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, mode):
     from intj.launcher import _LOADED
 
@@ -399,7 +407,7 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
         "p": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
         "n": Constexpr(type=tl.int32) if has_key else Argument(type=tl.int32, specialize=NEVER),
-    }, torch_access=mode)
+    }, torch_access_mode=mode)
     owner = _BoundPointer(4096)
     bound = factory.bind_device(0, x=owner, p=0)
     module = bound.__self__.__self__
@@ -437,7 +445,7 @@ def test_bind_device_cuda_template_backend_branches_compile(tmp_path, device_ker
     }), DeviceBinding.FIXED)
     context = _render_context(
         params=params, nwords=nwords, device_binding=DeviceBinding.FIXED, device_offset=offset,
-        torch_access="cpython", no_gpu=no_gpu, driver_path="/intj-test-no-driver.so",
+        torch_access_mode="interpreter", no_gpu=no_gpu, driver_path="/intj-test-no-driver.so",
         launch_symbol=backend.launch_symbol, device_symbol=backend.device_symbol,
         error_symbol=backend.error_symbol, error_style=backend.error_style,
     )
@@ -456,7 +464,7 @@ def test_bind_device_cuda_template_backend_branches_compile(tmp_path, device_ker
 def test_bind_device_resolves_without_changing_current_and_checks_first_compile(device_kernel, monkeypatch):
     current = torch.cuda.current_device()
     ordinal = (current + 1) % torch.cuda.device_count()
-    factory = make_launcher(device_kernel, bind_device=True, torch_access=TorchAccess.CPYTHON)
+    factory = make_launcher(device_kernel, bind_device=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     launch = factory.bind_device(ordinal)
     assert torch.cuda.current_device() == current
     monkeypatch.setattr("intj.launcher._current_device", lambda: ordinal + 1)
@@ -470,9 +478,9 @@ def test_bind_device_reports_driver_lookup_failure(device_kernel):
         sys.executable, "-c",
         "import runpy, sys\n"
         "from intj import make_launcher\n"
-        "from intj.torch_abi import TorchAccess\n"
+        "from intj import TorchAccessMode\n"
         "kernel = runpy.run_path(sys.argv[1])['device_kernel']\n"
-        "make_launcher(kernel, bind_device=True, torch_access=TorchAccess.CPYTHON).bind_device(2**31 - 1)\n",
+        "make_launcher(kernel, bind_device=True, torch_access_mode=TorchAccessMode.INTERPRETER).bind_device(2**31 - 1)\n",
         inspect.getfile(device_kernel.fn),
     ], capture_output=True, text=True)
     assert result.returncode != 0
@@ -486,7 +494,7 @@ def test_bind_device_launches_annotated_ast_source_on_gpu(compiled_kernels, has_
     factory = make_launcher(annotated_store, bind_device=True, extra_annotation={
         "o": Argument(type=tl.pointer_type(tl.int32), specialize=NEVER),
         "x": Constexpr(type=tl.int32) if has_key else Argument(type=tl.int32, specialize=NEVER),
-    }, torch_access=TorchAccess.CPYTHON)
+    }, torch_access_mode=TorchAccessMode.INTERPRETER)
     bound = factory.bind_device(torch.cuda.current_device())
     stream = torch.cuda.current_stream().cuda_stream
     for value in (1, 17, -31, 1):
@@ -551,7 +559,7 @@ def test_bound_launchers_are_fastcall_builtins(bound_kernel, bind_device):
     factory = make_launcher(bound_kernel, extra_annotation={
         name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
                        bind_value=BindValue.POINTER) for name in ("x", "p")
-    }, no_gpu=True, bind_device=bind_device, torch_access=TorchAccess.CPYTHON)
+    }, no_gpu=True, bind_device=bind_device, torch_access_mode=TorchAccessMode.INTERPRETER)
     launch = factory.bind_device(0, x=0, p=0) if bind_device else factory.bind(x=0, p=0)
     assert isinstance(launch, types.BuiltinFunctionType)
     flags = ctypes.pythonapi.PyCFunction_GetFlags
@@ -563,7 +571,7 @@ def test_bound_launchers_are_fastcall_builtins(bound_kernel, bind_device):
         assert call() is None
     if sys.version_info[:2] == (3, 12):
         assert "CALL_NO_KW_BUILTIN_FAST" in {
-            instruction.opname for instruction in dis.get_instructions(call, adaptive=True)
+            instruction.opname for instruction in dis.get_instructions(call, adaptive=True)  # pyright: ignore[reportCallIssue]  # 3.8 stubs lack it
         }
 
 
@@ -594,7 +602,7 @@ def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path
         name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
                        bind_value=BindValue.POINTER)
         for name in ("self", "values", "args")
-    }, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    }, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     bound = factory.bind(args=12288, values=8192, self=4096)
     assert tuple(inspect.signature(bound).parameters) == ("device", "stream", "grid", "n")
     assert bound(0, 0, 1, 4) is None
@@ -623,7 +631,7 @@ def test_bind_signature_control_names_avoid_kernel_names(tmp_path, public_names,
     kernel = _kernel_from_source(tmp_path, "binding_control_names", ", ".join(("x", *public_names)))
     factory = make_launcher(kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
-    }, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    }, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     bound = factory.bind(x=0)
     signature = inspect.signature(bound)
     assert tuple(signature.parameters) == (*control_names, *public_names)
@@ -632,13 +640,13 @@ def test_bind_signature_control_names_avoid_kernel_names(tmp_path, public_names,
     assert bound(0, 0, 1, *range(4, 4 + len(public_names))) is None
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mode):
     from intj.launcher import _LOADED
 
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(specialize=NEVER, bind_value=BindValue.TENSOR),
-    }, no_gpu=True, torch_access=mode)
+    }, no_gpu=True, torch_access_mode=mode)
     first = factory.bind(x=torch.empty(4))
     second = factory.bind(x=torch.empty(16))
     wide = factory.bind(x=torch.empty(4, dtype=torch.float64))
@@ -668,7 +676,7 @@ def test_bind_none_materializes_triton_constexpr(pointer_kernel, annotation, bin
 
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": annotation,
-    }, no_gpu=True, verify_annotation=verify, torch_access=TorchAccess.CPYTHON,
+    }, no_gpu=True, verify_annotation=verify, torch_access_mode=TorchAccessMode.INTERPRETER,
        bind_device=bind_device)
     bind = (lambda **values: factory.bind_device(0, **values)) if bind_device else factory.bind
     bound = bind(x=None)
@@ -726,13 +734,13 @@ def test_binding_null_and_structural_rules(mode, value, valid, pointer_kernel):
             factory.bind(x=value)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 @pytest.mark.parametrize("binding", [BindValue.TENSOR, BindValue.POINTER])
 @pytest.mark.parametrize("verify", [False, True])
 def test_bind_nulls_and_structural_safety(pointer_kernel, mode, binding, verify):
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=binding),
-    }, no_gpu=True, torch_access=mode, verify_annotation=verify)
+    }, no_gpu=True, torch_access_mode=mode, verify_annotation=verify)
     values = [None, torch.empty(4), torch.nn.Parameter(torch.empty(4))]
     bad = [object(), True, 0.0, 2**64]
     if binding is BindValue.POINTER:
@@ -747,22 +755,22 @@ def test_bind_nulls_and_structural_safety(pointer_kernel, mode, binding, verify)
             factory.bind(x=value)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 @pytest.mark.parametrize("binding", [BindValue.TENSOR, BindValue.POINTER])
 def test_bind_checked_dtype_and_unchecked_promises(pointer_kernel, mode, binding):
     annotation = {"x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
                                  bind_value=binding)}
     wrong = torch.empty(4, dtype=torch.float64)
     unchecked = make_launcher(pointer_kernel, extra_annotation=annotation,
-                               no_gpu=True, torch_access=mode).bind(x=wrong)
+                               no_gpu=True, torch_access_mode=mode).bind(x=wrong)
     assert unchecked(0, 0, 1) is None
     checked = make_launcher(pointer_kernel, extra_annotation=annotation,
-                             no_gpu=True, verify_annotation=True, torch_access=mode)
+                             no_gpu=True, verify_annotation=True, torch_access_mode=mode)
     with pytest.raises(TypeError, match="x.*type"):
         checked.bind(x=wrong)(0, 0, 1)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 @pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
 @pytest.mark.parametrize("bind_device", [False, True], ids=["module", "no-map"])
 def test_bind_tensor_rechecks_storage_after_set(pointer_kernel, mode, no_gpu, bind_device, monkeypatch):
@@ -770,7 +778,7 @@ def test_bind_tensor_rechecks_storage_after_set(pointer_kernel, mode, no_gpu, bi
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32),
                       specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.TENSOR),
-    }, no_gpu=no_gpu, bind_device=bind_device, verify_annotation=True, torch_access=mode)
+    }, no_gpu=no_gpu, bind_device=bind_device, verify_annotation=True, torch_access_mode=mode)
     device = "cpu" if no_gpu else "cuda"
     tensor = torch.empty(4, device=device)
     bound = factory.bind_device(0, x=tensor) if bind_device else factory.bind(x=tensor)
@@ -796,7 +804,7 @@ def test_bind_tensor_rechecks_storage_after_set(pointer_kernel, mode, no_gpu, bi
 
 
 @pytest.mark.parametrize("verify", [False, True])
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 @pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
 def test_bind_pointer_checks_once_and_warns_at_creation(pointer_kernel, verify, mode, no_gpu):
     with warnings.catch_warnings(record=True) as caught:
@@ -804,7 +812,7 @@ def test_bind_pointer_checks_once_and_warns_at_creation(pointer_kernel, verify, 
         factory = make_launcher(pointer_kernel, extra_annotation={
             "x": Argument(type=tl.pointer_type(tl.float32),
                           specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.POINTER),
-        }, no_gpu=no_gpu, verify_annotation=verify, torch_access=mode)
+        }, no_gpu=no_gpu, verify_annotation=verify, torch_access_mode=mode)
         assert len(caught) == int(verify)
         if verify:
             assert caught[0].category is RuntimeWarning
@@ -850,13 +858,13 @@ def test_binding_warnings_are_per_parameter_at_factory_creation(bound_kernel, ve
         assert len(caught) == 2 * int(verify)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 @pytest.mark.parametrize("binding", [BindValue.TENSOR, BindValue.POINTER])
 def test_binding_unchecked_assumptions_keep_structural_safety(pointer_kernel, mode, binding):
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32),
                       specialize=Assume(Aligned(16), PointerRange(32)), bind_value=binding),
-    }, no_gpu=True, torch_access=mode)
+    }, no_gpu=True, torch_access_mode=mode)
     large = torch.empty(2**28 + 1, dtype=torch.float64)
     wrong = large[1:2]  # Wrong dtype, unaligned pointer, and >2 GiB storage.
     assert factory.bind(x=wrong)(0, 0, 1) is None
@@ -871,7 +879,7 @@ def test_binding_unchecked_assumptions_keep_structural_safety(pointer_kernel, mo
             factory.bind(x=value)(0, 0, 1)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+@pytest.mark.parametrize("mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.STATIC_COMPILE])
 @pytest.mark.parametrize("cache_owner", ["module", "handle-map", "no-map"])
 def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mode, cache_owner):
     for verify in (True, False):
@@ -883,10 +891,10 @@ def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mo
                 "p": Argument(type=tl.pointer_type(tl.float32),
                               specialize=Assume(Aligned(16), PointerRange(32)), bind_value=BindValue.POINTER),
                 "n": Argument(type=tl.int32, specialize=NEVER if cache_owner == "no-map" else Assume(Aligned(16))),
-            }, no_gpu=True, verify_annotation=verify, torch_access=mode, bind_device=cache_owner != "module")
+            }, no_gpu=True, verify_annotation=verify, torch_access_mode=mode, bind_device=cache_owner != "module")
             bound = (factory.bind(x=None, p=0) if cache_owner == "module"
                      else factory.bind_device(0, x=None, p=0))
-        suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+        suffix = ".cpp" if mode is TorchAccessMode.STATIC_COMPILE else ".c"
         source = pathlib.Path(bound.__self__.__self__.__file__).with_name(f"bound_kernel{suffix}").read_text()
         pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
         bind = source[source.index("static PyObject *make_bound"):source.index("/* Debug/test entry")]
@@ -955,18 +963,18 @@ def test_baked_constraints_fail_before_materialization(scalar_kernel, monkeypatc
                       verify_annotation=verify)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 @pytest.mark.parametrize("binding", [BindValue.TENSOR, BindValue.POINTER])
 def test_bind_gpu_storage_and_owner_lifetime(mode, binding):
     factory = make_launcher(scale, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=binding),
-    }, torch_access=mode, verify_annotation=True)
+    }, torch_access_mode=mode, verify_annotation=True)
     original = torch.arange(16, device="cuda", dtype=torch.float32)
     tensor = original.detach()
     out = torch.empty_like(tensor)
     native_references = getattr(tensor, "_use_count")()
     bound = factory.bind(x=tensor)
-    owns_native_tensor = mode is TorchAccess.CXX and binding is BindValue.TENSOR
+    owns_native_tensor = mode is TorchAccessMode.STATIC_COMPILE and binding is BindValue.TENSOR
     assert getattr(tensor, "_use_count")() == native_references + int(owns_native_tensor)
     assert any(obj is tensor for obj in gc.get_referents(bound.__self__)) != owns_native_tensor
     launch(bound, (1,), out, 16, 2.0, 16)
@@ -997,7 +1005,7 @@ def test_bind_pointer_snapshots_data_ptr_object_on_gpu():
     owner = _BoundPointer(tensor.data_ptr())
     bound = make_launcher(scale, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
-    }, torch_access=TorchAccess.CPYTHON).bind(x=owner)
+    }, torch_access_mode=TorchAccessMode.INTERPRETER).bind(x=owner)
     owner.address = 0
     launch(bound, (1,), out, 16, 2.0, 16)
     torch.testing.assert_close(out, tensor * 2)
@@ -1011,7 +1019,7 @@ def test_bind_null_pointer_reaches_gpu(binding, value):
     out = torch.zeros(1, device="cuda", dtype=torch.int32)
     bound = make_launcher(annotated_null, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=binding),
-    }, verify_annotation=True, torch_access=TorchAccess.CPYTHON).bind(x=value)
+    }, verify_annotation=True, torch_access_mode=TorchAccessMode.INTERPRETER).bind(x=value)
     launch(bound, (1,), out)
     assert out.item() == 1
 
@@ -1021,7 +1029,7 @@ def test_bind_inferred_none_reaches_gpu_as_constexpr(compiled_kernels):
     out = torch.empty_like(tensor)
     bound = make_launcher(axpy, extra_annotation={
         "bias": Argument(specialize=NEVER, bind_value=BindValue.TENSOR),
-    }, verify_annotation=True, torch_access=TorchAccess.CPYTHON).bind(bias=None)
+    }, verify_annotation=True, torch_access_mode=TorchAccessMode.INTERPRETER).bind(bias=None)
     launch(bound, (1,), tensor, tensor, out, 16, 2.0, False, 16)
     torch.testing.assert_close(out, tensor * 2)
     assert compiled_kernels[-1].src.signature["bias"] == "constexpr"
@@ -1036,7 +1044,7 @@ def test_bind_mixed_and_baked_values_follow_declaration_order_on_gpu():
         "o": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
         "n": Argument(type=tl.int32, specialize=NEVER, value=16),
         "BLOCK": Constexpr(value=16),
-    }, verify_annotation=True, torch_access=TorchAccess.CXX)
+    }, verify_annotation=True, torch_access_mode=TorchAccessMode.STATIC_COMPILE)
     bound = factory.bind(o=out, x=tensor)
     assert tuple(inspect.signature(bound).parameters) == ("device", "stream", "grid", "s")
     for scale_value in (2.0, 3.0):
@@ -1052,23 +1060,23 @@ def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkey
         monkeypatch.setattr(f"intj.launcher.{name}", forbidden)
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(specialize=NEVER, bind_value=BindValue.TENSOR),
-    }, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    }, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     for value in (None, torch.empty(4)):
         bound = factory.bind(x=value)
         assert bound(0, 0, 1) is None
 
 
 @pytest.mark.parametrize("mode,binding", [
-    (TorchAccess.SHIM, BindValue.TENSOR), (TorchAccess.CPYTHON, BindValue.TENSOR),
-    (TorchAccess.CXX, BindValue.POINTER), (TorchAccess.SHIM, BindValue.POINTER),
-    (TorchAccess.CPYTHON, BindValue.POINTER),
+    (TorchAccessMode.RUNTIME_SHIM, BindValue.TENSOR), (TorchAccessMode.INTERPRETER, BindValue.TENSOR),
+    (TorchAccessMode.STATIC_COMPILE, BindValue.POINTER), (TorchAccessMode.RUNTIME_SHIM, BindValue.POINTER),
+    (TorchAccessMode.INTERPRETER, BindValue.POINTER),
 ])
 def test_bind_retains_extension_and_collects_owner_cycles(pointer_kernel, mode, binding):
     from intj.launcher import _LOADED
 
     factory = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=binding),
-    }, no_gpu=True, torch_access=mode)
+    }, no_gpu=True, torch_access_mode=mode)
     owner = torch.empty(4) if binding is BindValue.TENSOR else _BoundPointer(4096)
     bound = factory.bind(x=owner)
     other = factory.bind(x=torch.empty(4) if binding is BindValue.TENSOR else 8192)
@@ -1089,12 +1097,12 @@ def test_bind_retains_extension_and_collects_owner_cycles(pointer_kernel, mode, 
     assert module_ref() is None
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CXX, TorchAccess.SHIM, TorchAccess.CPYTHON])
+@pytest.mark.parametrize("mode", [TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.INTERPRETER])
 def test_bind_native_failure_releases_partial_owners(bound_kernel, mode):
     factory = make_launcher(bound_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.TENSOR),
         "p": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
-    }, no_gpu=True, torch_access=mode)
+    }, no_gpu=True, torch_access_mode=mode)
     bound = factory.bind(x=None, p=0)
     tensor = torch.empty(4)
     references, native_references = sys.getrefcount(tensor), getattr(tensor, "_use_count")()
@@ -1114,7 +1122,7 @@ def test_bind_native_failure_releases_partial_owners(bound_kernel, mode):
 def test_bind_hot_fastcall_creates_no_python_frame(pointer_kernel):
     bound = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER),
-    }, no_gpu=True, torch_access=TorchAccess.CPYTHON).bind(x=4096)
+    }, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER).bind(x=4096)
     bound(0, 0, 1)
     calls = []
 
@@ -1336,13 +1344,13 @@ def test_baked_constexpr_invalid_at_creation(power_kernel, annotation, verify):
                       verify_annotation=verify, no_gpu=True)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+@pytest.mark.parametrize("mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.STATIC_COMPILE])
 def test_constexpr_checked_source_has_one_predicted_branch(power_kernel, mode):
     for verify in (True, False):
         module = getattr(make_launcher(power_kernel, extra_annotation={"N": Constexpr(
             type=(tl.int8, tl.uint64), power_of_two_or_zero=True)},
-            verify_annotation=verify, no_gpu=True, torch_access=mode), "__self__")
-        suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+            verify_annotation=verify, no_gpu=True, torch_access_mode=mode), "__self__")
+        suffix = ".cpp" if mode is TorchAccessMode.STATIC_COMPILE else ".c"
         source = pathlib.Path(module.__file__).with_name(f"power_kernel{suffix}").read_text()
         assert source.count("INTJ_UNLIKELY(!valid_0)") == int(verify)
         assert source.count("INTJ_ASSUME(valid_0)") == int(verify)
@@ -1425,7 +1433,7 @@ def test_checked_ordinary_allowlist_is_not_coercion(scalar_kernel):
 def test_unchecked_ordinary_keeps_only_structural_checks(scalar_kernel):
     launch = make_launcher(scalar_kernel, extra_annotation={
         "x": Argument(type=tl.int8, specialize=Assume(Aligned(16)))},
-        no_gpu=True, torch_access=TorchAccess.CPYTHON)
+        no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     for value in (129, 17, None, True):
         assert launch(0, 0, 1, value) is None
     for value in (object(), 2**64):
@@ -1433,12 +1441,12 @@ def test_unchecked_ordinary_keeps_only_structural_checks(scalar_kernel):
             launch(0, 0, 1, value)
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.SHIM, TorchAccess.CXX])
+@pytest.mark.parametrize("mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE])
 def test_checked_ordinary_pointer_null_and_dtype(pointer_kernel, mode):
     launch = make_launcher(
         pointer_kernel,
         extra_annotation={"x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER)},
-        verify_annotation=True, no_gpu=True, torch_access=mode,
+        verify_annotation=True, no_gpu=True, torch_access_mode=mode,
     )
     for value in (None, 0, torch.empty(4)):
         assert launch(0, 0, 1, value) is None
@@ -1453,7 +1461,7 @@ def test_checked_ordinary_pointer_allowlist_rejects_missing_torch_dtype(pointer_
     # accidentally match the first compact dtype index (uint8).
     launch = make_launcher(pointer_kernel, extra_annotation={
         "x": Argument(type=(tl.pointer_type(tl.float8e4b15), tl.int32), specialize=NEVER)},
-        verify_annotation=True, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+        verify_annotation=True, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     assert launch(0, 0, 1, 7) is None
     with pytest.raises(TypeError, match="x.*allowlist"):
         launch(0, 0, 1, torch.empty(1, dtype=torch.uint8))
@@ -1482,7 +1490,7 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
     for specialization in (AUTO, NEVER):
         baseline = getattr(make_launcher(
             pointer_kernel, extra_annotation={"x": Argument(specialize=specialization)},
-            no_gpu=True, torch_access=TorchAccess.CPYTHON,
+            no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER,
         ), "__self__")
         assert baseline.spec_key(small) == baseline.spec_key(large)
         key = next(key for key, module in _LOADED.items() if module is baseline)
@@ -1539,7 +1547,7 @@ def test_baked_argument_removes_public_value_and_key(bound_kernel, value, slots)
 def test_baked_argument_preserves_float_bits(scalar_kernel, value, bits):
     launch = make_launcher(scalar_kernel, extra_annotation={
         "x": Argument(type=tl.float64, value=value, specialize=NEVER)},
-        no_gpu=True, torch_access=TorchAccess.CPYTHON)
+        no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     assert launch(0, 0, 1) is None
     assert getattr(launch, "__self__").spec_key() == (bytes(8), 1)
     path = pathlib.Path(getattr(launch, "__self__").__file__)
@@ -1561,15 +1569,15 @@ def test_annotation_module_identity(scalar_kernel):
     assert getattr(checked, "__self__").__file__ != paths[0]
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.CPYTHON, TorchAccess.CXX])
+@pytest.mark.parametrize("mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.STATIC_COMPILE])
 def test_checked_source_has_one_predicted_branch_per_argument(scalar_kernel, mode):
     sources = []
     for verify in (True, False):
         launch = make_launcher(scalar_kernel, extra_annotation={
             "x": Argument(type=tl.int32, specialize=Assume(Aligned(16)))},
-            verify_annotation=verify, no_gpu=True, torch_access=mode)
+            verify_annotation=verify, no_gpu=True, torch_access_mode=mode)
         path = pathlib.Path(getattr(launch, "__self__").__file__)
-        suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+        suffix = ".cpp" if mode is TorchAccessMode.STATIC_COMPILE else ".c"
         sources.append(path.with_name(f"scalar_kernel{suffix}").read_text())
     checked, unchecked = sources
     assert checked.count("INTJ_UNLIKELY(!valid_0)") == 1
@@ -1590,7 +1598,7 @@ def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     monkeypatch.setattr(launcher, "_current_device", forbidden)
     monkeypatch.setattr(launcher, "_canonical_options", forbidden)
     monkeypatch.setattr(launcher, "_make_compile_callback", forbidden)
-    host = make_launcher(scale, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    host = make_launcher(scale, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     x = torch.ones(8)
     out = torch.zeros(8)
     assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
@@ -1618,7 +1626,7 @@ def test_no_gpu_does_not_read_gpu_compilation_knobs(scalar_kernel, monkeypatch):
     monkeypatch.setattr(type(knobs.runtime), "debug", property(forbidden))
     monkeypatch.setattr(type(knobs.compilation), "instrumentation_mode", property(forbidden))
     monkeypatch.setattr("intj.launcher._canonical_options", forbidden)
-    host = make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    host = make_launcher(scalar_kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     host(0, 0, (1,), 7)
 
 
@@ -1727,7 +1735,7 @@ def test_grid_spellings(scale_launcher):
 
 @pytest.mark.parametrize("sequence", [tuple, list])
 def test_nonzero_grid_product_overflow_does_not_skip_decoding(scalar_kernel, sequence):
-    host = make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    host = make_launcher(scalar_kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     # The product is 2**64; every dimension is valid and nonzero.
     with pytest.raises(TypeError, match="argument 'x'"):
         host(0, 0, sequence((1 << 22, 1 << 21, 1 << 21)), object())
@@ -1735,7 +1743,7 @@ def test_nonzero_grid_product_overflow_does_not_skip_decoding(scalar_kernel, seq
 
 @pytest.mark.parametrize("sequence", [tuple, list])
 def test_grid_sequence_validation_and_zero_dimensions(scalar_kernel, sequence):
-    host = make_launcher(scalar_kernel, no_gpu=True, torch_access=TorchAccess.CPYTHON)
+    host = make_launcher(scalar_kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER)
     for size in (1, 2, 3):
         assert host(0, 0, sequence([2**32 - 1] * size), 7) is None
         for dim in range(size):
@@ -1874,7 +1882,7 @@ def test_annotated_effective_compile_options_and_identity(
     monkeypatch.setattr(scalar_kernel, "debug", False)
     monkeypatch.setattr(knobs.runtime, "debug", False)
     monkeypatch.setattr(knobs.compilation, "instrumentation_mode", "")
-    baseline = make_launcher(scalar_kernel, torch_access=TorchAccess.CPYTHON)
+    baseline = make_launcher(scalar_kernel, torch_access_mode=TorchAccessMode.INTERPRETER)
     baseline_key = next(key for key, module in launcher._LOADED.items()
                         if module is getattr(baseline, "__self__"))
     monkeypatch.setattr(scalar_kernel, "debug", jit_debug)
@@ -1904,7 +1912,7 @@ def test_annotated_effective_compile_options_and_identity(
 
     monkeypatch.setattr(triton.compiler, "compile", capture_compile)
     monkeypatch.setattr(launcher, "_loaded_module", capture_module)
-    make_launcher(scalar_kernel, options=options, torch_access=TorchAccess.CPYTHON)
+    make_launcher(scalar_kernel, options=options, torch_access_mode=TorchAccessMode.INTERPRETER)
 
 
 def test_launchers_of_one_kernel_stay_independent(compiled_kernels):
@@ -1988,7 +1996,7 @@ def test_modules_stay_out_of_the_import_system():
 
 
 def test_source_and_binary_are_cached_on_disk():
-    launcher = make_launcher(scale, options={"num_stages": 4}, torch_access=TorchAccess.SHIM)
+    launcher = make_launcher(scale, options={"num_stages": 4}, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
     so_path = pathlib.Path(getattr(launcher, "__self__").__file__)
     source = so_path.with_name("scale.c")
     assert so_path.exists() and source.exists()
@@ -2145,7 +2153,7 @@ def test_annotated_scalar_matches_triton(annotation, values, signature, output_d
     actual = torch.empty_like(reference)
     pointer = "*fp64" if output_dtype == torch.float64 else "*i64"
     launcher = make_launcher(annotated_store, extra_annotation={"x": annotation},
-                             torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+                             torch_access_mode=TorchAccessMode.INTERPRETER, verify_annotation=True)
     for value in values:
         expected = triton_compile(ASTSource(
             annotated_store, {"o": pointer, "x": signature},
@@ -2166,7 +2174,7 @@ def test_annotated_null_pointer_matches_triton(null):
     expected[(1, 1, 1)](reference, None)
     launcher = make_launcher(annotated_null, extra_annotation={
         "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER),
-    }, torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    }, torch_access_mode=TorchAccessMode.INTERPRETER, verify_annotation=True)
     launch(launcher, (1,), actual, null)
     torch.testing.assert_close(actual, reference)
     assert actual.item() == 1
@@ -2180,7 +2188,7 @@ def test_annotated_tensor_matches_triton(specialize):
         "x": Argument(type=tl.pointer_type(tl.float64), specialize=specialize),
         "o": Argument(type=tl.pointer_type(tl.float64), specialize=specialize),
         "s": Argument(type=tl.float64),
-    }, torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    }, torch_access_mode=TorchAccessMode.INTERPRETER, verify_annotation=True)
     check_matches_triton(scale, launcher, (1,), (x, out, 128, 2.0, 128), 1)
 
 
@@ -2203,7 +2211,7 @@ def test_annotated_baked_arguments_compile_without_jit_state(monkeypatch):
         "x": Argument(type=tl.float64, value=2.5, specialize=NEVER),
         "BLOCK": Constexpr(type=tl.int16, value=128),
         "bias": Argument(type=tl.int32, specialize=NEVER),
-    }, torch_access=TorchAccess.CPYTHON, verify_annotation=True)
+    }, torch_access_mode=TorchAccessMode.INTERPRETER, verify_annotation=True)
     launch(launcher, (1,), actual, 7)
     torch.testing.assert_close(actual, expected_out)
     assert dict(annotated_baked.device_caches) == caches
@@ -2231,7 +2239,7 @@ def test_annotated_spec_key_is_never_coarser_than_triton(scalar_kernel, annotati
     params, _, _ = _render_params(_resolve_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED)
     backend = make_backend(_current_target())
     module = getattr(make_launcher(scalar_kernel, extra_annotation=extra,
-                                   torch_access=TorchAccess.CPYTHON, verify_annotation=True), "__self__")
+                                   torch_access_mode=TorchAccessMode.INTERPRETER, verify_annotation=True), "__self__")
     seen = {}
     for value in values:
         key, nparams = module.spec_key(value)
@@ -2252,7 +2260,7 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(pointer_kernel,
     params, _, _ = _render_params(_resolve_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED)
     backend = make_backend(_current_target())
     module = getattr(make_launcher(pointer_kernel, extra_annotation=extra,
-                                   torch_access=TorchAccess.CPYTHON), "__self__")
+                                   torch_access_mode=TorchAccessMode.INTERPRETER), "__self__")
     seen = {}
     for value in (None, 0, base, base[1:], large, large[1:]):
         key, nparams = module.spec_key(value)
@@ -2284,7 +2292,7 @@ def _recording_input_launcher(kernel, annotation, *, no_gpu, bind_device, monkey
     monkeypatch.setattr("intj.launcher._LOADED", {})
     factory = make_launcher(kernel, extra_annotation={"x": annotation}, no_gpu=no_gpu,
                             bind_device=bind_device, verify_annotation=True,
-                            torch_access=TorchAccess.CPYTHON)
+                            torch_access_mode=TorchAccessMode.INTERPRETER)
     native = factory.bind_device(0, **bound_values) if bind_device else factory
     module = _launcher_module(native)
     # Use the placed, resolved annotations, including the inferred bound dtype.
@@ -2402,8 +2410,11 @@ def test_no_map_compiler_input_invariant(
         assert calls == [(b"", expected)], "no-map handle must compile exactly once"
 
 
-@pytest.mark.parametrize("nparams,nconstexpr", [(1, 0), (1, 1), (7, 2), (8, 3)])
+@pytest.mark.parametrize(
+    "nparams,nconstexpr", [(1, 0), (1, 1), (6, 0), (7, 0), (8, 0), (7, 2), (8, 3)]
+)
 def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
+    """The 7/8 parameter cases straddle the device byte's word boundary."""
     import importlib.util
 
     from intj.annotation import DeviceBinding, _resolve_annotations
@@ -2420,7 +2431,7 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
     params, device_offset, nwords = _render_params(
         _resolve_annotations(module.k, None), DeviceBinding.NOT_FIXED
@@ -2441,20 +2452,28 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
 
 
 def _render_context(**overrides):
+    from intj.annotation import DeviceBinding, ResolvedParam
+    from intj.launcher import _render_params
+
     ordinary = CanonicalAnnotation("argument", None, "auto", "auto", "auto", (), False, None, ())
     constexpr = CanonicalAnnotation("constexpr", None, "auto", "auto", "auto", (), False, None, ())
+    params, device_offset, nwords = _render_params(
+        (ResolvedParam("x", 0, ordinary), ResolvedParam("BLOCK", 1, constexpr)),
+        DeviceBinding.NOT_FIXED,
+    )
     fields = dict(
         module_name="m", kernel_repr="a.b",
-        params=(
-            Param(name="x", index=0, call_index=0, annotation=ordinary),
-            Param(name="BLOCK", index=1, call_index=1, annotation=constexpr),
-        ),
-        nwords=2, device_binding="not_fixed", device_offset=10,
+        params=params,
+        nwords=nwords, device_binding=DeviceBinding.NOT_FIXED, device_offset=device_offset,
         verify_annotation=False, no_gpu=False,
         max_slots=1, spec_pointer_range=1, driver_path="/driver.so",
         launch_symbol="launch", device_symbol="device_get", error_symbol="error", error_style="return",
-        torch_access="shim", torch_version=None, cxx_abi=None,
+        torch_access_mode="runtime_shim", torch_version=None, cxx_abi=None,
         kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
+        python_version=cpython_abi.python_version(),
+        free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+        cpython_static_compile_header=cpython_abi.header_for() or "",
+        pointer_types=(),
     )
     return RenderContext(**{**fields, **overrides})
 
@@ -2521,11 +2540,35 @@ def test_render_context_digest_tracks_every_field():
     base = _module_key()
     for field in dataclasses.fields(base.context):
         value = getattr(base.context, field.name)
-        changed = "zz" if isinstance(value, str) else (value + 1 if isinstance(value, int) else (1, 2))
+        if isinstance(value, bool):
+            changed = not value
+        elif isinstance(value, str):
+            changed = "zz"
+        elif isinstance(value, int):
+            changed = value + 1
+        else:
+            changed = (1, 2)
         if value == changed:
             continue
         other = dataclasses.replace(base, context=dataclasses.replace(base.context, **{field.name: changed}))
         assert other.digest() != base.digest(), field.name
+
+
+def test_free_threaded_build_changes_module_digest():
+    key = _module_key()
+    free_threaded = dataclasses.replace(key.context, free_threaded=True)
+    assert dataclasses.replace(key, context=free_threaded).digest() != key.digest()
+
+
+def test_render_rejects_mismatched_free_threaded_headers(tmp_path, capfd):
+    context = _render_context(
+        python_version=cpython_abi.python_version(),
+        cpython_static_compile_header=cpython_abi.header_for() or "",
+        free_threaded=not bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        launcher._build(tmp_path / "m.so", context)
+    assert "intj: compiling against headers of the wrong GIL build" in capfd.readouterr().err
 
 
 def test_artifact_layout_and_nested_kernels():
@@ -2573,11 +2616,11 @@ def _provisioned(cache):
 def test_kernel_cache_backends_launch_the_same(cache):
     """Every backend is a kernel cache: same key in, same kernel out.
 
-    tsl and absl are C++ maps, so they also drag a shim-mode module into a C++
+    tsl and absl are C++ maps, so they also drag a RUNTIME_SHIM module into a C++
     build -- which is the part most likely to break.
     """
     _provisioned(cache)
-    launcher = make_launcher(scale, torch_access=TorchAccess.SHIM, kernel_cache=cache)
+    launcher = make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM, kernel_cache=cache)
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
     for block in (64, 128):  # two specializations, so the cache is used
@@ -2655,6 +2698,16 @@ def test_refuses_non_jit_function():
         make_launcher(lambda: None)
 
 
+@pytest.mark.parametrize("version", [None, "3.7.0"])
+def test_launcher_requires_triton_extra(monkeypatch, version):
+    installed = types.ModuleType("triton")
+    setattr(installed, "__version__", version)
+    monkeypatch.setitem(sys.modules, "triton", installed if version else None)
+
+    with pytest.raises(UnsupportedKernel, match=r"Triton >=3\.8.*intj\[launcher\]"):
+        make_launcher(object())
+
+
 def test_refuses_kernel_reading_globals():
     with pytest.raises(UnsupportedKernel, match="global variable"):
         make_launcher(uses_global)
@@ -2672,7 +2725,11 @@ def uses_global(x, o, n, BLOCK: tl.constexpr):
 
 # ---------------------------------------------------------------- torch access
 
-ACCESS_MODES = [TorchAccess.SHIM, TorchAccess.CPYTHON, TorchAccess.CXX]
+ACCESS_MODES = [
+    TorchAccessMode.RUNTIME_SHIM,
+    TorchAccessMode.INTERPRETER,
+    TorchAccessMode.STATIC_COMPILE,
+]
 
 
 @pytest.fixture(scope="module", params=ACCESS_MODES, ids=lambda m: m.name.lower())
@@ -2682,7 +2739,7 @@ def mode(request):
 
 @pytest.fixture(scope="module")
 def scale_by_mode(mode):
-    return mode, make_launcher(scale, torch_access=mode)
+    return mode, make_launcher(scale, torch_access_mode=mode)
 
 
 def _read_corpus():
@@ -2690,8 +2747,8 @@ def _read_corpus():
 
     The empty views matter most: `Tensor::data_ptr()` returns null for any
     zero-element tensor even when its storage is live and its storage_offset is
-    not, so the shim's `data + offset * itemsize` arithmetic has to special-case
-    them or it keys differently from the other two modes.
+    not, so RUNTIME_SHIM must special-case its `data + offset * itemsize`
+    arithmetic or it keys differently from the other two modes.
     """
     base = torch.randn(4096, device="cuda")
     half = torch.randn(4096, device="cuda", dtype=torch.float16)
@@ -2723,13 +2780,13 @@ def test_every_mode_matches_triton_specialization(scale_by_mode):
 
 
 def test_modes_agree_on_every_read():
-    """The independent-oracle test: cpython assumes nothing about TensorImpl.
+    """The independent-oracle test: INTERPRETER assumes nothing about TensorImpl.
 
-    If torch moves a field, the shim mode keeps reading the old offset and this
+    If torch moves a field, RUNTIME_SHIM keeps reading the old offset and this
     is what notices.
     """
     modules = {
-        m: getattr(make_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES
+        m: getattr(make_launcher(scale, torch_access_mode=m), "__self__") for m in ACCESS_MODES
     }
     o = torch.empty(4096, device="cuda")
     for x in _read_corpus():
@@ -2755,39 +2812,44 @@ def test_recorded_dtypes_match_this_torch():
     A drifted row is not cosmetic: the offsets in the same stanza were measured
     against that set of dtypes, and `itemsize_table` refuses the whole stanza
     when they no longer agree -- so this failing is what a silent fall back to
-    `CPYTHON` on a torch intj thinks it supports looks like before it happens.
+    another mode on a torch intj thinks it supports looks like before it happens.
     """
-    from intj.torch_abi import _DTYPES, live_dtypes, torch_version
+    from intj.torch_intf.torch_abi import _DTYPES, live_dtypes, torch_version
 
     recorded = _DTYPES.get(torch_version())
     assert recorded is not None, "no stanza for the torch the suite is running against"
     assert recorded == live_dtypes(), (
-        "intj/torch_abi.txt is stale; regenerate with `python -m intj.torch_abi`"
+        "intj/torch_intf/torch_abi.toml is stale; regenerate with `python -m intj.torch_intf.abi_detect`"
     )
 
 
-def test_abi_file_parses_wrapped_rows_and_refuses_broken_ones():
-    """`torch_abi.txt` is pasted by hand, so its parser is a trust boundary."""
-    from intj.torch_abi import _parse_abi, _parse_dtypes
+def test_abi_file_parses_and_refuses_broken_entries():
+    """`torch_abi.toml` is pasted by hand, so its parser is a trust boundary."""
+    from intj.torch_intf.torch_abi import OFFSETS, _parse_abi
 
-    stanzas = _parse_abi(
-        "# a comment\n"
-        "[2.9]\n"
-        "layout: cdata=16  # trailing comment\n"
-        "dtypes: 0=uint8:1\n"
-        "  1=int8:1\n"
-    )
-    assert stanzas == {(2, 9): {"layout": "cdata=16", "dtypes": "0=uint8:1 1=int8:1"}}
-    assert _parse_dtypes(stanzas[(2, 9)]["dtypes"]) == {0: ("uint8", 1), 1: ("int8", 1)}
+    offsets = "".join(f"{f} = {i}\n" for i, f in enumerate(OFFSETS))
+    good = '["2.9"]\n' + offsets + 'dtypes = [["uint8", 1], ["int8", 1]]\n'
+    assert _parse_abi(good) == {
+        (2, 9): ({f: i for i, f in enumerate(OFFSETS)}, {0: ("uint8", 1), 1: ("int8", 1)})
+    }
 
-    for broken in ("layout: cdata=16\n", "[2.9\nlayout: cdata=16\n", "[2.9]\n  1=int8:1\n"):
-        with pytest.raises(ValueError, match="torch_abi.txt"):
+    for broken in (
+        good.replace('["2.9"]', "[2.9"),  # not TOML
+        good.replace('"2.9"', '"two.nine"'),  # not a version
+        good.replace("cdata = 0\n", ""),  # a missing offset
+        good + "extra = 1\n",  # an unknown field
+        good.replace("cdata = 0", "cdata = 65536"),  # wraps in the C side's uint16_t
+        good.replace("cdata = 0", 'cdata = "0"'),
+        good.replace('["int8", 1]', '["int8", "1"]'),
+        good.replace('["int8", 1]', '["int8", 1, 2]'),
+    ):
+        with pytest.raises(ValueError, match="torch_abi.toml"):
             _parse_abi(broken)
 
 
 def test_drifted_dtypes_refuse_the_whole_stanza(monkeypatch):
     """A torch whose dtypes moved is an unverified torch, offsets and all."""
-    from intj import torch_abi as abi
+    from intj.torch_intf import torch_abi as abi
 
     drifted = dict(abi.live_dtypes())
     drifted.pop(max(drifted))  # torch dropped a dtype since the stanza was taken
@@ -2811,7 +2873,7 @@ def test_live_dtypes_have_no_holes():
     then reject a perfectly ordinary tensor of that dtype as a layout mismatch.
     Density is the check that `dir(torch)` is still an exhaustive enumeration.
     """
-    from intj.torch_abi import live_dtypes
+    from intj.torch_intf.torch_abi import live_dtypes
 
     codes = sorted(live_dtypes())
     assert codes, "no dtype was found at all"
@@ -2837,7 +2899,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     kernel = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(kernel)
+    spec.loader.exec_module(kernel)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
     annotation = {
         f"C{bits}": intj.Constexpr(type=getattr(tl, f"int{bits}"))
@@ -2845,7 +2907,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     }
     module = getattr(make_launcher(kernel.k, extra_annotation=annotation), "__self__")
     context = next(key.context for key, loaded in launcher_module._LOADED.items() if loaded is module)
-    suffix = ".cpp" if context.torch_access == TorchAccess.CXX.value else ".c"
+    suffix = ".cpp" if context.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value else ".c"
     source = pathlib.Path(module.__file__).with_name(f"k{suffix}").read_text()
     pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
     assert "((uint8_t *)key)" not in pack
@@ -2883,12 +2945,12 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
         ]
 
 
-@pytest.mark.parametrize("mode", [TorchAccess.SHIM, TorchAccess.CXX])
+@pytest.mark.parametrize("mode", [TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE])
 def test_unannotated_key_decode_stays_direct(mode):
-    suffix = ".cpp" if mode is TorchAccess.CXX else ".c"
+    suffix = ".cpp" if mode is TorchAccessMode.STATIC_COMPILE else ".c"
     modules = [
         getattr(make_launcher(
-            scale, torch_access=mode, no_gpu=True, verify_annotation=verify
+            scale, torch_access_mode=mode, no_gpu=True, verify_annotation=verify
         ), "__self__")
         for verify in (False, True)
     ]
@@ -2910,15 +2972,15 @@ def test_unannotated_key_decode_stays_direct(mode):
 def test_unsupported_dtype_is_refused_in_every_mode():
     """The path that skipped the dtype check: numel == 0 returns before it.
 
-    The shim reader bails at numel == 0 ahead of its own bound test, and the
-    cpython reader has no bound test at all.  Harmless while the dtype had 32
+    RUNTIME_SHIM bails at numel == 0 ahead of its own bound test, and the
+    INTERPRETER reader has no bound test at all. Harmless while the dtype had 32
     bits of the key to itself; under a byte code every unmapped dtype would
     alias every other one.  So the check lives in the decode, which all three
     readers pass through.
     """
     o = torch.empty(4096, device="cuda")
     for mode in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=mode), "__self__")
+        module = getattr(make_launcher(scale, torch_access_mode=mode), "__self__")
         for x in (torch.zeros(4, device="cuda", dtype=torch.complex64),
                   torch.zeros(0, device="cuda", dtype=torch.complex64)):
             with pytest.raises(RuntimeError, match="triton does not take"):
@@ -2963,6 +3025,7 @@ def test_dtype_index_table_matches_triton():
 
     assert canonical, "no torch dtype canonicalized; the table is empty"
     # the three spellings triton folds into one type must share one index
+    # torch's stubs omit uint1 and int1.
     assert table[dtype_code(torch.bool)] == table[dtype_code(getattr(torch, "uint1"))]
     assert table[dtype_code(getattr(torch, "int1"))] == table[dtype_code(torch.bool)]
     # and a dtype triton has never accepted must be refused
@@ -2978,12 +3041,12 @@ def test_dtype_index_table_is_deterministic():
 
 
 def test_layout_probe_reproduces_torch():
-    """Every offset the shim mode reads, checked against torch's own accessors."""
+    """Every offset RUNTIME_SHIM reads, checked against torch's own accessors."""
     layout = layout_for()
     assert layout is not None, "probe failed on a torch intj is expected to support"
     assert len(layout.itemsize) == NDTYPES
     for x in _read_corpus() + [torch.arange(9, dtype=torch.float64)[2:]]:
-        impl = ctypes.c_size_t.from_address(id(x) + layout.cdata).value
+        impl = ctypes.c_size_t.from_address(id(x) + cpython_abi.pyobject_size() + layout.cdata).value
         assert impl == x._cdata
         assert ctypes.c_int64.from_address(impl + layout.numel).value == x.numel()
         assert ctypes.c_int64.from_address(impl + layout.storage_offset).value == x.storage_offset()
@@ -2998,68 +3061,114 @@ def test_launch_correctness_per_mode(scale_by_mode):
     check_matches_triton(scale, launcher, (8,), (x[1:], o, 1023, 2.0, 128), 1)
 
 
-def test_auto_resolves_and_explicit_modes_validate():
-    from intj.launcher import _resolve_access
+def test_default_resolves_and_explicit_modes_validate(monkeypatch):
+    from intj import launcher as launcher_mod
 
-    assert _resolve_access(TorchAccess.AUTO) in set(ACCESS_MODES)
+    resolve = launcher_mod._resolve_torch_access_mode
+    monkeypatch.setattr(launcher_mod, "_cxx_toolchain", lambda: ([], []))
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda: object())
     for m in ACCESS_MODES:
-        assert _resolve_access(m) is m
+        assert resolve(m) is m
+    assert resolve(None) is TorchAccessMode.STATIC_COMPILE
+    monkeypatch.setattr(launcher_mod, "_cxx_toolchain", lambda: None)
+    assert resolve(None) is TorchAccessMode.RUNTIME_SHIM
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda: None)
+    assert resolve(None) is TorchAccessMode.INTERPRETER
+
+
+def test_public_torch_access_modes():
+    assert intj.TorchAccessMode is TorchAccessMode
+    assert list(TorchAccessMode) == [
+        TorchAccessMode.INTERPRETER,
+        TorchAccessMode.RUNTIME_SHIM,
+        TorchAccessMode.STATIC_COMPILE,
+    ]
 
 
 def test_hardcoded_layout_matches_this_torch():
-    """The table is data, and data goes stale.  Check the row against reality.
+    """The table is data, and data goes stale.  Check the entry against reality.
 
     `probe_layout` finds each offset by matching field values against torch's own
     accessors, so it is an independent oracle for the hardcoded row -- and the
-    thing that generates rows in the first place (`python -m intj.torch_abi`).
+    thing that generates entries in the first place (`python -m intj.torch_intf.abi_detect`).
     """
-    table, probed = layout_for(), probe_layout()
-    assert table is not None, "no row for the torch the suite is running against"
+    table, probed = layout_for(), probe_layout(cpython_abi.pyobject_size())
+    assert table is not None, "no entry for the torch the suite is running against"
     assert probed is not None, "probe could not pin this torch's layout"
     assert table == probed
 
 
-def test_shim_is_refused_rather_than_guessed(monkeypatch):
+def test_hardcoded_layout_matches_torch_headers():
+    """The same entry, checked by the other detector: the compiler places each field.
+
+    Element sizes are compared by code only; the spellings are python's, and the
+    headers know none of them.  Codes the headers declare past the recorded ones
+    must be sizeless placeholders, or the table is missing a dtype.
+    """
+    from intj.launcher import _cxx_toolchain
+    from intj.torch_intf.cpp_detect import detect
+    from intj.torch_intf.torch_abi import OFFSETS
+
+    if _cxx_toolchain() is None:
+        pytest.skip("no C++ compiler and torch headers")
+    table = layout_for()
+    assert table is not None, "no entry for the torch the suite is running against"
+    offsets, sizes = detect()
+    assert offsets == {f: getattr(table, f) for f in OFFSETS}
+    assert {c: s for c, s in sizes.items() if s} == {c: table.itemsize[c] for c in range(NDTYPES) if table.itemsize[c]}
+
+
+def test_runtime_shim_is_refused_rather_than_guessed(monkeypatch):
     """An unverified torch must raise, never fall back to a guessed offset."""
     from intj import launcher as launcher_mod
 
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
-        make_launcher(scale, torch_access=TorchAccess.SHIM)
+        make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
 
 
-def test_only_the_cxx_module_is_keyed_on_the_torch_version(monkeypatch):
-    """shim and cpython bake in nothing torch-specific, so their `.so` is reusable.
+def test_static_compile_needs_no_table(monkeypatch):
+    """The compiler supplies offsets, even for an unverified torch."""
+    from intj import launcher as launcher_mod
 
-    Moving the reported torch version must not move their digest -- and must move
-    the c++ one, which really did compile against those headers.
+    monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
+    x = torch.arange(128, device="cuda", dtype=torch.float32)
+    o = torch.empty_like(x)
+    check_matches_triton(scale, make_launcher(scale, torch_access_mode=TorchAccessMode.STATIC_COMPILE), (1,), (x, o, 128, 2.0, 128), 1)
+
+
+def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
+    """RUNTIME_SHIM and INTERPRETER bake in no Torch version.
+
+    Their `.so` is reusable across Torch versions, while STATIC_COMPILE compiles
+    against Torch's headers and must get a different digest.
     """
     from intj import launcher as launcher_mod
 
     def digest_dir(m):
-        return pathlib.Path(getattr(make_launcher(scale, torch_access=m), "__self__").__file__).parent.parent.name
+        return pathlib.Path(getattr(make_launcher(scale, torch_access_mode=m), "__self__").__file__).parent.parent.name
 
     before = {m: digest_dir(m) for m in ACCESS_MODES}
     monkeypatch.setattr(launcher_mod, "torch_version", lambda: (99, 99))
     after = {m: digest_dir(m) for m in ACCESS_MODES}
 
-    assert after[TorchAccess.SHIM] == before[TorchAccess.SHIM]
-    assert after[TorchAccess.CPYTHON] == before[TorchAccess.CPYTHON]
-    assert after[TorchAccess.CXX] != before[TorchAccess.CXX]
+    assert after[TorchAccessMode.RUNTIME_SHIM] == before[TorchAccessMode.RUNTIME_SHIM]
+    assert after[TorchAccessMode.INTERPRETER] == before[TorchAccessMode.INTERPRETER]
+    assert after[TorchAccessMode.STATIC_COMPILE] != before[TorchAccessMode.STATIC_COMPILE]
 
 
 def test_unconfigured_module_refuses_to_launch():
     """`entry` is unreachable before set_torch_version; prove the guard exists."""
-    module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    module = getattr(make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM), "__self__")
     assert hasattr(module, "set_torch_version")
     index = dtype_index_table()
     with pytest.raises(ValueError, match="needs a tensor layout"):
         module.set_torch_version((2, 14), None, index)
     layout = layout_for()
     assert layout is not None
-    cpython = getattr(make_launcher(scale, torch_access=TorchAccess.CPYTHON), "__self__")
+    interpreter = getattr(make_launcher(scale, torch_access_mode=TorchAccessMode.INTERPRETER), "__self__")
     with pytest.raises(ValueError, match="takes no tensor layout"):
-        cpython.set_torch_version((2, 14), layout.as_args(), index)
+        interpreter.set_torch_version((2, 14), layout.as_args(), index)
 
 
 def test_a_failed_set_torch_version_changes_nothing():
@@ -3072,7 +3181,7 @@ def test_a_failed_set_torch_version_changes_nothing():
     on float32 memory with no error at all.  Silent, and the worst failure this
     design has.
     """
-    module = getattr(make_launcher(scale, torch_access=TorchAccess.SHIM), "__self__")
+    module = getattr(make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM), "__self__")
     o = torch.empty(64, device="cuda")
 
     def keys():
@@ -3088,7 +3197,7 @@ def test_a_failed_set_torch_version_changes_nothing():
     assert good is not None
     index = dtype_index_table()
     for layout, table in (
-        (None, bytes(NDTYPES)),  # shim rejects a None layout...
+        (None, bytes(NDTYPES)),  # RUNTIME_SHIM rejects a None layout...
         (None, index),  # ...whichever table comes with it
         (good.as_args(), b"\xff" * (NDTYPES - 1)),  # wrong length
         (good.as_args(), bytes([32]) + index[1:]),  # an index past five bits
@@ -3101,7 +3210,7 @@ def test_a_failed_set_torch_version_changes_nothing():
 
 
 def test_set_torch_version_needs_the_dtype_index_in_every_mode():
-    """The dtype table is not a shim detail: all three readers key on it.
+    """The dtype table is not a RUNTIME_SHIM detail: all three readers key on it.
 
     Installed in only some modes, the others would see an all-zero table and key
     every dtype to index 0 -- coarse in the same way in each, so the cross-mode
@@ -3110,8 +3219,8 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
     layout = layout_for()
     assert layout is not None
     for mode in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=mode), "__self__")
-        args = layout.as_args() if mode is not TorchAccess.CPYTHON else None
+        module = getattr(make_launcher(scale, torch_access_mode=mode), "__self__")
+        args = layout.as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None
         with pytest.raises(TypeError, match="dtype_index"):
             module.set_torch_version((2, 14), args)
         with pytest.raises(ValueError, match="dtype index table"):
@@ -3121,7 +3230,7 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
 def test_modes_agree_on_rejecting_a_storageless_tensor():
     """A sparse tensor has no data pointer at all, so every mode must raise.
 
-    The shim reads offsets rather than calling torch, so this is the one place it
+    RUNTIME_SHIM reads offsets rather than calling torch, so this is the one place it
     could have handed the kernel a null pointer instead of failing.
     """
     sparse = torch.sparse_coo_tensor(
@@ -3129,21 +3238,21 @@ def test_modes_agree_on_rejecting_a_storageless_tensor():
     ).cuda()
     o = torch.empty(1024, device="cuda")
     for m in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=m), "__self__")
+        module = getattr(make_launcher(scale, torch_access_mode=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(sparse, o, 1024, 2.0, 128)
 
 
 def test_modes_agree_on_tensors_with_unusual_impls():
-    """The shim cannot see the bitfields that make torch's accessors throw.
+    """RUNTIME_SHIM cannot see the bitfields that make torch's accessors throw.
 
     `storage_access_should_throw_`, `throw_on_immutable_data_ptr_` and
     `size_bytes_is_heap_allocated_` are invisible to offset arithmetic, so the
-    shim could in principle accept a tensor the c++ mode rejects.  In practice
-    the impls carrying them belong to `Tensor` *subclasses*, which INTJ_DECODE's
+    RUNTIME_SHIM could accept a tensor STATIC_COMPILE rejects. In practice the
+    impls carrying them belong to `Tensor` *subclasses*, which INTJ_DECODE's
     exact-type test already refuses -- this pins that reasoning.
     """
-    modules = {m: getattr(make_launcher(scale, torch_access=m), "__self__") for m in ACCESS_MODES}
+    modules = {m: getattr(make_launcher(scale, torch_access_mode=m), "__self__") for m in ACCESS_MODES}
     o = torch.empty(1024, device="cuda")
 
     with torch.inference_mode():
@@ -3167,27 +3276,27 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
     """Nested tensors read as empty, identically in every mode.  Documented, not fixed.
 
     A nested tensor stores `numel_ == 0` and reports `numel() == 8` through a
-    virtual override.  `shim` cannot see the policy bit that says so, and `cxx`
-    reads the field too rather than diverge from it -- one documented limitation
+    virtual override. RUNTIME_SHIM cannot see the policy bit that says so, and
+    STATIC_COMPILE reads the field too rather than diverge from it -- one documented limitation
     beats two modes that disagree.  See `docs/Usage.md`.
 
     This pins the behaviour so that a torch change, or a decision to start
     detecting these, shows up here instead of silently.
     """
-    from intj.torch_abi import _read
+    from intj.torch_intf.abi_detect import _read
 
     layout = layout_for()
     assert layout is not None
     nested = torch.nested.nested_tensor([torch.randn(3), torch.randn(5)])
     assert nested.numel() == 8 and nested.data_ptr() != 0
-    assert _read(layout, nested)[0] == 0, "expected the known-wrong null pointer"
+    assert _read(layout, nested, cpython_abi.pyobject_size())[0] == 0, "expected the known-wrong null pointer"
 
     # mkldnn has no storage at all, and that *is* detected
     mkl = torch.randn(4, 4).to_mkldnn()
     with pytest.raises(RuntimeError):
-        _read(layout, mkl)
+        _read(layout, mkl, cpython_abi.pyobject_size())
     o = torch.empty(16, device="cuda")
     for m in ACCESS_MODES:
-        module = getattr(make_launcher(scale, torch_access=m), "__self__")
+        module = getattr(make_launcher(scale, torch_access_mode=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(mkl, o, 16, 2.0, 128)

@@ -10,6 +10,20 @@ INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunct
 
 This is the initial version: torch tensors only, static grid. Anything outside that is refused, see `docs/Usage.md`. AMD is tested on gfx942; the NVIDIA path is implemented (`cuLaunchKernel`) but untested, no NVIDIA GPU here.
 
+## Install
+
+From this checkout, install the launcher on a CPython build with a Triton 3.8 wheel:
+
+```sh
+python -m pip install '.[launcher]'
+```
+
+On x86-64 Linux, Triton 3.8 wheels are available for CPython 3.10–3.14 with
+the GIL and free-threaded 3.14, but not 3.8, 3.9, or free-threaded 3.13. On
+those builds, `python -m pip install .` installs the base package. Torch may
+bring in an older Triton as a dependency; that does not satisfy the launcher's
+Triton 3.8 requirement.
+
 ## Usage
 
 ```python
@@ -81,18 +95,27 @@ median of seven 20k-call batches. Each process used a separate empty
 | `grid=(0,)`, i.e. no driver call | 13.47 us | 0.15 us |
 | argument decoding + spec key only | — | 0.12 us |
 
-Argument decoding depends on how the module reads a tensor (`torch_access`), for a
-kernel with three tensor arguments:
+Argument decoding depends on how the module reads a tensor (`torch_access_mode`), for a
+kernel with three tensor arguments. These access-mode measurements came from a
+separate 20k-iteration MI300X run:
 
-| `TorchAccess` | decode + spec key | first build |
+| `TorchAccessMode` | decode + spec key | first build |
 |---|---|---|
-| `SHIM` — torch's structs, at offsets discovered at load | 121.5 ns | 1.07 s |
-| `CXX` — compiled against torch's headers | 118.2 ns | 2.28 s |
-| `CPYTHON` — through the interpreter | 915.4 ns | 0.74 s |
+| `RUNTIME_SHIM` — torch's structs, at recorded offsets selected at load | 89 ns | 0.6 s |
+| `STATIC_COMPILE` — compiled against torch's headers | 90 ns | 1.9 s |
+| `INTERPRETER` — pointer and storage size through the interpreter | 300 ns | 0.6 s |
 
-`SHIM` and `CXX` make the same loads and land within ~4 ns of each other; `CXX`
-has the compiler supply the field offsets that `SHIM` probes for. `CXX` pays a little build time for that, and is the only mode whose `.so` must
-be rebuilt when torch is upgraded.
+Omitting `torch_access_mode` selects `STATIC_COMPILE` when its toolchain is
+available, else `RUNTIME_SHIM` when a verified layout exists, else `INTERPRETER`.
+
+`RUNTIME_SHIM` can reuse its `.so` across supported PyTorch versions, but not
+across CPython ABIs: the module is compiled and cached for the exact CPython
+version and GIL/free-threaded build.
+
+`RUNTIME_SHIM` and `STATIC_COMPILE` make the same loads and land within ~1 ns of
+each other; `STATIC_COMPILE` has the compiler supply the field offsets that
+`RUNTIME_SHIM` gets from the verified table. It pays a little build time for
+that and is the only mode whose `.so` must be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
 which is the third row's 0.12 us. Host overhead is therefore ~0.3 us against
