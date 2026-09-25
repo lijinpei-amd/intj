@@ -105,4 +105,7 @@ host-only timings with 4, 16, and 32 integer or tensor arguments. See the
 For TVM FFI call, callback, utility, and HIP launch timings, see the
 [2026-09-25 script comparison](benchmarks/journals/2026-09-25_tvm-ffi-scripts_0_90b2959.md).
 
+The [same-HSACO HIP launch and Python utility diagnostics](benchmarks/journals/2026-09-25_hip-utilities_0_660d458.md)
+compare TVM FFI, Triton, and INTJ and explain the keyword/dataclass timing gaps.
+
 TODO: sweep constexpr argument counts independently.

@@ -90,3 +90,6 @@ at `journals/2026-09-25_tvm-ffi_1_00087e3.md` (index 0 is the long-batch diagnos
 
 The 2026-09-25 upstream TVM FFI script comparison starts at
 `journals/2026-09-25_tvm-ffi-scripts_0_90b2959.md` (three separate rounds).
+
+The same-HSACO HIP launch and controlled keyword/dataclass diagnostics start at
+`journals/2026-09-25_hip-utilities_0_660d458.md` (three process rounds).
