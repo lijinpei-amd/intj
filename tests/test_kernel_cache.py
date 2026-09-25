@@ -53,17 +53,31 @@ def _benchmark_toolchain():
     return None
 
 
-def _build(cache: KernelCache, nwords: int, include: str, libraries: list[str], out: pathlib.Path):
+def _build(
+    cache: KernelCache,
+    nwords: int,
+    include: str,
+    libraries: list[str],
+    out: pathlib.Path,
+):
     toolchain = toolchain_for(cache)
     assert toolchain is not None
     command = [
-        os.environ.get("CXX", "g++"), "-O3", "-DNDEBUG", "-std=c++20",
+        os.environ.get("CXX", "g++"),
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
         f"-DINTJ_NWORDS={nwords}",
         f"-DINTJ_CACHE_{cache.value.upper()}",
         f'-DINTJ_CACHE_NAME="{cache.value}"',
-        str(_SOURCE), "-o", str(out),
-        f'-DINTJ_CPYTHON_STATIC_COMPILE_HEADER="{cpython_abi.header_for()}"', f"-I{_PYTHON_INTF}",
-        f"-I{_RUNTIME}", f"-I{include}", f"-I{sysconfig.get_paths()['include']}",
+        str(_SOURCE),
+        "-o",
+        str(out),
+        f'-DINTJ_CPYTHON_STATIC_COMPILE_HEADER="{cpython_abi.header_for()}"',
+        f"-I{_PYTHON_INTF}",
+        f"-I{_RUNTIME}",
+        f"-I{include}",
+        f"-I{sysconfig.get_paths()['include']}",
         *(f"-I{d}" for d in toolchain["include_dirs"]),
     ]
     if toolchain["archives"]:
@@ -95,20 +109,26 @@ def test_kernel_cache_benchmark(capsys):
             )
             run = subprocess.run(
                 [str(binary), "--benchmark_format=json", "--benchmark_min_time=0.05s"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             assert run.returncode == 0, (
                 f"{cache.value} at {nwords} words failed to run:\n{run.stderr[-2000:]}"
             )
             for entry in json.loads(run.stdout)["benchmarks"]:
                 assert "error_message" not in entry, entry
-                results.setdefault((nwords, entry["name"]), {})[cache.value] = entry["real_time"]
+                results.setdefault((nwords, entry["name"]), {})[cache.value] = entry[
+                    "real_time"
+                ]
 
     with capsys.disabled():
         for nwords in _NWORDS:
             names = sorted(
                 (n for w, n in results if w == nwords),
-                key=lambda n: (n.split("/")[0], int(n.split("/")[-1]) if "/" in n else 0),
+                key=lambda n: (
+                    n.split("/")[0],
+                    int(n.split("/")[-1]) if "/" in n else 0,
+                ),
             )
             print(f"\nkernel cache, {nwords}-word key, ns per operation\n")
             print(f"{'':<16}" + "".join(f"{c.value:>10}" for c in available))

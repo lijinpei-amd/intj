@@ -249,7 +249,8 @@ def _merge_field(
     elif field == "value" and left is not UNSET and right is not UNSET:
         equal = type(left) is type(right) and (
             struct.pack(">d", left) == struct.pack(">d", right)
-            if type(left) is float else left == right
+            if type(left) is float
+            else left == right
         )
     else:
         equal = left == right
@@ -388,18 +389,37 @@ def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launche
         if types == (None,):
             return ()
         descriptor = types is None or len(types) > 1
-        width = 8 if types is None else max(
-            0 if ty is None else 8 if ty == "fp64" else 1 if ty == "u1" else int(ty[1:]) // 8
-            for ty in types
+        width = (
+            8
+            if types is None
+            else max(
+                0
+                if ty is None
+                else 8
+                if ty == "fp64"
+                else 1
+                if ty == "u1"
+                else int(ty[1:]) // 8
+                for ty in types
+            )
         )
         return ((KeyField("descriptor", 1),) if descriptor else ()) + (
             (KeyField("payload", width),) if width else ()
         )
-    descriptor = types is None or len(types) > 1 or any(
-        mode == "auto" and any(_applicable(ty, field) for ty in types)
-        for field, mode in zip(_FACT_NAMES, (
-            annotation.equal_to_one, annotation.aligned_16, annotation.pointer_range_32
-        ))
+    descriptor = (
+        types is None
+        or len(types) > 1
+        or any(
+            mode == "auto" and any(_applicable(ty, field) for ty in types)
+            for field, mode in zip(
+                _FACT_NAMES,
+                (
+                    annotation.equal_to_one,
+                    annotation.aligned_16,
+                    annotation.pointer_range_32,
+                ),
+            )
+        )
     )
     return (KeyField("descriptor", 1),) if descriptor else ()
 
@@ -412,7 +432,9 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
     extra = extra_annotation or {}
     unknown = set(extra) - {param.name for param in jit_func.params}
     if unknown:
-        raise ValueError(f"intj: unknown extra_annotation parameter(s) {sorted(unknown)}")
+        raise ValueError(
+            f"intj: unknown extra_annotation parameter(s) {sorted(unknown)}"
+        )
     resolved: list[ResolvedParam] = []
     for index, param in enumerate(jit_func.params):
         name = param.name
@@ -440,29 +462,49 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             assert isinstance(left, Argument) and isinstance(right, Argument)
             raw_type = _merge_field(name, "type", left.type, right.type, kind=kind)
             baked = _merge_field(name, "value", left.value, right.value)
-            bind_value = _merge_field(name, "bind_value",
-                                      left.bind_value if left.bind_value is not None else UNSET,
-                                      right.bind_value if right.bind_value is not None else UNSET)
+            bind_value = _merge_field(
+                name,
+                "bind_value",
+                left.bind_value if left.bind_value is not None else UNSET,
+                right.bind_value if right.bind_value is not None else UNSET,
+            )
             if bind_value is UNSET:
                 bind_value = None
             if baked is not UNSET and bind_value is not None:
-                raise ValueError(f"intj: parameter {name!r} has both value and bind_value")
+                raise ValueError(
+                    f"intj: parameter {name!r} has both value and bind_value"
+                )
             left_modes = _specialization_modes(left.specialize)
             right_modes = _specialization_modes(right.specialize)
-            modes = tuple(_merge_field(name, field, a, b)
-                          for field, a, b in zip(_FACT_NAMES, left_modes, right_modes))
+            modes = tuple(
+                _merge_field(name, field, a, b)
+                for field, a, b in zip(_FACT_NAMES, left_modes, right_modes)
+            )
             if param.do_not_specialize:
-                modes = tuple(_merge_field(name, field, mode, "never") if i < 2 else mode
-                              for i, (field, mode) in enumerate(zip(_FACT_NAMES, modes)))
+                modes = tuple(
+                    _merge_field(name, field, mode, "never") if i < 2 else mode
+                    for i, (field, mode) in enumerate(zip(_FACT_NAMES, modes))
+                )
             if param.do_not_specialize_on_alignment:
-                modes = (modes[0], _merge_field(name, "aligned_16", modes[1], "never"), modes[2])
+                modes = (
+                    modes[0],
+                    _merge_field(name, "aligned_16", modes[1], "never"),
+                    modes[2],
+                )
             modes = tuple("auto" if mode is UNSET else mode for mode in modes)
             power = False
         types = _canonical_types(raw_type, kind)
-        if power and types is not None and any(
-            ty is None or not ty.startswith(("i", "u")) or ty == "u1" for ty in types
+        if (
+            power
+            and types is not None
+            and any(
+                ty is None or not ty.startswith(("i", "u")) or ty == "u1"
+                for ty in types
+            )
         ):
-            raise ValueError(f"intj: parameter {name!r} power_of_two_or_zero needs an integer type")
+            raise ValueError(
+                f"intj: parameter {name!r} power_of_two_or_zero needs an integer type"
+            )
         tag = () if baked is UNSET else _canonical_value(baked)
         if baked is not UNSET:
             if kind == "constexpr" and types is None:
@@ -473,65 +515,130 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
                     types = (inferred,)
                 elif len(types) != 1:
                     if inferred not in types:
-                        raise ValueError(f"intj: parameter {name!r} baked value has no allowed type")
+                        raise ValueError(
+                            f"intj: parameter {name!r} baked value has no allowed type"
+                        )
                     types = (inferred,)
                 if types[0] is not None and types[0].startswith("*"):
-                    raise ValueError(f"intj: parameter {name!r} cannot bake a pointer value")
+                    raise ValueError(
+                        f"intj: parameter {name!r} cannot bake a pointer value"
+                    )
                 if not _fits_scalar(baked, types[0], kind):
-                    raise ValueError(f"intj: parameter {name!r} baked value does not fit type")
+                    raise ValueError(
+                        f"intj: parameter {name!r} baked value does not fit type"
+                    )
             elif types is not None:
                 matching = [ty for ty in types if _fits_scalar(baked, ty, kind)]
                 if not matching:
-                    raise ValueError(f"intj: parameter {name!r} baked value does not fit type")
-                types = (min(matching, key=lambda ty: (
-                    0 if ty is None else 1 if ty == "u1" else
-                    64 if ty == "fp64" else int(ty[1:]), ty or ""
-                )),)
+                    raise ValueError(
+                        f"intj: parameter {name!r} baked value does not fit type"
+                    )
+                types = (
+                    min(
+                        matching,
+                        key=lambda ty: (
+                            0
+                            if ty is None
+                            else 1
+                            if ty == "u1"
+                            else 64
+                            if ty == "fp64"
+                            else int(ty[1:]),
+                            ty or "",
+                        ),
+                    ),
+                )
         if power:
-            if baked is not UNSET and (type(baked) is not int or
-                                       not (baked == 0 or abs(baked).bit_count() == 1)):
-                raise ValueError(f"intj: parameter {name!r} baked value is not a power of two or zero")
-        assumed = tuple((field, expected) for field, expected in _FACT_CLASSES.values()
-                        if modes[_FACT_NAMES.index(field)] == "assume")
+            if baked is not UNSET and (
+                type(baked) is not int
+                or not (baked == 0 or abs(baked).bit_count() == 1)
+            ):
+                raise ValueError(
+                    f"intj: parameter {name!r} baked value is not a power of two or zero"
+                )
+        assumed = tuple(
+            (field, expected)
+            for field, expected in _FACT_CLASSES.values()
+            if modes[_FACT_NAMES.index(field)] == "assume"
+        )
         if kind == "argument":
             branches = types if types is not None else ("i32", "*fp32")
             for field, _ in assumed:
                 if not any(_applicable(branch, field) for branch in branches):
                     raise ValueError(f"intj: parameter {name!r} has dead {field} fact")
             for branch in branches:
-                if branch is not None and _applicable(branch, "equal_to_one") and \
-                   _applicable(branch, "aligned_16") and modes[0] == modes[1] == "assume":
-                    raise ValueError(f"intj: parameter {name!r} has impossible {branch} branch")
+                if (
+                    branch is not None
+                    and _applicable(branch, "equal_to_one")
+                    and _applicable(branch, "aligned_16")
+                    and modes[0] == modes[1] == "assume"
+                ):
+                    raise ValueError(
+                        f"intj: parameter {name!r} has impossible {branch} branch"
+                    )
             if baked is not UNSET:
                 assert types is not None
                 for field, _ in assumed:
                     if _applicable(types[0], field) and (
-                        field == "equal_to_one" and baked != 1 or
-                        field == "aligned_16" and cast(int, baked) % 16 != 0
+                        field == "equal_to_one"
+                        and baked != 1
+                        or field == "aligned_16"
+                        and cast(int, baked) % 16 != 0
                     ):
-                        raise ValueError(f"intj: parameter {name!r} baked value violates {field}")
+                        raise ValueError(
+                            f"intj: parameter {name!r} baked value violates {field}"
+                        )
             if bind_value is BindValue.POINTER and (
-                raw_type is UNSET or raw_type is AUTO or isinstance(raw_type, tuple) or
-                types is None or len(types) != 1 or types[0] is None or
-                not types[0].startswith("*")
+                raw_type is UNSET
+                or raw_type is AUTO
+                or isinstance(raw_type, tuple)
+                or types is None
+                or len(types) != 1
+                or types[0] is None
+                or not types[0].startswith("*")
             ):
-                raise ValueError(f"intj: parameter {name!r} BindValue.POINTER needs exactly one explicit pointer type")
-            if bind_value is BindValue.TENSOR and types is not None and (
-                len(types) != 1 or types[0] is not None and not types[0].startswith("*")
+                raise ValueError(
+                    f"intj: parameter {name!r} BindValue.POINTER needs exactly one explicit pointer type"
+                )
+            if (
+                bind_value is BindValue.TENSOR
+                and types is not None
+                and (
+                    len(types) != 1
+                    or types[0] is not None
+                    and not types[0].startswith("*")
+                )
             ):
-                raise ValueError(f"intj: parameter {name!r} BindValue.TENSOR needs a pointer type or None")
+                raise ValueError(
+                    f"intj: parameter {name!r} BindValue.TENSOR needs a pointer type or None"
+                )
             if baked is not UNSET or bind_value is not None:
                 if types is not None and len(types) != 1:
-                    raise ValueError(f"intj: parameter {name!r} needs one effective type")
+                    raise ValueError(
+                        f"intj: parameter {name!r} needs one effective type"
+                    )
                 if types is None and bind_value is not BindValue.TENSOR:
-                    raise ValueError(f"intj: parameter {name!r} needs one effective type")
+                    raise ValueError(
+                        f"intj: parameter {name!r} needs one effective type"
+                    )
                 applicable = types if types is not None else ("i32", "*fp32")
-                if any(mode == "auto" and any(_applicable(ty, field) for ty in applicable)
-                       for field, mode in zip(_FACT_NAMES, modes)):
-                    raise ValueError(f"intj: parameter {name!r} has AUTO specialization with a fixed value")
+                if any(
+                    mode == "auto" and any(_applicable(ty, field) for ty in applicable)
+                    for field, mode in zip(_FACT_NAMES, modes)
+                ):
+                    raise ValueError(
+                        f"intj: parameter {name!r} has AUTO specialization with a fixed value"
+                    )
         annotation = CanonicalAnnotation(
-            kind, types, cast(str, modes[0]), cast(str, modes[1]), cast(str, modes[2]),
-            assumed, power, bind_value.value if isinstance(bind_value, BindValue) else None, tag,
+            kind,
+            types,
+            cast(str, modes[0]),
+            cast(str, modes[1]),
+            cast(str, modes[2]),
+            assumed,
+            power,
+            bind_value.value if isinstance(bind_value, BindValue) else None,
+            tag,
         )
         resolved.append(ResolvedParam(name, index, annotation, baked))
     return tuple(resolved)

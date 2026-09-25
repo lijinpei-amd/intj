@@ -138,12 +138,24 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
         src.write_text(_SOURCE)
         subprocess.run(
             [
-                os.environ.get("CXX", "c++"), "-std=c++20", "-shared", "-fPIC", "-w",
+                os.environ.get("CXX", "c++"),
+                "-std=c++20",
+                "-shared",
+                "-fPIC",
+                "-w",
                 f"-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}",
-                *(f"-I{d}" for d in [*includes, sysconfig.get_paths()["include"], _RUNTIME]),
-                str(src), "-o", str(lib),
-                *(f"-L{d}" for d in libs), *(f"-Wl,-rpath,{d}" for d in libs),
-                "-lc10", "-ltorch_cpu", "-ltorch_python",
+                *(
+                    f"-I{d}"
+                    for d in [*includes, sysconfig.get_paths()["include"], _RUNTIME]
+                ),
+                str(src),
+                "-o",
+                str(lib),
+                *(f"-L{d}" for d in libs),
+                *(f"-Wl,-rpath,{d}" for d in libs),
+                "-lc10",
+                "-ltorch_cpu",
+                "-ltorch_python",
             ],
             check=True,
         )
@@ -151,7 +163,9 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
         detect_fn = ctypes.CDLL(str(lib)).intj_detect
         detect_fn.restype = ctypes.c_char_p
         out = detect_fn().decode()
-    head, layout, dtypes = (dict(p.split("=") for p in line.split()) for line in out.splitlines())
+    head, layout, dtypes = (
+        dict(p.split("=") for p in line.split()) for line in out.splitlines()
+    )
     return (
         {k: int(v) for k, v in head.items()},
         {k: int(v) for k, v in layout.items()},

@@ -52,7 +52,8 @@ namespace {
 
 std::vector<std::vector<uint64_t>> make_keys(int n) {
   std::mt19937_64 rng(20260923);
-  std::vector<std::vector<uint64_t>> keys(n, std::vector<uint64_t>(INTJ_NWORDS));
+  std::vector<std::vector<uint64_t>> keys(n,
+                                          std::vector<uint64_t>(INTJ_NWORDS));
   for (auto &key : keys)
     for (auto &word : key)
       word = rng();
@@ -119,7 +120,8 @@ void miss(benchmark::State &state) {
   int i = 0;
   for (auto _ : state) {
     const int j = i++ & (n - 1);
-    intj_kernel *found = intj_cache_get(&cache, absent[j].data(), absent_hashes[j]);
+    intj_kernel *found =
+        intj_cache_get(&cache, absent[j].data(), absent_hashes[j]);
     benchmark::DoNotOptimize(found);
     if (found != NULL)
       state.SkipWithError("a key that was never inserted was found");
@@ -140,7 +142,7 @@ void hash_only(benchmark::State &state) {
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
-}  // namespace
+} // namespace
 
 BENCHMARK(hit)->Arg(1)->Arg(8)->Arg(64)->Arg(512);
 BENCHMARK(miss)->Arg(1)->Arg(8)->Arg(64)->Arg(512);

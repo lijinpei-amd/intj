@@ -33,7 +33,6 @@ _TENSORIMPL_WINDOW = 192
 _STORAGEIMPL_WINDOW = 72
 
 
-
 def _probes() -> list[Any]:
     """Tensors whose disagreement pins every offset to one candidate.
 
@@ -86,7 +85,7 @@ def _window(address: int, size: int) -> bytes:
 def _find_u64(blob: bytes, want: int, align: int = 8) -> set[int]:
     """Offsets in `blob` holding `want` as a little-endian 8-byte value."""
     target = want.to_bytes(8, "little", signed=want < 0)
-    return {i for i in range(0, len(blob) - 7, align) if blob[i:i + 8] == target}
+    return {i for i in range(0, len(blob) - 7, align) if blob[i : i + 8] == target}
 
 
 def _find_u8(blob: bytes, want: int) -> set[int]:
@@ -143,7 +142,11 @@ def probe_layout(header_size: int) -> TensorABI | None:
             si_fields[key] = hits if key not in si_fields else (si_fields[key] & hits)
 
     pinned: dict[str, int] = {}
-    for name, hits in [("cdata", cdata or set()), *ti_fields.items(), *si_fields.items()]:
+    for name, hits in [
+        ("cdata", cdata or set()),
+        *ti_fields.items(),
+        *si_fields.items(),
+    ]:
         if len(hits) != 1:
             return None
         pinned[name] = hits.pop()
@@ -216,7 +219,9 @@ def _main() -> None:
     # entry with a hole in it.
     holes = sorted(set(range(max(dtypes, default=0))) - set(dtypes))
     if holes:
-        raise SystemExit(f"intj: torch {torch.__version__} names no dtype for codes {holes}")
+        raise SystemExit(
+            f"intj: torch {torch.__version__} names no dtype for codes {holes}"
+        )
 
     print(f"# torch {torch.__version__}, x86-64")
     print('["%d.%d"]' % torch_version())

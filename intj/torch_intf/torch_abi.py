@@ -59,8 +59,14 @@ class TensorABI:
     def as_args(self) -> tuple[Any, ...]:
         """The tuple `set_torch_version` parses."""
         return (
-            self.cdata, self.storage, self.storage_offset, self.numel,
-            self.data_type, self.s_data, self.s_nbytes, self.itemsize,
+            self.cdata,
+            self.storage,
+            self.storage_offset,
+            self.numel,
+            self.data_type,
+            self.s_data,
+            self.s_nbytes,
+            self.itemsize,
         )
 
 
@@ -214,7 +220,9 @@ def _parse_abi(
         if not (major.isdigit() and minor.isdigit()):
             raise bad(f"has {version!r} where a major.minor version belongs")
         if not isinstance(entry, dict) or set(entry) != {*OFFSETS, "dtypes"}:
-            raise bad(f"[{version!r}] must have exactly {', '.join(OFFSETS)} and dtypes")
+            raise bad(
+                f"[{version!r}] must have exactly {', '.join(OFFSETS)} and dtypes"
+            )
         offsets: dict[str, Any] = {k: entry[k] for k in OFFSETS}
         # the C side keeps offsets in uint16_t; a larger one would wrap, not fail
         if not all(type(v) is int and 0 <= v < 1 << 16 for v in offsets.values()):
@@ -224,12 +232,17 @@ def _parse_abi(
             isinstance(dtypes, list)
             and len(dtypes) <= NDTYPES
             and all(
-                isinstance(d, list) and len(d) == 2
-                and isinstance(d[0], str) and type(d[1]) is int and 0 < d[1] < 256
+                isinstance(d, list)
+                and len(d) == 2
+                and isinstance(d[0], str)
+                and type(d[1]) is int
+                and 0 < d[1] < 256
                 for d in dtypes
             )
         ):
-            raise bad(f"[{version!r}] dtypes must be at most {NDTYPES} [name, size] pairs")
+            raise bad(
+                f"[{version!r}] dtypes must be at most {NDTYPES} [name, size] pairs"
+            )
         table[(int(major), int(minor))] = (
             offsets,
             {code: (name, size) for code, (name, size) in enumerate(dtypes)},

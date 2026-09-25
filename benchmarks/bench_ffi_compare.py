@@ -48,7 +48,9 @@ constexpr int kMixedThreads = 4 * 32;
 #endif
 """
 
-GPU_SOURCE = GPU_PREAMBLE + r"""
+GPU_SOURCE = (
+    GPU_PREAMBLE
+    + r"""
 __global__ void EmptyKernel(const float*, const float*, float*) {}
 
 __global__ void MixedKernel(const float* x, const float* y, float* z, int n, float a) {
@@ -77,34 +79,49 @@ void launch_mixed(tvm::ffi::TensorView x, tvm::ffi::TensorView y, tvm::ffi::Tens
                                                 static_cast<float*>(z.data_ptr()), n, a);
 }
 """
+)
 
 
 def sweep_kinds(count: int) -> tuple[str, ...]:
     """Use three tensors, then repeat int, float, tensor."""
-    return tuple("tensor" if i < 3 else ("int", "float", "tensor")[(i - 3) % 3]
-                 for i in range(count))
+    return tuple(
+        "tensor" if i < 3 else ("int", "float", "tensor")[(i - 3) % 3]
+        for i in range(count)
+    )
 
 
 def sweep_source(counts: list[int], device: int) -> str:
-    source = [GPU_PREAMBLE, r"""
+    source = [
+        GPU_PREAMBLE,
+        r"""
 #if defined(__HIP_PLATFORM_AMD__)
 constexpr int kSweepDeviceType = kDLROCM;
 #else
 constexpr int kSweepDeviceType = kDLCUDA;
 #endif
-"""]
+""",
+    ]
     ffi_types = {"tensor": "tvm::ffi::TensorView", "int": "int", "float": "float"}
     gpu_types = {"tensor": "const float*", "int": "int", "float": "float"}
     for count in counts:
         kinds = sweep_kinds(count)
-        ffi_params = ", ".join(f"{ffi_types[kind]} a{i}" for i, kind in enumerate(kinds))
-        gpu_params = ", ".join(f"{gpu_types[kind]} a{i}" for i, kind in enumerate(kinds))
+        ffi_params = ", ".join(
+            f"{ffi_types[kind]} a{i}" for i, kind in enumerate(kinds)
+        )
+        gpu_params = ", ".join(
+            f"{gpu_types[kind]} a{i}" for i, kind in enumerate(kinds)
+        )
         gpu_args = ", ".join(
-            f"static_cast<const float*>(a{i}.data_ptr())" if kind == "tensor" else f"a{i}"
+            f"static_cast<const float*>(a{i}.data_ptr())"
+            if kind == "tensor"
+            else f"a{i}"
             for i, kind in enumerate(kinds)
         )
-        stream_device = ("a0.device().device_type, a0.device().device_id" if count
-                         else f"kSweepDeviceType, {device}")
+        stream_device = (
+            "a0.device().device_type, a0.device().device_id"
+            if count
+            else f"kSweepDeviceType, {device}"
+        )
         source.append(
             f"\n__global__ void SweepKernel_{count}({gpu_params}) {{}}\n"
             f"void typed_{count}({ffi_params}) {{}}\n"
@@ -125,8 +142,11 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
     tensor = torch.empty(2, device="cuda", dtype=torch.float32)
     converted = tvm_ffi.from_dlpack(tensor)
     mod = tvm_ffi.cpp.load_inline(
-        name="benchmark_ffi_arg_sweep", cuda_sources=sweep_source(counts, device),
-        functions=[name for count in counts for name in (f"typed_{count}", f"launch_{count}")],
+        name="benchmark_ffi_arg_sweep",
+        cuda_sources=sweep_source(counts, device),
+        functions=[
+            name for count in counts for name in (f"typed_{count}", f"launch_{count}")
+        ],
     )
     packed_nop = tvm_ffi.get_global_func("testing.nop")
     cases = []
@@ -145,25 +165,44 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
             kernel = getattr(kernel_module, f"sweep_kernel_{count}")
             annotation = {
                 f"a{i}": Argument(
-                    type={"tensor": tl.pointer_type(tl.float32), "int": tl.int32,
-                          "float": tl.float32}[kind],
+                    type={
+                        "tensor": tl.pointer_type(tl.float32),
+                        "int": tl.int32,
+                        "float": tl.float32,
+                    }[kind],
                     specialize=NEVER,
-                ) for i, kind in enumerate(kinds)
+                )
+                for i, kind in enumerate(kinds)
             }
-            args = tuple({"tensor": tensor, "int": 17, "float": 1.25}[kind]
-                         for kind in kinds)
-            ffi_args = tuple({"tensor": converted, "int": 17, "float": 1.25}[kind]
-                             for kind in kinds)
-            cases.extend((
-                (count, "FFI packed nop", packed_nop, ffi_args),
-                (count, "FFI typed nop", getattr(mod, f"typed_{count}"), ffi_args),
-                (count, "FFI empty kernel", getattr(mod, f"launch_{count}"), ffi_args),
-            ))
+            args = tuple(
+                {"tensor": tensor, "int": 17, "float": 1.25}[kind] for kind in kinds
+            )
+            ffi_args = tuple(
+                {"tensor": converted, "int": 17, "float": 1.25}[kind] for kind in kinds
+            )
+            cases.extend(
+                (
+                    (count, "FFI packed nop", packed_nop, ffi_args),
+                    (count, "FFI typed nop", getattr(mod, f"typed_{count}"), ffi_args),
+                    (
+                        count,
+                        "FFI empty kernel",
+                        getattr(mod, f"launch_{count}"),
+                        ffi_args,
+                    ),
+                )
+            )
             for mode in (TorchAccessMode.STATIC_COMPILE, TorchAccessMode.RUNTIME_SHIM):
-                launch = make_launcher(kernel, extra_annotation=annotation,
-                                       bind_device=True, torch_access_mode=mode).bind_device(device)
+                launch = make_launcher(
+                    kernel,
+                    extra_annotation=annotation,
+                    bind_device=True,
+                    torch_access_mode=mode,
+                ).bind_device(device)
                 assert launch.__self__.__self__.spec_key(*args) == (b"", count)
-                cases.append((count, f"INTJ {mode.value} kernel", launch, (stream, (1,), *args)))
+                cases.append(
+                    (count, f"INTJ {mode.value} kernel", launch, (stream, (1,), *args))
+                )
 
         results: dict[tuple[int, str], list[float]] = {
             (count, name): [] for count, name, *_ in cases
@@ -174,11 +213,15 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
                     results[count, name].append(
                         bench(fn, args, iters, 1, torch.cuda.synchronize) / 1_000
                     )
-        print(f"counts={counts} iters={iters} batches={batches} unit=us/call "
-              "(host-only, no timed sync); INTJ device-bound, no specialization key")
+        print(
+            f"counts={counts} iters={iters} batches={batches} unit=us/call "
+            "(host-only, no timed sync); INTJ device-bound, no specialization key"
+        )
         for (count, name), samples in results.items():
-            print(f"args={count:2d} {name:<24} median={statistics.median(samples):.4f} "
-                  f"samples={samples}")
+            print(
+                f"args={count:2d} {name:<24} median={statistics.median(samples):.4f} "
+                f"samples={samples}"
+            )
 
 
 def main(iters: int, batches: int) -> None:
@@ -186,7 +229,8 @@ def main(iters: int, batches: int) -> None:
         raise RuntimeError("a CUDA or ROCm GPU is required")
 
     mod = tvm_ffi.cpp.load_inline(
-        name="benchmark_ffi_nop_launch", cuda_sources=GPU_SOURCE,
+        name="benchmark_ffi_nop_launch",
+        cuda_sources=GPU_SOURCE,
         functions=["typed_nop", "launch_empty", "typed_nop_mixed", "launch_mixed"],
     )
     tensors = (
@@ -202,8 +246,10 @@ def main(iters: int, batches: int) -> None:
     intj_launch = make_launcher(empty_kernel)
     intj_bound = make_launcher(empty_kernel, bind_device=True).bind_device(device)
     annotation = {
-        **{name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER)
-           for name in ("x", "y", "z")},
+        **{
+            name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER)
+            for name in ("x", "y", "z")
+        },
         "n": Argument(type=tl.int32, specialize=NEVER),
         "a": Argument(type=tl.float32, specialize=NEVER),
     }
@@ -244,7 +290,9 @@ def main(iters: int, batches: int) -> None:
         assert tensors[2][1].item() == 8.0
         for sample in range(batches):
             for name, fn, args in reversed(cases) if sample % 2 else cases:
-                results[name].append(bench(fn, args, iters, 1, torch.cuda.synchronize) / 1_000)
+                results[name].append(
+                    bench(fn, args, iters, 1, torch.cuda.synchronize) / 1_000
+                )
 
     print(f"iters={iters} batches={batches} unit=us/call (host-only, no timed sync)")
     for name, values in results.items():
@@ -255,12 +303,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iters", type=int, default=10_000)
     parser.add_argument("--batches", type=int, default=5)
-    parser.add_argument("--sweep", action="store_true", help="compare zero to 64 arguments")
-    parser.add_argument("--counts", type=int, nargs="+", default=[0, 3, 5, 8, 16, 32, 64])
+    parser.add_argument(
+        "--sweep", action="store_true", help="compare zero to 64 arguments"
+    )
+    parser.add_argument(
+        "--counts", type=int, nargs="+", default=[0, 3, 5, 8, 16, 32, 64]
+    )
     args = parser.parse_args()
     if args.iters < 1 or args.batches < 1:
         parser.error("--iters and --batches must be positive")
-    if any(count < 0 for count in args.counts) or len(set(args.counts)) != len(args.counts):
+    if any(count < 0 for count in args.counts) or len(set(args.counts)) != len(
+        args.counts
+    ):
         parser.error("--counts must be distinct nonnegative integers")
     if args.sweep:
         sweep(args.counts, args.iters, args.batches)

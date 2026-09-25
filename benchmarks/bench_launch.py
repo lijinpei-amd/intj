@@ -24,14 +24,29 @@ import torch
 import triton
 import triton.language as tl
 
-from intj import Annotation, Argument, Assume, Aligned, BindValue, Constexpr, NEVER, PointerRange, TorchAccessMode, make_launcher
+from intj import (
+    Annotation,
+    Argument,
+    Assume,
+    Aligned,
+    BindValue,
+    Constexpr,
+    NEVER,
+    PointerRange,
+    TorchAccessMode,
+    make_launcher,
+)
 
 
 @triton.jit
 def noop(x, y, o, n, a, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = off < n
-    tl.store(o + off, tl.load(x + off, mask=mask) + tl.load(y + off, mask=mask) * a, mask=mask)
+    tl.store(
+        o + off,
+        tl.load(x + off, mask=mask) + tl.load(y + off, mask=mask) * a,
+        mask=mask,
+    )
 
 
 def bench(fn, args, iters, batches, sync):
@@ -59,8 +74,11 @@ def bench_readme(iters, batches):
     sync = torch.cuda.synchronize
 
     access_rows = []
-    for mode in (TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE,
-                 TorchAccessMode.INTERPRETER):
+    for mode in (
+        TorchAccessMode.RUNTIME_SHIM,
+        TorchAccessMode.STATIC_COMPILE,
+        TorchAccessMode.INTERPRETER,
+    ):
         start = time.perf_counter_ns()
         module = getattr(make_launcher(noop, torch_access_mode=mode), "__self__")
         build_s = (time.perf_counter_ns() - start) / 1e9
@@ -76,8 +94,10 @@ def bench_readme(iters, batches):
         triton_ns = bench(noop[grid], args, iters, batches, sync)  # pyright: ignore[reportArgumentType]
         launch_args = (device, stream, grid) + args
         intj_ns = bench(launcher, launch_args, iters, batches, sync)
-        print(f"{label:>12} {triton_ns / 1000:11.2f} {intj_ns / 1000:10.2f} "
-              f"{triton_ns / intj_ns:8.1f}x")
+        print(
+            f"{label:>12} {triton_ns / 1000:11.2f} {intj_ns / 1000:10.2f} "
+            f"{triton_ns / intj_ns:8.1f}x"
+        )
 
     print()
     print(f"{'torch_access_mode':>17} {'decode ns':>11} {'build s':>10}")
@@ -92,7 +112,9 @@ def bench_sweep(iters, batches):
         for count in (4, 16, 32):
             path = pathlib.Path(tmp) / f"args_{count}.py"
             names = ", ".join(f"x{i}" for i in range(count))
-            path.write_text(f"import triton\n\n@triton.jit\ndef noop({names}):\n    pass\n")
+            path.write_text(
+                f"import triton\n\n@triton.jit\ndef noop({names}):\n    pass\n"
+            )
             spec = importlib.util.spec_from_file_location(path.stem, path)
             assert spec is not None and spec.loader is not None
             module = importlib.util.module_from_spec(spec)
@@ -119,35 +141,63 @@ def main(iters=20000, batches=7, no_gpu=False):
         name: Argument(type=pointer, specialize=Assume(Aligned(16), PointerRange(32)))
         for name in ("x", "y", "o")
     }
-    fixed.update(n=Argument(type=tl.int32, specialize=NEVER),
-                 a=Argument(type=tl.float32, specialize=NEVER),
-                 BLOCK=Constexpr(type=tl.int32))
+    fixed.update(
+        n=Argument(type=tl.int32, specialize=NEVER),
+        a=Argument(type=tl.float32, specialize=NEVER),
+        BLOCK=Constexpr(type=tl.int32),
+    )
     reduced: dict[str, Annotation] = {
         name: Argument(type=pointer, specialize=NEVER) for name in ("x", "y", "o")
     }
     reduced.update(n=fixed["n"], a=fixed["a"], BLOCK=fixed["BLOCK"])
 
-    print(f"mode={'host-only' if no_gpu else 'gpu'}; {iters} calls × {batches} batches; median ns/call")
-    print(f"{'path':>19} {'ns/call':>10} {'Δ ns':>10} {'Δ %':>9} {'build ms':>10} {'bind ms':>9}")
+    print(
+        f"mode={'host-only' if no_gpu else 'gpu'}; {iters} calls × {batches} batches; median ns/call"
+    )
+    print(
+        f"{'path':>19} {'ns/call':>10} {'Δ ns':>10} {'Δ %':>9} {'build ms':>10} {'bind ms':>9}"
+    )
 
-    def row(label, annotation=None, *, verify=False, binding=None, fixed_device=False,
-            baked_n=False, baked_block=False):
+    def row(
+        label,
+        annotation=None,
+        *,
+        verify=False,
+        binding=None,
+        fixed_device=False,
+        baked_n=False,
+        baked_block=False,
+    ):
         start = time.perf_counter_ns()
-        factory = make_launcher(noop, extra_annotation=annotation, no_gpu=no_gpu,
-                                verify_annotation=verify, bind_device=fixed_device)
+        factory = make_launcher(
+            noop,
+            extra_annotation=annotation,
+            no_gpu=no_gpu,
+            verify_annotation=verify,
+            bind_device=fixed_device,
+        )
         build_ms = (time.perf_counter_ns() - start) / 1e6
         bind_ms = None
         if binding is not None or fixed_device:
             start = time.perf_counter_ns()
-            values = {"x": x if binding is BindValue.TENSOR else x.data_ptr()} if binding else {}
-            launcher = (factory.bind_device(ordinal, **values) if fixed_device
-                        else factory.bind(**values))
+            values = (
+                {"x": x if binding is BindValue.TENSOR else x.data_ptr()}
+                if binding
+                else {}
+            )
+            launcher = (
+                factory.bind_device(ordinal, **values)
+                if fixed_device
+                else factory.bind(**values)
+            )
             bind_ms = (time.perf_counter_ns() - start) / 1e6
         else:
             launcher = factory
         call_args = args[1:] if binding else args
         if baked_n:
-            call_args = call_args[:2 if binding else 3] + call_args[3 if binding else 4:]
+            call_args = (
+                call_args[: 2 if binding else 3] + call_args[3 if binding else 4 :]
+            )
         if baked_block:
             call_args = call_args[:-1]
         controls = (stream, (1,)) if fixed_device else (ordinal, stream, (1,))
@@ -156,31 +206,63 @@ def main(iters=20000, batches=7, no_gpu=False):
         baseline = elapsed if label == "auto map" else auto_ns
         delta = elapsed - baseline
         binding_time = f"{bind_ms:.2f}" if bind_ms is not None else "-"
-        print(f"{label:>19} {elapsed:10.1f} {delta:+10.1f} "
-              f"{delta / baseline * 100:+9.1f} {build_ms:10.2f} {binding_time:>9}")
+        print(
+            f"{label:>19} {elapsed:10.1f} {delta:+10.1f} "
+            f"{delta / baseline * 100:+9.1f} {build_ms:10.2f} {binding_time:>9}"
+        )
         return elapsed
 
     auto_ns = row("auto map")
     row("reduced key", reduced)
     row("verify off", fixed)
     row("verify on", fixed, verify=True)
-    row("baked", {**fixed, "n": Argument(type=tl.int32, specialize=NEVER, value=n),
-                  "BLOCK": Constexpr(type=tl.int32, value=128)}, baked_n=True, baked_block=True)
-    row("bound tensor", {**fixed, "x": Argument(type=pointer, specialize=NEVER,
-                                                bind_value=BindValue.TENSOR)}, binding=BindValue.TENSOR)
-    row("bound pointer", {**fixed, "x": Argument(type=pointer, specialize=NEVER,
-                                                 bind_value=BindValue.POINTER)}, binding=BindValue.POINTER)
+    row(
+        "baked",
+        {
+            **fixed,
+            "n": Argument(type=tl.int32, specialize=NEVER, value=n),
+            "BLOCK": Constexpr(type=tl.int32, value=128),
+        },
+        baked_n=True,
+        baked_block=True,
+    )
+    row(
+        "bound tensor",
+        {
+            **fixed,
+            "x": Argument(type=pointer, specialize=NEVER, bind_value=BindValue.TENSOR),
+        },
+        binding=BindValue.TENSOR,
+    )
+    row(
+        "bound pointer",
+        {
+            **fixed,
+            "x": Argument(type=pointer, specialize=NEVER, bind_value=BindValue.POINTER),
+        },
+        binding=BindValue.POINTER,
+    )
     row("fixed device map", fixed_device=True)
-    row("fixed device no-map", {**fixed, "BLOCK": Constexpr(type=tl.int32, value=128)},
-        fixed_device=True, baked_block=True)
+    row(
+        "fixed device no-map",
+        {**fixed, "BLOCK": Constexpr(type=tl.int32, value=128)},
+        fixed_device=True,
+        baked_block=True,
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--no-gpu", action="store_true", help="decode and cache on the host only")
+    parser.add_argument(
+        "--no-gpu", action="store_true", help="decode and cache on the host only"
+    )
     modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--readme", action="store_true", help="reproduce the README launcher comparison")
-    modes.add_argument("--sweep", action="store_true", help="compare argument counts on the host only")
+    modes.add_argument(
+        "--readme", action="store_true", help="reproduce the README launcher comparison"
+    )
+    modes.add_argument(
+        "--sweep", action="store_true", help="compare argument counts on the host only"
+    )
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
     options = parser.parse_args()

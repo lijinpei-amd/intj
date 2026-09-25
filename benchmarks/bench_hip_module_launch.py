@@ -85,7 +85,8 @@ def main(iters: int, batches: int) -> None:
     assert compiled.name == "empty_kernel" and compiled.metadata.shared == 0
     block_threads = compiled.metadata.num_warps * compiled.metadata.warp_size
     mod = tvm_ffi.cpp.load_inline(
-        name="intj_hip_hsaco_overhead", cuda_sources=HIP_SOURCE,
+        name="intj_hip_hsaco_overhead",
+        cuda_sources=HIP_SOURCE,
         functions=["load_hsaco", "launch_empty"],
     )
     mod.load_hsaco(hsaco, block_threads)
@@ -112,9 +113,13 @@ def main(iters: int, batches: int) -> None:
         assert callback_count == 1
         for sample in range(batches):
             for name, fn, args in reversed(cases) if sample % 2 else cases:
-                results[name].append(bench(fn, args, iters, 1, torch.cuda.synchronize) / 1000)
-    print(f"hsaco_sha256={hashlib.sha256(hsaco).hexdigest()} kernel={compiled.name} "
-          f"threads={block_threads} shared={compiled.metadata.shared} callback_count={callback_count}")
+                results[name].append(
+                    bench(fn, args, iters, 1, torch.cuda.synchronize) / 1000
+                )
+    print(
+        f"hsaco_sha256={hashlib.sha256(hsaco).hexdigest()} kernel={compiled.name} "
+        f"threads={block_threads} shared={compiled.metadata.shared} callback_count={callback_count}"
+    )
     print(f"iters={iters} batches={batches} unit=us/call (host enqueue, no timed sync)")
     for name, samples in results.items():
         print(f"{name:<25} median={statistics.median(samples):.4f} samples={samples}")

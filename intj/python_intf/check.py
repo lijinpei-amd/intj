@@ -43,12 +43,14 @@ PyObject *check_reraise(void) {
 """
 
 #: Every digit-count and width boundary the decoders branch on, both signs.
-_INTS = sorted({
-    s * v
-    for b in (0, 1, 29, 30, 31, 32, 60, 62, 63, 64, 89, 90, 100)
-    for v in (2**b - 1, 2**b, 2**b + 1)
-    for s in (1, -1)
-})
+_INTS = sorted(
+    {
+        s * v
+        for b in (0, 1, 29, 30, 31, 32, 60, 62, 63, 64, 89, 90, 100)
+        for v in (2**b - 1, 2**b, 2**b + 1)
+        for s in (1, -1)
+    }
+)
 _FLOATS = (0.0, -0.0, 1.5, -2.25, 1e300, float("inf"))
 
 
@@ -57,10 +59,16 @@ def _build(header: str, out: pathlib.Path) -> ctypes.PyDLL:
     src.write_text(_SOURCE)
     subprocess.run(
         [
-            os.environ.get("CC", "cc"), "-shared", "-fPIC", "-O2",
-            f"-DINTJ_CPYTHON_STATIC_COMPILE_HEADER=\"{header}\"",
-            f"-I{sysconfig.get_paths()['include']}", f"-I{_HERE}",
-            str(src), "-o", str(out),
+            os.environ.get("CC", "cc"),
+            "-shared",
+            "-fPIC",
+            "-O2",
+            f'-DINTJ_CPYTHON_STATIC_COMPILE_HEADER="{header}"',
+            f"-I{sysconfig.get_paths()['include']}",
+            f"-I{_HERE}",
+            str(src),
+            "-o",
+            str(out),
         ],
         check=True,
     )
@@ -84,13 +92,17 @@ def check(header: str | None = None) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         lib = _build(header, pathlib.Path(tmp, "check.so"))
         if lib.check_pyobject_size() != pyobject_size():
-            errors.append(f"sizeof(PyObject) {lib.check_pyobject_size()} != {pyobject_size()}")
+            errors.append(
+                f"sizeof(PyObject) {lib.check_pyobject_size()} != {pyobject_size()}"
+            )
         for v in _INTS:
             u, i = ctypes.c_uint64(), ctypes.c_int64()
             kind = lib.check_int(v, ctypes.byref(u))
             want = 1 if -(2**63) <= v < 2**63 else 2 if 2**63 <= v < 2**64 else 0
             if kind != want or (want and u.value != v % 2**64):
-                errors.append(f"intj_as_int({v}) = ({kind}, {u.value}), want ({want}, {v % 2**64})")
+                errors.append(
+                    f"intj_as_int({v}) = ({kind}, {u.value}), want ({want}, {v % 2**64})"
+                )
             rc = lib.check_i64(v, ctypes.byref(i))
             fits = -(2**63) <= v < 2**63
             if rc != (0 if fits else -1) or (fits and i.value != v):
@@ -110,7 +122,9 @@ def check(header: str | None = None) -> list[str]:
 if __name__ == "__main__":
     header = sys.argv[1] if len(sys.argv) > 1 else None
     errors = check(header)
-    build = "free-threaded" if sysconfig.get_config_var("Py_GIL_DISABLED") else "default"
+    build = (
+        "free-threaded" if sysconfig.get_config_var("Py_GIL_DISABLED") else "default"
+    )
     name = "%d.%d.%d" % python_version()
     for e in errors:
         print(e, file=sys.stderr)

@@ -1,0 +1,4 @@
+BasedOnStyle: LLVM
+ReflowComments: Never
+SortIncludes: Never
+StatementMacros: [PyObject_HEAD]

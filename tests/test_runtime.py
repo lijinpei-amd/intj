@@ -29,7 +29,12 @@ from intj import launcher
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
 from intj.launcher import RenderContext
 from intj.python_intf import cpython_abi
-from intj.torch_intf.torch_abi import NDTYPES, TorchAccessMode, layout_for, torch_version
+from intj.torch_intf.torch_abi import (
+    NDTYPES,
+    TorchAccessMode,
+    layout_for,
+    torch_version,
+)
 
 _STUB = r"""
 #include <stdint.h>
@@ -57,7 +62,9 @@ const char *stub_error(int32_t status) { return "stub failure"; }
 """
 
 #: x: tensor, n: int, m: do_not_specialize int, f: float, flag: bool, BLOCK: constexpr
-_AUTO = CanonicalAnnotation("argument", None, "auto", "auto", "auto", (), False, None, ())
+_AUTO = CanonicalAnnotation(
+    "argument", None, "auto", "auto", "auto", (), False, None, ()
+)
 _NEVER = dataclasses.replace(_AUTO, equal_to_one="never", aligned_16="never")
 _CONSTEXPR = dataclasses.replace(_AUTO, kind="constexpr")
 _PARAMS, _DEVICE_OFFSET, _NWORDS = launcher._render_params(
@@ -72,11 +79,17 @@ _PARAMS, _DEVICE_OFFSET, _NWORDS = launcher._render_params(
     DeviceBinding.NOT_FIXED,
 )
 
-_MODES = [TorchAccessMode.INTERPRETER] + ([TorchAccessMode.RUNTIME_SHIM] if layout_for() else [])
+_MODES = [TorchAccessMode.INTERPRETER] + (
+    [TorchAccessMode.RUNTIME_SHIM] if layout_for() else []
+)
 
 
 def _cc(language: str) -> str:
-    return os.environ.get("CXX", "c++") if language == "c++" else os.environ.get("CC", "cc")
+    return (
+        os.environ.get("CXX", "c++")
+        if language == "c++"
+        else os.environ.get("CC", "cc")
+    )
 
 
 @pytest.fixture(scope="module")
@@ -84,7 +97,9 @@ def stub(tmp_path_factory):
     out = tmp_path_factory.mktemp("stub")
     src, lib = out / "stub.c", out / "stub.so"
     src.write_text(_STUB)
-    subprocess.run([_cc("c"), "-shared", "-fPIC", "-O2", str(src), "-o", str(lib)], check=True)
+    subprocess.run(
+        [_cc("c"), "-shared", "-fPIC", "-O2", str(src), "-o", str(lib)], check=True
+    )
     return ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL), str(lib)
 
 
@@ -108,29 +123,58 @@ def built(request, stub, tmp_path_factory):
     lib, lib_path = stub
     mode = request.param
     context = RenderContext(
-        module_name=f"rt_{mode.value}", kernel_repr="test_runtime.kernel", params=_PARAMS,
-        nwords=_NWORDS, device_binding=DeviceBinding.NOT_FIXED, device_offset=_DEVICE_OFFSET,
-        verify_annotation=False, no_gpu=False,
-        max_slots=5, spec_pointer_range=1, driver_path=lib_path,
-        launch_symbol="stub_launch", device_symbol="", error_symbol="stub_error", error_style="return",
-        torch_access_mode=mode.value, kernel_cache="intj", cache_include_dirs=(), cache_archives=(),
-        torch_version=None, cxx_abi=None,
+        module_name=f"rt_{mode.value}",
+        kernel_repr="test_runtime.kernel",
+        params=_PARAMS,
+        nwords=_NWORDS,
+        device_binding=DeviceBinding.NOT_FIXED,
+        device_offset=_DEVICE_OFFSET,
+        verify_annotation=False,
+        no_gpu=False,
+        max_slots=5,
+        spec_pointer_range=1,
+        driver_path=lib_path,
+        launch_symbol="stub_launch",
+        device_symbol="",
+        error_symbol="stub_error",
+        error_style="return",
+        torch_access_mode=mode.value,
+        kernel_cache="intj",
+        cache_include_dirs=(),
+        cache_archives=(),
+        torch_version=None,
+        cxx_abi=None,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=cpython_abi.header_for() or "",
     )
     flags = launcher._build_flags(context)
-    template = jinja2.Template(launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined)
+    template = jinja2.Template(
+        launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined
+    )
     out = tmp_path_factory.mktemp(mode.value)
     src = out / "entry.c"
     so = out / f"{context.module_name}{sysconfig.get_config_var('EXT_SUFFIX')}"
     src.write_text(template.render(**dataclasses.asdict(context)))
     subprocess.run(
         [
-            _cc(flags["language"]), "-shared", "-fPIC", "-O2", "-Wall", "-Werror",
-            "-Wno-unused-but-set-variable", "-x", flags["language"], *flags["ccflags"],
-            *(f"-I{d}" for d in [*flags["include_dirs"], sysconfig.get_paths()["include"]]),
-            str(src), "-o", str(so),
+            _cc(flags["language"]),
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-Wall",
+            "-Werror",
+            "-Wno-unused-but-set-variable",
+            "-x",
+            flags["language"],
+            *flags["ccflags"],
+            *(
+                f"-I{d}"
+                for d in [*flags["include_dirs"], sysconfig.get_paths()["include"]]
+            ),
+            str(src),
+            "-o",
+            str(so),
         ],
         check=True,
     )
@@ -147,7 +191,9 @@ def built(request, stub, tmp_path_factory):
     module.set_compile_callback(compile_cb)
     layout = layout_for().as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
     # every torch code its own 5-bit index; the real one comes from triton
-    module.set_torch_version(torch_version(), layout, bytes(c if c < 32 else 0xFF for c in range(NDTYPES)))
+    module.set_torch_version(
+        torch_version(), layout, bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
+    )
     return module, Stub(lib), compiles
 
 
@@ -155,15 +201,18 @@ def _f32(v: float) -> int:
     return struct.unpack("<I", struct.pack("<f", v))[0]
 
 
-@pytest.mark.parametrize("head, version, expected", [
-    (16, (2, 9), 8),
-    (32, (2, 9), 8),
-    (16, (2, 10), 0),
-    (32, (2, 10), 0),
-    (65535, (2, 9), None),
-    (65535, (2, 10), 0),
-    (65536, (2, 10), None),
-])
+@pytest.mark.parametrize(
+    "head, version, expected",
+    [
+        (16, (2, 9), 8),
+        (32, (2, 9), 8),
+        (16, (2, 10), 0),
+        (32, (2, 10), 0),
+        (65535, (2, 9), None),
+        (65535, (2, 10), 0),
+        (65536, (2, 10), None),
+    ],
+)
 def test_runtime_shim_cdata_is_header_relative(monkeypatch, head, version, expected):
     from intj.torch_intf import torch_abi as abi
 
@@ -250,7 +299,9 @@ def test_torch_abi_is_installed_once(built):
     layout = layout_for() if module.__name__ == "rt_runtime_shim" else None
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(RuntimeError, match="already installed"):
-        module.set_torch_version(torch_version(), layout.as_args() if layout else None, index)
+        module.set_torch_version(
+            torch_version(), layout.as_args() if layout else None, index
+        )
 
 
 @pytest.mark.parametrize("oversized_offset", [65536, 2**32])
@@ -286,10 +337,28 @@ def test_arguments_reach_the_launch(built, grid):
     assert stub.last(0)[0] == (4, 1, 1)
 
 
-@pytest.mark.parametrize("value", [
-    0, 16, 17, -17, 2**30 - 1, 2**30, -(2**30), 2**31, 2**60 + 3, 2**63 - 1, -(2**63),
-    2**63, 2**64 - 1, 2**64, -(2**63) - 1, 2**90, 2**100,
-])
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        16,
+        17,
+        -17,
+        2**30 - 1,
+        2**30,
+        -(2**30),
+        2**31,
+        2**60 + 3,
+        2**63 - 1,
+        -(2**63),
+        2**63,
+        2**64 - 1,
+        2**64,
+        -(2**63) - 1,
+        2**90,
+        2**100,
+    ],
+)
 def test_int_values(built, value):
     module, stub, _ = built
     x = torch.zeros(4)
@@ -318,9 +387,13 @@ def test_spec_key_buckets(built):
     ints = [key(x, v, 0, 0.0, False, 64) for v in (17, 16, 2**31, 2**63, 1)]
     assert len(set(ints)) == len(ints)
     assert key(x, 17, 0, 0.0, False, 64) == key(x, 19, 0, 0.0, False, 64)
-    assert key(x, 17, 16, 0.0, False, 64) == key(x, 17, 17, 0.0, False, 64)  # do_not_specialize
+    assert key(x, 17, 16, 0.0, False, 64) == key(
+        x, 17, 17, 0.0, False, 64
+    )  # do_not_specialize
     assert key(x, 17, 0, 0.0, False, 64) != key(x.half(), 17, 0, 0.0, False, 64)
-    assert key(x, 17, 0, 0.0, False, 64) != key(x[1:], 17, 0, 0.0, False, 64)  # alignment
+    assert key(x, 17, 0, 0.0, False, 64) != key(
+        x[1:], 17, 0, 0.0, False, 64
+    )  # alignment
     assert key(x, 17, 0, 0.0, False, 64) != key(x, 17, 0, 0.0, False, 128)
     assert key(x, 17, 0, 0.0, False, 2**64 - 1) != key(x, 17, 0, 0.0, False, 2**63 - 1)
 
@@ -342,7 +415,9 @@ def test_bad_arguments(built):
     assert stub.calls() == calls  # an empty grid launches nothing
 
 
-@pytest.mark.skipif(not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="requires free threading")
+@pytest.mark.skipif(
+    not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="requires free threading"
+)
 def test_list_grid_survives_concurrent_resize(built):
     """A list resize must not invalidate the grid parser's borrowed item array."""
     module, _, _ = built
@@ -381,8 +456,12 @@ finally:
     stop.set()
     thread.join()
 """
-    result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", code],
-                            capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert result.returncode == 0, result.stderr
 
 

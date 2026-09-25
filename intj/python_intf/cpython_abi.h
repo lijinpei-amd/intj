@@ -24,9 +24,8 @@ static INTJ_ALWAYS_INLINE int intj_long_compact(PyLongObject *v, int64_t *out) {
   return 1;
 }
 
-static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
-                                                         size_t *nd,
-                                                         int *negative) {
+static INTJ_ALWAYS_INLINE const digit *
+intj_long_digits(PyLongObject *v, size_t *nd, int *negative) {
   Py_ssize_t size = Py_SIZE(v);
   *negative = size < 0;
   *nd = (size_t)(size < 0 ? -size : size);
@@ -42,9 +41,8 @@ static INTJ_ALWAYS_INLINE int intj_long_compact(PyLongObject *v, int64_t *out) {
   return 1;
 }
 
-static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
-                                                         size_t *nd,
-                                                         int *negative) {
+static INTJ_ALWAYS_INLINE const digit *
+intj_long_digits(PyLongObject *v, size_t *nd, int *negative) {
   uintptr_t tag = v->long_value.lv_tag;
   *nd = (size_t)(tag >> _PyLong_NON_SIZE_BITS);
   *negative = (tag & _PyLong_SIGN_MASK) == 2;
@@ -55,9 +53,8 @@ static INTJ_ALWAYS_INLINE const digit *intj_long_digits(PyLongObject *v,
 static_assert(PyLong_SHIFT == 30, "intj's int decoder assumes 30-bit digits");
 
 /* The magnitude, if it fits 90 bits: 0 = ok, -1 = larger. */
-static INTJ_ALWAYS_INLINE int intj_long_magnitude(PyLongObject *v,
-                                                  __uint128_t *acc,
-                                                  int *negative) {
+static INTJ_ALWAYS_INLINE int
+intj_long_magnitude(PyLongObject *v, __uint128_t *acc, int *negative) {
   size_t nd;
   const digit *d = intj_long_digits(v, &nd, negative);
   if (INTJ_UNLIKELY(nd > 3)) /* > 90 bits */

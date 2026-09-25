@@ -33,14 +33,19 @@
 
 /* CPYTHON_ACCESS_MODE.STATIC_COMPILE selects its layout by PY_VERSION_HEX. */
 #ifndef INTJ_CPYTHON_STATIC_COMPILE_HEADER
-#error "define INTJ_CPYTHON_STATIC_COMPILE_HEADER to a header from intj/python_intf"
+#error                                                                         \
+    "define INTJ_CPYTHON_STATIC_COMPILE_HEADER to a header from intj/python_intf"
 #endif
 #include INTJ_CPYTHON_STATIC_COMPILE_HEADER
 
 #if defined(__clang__)
 #define INTJ_ASSUME(x) __builtin_assume(x)
 #elif defined(__GNUC__)
-#define INTJ_ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+#define INTJ_ASSUME(x)                                                         \
+  do {                                                                         \
+    if (!(x))                                                                  \
+      __builtin_unreachable();                                                 \
+  } while (0)
 #else
 #define INTJ_ASSUME(x) ((void)0)
 #endif
@@ -259,7 +264,8 @@ struct intj_key_hash {
 #if defined(INTJ_CACHE_TSL)
 using intj_cache_map = tsl::robin_map<intj_key, intj_kernel *, intj_key_hash>;
 #else
-using intj_cache_map = absl::flat_hash_map<intj_key, intj_kernel *, intj_key_hash>;
+using intj_cache_map =
+    absl::flat_hash_map<intj_key, intj_kernel *, intj_key_hash>;
 #endif
 
 typedef struct {
@@ -312,7 +318,9 @@ static inline void intj_cache_free(intj_cache *c) {
 
 typedef intj_map intj_cache;
 
-static inline int intj_cache_init(intj_cache *c) { return intj_map_init(c, 16); }
+static inline int intj_cache_init(intj_cache *c) {
+  return intj_map_init(c, 16);
+}
 
 static inline intj_kernel *intj_cache_get(const intj_cache *c,
                                           const uint64_t *k, uint64_t h) {
@@ -365,7 +373,7 @@ typedef struct {
    * dtype.  Unlike itemsize, every access mode reads this: it is what the key
    * encodes, not how a pointer is computed. */
   uint8_t dtype_index[INTJ_NDTYPES];
-  int ready;               /* set_torch_version has run */
+  int ready; /* set_torch_version has run */
 } intj_torch_abi;
 
 #ifdef INTJ_TORCH_ACCESS_STATIC_COMPILE
@@ -452,7 +460,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
    * payload. Only reached after intj_decode_argument's exact-type test, so `o` really is
    * a tensor and `d` really is a THPDtype.
    */
-  *dt = (int32_t) * (const int8_t *)((char *)d + sizeof(PyObject));
+  *dt = (int32_t)*(const int8_t *)((char *)d + sizeof(PyObject));
   Py_DECREF(d);
 
   PyObject *v = PyObject_CallMethodNoArgs(o, intj_str_data_ptr);
@@ -508,16 +516,16 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
  * The cost is that a torch release renaming any of these fields breaks the
  * build.  That is the right failure: a compile error, not a wrong pointer --
  * which is what RUNTIME_SHIM would get, since it cannot see names at all.
- */namespace intj_rob {
-template <typename Tag, typename Tag::type M>
-struct Rob {
+ */
+namespace intj_rob {
+template <typename Tag, typename Tag::type M> struct Rob {
   friend typename Tag::type get(Tag) { return M; }
 };
 #define INTJ_ROB(NAME, CLASS, MEMBER, ...)                                     \
-  struct NAME {                                                               \
-    using type = __VA_ARGS__ CLASS::*;                                        \
-    friend type get(NAME);                                                    \
-  };                                                                          \
+  struct NAME {                                                                \
+    using type = __VA_ARGS__ CLASS::*;                                         \
+    friend type get(NAME);                                                     \
+  };                                                                           \
   template struct Rob<NAME, &CLASS::MEMBER>;
 
 INTJ_ROB(ti_storage, c10::TensorImpl, storage_, c10::Storage)
@@ -527,12 +535,12 @@ INTJ_ROB(ti_data_type, c10::TensorImpl, data_type_, caffe2::TypeMeta)
 INTJ_ROB(si_size_bytes, c10::StorageImpl, size_bytes_, c10::SymInt)
 INTJ_ROB(si_data_ptr, c10::StorageImpl, data_ptr_, c10::DataPtr)
 #undef INTJ_ROB
-}  // namespace intj_rob
+} // namespace intj_rob
 
 static INTJ_ALWAYS_INLINE int intj_read_cxx_tensor(const intj_torch_abi *abi,
-                                                   const at::Tensor &t, void **p,
-                                                   int32_t *dt, int want_size,
-                                                   int64_t *sz) {
+                                                   const at::Tensor &t,
+                                                   void **p, int32_t *dt,
+                                                   int want_size, int64_t *sz) {
   using namespace intj_rob;
   (void)abi;
   c10::TensorImpl *ti = t.unsafeGetTensorImpl();
@@ -549,7 +557,8 @@ static INTJ_ALWAYS_INLINE int intj_read_cxx_tensor(const intj_torch_abi *abi,
   c10::StorageImpl *si = storage.unsafeGetStorageImpl();
 
   caffe2::TypeMeta meta = ti->*get(ti_data_type());
-  if (INTJ_UNLIKELY(!meta.isScalarType())) { /* also stops toScalarType() throwing */
+  if (INTJ_UNLIKELY(
+          !meta.isScalarType())) { /* also stops toScalarType() throwing */
     PyErr_SetString(PyExc_RuntimeError, "intj: tensor has no scalar dtype");
     return -1;
   }
@@ -578,7 +587,8 @@ static INTJ_ALWAYS_INLINE int intj_read_tensor(const intj_torch_abi *abi,
 }
 
 #else
-#error "intj: define one INTJ_TORCH_ACCESS_{INTERPRETER,RUNTIME_SHIM,STATIC_COMPILE}"
+#error                                                                         \
+    "intj: define one INTJ_TORCH_ACCESS_{INTERPRETER,RUNTIME_SHIM,STATIC_COMPILE}"
 #endif
 
 /* Re-raise the reader's error as "which argument", keeping torch's own message
@@ -627,10 +637,11 @@ static inline int intj_dtype_selfcheck(PyObject *torch) {
            strncmp(payload + 1, "float32", 8) == 0;
   Py_DECREF(f32);
   if (!ok) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "intj: torch.dtype is not laid out as intj expects "
-                    "(THPDtype { PyObject_HEAD ScalarType; char name[] }); "
-                    "this torch is too new or too old for INTERPRETER tensor access");
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "intj: torch.dtype is not laid out as intj expects "
+        "(THPDtype { PyObject_HEAD ScalarType; char name[] }); "
+        "this torch is too new or too old for INTERPRETER tensor access");
     return -1;
   }
   return 0;
@@ -719,22 +730,25 @@ intj_decode_constexpr(PyObject *o, const char *pname, intj_decoded *out) {
   } else {
     PyErr_Format(PyExc_TypeError,
                  "intj: unsupported argument '%s' of type %s; pass a "
-                 "scalar int, float, bool or None", pname, Py_TYPE(o)->tp_name);
+                 "scalar int, float, bool or None",
+                 pname, Py_TYPE(o)->tp_name);
     return -1;
   }
   return 0;
 }
 
-static INTJ_ALWAYS_INLINE int
-intj_finish_tensor(const intj_torch_abi *abi, int32_t dtype,
-                    const char *pname, intj_decoded *out) {
+static INTJ_ALWAYS_INLINE int intj_finish_tensor(const intj_torch_abi *abi,
+                                                 int32_t dtype,
+                                                 const char *pname,
+                                                 intj_decoded *out) {
   /* All three readers, including zero-element tensors, share this gate. */
-  uint32_t index = (dtype >= 0 && dtype < INTJ_NDTYPES)
-                       ? abi->dtype_index[dtype] : 0xFFu;
+  uint32_t index =
+      (dtype >= 0 && dtype < INTJ_NDTYPES) ? abi->dtype_index[dtype] : 0xFFu;
   if (INTJ_UNLIKELY(index == 0xFFu)) {
     PyErr_Format(PyExc_RuntimeError,
                  "intj: tensor argument '%s' has dtype code %d, which "
-                 "triton does not take", pname, (int)dtype);
+                 "triton does not take",
+                 pname, (int)dtype);
     return -1;
   }
   out->kind = INTJ_VALUE_TENSOR;
@@ -752,8 +766,8 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
     return intj_decode_constexpr(o, pname, out);
   memset(out, 0, sizeof(*out));
   int32_t dtype = -1;
-  if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype,
-                                    want_size, &out->storage_nbytes) != 0)) {
+  if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype, want_size,
+                                     &out->storage_nbytes) != 0)) {
     intj_note_param(pname);
     return -1;
   }
@@ -781,12 +795,14 @@ typedef struct intj_bound_launcher {
 #endif
 } intj_bound_launcher;
 
-static inline int
-intj_bind_tensor(intj_bound_launcher *bound, int index, PyObject *value,
-                 PyTypeObject *tensor_type, PyTypeObject *param_type,
-                 const char *pname) {
-  if (value != Py_None && Py_TYPE(value) != tensor_type && Py_TYPE(value) != param_type) {
-    PyErr_Format(PyExc_TypeError, "intj: bound tensor '%s' must be a tensor or None", pname);
+static inline int intj_bind_tensor(intj_bound_launcher *bound, int index,
+                                   PyObject *value, PyTypeObject *tensor_type,
+                                   PyTypeObject *param_type,
+                                   const char *pname) {
+  if (value != Py_None && Py_TYPE(value) != tensor_type &&
+      Py_TYPE(value) != param_type) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: bound tensor '%s' must be a tensor or None", pname);
     return -1;
   }
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
@@ -806,7 +822,8 @@ intj_bind_tensor(intj_bound_launcher *bound, int index, PyObject *value,
 static INTJ_ALWAYS_INLINE int
 intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
                          PyTypeObject *param_type, intj_bound_launcher *bound,
-                         int index, int want_size, const char *pname, intj_decoded *out) {
+                         int index, int want_size, const char *pname,
+                         intj_decoded *out) {
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   memset(out, 0, sizeof(*out));
   if (!bound->tensors[index]) {
@@ -814,36 +831,43 @@ intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
     return 0;
   }
   int32_t dtype = -1;
-  if (INTJ_UNLIKELY(intj_read_cxx_tensor(abi, *bound->tensors[index], &out->pointer,
-                                        &dtype, want_size, &out->storage_nbytes) != 0)) {
+  if (INTJ_UNLIKELY(intj_read_cxx_tensor(abi, *bound->tensors[index],
+                                         &out->pointer, &dtype, want_size,
+                                         &out->storage_nbytes) != 0)) {
     intj_note_param(pname);
     return -1;
   }
   return intj_finish_tensor(abi, dtype, pname, out);
 #else
-  return intj_decode_argument(abi, tensor_type, param_type, bound->owners[index],
-                              want_size, pname, out);
+  return intj_decode_argument(abi, tensor_type, param_type,
+                              bound->owners[index], want_size, pname, out);
 #endif
 }
 
 /* A POINTER is decoded only during bind. Addresses carry no allocation range. */
-static inline int
-intj_decode_pointer(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                     PyTypeObject *param_type, PyObject *value,
-                     const char *pname, intj_decoded *out) {
+static inline int intj_decode_pointer(const intj_torch_abi *abi,
+                                      PyTypeObject *tensor_type,
+                                      PyTypeObject *param_type, PyObject *value,
+                                      const char *pname, intj_decoded *out) {
   if (Py_TYPE(value) == tensor_type || Py_TYPE(value) == param_type)
-    return intj_decode_argument(abi, tensor_type, param_type, value, 0, pname, out);
+    return intj_decode_argument(abi, tensor_type, param_type, value, 0, pname,
+                                out);
   if (value == Py_None || PyLong_CheckExact(value))
     return intj_decode_constexpr(value, pname, out);
   PyObject *address = PyObject_CallMethodNoArgs(value, intj_str_data_ptr);
   if (!address) {
     if (PyErr_ExceptionMatches(PyExc_AttributeError))
-      PyErr_Format(PyExc_TypeError, "intj: bound pointer '%s' needs a tensor, int, data_ptr() or None", pname);
+      PyErr_Format(
+          PyExc_TypeError,
+          "intj: bound pointer '%s' needs a tensor, int, data_ptr() or None",
+          pname);
     return -1;
   }
   if (!PyLong_CheckExact(address)) {
     Py_DECREF(address);
-    PyErr_Format(PyExc_TypeError, "intj: bound pointer '%s' data_ptr() must return an exact int", pname);
+    PyErr_Format(PyExc_TypeError,
+                 "intj: bound pointer '%s' data_ptr() must return an exact int",
+                 pname);
     return -1;
   }
   int rc = intj_decode_constexpr(address, pname, out);
@@ -859,31 +883,44 @@ static INTJ_ALWAYS_INLINE double intj_as_double(uint64_t bits) {
 
 static INTJ_ALWAYS_INLINE uint32_t intj_infer_type(const intj_decoded *value) {
   switch (value->kind) {
-  case INTJ_VALUE_TENSOR: return INTJ_B_PTR(value->dtype_index, 0, 0);
-  case INTJ_VALUE_BOOL: return INTJ_B_U1;
+  case INTJ_VALUE_TENSOR:
+    return INTJ_B_PTR(value->dtype_index, 0, 0);
+  case INTJ_VALUE_BOOL:
+    return INTJ_B_U1;
   case INTJ_VALUE_I64:
-    return (int64_t)value->bits >= INT32_MIN && (int64_t)value->bits <= INT32_MAX
-               ? INTJ_B_I32 : INTJ_B_I64;
-  case INTJ_VALUE_U64: return INTJ_B_U64;
-  case INTJ_VALUE_FP64: return INTJ_B_FP32;
-  case INTJ_VALUE_NONE: return INTJ_B_NONE;
+    return (int64_t)value->bits >= INT32_MIN &&
+                   (int64_t)value->bits <= INT32_MAX
+               ? INTJ_B_I32
+               : INTJ_B_I64;
+  case INTJ_VALUE_U64:
+    return INTJ_B_U64;
+  case INTJ_VALUE_FP64:
+    return INTJ_B_FP32;
+  case INTJ_VALUE_NONE:
+    return INTJ_B_NONE;
   }
   return INTJ_B_NONE;
 }
 
-static INTJ_ALWAYS_INLINE uint32_t intj_constexpr_type(const intj_decoded *value) {
+static INTJ_ALWAYS_INLINE uint32_t
+intj_constexpr_type(const intj_decoded *value) {
   switch (value->kind) {
-  case INTJ_VALUE_BOOL: return INTJ_B_CX_BOOL;
-  case INTJ_VALUE_I64: return INTJ_B_CX_INT;
-  case INTJ_VALUE_U64: return INTJ_B_CX_UINT;
-  case INTJ_VALUE_FP64: return INTJ_B_CX_FLOAT;
-  default: return INTJ_B_CX_NONE;
+  case INTJ_VALUE_BOOL:
+    return INTJ_B_CX_BOOL;
+  case INTJ_VALUE_I64:
+    return INTJ_B_CX_INT;
+  case INTJ_VALUE_U64:
+    return INTJ_B_CX_UINT;
+  case INTJ_VALUE_FP64:
+    return INTJ_B_CX_FLOAT;
+  default:
+    return INTJ_B_CX_NONE;
   }
 }
 
 /* Magnitude and sign are separate so both +2**63 and -2**63 are representable. */
-static INTJ_ALWAYS_INLINE uint8_t
-intj_power_of_two_or_zero(uint64_t magnitude, int negative) {
+static INTJ_ALWAYS_INLINE uint8_t intj_power_of_two_or_zero(uint64_t magnitude,
+                                                            int negative) {
   if (magnitude == 0)
     return 0;
   uint8_t code = (uint8_t)(__builtin_ctzll(magnitude) + 1);
@@ -895,7 +932,8 @@ static INTJ_ALWAYS_INLINE int intj_integer_type(uint32_t type) {
          (type >= INTJ_B_I8 && type <= INTJ_B_U32);
 }
 
-static INTJ_ALWAYS_INLINE uint64_t intj_pack_value(uint64_t bits, uint32_t type) {
+static INTJ_ALWAYS_INLINE uint64_t intj_pack_value(uint64_t bits,
+                                                   uint32_t type) {
   if (type == INTJ_B_FP32) {
     float value = (float)intj_as_double(bits);
     uint32_t packed;
@@ -909,8 +947,8 @@ static INTJ_ALWAYS_INLINE uint64_t intj_pack_value(uint64_t bits, uint32_t type)
 #define INTJ_KEY_STORE(WIDTH)                                                  \
   static INTJ_ALWAYS_INLINE void intj_key_store##WIDTH(                        \
       void *out, uint##WIDTH##_t value) {                                      \
-    if (PY_BIG_ENDIAN)                                                        \
-      value = __builtin_bswap##WIDTH(value);                                  \
+    if (PY_BIG_ENDIAN)                                                         \
+      value = __builtin_bswap##WIDTH(value);                                   \
     memcpy(out, &value, sizeof(value));                                        \
   }
 INTJ_KEY_STORE(16)

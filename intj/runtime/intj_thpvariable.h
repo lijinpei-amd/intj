@@ -17,7 +17,7 @@
 #include <torch/version.h>
 
 /* torch 2.10 made `cdata` a plain Tensor; before, a MaybeOwned<Tensor>. */
-#define INTJ_CDATA_IS_MAYBE_OWNED \
+#define INTJ_CDATA_IS_MAYBE_OWNED                                              \
   (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 10)
 
 struct intj_THPVariable {
