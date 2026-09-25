@@ -123,6 +123,12 @@ which is the third row's 0.12 us. Host overhead is therefore ~0.3 us against
 
 Run `python benchmarks/bench_launch.py --sweep --iters 100000 --batches 9` for
 host-only timings with 4, 16, and 32 integer or tensor arguments. See the
-[2026-09-24 optimization measurements](docs/benchmark-2026-09-24.md) for before/after results.
+[2026-09-24 optimization measurements](benchmarks/journals/2026-09-24_launcher-optimization_0_4f0b13e.md) for before/after results.
+
+For TVM FFI call, callback, utility, and HIP launch timings, see the
+[2026-09-25 script comparison](benchmarks/journals/2026-09-25_tvm-ffi-scripts_0_90b2959.md).
+
+The [same-HSACO HIP launch and Python utility diagnostics](benchmarks/journals/2026-09-25_hip-utilities_0_660d458.md)
+compare TVM FFI, Triton, and INTJ and explain the keyword/dataclass timing gaps.
 
 TODO: sweep constexpr argument counts independently.

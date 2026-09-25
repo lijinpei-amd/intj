@@ -1,0 +1,147 @@
+# Launcher optimization — 2026-09-24, repeat 3 of 5
+
+**Benchmark:** `benchmarks/bench_launch.py` (wrapper-based runner from the
+candidate working tree, before commit `4f0b13e`). Baseline source:
+`4a3df7f`, archived; candidate source: working tree later committed as
+`4f0b13e` with matching `entry.c.jinja` SHA-256 `38b8a7ae495d22eeb3ecebfad40d2d85dba1f6142ac38d6321097a467e63481c`. Baseline
+and candidate both used the updated runner. [Five-repeat summary and repeat 0](2026-09-24_launcher-optimization_0_4f0b13e.md).
+
+**Environment:** Intel Xeon Platinum 8480C, CPU 0 affinity; AMD Instinct
+MI308X (gfx942), GPU 0; CPython 3.12.3, Torch 2.14.0+rocm7.2, Triton 3.8.0,
+GCC 13.3.0; `/tmp/gb2/bin/python`, separate `TRITON_HOME` per revision. Each
+process reused its revision's cache after the first build. Run order
+alternated by repeat index.
+
+**Calls:** `taskset -c 0` with `PYTHONPATH` set to baseline or candidate source.
+`--no-gpu` and `--sweep`: 100,000 calls × 9 batches; GPU default and `--readme`:
+20,000 calls × 7 batches. The printed rows are the process medians, with build
+times where reported. The wrapper-based timer stops before GPU synchronization.
+Later direct-call benchmarks have a different timing boundary.
+
+## Raw script outputs — repeat 3
+
+### `bench_launch.py` sweep, baseline 4a3df7f
+
+```text
+source=/tmp/intj-optimize-7g_as4_o/baseline/intj/__init__.py
+mode=sweep; host-only; 100000 calls × 9 batches; median ns/call
+count   kind    ns/call
+    4    int      145.1
+    4 tensor      144.5
+   16    int      224.5
+   16 tensor      257.5
+   32    int      371.1
+   32 tensor      495.4
+```
+
+### `bench_launch.py` sweep, candidate 4f0b13e
+
+```text
+source=/mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/optimize/intj/__init__.py
+mode=sweep; host-only; 100000 calls × 9 batches; median ns/call
+count   kind    ns/call
+    4    int      143.9
+    4 tensor      147.9
+   16    int      222.4
+   16 tensor      261.8
+   32    int      325.9
+   32 tensor      493.5
+```
+
+### `bench_launch.py` host, baseline 4a3df7f
+
+```text
+source=/tmp/intj-optimize-7g_as4_o/baseline/intj/__init__.py
+mode=host-only; 100000 calls × 9 batches; median ns/call
+               path    ns/call       Δ ns       Δ %   build ms   bind ms
+           auto map      166.4       +0.0      +0.0      60.03         -
+        reduced key      160.8       -5.7      -3.4       1.37         -
+         verify off      164.4       -2.0      -1.2       1.24         -
+          verify on      163.2       -3.2      -1.9       1.19         -
+              baked      150.2      -16.2      -9.8       1.33         -
+       bound tensor      161.1       -5.3      -3.2       0.13      1.17
+      bound pointer      162.2       -4.2      -2.5       0.13      1.14
+   fixed device map      155.1      -11.4      -6.8       0.10      1.11
+fixed device no-map      153.6      -12.8      -7.7       0.14      1.12
+```
+
+### `bench_launch.py` host, candidate 4f0b13e
+
+```text
+source=/mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/optimize/intj/__init__.py
+mode=host-only; 100000 calls × 9 batches; median ns/call
+               path    ns/call       Δ ns       Δ %   build ms   bind ms
+           auto map      168.0       +0.0      +0.0      60.91         -
+        reduced key      160.0       -7.9      -4.7       1.37         -
+         verify off      167.7       -0.3      -0.2       1.21         -
+          verify on      160.5       -7.5      -4.4       1.20         -
+              baked      146.1      -21.9     -13.0       1.38         -
+       bound tensor      163.8       -4.2      -2.5       0.13      1.13
+      bound pointer      157.4      -10.6      -6.3       0.12      1.15
+   fixed device map      155.6      -12.3      -7.3       0.11      1.21
+fixed device no-map      152.6      -15.3      -9.1       0.12      1.09
+```
+
+### `bench_launch.py` gpu, baseline 4a3df7f
+
+```text
+source=/tmp/intj-optimize-7g_as4_o/baseline/intj/__init__.py
+mode=gpu; 20000 calls × 7 batches; median ns/call
+               path    ns/call       Δ ns       Δ %   build ms   bind ms
+           auto map     3152.2       +0.0      +0.0      71.23         -
+        reduced key     3184.3      +32.2      +1.0       1.93         -
+         verify off     3219.7      +67.5      +2.1       1.77         -
+          verify on     3195.1      +42.9      +1.4       1.88         -
+              baked     3126.6      -25.6      -0.8       1.91         -
+       bound tensor     3172.9      +20.8      +0.7       0.37      1.46
+      bound pointer     3167.0      +14.9      +0.5       0.33      1.40
+   fixed device map     3166.2      +14.0      +0.4       0.31      1.53
+fixed device no-map     3241.3      +89.1      +2.8       0.34      1.40
+```
+
+### `bench_launch.py` gpu, candidate 4f0b13e
+
+```text
+source=/mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/optimize/intj/__init__.py
+mode=gpu; 20000 calls × 7 batches; median ns/call
+               path    ns/call       Δ ns       Δ %   build ms   bind ms
+           auto map     3175.5       +0.0      +0.0      72.85         -
+        reduced key     3156.5      -18.9      -0.6       1.89         -
+         verify off     3186.4      +10.9      +0.3       1.78         -
+          verify on     3167.1       -8.3      -0.3       1.69         -
+              baked     3149.2      -26.2      -0.8       1.73         -
+       bound tensor     3198.2      +22.7      +0.7       0.38      1.47
+      bound pointer     3236.6      +61.1      +1.9       0.29      1.36
+   fixed device map     3208.9      +33.4      +1.1       0.31      1.51
+fixed device no-map     3212.4      +36.9      +1.2       0.35      1.36
+```
+
+### `bench_launch.py` readme, baseline 4a3df7f
+
+```text
+source=/tmp/intj-optimize-7g_as4_o/baseline/intj/__init__.py
+mode=readme; 20000 calls × 7 batches; median
+        path   triton us    intj us   speedup
+   grid=(1,)       16.99       3.22      5.3x
+   grid=(0,)       13.27       0.15     90.9x
+
+torch_access   decode ns    build s
+        shim       117.0       0.02
+         cxx       116.5       0.06
+     cpython       901.8       0.00
+```
+
+### `bench_launch.py` readme, candidate 4f0b13e
+
+```text
+source=/mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/optimize/intj/__init__.py
+mode=readme; 20000 calls × 7 batches; median
+        path   triton us    intj us   speedup
+   grid=(1,)       16.92       3.17      5.3x
+   grid=(0,)       13.32       0.15     91.4x
+
+torch_access   decode ns    build s
+        shim       122.3       0.02
+         cxx       115.7       0.06
+     cpython       895.5       0.00
+```
