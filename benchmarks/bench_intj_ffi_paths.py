@@ -15,6 +15,7 @@ from collections.abc import Callable
 import torch
 import triton
 import triton.language as tl
+from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
 from tvm_ffi.utils.unpack_dataclass import unpack_dataclass_to_tuple
 
 from intj import make_launcher
@@ -101,11 +102,15 @@ def kwargs(iters: int, batches: int) -> None:
     def adapter(x: int, y: int = 2, z: int = 3) -> None:
         launch(0, 0, 1, x, y, z)
 
+    ffi_wrapper = make_kwargs_wrapper(
+        launch, ["device", "stream", "grid", "x", "y", "z"], arg_defaults=(2, 3))
     for label, fn in (
         ("INTJ direct positional", lambda: launch(0, 0, 1, 1, 2, 3)),
         ("INTJ adapter positional", lambda: adapter(1, 2, 3)),
         ("INTJ adapter kwargs", lambda: adapter(x=1, y=2, z=3)),
         ("INTJ adapter defaults", lambda: adapter(1)),
+        ("INTJ FFI wrapper positional", lambda: ffi_wrapper(0, 0, 1, 1, 2, 3)),
+        ("INTJ FFI wrapper kwargs", lambda: ffi_wrapper(0, 0, 1, x=1, y=2, z=3)),
     ):
         report(label, time_calls(fn, iters, batches))
     try:
@@ -123,8 +128,11 @@ def dataclass(iters: int, batches: int) -> None:
     three_launch = make_launcher(three, no_gpu=True)
     assert unpack_dataclass_to_tuple(pair) == (1, 2)
     assert unpack_dataclass_to_tuple(cfg) == (1, 2, 3)
+    fields = (pair.x, pair.y)
     for label, fn in (
         ("INTJ pair direct", lambda: launch(0, 0, 1, pair.x, pair.y)),
+        ("INTJ pair prebuilt *tuple", lambda: launch(0, 0, 1, *fields)),
+        ("FFI unpack Pair only", lambda: unpack_dataclass_to_tuple(pair)),
         ("INTJ pair manual unpack", lambda: launch(0, 0, 1, *(pair.x, pair.y))),
         ("INTJ pair FFI unpack", lambda: launch(0, 0, 1, *unpack_dataclass_to_tuple(pair))),
         ("INTJ pair stdlib astuple", lambda: launch(0, 0, 1, *dataclasses.astuple(pair))),

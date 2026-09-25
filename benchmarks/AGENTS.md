@@ -16,9 +16,12 @@ before timing when the benchmark writes data.
 - `bench_ffi_compare.py`: cached INTJ versus preconverted TVM FFI no-ops and GPU
   kernel launches; `--sweep` measures 0, 3, 5, 8, 16, 32, and 64 arguments.
   Requires `apache-tvm-ffi` and a ROCm or CUDA GPU.
-- `bench_intj_ffi_paths.py`: INTJ host-only cache-miss callback and cached
-  launch, positional/keyword adapter, and manual versus TVM FFI dataclass
-  unpacking. Requires `apache-tvm-ffi`; callback mode also needs a GPU tensor.
+- `bench_intj_ffi_paths.py`: INTJ host-only callback, keyword adapter, and
+  dataclass unpacking, including matched-target wrapper and prebuilt-tuple
+  diagnostics. Requires `apache-tvm-ffi`; callback mode needs a GPU tensor.
+- `bench_hip_module_launch.py`: the CUDA CUBIN example adapted to HIP; loads
+  the same Triton HSACO into TVM FFI and uses its compiled function in INTJ.
+  Requires `apache-tvm-ffi` and a ROCm GPU.
 - `../tests/bench_kernel_cache.cpp`, run by `../tests/test_kernel_cache.py`:
   direct cache hits, misses, and hashes for 1-, 2-, and 5-word keys and 1, 8,
   64, or 512 entries. Requires Google Benchmark (`INTJ_BENCHMARK_ROOT` if it is
@@ -32,6 +35,7 @@ PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_launch.py --readme --iters 
 PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_ffi_compare.py --iters 1000 --batches 9
 PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_ffi_compare.py --sweep --iters 1000 --batches 9
 PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_intj_ffi_paths.py --iters 1000 --batches 9
+PYTHONPATH=$PWD taskset -c 0 python benchmarks/bench_hip_module_launch.py --iters 1000 --batches 9
 PYTHONPATH=$PWD python -m pytest tests/test_kernel_cache.py -s
 ```
 
@@ -56,8 +60,10 @@ PYTHONPATH=$PWD python -m pytest tests/test_kernel_cache.py -s
   rows have different boundaries and must not be used to claim relative
   callback throughput.
 - TVM FFI's CUBIN example uses CUDA-specific code and cannot run on ROCm.
-  `bench_ffi_compare.py` provides a HIP empty-launch analogue with different
-  GPU binaries; do not describe it as the same-kernel comparison.
+  `bench_hip_module_launch.py` compares one HSACO through FFI, Triton, and
+  INTJ. FFI checks TensorView shape and receives preconverted tensors; INTJ
+  receives Torch tensors. The older `bench_ffi_compare.py` uses different
+  GPU binaries and must not be described as a same-kernel comparison.
 - CUDA runtime cannot be tested on this development machine; mark it untested
   when reporting GPU results. A skipped cache benchmark supplies no timing data.
 
