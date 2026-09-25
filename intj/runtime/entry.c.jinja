@@ -465,7 +465,8 @@ static int intj_grid_object(PyObject *g, uint32_t *gx, uint32_t *gy, uint32_t *g
     g = snapshot;
   }
 {% endif %}
-  Py_ssize_t n = PyTuple_CheckExact(g) ? PyTuple_GET_SIZE(g) : PyList_GET_SIZE(g);
+  int is_tuple = PyTuple_CheckExact(g);
+  Py_ssize_t n = is_tuple ? PyTuple_GET_SIZE(g) : PyList_GET_SIZE(g);
   if (n < 1 || n > 3) {
 {% if free_threaded %}    Py_XDECREF(snapshot);
 {% endif %}
@@ -473,10 +474,10 @@ static int intj_grid_object(PyObject *g, uint32_t *gx, uint32_t *gy, uint32_t *g
                     "intj: grid must have between 1 and 3 dimensions");
     return -1;
   }
+  PyObject **items = is_tuple ? ((PyTupleObject *)g)->ob_item : ((PyListObject *)g)->ob_item;
   uint32_t *dims[3] = {gx, gy, gz};
   for (Py_ssize_t i = 0; i < n; i++) {
-    PyObject *item = PyTuple_CheckExact(g) ? PyTuple_GET_ITEM(g, i) : PyList_GET_ITEM(g, i);
-    if (intj_grid_dim(item, dims[i]) != 0) {
+    if (intj_grid_dim(items[i], dims[i]) != 0) {
 {% if free_threaded %}      Py_XDECREF(snapshot);
 {% endif %}
       return -1;
