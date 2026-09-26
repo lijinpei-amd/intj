@@ -316,3 +316,33 @@ def test_computed_keys_are_refused_until_task_4():
 
     with pytest.raises(UnsupportedKernel, match="computed"):
         make_launcher(triton.heuristics({"EVEN": lambda a: a["n"] % 2 == 0})(evens))
+
+
+def test_default_restore_and_reset_hooks_stay_private():
+    @triton.jit
+    def bump(x, acc, TAG: tl.constexpr):
+        tl.store(x, tl.load(x) + TAG)
+        tl.store(acc, tl.load(acc) + TAG)
+
+    x = torch.full((1,), 100, device="cuda", dtype=torch.int32)
+    acc = torch.zeros_like(x)
+    bench = Bench(acc, {None: {1: 2.0, 2: 1.0}})
+    kernel = triton.autotune(
+        configs=[triton.Config({"TAG": 1}), triton.Config({"TAG": 2})],
+        key=[],
+        restore_value=["x"],
+        reset_to_zero=["acc"],
+        do_bench=bench,
+    )(bump)
+    launch = make_launcher(kernel)
+    device, stream = controls()
+    launch(device, stream, 1, x, acc)
+    torch.cuda.synchronize()
+    assert bench.calls == [1, 2]
+    assert int(x.item()) == 102, (
+        "benchmark runs restore x; only the final launch sticks"
+    )
+    assert int(acc.item()) == 2, "acc is reset after benchmarking"
+    assert "restore_copies" not in kernel.__dict__, (
+        "the user's tuner must not be written"
+    )

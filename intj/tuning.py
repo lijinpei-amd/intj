@@ -207,9 +207,45 @@ def _private_chain(layers: tuple[Any, ...], shim: _Shim) -> list[Any]:
     for layer in private:
         if type(layer) is Autotuner:
             layer.cache = {}
-            for name in ("best_config", "bench_time", "configs_timings", "nargs"):
+            for name in (
+                "best_config",
+                "bench_time",
+                "configs_timings",
+                "nargs",
+                "restore_copies",
+            ):
                 layer.__dict__.pop(name, None)
+            _rebind_default_hooks(layer)
     return private
+
+
+def _rebind_default_hooks(tuner: Any) -> None:
+    """Triton's default reset_to_zero/restore_value hooks close over the tuner
+    they were built for; a copy's hooks would write the user's tuner. Rebuild
+    them over `tuner`, as `Autotuner.__init__` does. User hooks stay as given."""
+    if not tuner.user_defined_pre_hook and (tuner.reset_to_zero or tuner.restore_value):
+
+        def pre_hook(kwargs: dict[str, Any], reset_only: bool = False) -> None:
+            for name in tuner.reset_to_zero:
+                if kwargs[name] is not None:
+                    kwargs[name].zero_()
+            if not reset_only:
+                tuner.restore_copies = {
+                    name: kwargs[name].clone()
+                    for name in tuner.restore_value
+                    if kwargs[name] is not None
+                }
+
+        tuner.pre_hook = pre_hook
+    if not tuner.user_defined_post_hook and tuner.restore_value:
+
+        def post_hook(kwargs: dict[str, Any], exception: Any) -> None:
+            del exception
+            for name, value in tuner.restore_copies.items():
+                kwargs[name].copy_(value)
+            tuner.restore_copies = {}
+
+        tuner.post_hook = post_hook
 
 
 def _copy_back(originals: tuple[Any, ...], private: list[Any]) -> None:
