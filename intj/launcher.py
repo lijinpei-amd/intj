@@ -1222,7 +1222,7 @@ def _tuning_render(
             for config in layer.configs:
                 for name, value in config.all_kwargs().items():
                     if name in dep_names:
-                        c_scalar(name, value)
+                        c_scalar(str(name), value)
     sources: dict[str, Source] = {}
     for p in resolved:
         if p.annotation.baked_value:
