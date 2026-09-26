@@ -32,9 +32,16 @@ class GridCode:
 
 
 def compile_grid(
-    fn: object, params: Sequence[Param], baked: Mapping[int, object]
+    fn: object,
+    params: Sequence[Param],
+    baked: Mapping[int, object],
+    deps: Mapping[str, int] | None = None,
 ) -> GridCode:
-    """Validate `fn` without executing it and emit one checked native evaluator."""
+    """Validate `fn` without executing it and emit one checked native evaluator.
+
+    `deps` maps tuned parameter names to their slot in the record's dependent
+    values. When it is given, the evaluator takes them as `const int64_t *dep`.
+    """
     if type(fn) is not types.FunctionType:
         raise GridError("grid_cpp requires a Python def function")
     if fn.__code__.co_freevars:
@@ -118,7 +125,13 @@ def compile_grid(
         fn.__globals__.get("triton") is triton and triton.cdiv is _TRITON_CDIV
     )
 
-    lines = ["static int intj_eval_grid(PyObject *const *args, uint32_t dims[3]) {"]
+    lines = [
+        "static int intj_eval_grid(PyObject *const *args, "
+        + ("const int64_t *dep, " if deps is not None else "")
+        + "uint32_t dims[3]) {"
+    ]
+    if deps is not None:
+        lines.append("  (void)dep;")
     bound: dict[str, tuple[str, str]] = {}
     serial = 0
 
@@ -140,7 +153,14 @@ def compile_grid(
             )
         else:
             param = by_name[name]
-            if param.call_index is not None:
+            if deps is not None and name in deps:
+                slot = deps[name]
+                lines.append(f"  int64_t {var};")
+                lines.append(
+                    f"  if (intj_grid_input_dep(dep[{2 * slot}], dep[{2 * slot + 1}], "
+                    f"{1 if kind == 'bool' else 0}, {json.dumps(name)}, &{var}) != 0) return -1;"
+                )
+            elif param.call_index is not None:
                 index = len(extras) + param.call_index
                 lines.append(f"  int64_t {var};")
                 lines.append(

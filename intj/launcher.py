@@ -90,6 +90,21 @@ class Param:
 
 
 @dataclasses.dataclass(frozen=True)
+class TuningRender:
+    """What `entry.c.jinja` renders for an autotune/heuristics launcher."""
+
+    levels: int  # lookups per launch
+    computed: tuple[int, ...]  # computed keys keyed at each level
+    #: level-0 computed keys: (value, kind) byte offsets in the level-0 key
+    computed_fields: tuple[tuple[int, int], ...]
+    computed_names: tuple[str, ...]  # level-major; the callback's `computed`
+    deps: tuple[int, ...]  # dependent values C reads, stored per level
+    dep_names: tuple[str, ...]  # level-major; the callback's `deps`
+    meta_names: tuple[str, ...]  # grid_py: tuned parameters, declaration order
+    source: str  # generated `intj_tuned_level_<n>` functions
+
+
+@dataclasses.dataclass(frozen=True)
 class CompilerInput:
     """The final annotated ASTSource identity, with its original Python constants."""
 
@@ -165,6 +180,7 @@ class RenderContext:
     grid_cpp_source: str = ""
     grid_extra: tuple[str, ...] = ()
     return_compiled: bool = False
+    tuning: TuningRender | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -210,6 +226,8 @@ class LauncherFactory:
     grid_py: Callable[[dict[str, object]], object] | None = None
     grid_cpp: GridCode | None = None
     return_compiled: bool = False
+    tuned: _Tuned | None = None
+    grid_fn: object | None = None
 
     def bind(self, /, **values: object) -> Callable[..., Any]:
         if self.bind_device_requested:
@@ -281,8 +299,36 @@ class LauncherFactory:
             grid_py_mode=self.grid_py is not None,
             grid_cpp=self.grid_cpp,
             return_compiled=self.return_compiled,
+            tuning=self.tuned.render if self.tuned else None,
         )
         bound_values = tuple(values[p.name] for p in resolved if p.name in names)
+        prefix: tuple[object, ...] = ()
+        if self.tuned is not None:
+            from .tuning import TunedGrid, make_tuned_callback
+
+            assert self.tuned.render is not None
+            if self.grid_py is not None:
+                grid = TunedGrid("py", self.grid_py)
+            elif self.grid_cpp is not None:
+                code = getattr(self.grid_fn, "__code__")
+                grid = TunedGrid(
+                    "cpp",
+                    self.grid_fn,
+                    tuple(code.co_varnames[: code.co_argcount]),
+                    self.grid_cpp.extras,
+                )
+            else:
+                grid = TunedGrid("dims")
+            prefix = (
+                make_tuned_callback(
+                    self.tuned.plan,
+                    tuple(resolved),
+                    dict(self.options),
+                    grid,
+                    self.tuned.render,
+                    self.return_compiled,
+                ),
+            )
         if self.grid_py is not None:
             hidden = tuple(
                 values[p.name] if p.name in names else p.baked
@@ -290,12 +336,14 @@ class LauncherFactory:
                 if p.annotation.bind_value is not None or p.annotation.baked_value
             )
             return module.make_bound(
+                *prefix,
                 self.grid_py,
                 hidden,
                 *((device,) if self.bind_device_requested else ()),
                 *bound_values,
             )
         return module.make_bound(
+            *prefix,
             *((device,) if self.bind_device_requested else ()),
             *bound_values,
         )
@@ -384,8 +432,27 @@ def make_launcher(
         raise UnsupportedKernel(
             "intj: no_gpu=True supports only default compile options"
         )
+    from triton.runtime.autotuner import Autotuner, Heuristics
+
+    chain = jit_func
+    while type(jit_func) in (Autotuner, Heuristics):
+        jit_func = jit_func.fn
     jit_func = _check_kernel(jit_func, options)
     resolved = _resolve_annotations(jit_func, extra_annotation)
+    tuned: _Tuned | None = None
+    if chain is not jit_func:
+        tuned = _plan_tuning(chain, resolved, extra_annotation, options, no_gpu)
+        resolved = tuple(
+            dataclasses.replace(
+                p,
+                annotation=dataclasses.replace(
+                    p.annotation,
+                    tuned=p.name in tuned.plan.tuned,
+                    exact_key=p.name in tuned.plan.exact_keys,
+                ),
+            )
+            for p in resolved
+        )
     for p in jit_func.params:
         kind = p._param.kind
         if kind not in (
@@ -400,14 +467,38 @@ def make_launcher(
         from .grid import GridError, compile_grid
 
         grid_params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+        grid_code = getattr(grid_cpp, "__code__", None)
+        positional = grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()
+        dep_names = tuple(
+            n for n in positional if tuned is not None and n in tuned.plan.tuned
+        )
         try:
             compiled_grid = compile_grid(
                 grid_cpp,
                 grid_params,
                 {p.index: p.baked for p in resolved if p.annotation.baked_value},
+                {n: i for i, n in enumerate(dep_names)} if tuned is not None else None,
             )
         except GridError as error:
             raise UnsupportedKernel(f"intj: {error}") from error
+    else:
+        dep_names = ()
+    if tuned is not None:
+        tuned = dataclasses.replace(
+            tuned,
+            render=TuningRender(
+                levels=1,
+                computed=(0,),
+                computed_fields=(),
+                computed_names=(),
+                deps=(len(dep_names),),
+                dep_names=dep_names,
+                meta_names=tuple(p.name for p in resolved if p.annotation.tuned)
+                if grid_py is not None
+                else (),
+                source="",
+            ),
+        )
     if not no_gpu:
         from triton import knobs
 
@@ -420,7 +511,7 @@ def make_launcher(
     needs_binding = bind_device or any(
         p.annotation.bind_value is not None for p in resolved
     )
-    if needs_binding or grid_py is not None:
+    if needs_binding or grid_py is not None or tuned is not None:
         if not no_gpu:
             _canonical_options(_current_target(), options)
         if verify_annotation:
@@ -448,6 +539,8 @@ def make_launcher(
             grid_py,
             compiled_grid,
             bool(return_compiled),
+            tuned,
+            grid_cpp,
         )
         return factory if needs_binding else factory.bind()
     return _materialize_module(
@@ -477,6 +570,7 @@ def _materialize_module(
     grid_py_mode: bool = False,
     grid_cpp: GridCode | None = None,
     return_compiled: bool = False,
+    tuning: TuningRender | None = None,
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -492,6 +586,8 @@ def _materialize_module(
             )
         canonical_options = _canonical_options(target, options)
     params, device_offset, nwords = _render_params(resolved, device_binding)
+    # tuned levels always use a map
+    nwords = max(nwords, 1) if tuning is not None else nwords
     # last, after every refusal above it: a kernel that is going to be rejected
     # anyway must not pay for a download and an abseil build first
     cache_toolchain = _provision(kernel_cache)
@@ -540,6 +636,7 @@ def _materialize_module(
         grid_cpp_source=grid_cpp.source if grid_cpp else "",
         grid_extra=grid_cpp.extras if grid_cpp else (),
         return_compiled=return_compiled,
+        tuning=tuning,
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -711,7 +808,9 @@ def _loaded_module(
         if module is None:
             module = _load(key, jit_func, context)
             module.set_compile_callback(
-                _make_host_compile_callback()
+                _refuse_module_compile
+                if context.tuning is not None
+                else _make_host_compile_callback()
                 if context.no_gpu
                 else _make_compile_callback(
                     jit_func,
@@ -1021,8 +1120,8 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
         raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
     if not isinstance(jit_func, JITFunction):
         raise UnsupportedKernel(
-            f"intj: expected a @triton.jit function, got {type(jit_func).__name__}; "
-            "autotuned and heuristic kernels are not supported"
+            "intj: expected a @triton.jit function, optionally wrapped in "
+            f"@triton.autotune / @triton.heuristics, got {type(jit_func).__name__}"
         )
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")
@@ -1037,6 +1136,59 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
         if key in options:
             raise UnsupportedKernel(f"intj: option {key!r} is not allowed")
     return jit_func
+
+
+@dataclasses.dataclass(frozen=True)
+class _Tuned:
+    plan: Any  # tuning.TuningPlan
+    render: TuningRender | None = None  # filled once the grid is known
+
+
+def _plan_tuning(
+    chain: Any,
+    resolved: tuple[ResolvedParam, ...],
+    extra_annotation: Mapping[str, object] | None,
+    options: Mapping[str, Any],
+    no_gpu: bool,
+) -> _Tuned:
+    from triton.runtime.autotuner import Autotuner
+
+    from .tuning import analyze
+
+    if no_gpu:
+        raise UnsupportedKernel(
+            "intj: autotune/heuristics launchers need a GPU; no_gpu=True is not supported"
+        )
+    plan = analyze(chain, fixed=[p.name for p in resolved if p.annotation.baked_value])
+    if plan.computed:
+        raise UnsupportedKernel(
+            f"intj: computed heuristic keys {[c.name for c in plan.computed]} are not supported yet"
+        )
+    for p in resolved:
+        if p.annotation.bind_value is not None:
+            raise UnsupportedKernel(
+                f"intj: bound parameter {p.name!r} cannot be tuned over"
+            )
+    clash = sorted(set(extra_annotation or {}) & plan.tuned)
+    if clash:
+        raise UnsupportedKernel(f"intj: extra_annotation names tuned value(s) {clash}")
+    owned = sorted(set(options) & plan.tuned)
+    if owned:
+        raise UnsupportedKernel(
+            f"intj: options {owned} are set by the autotune configs"
+        )
+    target = _current_target()
+    names = {p.name for p in resolved}
+    for layer in plan.layers:
+        if type(layer) is Autotuner:
+            for config in layer.configs:
+                config_options: dict[str, Any] = {
+                    str(k): v for k, v in config.all_kwargs().items() if k not in names
+                }
+                if config_options.get("num_ctas", 1) != 1:
+                    raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
+                _canonical_options(target, {**options, **config_options})
+    return _Tuned(plan)
 
 
 def _render_params(
@@ -1059,7 +1211,11 @@ def _render_params(
                 )
             ),
         )
-        public = not annotation.baked_value and annotation.bind_value is None
+        public = (
+            not annotation.baked_value
+            and annotation.bind_value is None
+            and not annotation.tuned
+        )
         params.append(
             Param(p.name, p.index, call_index if public else None, annotation)
         )
@@ -1247,6 +1403,42 @@ def _compiler_input(
     )
 
 
+def _checked_compile(
+    jit_func: JitFunction,
+    compiler_input: CompilerInput,
+    target: Any,
+    canonical_options: Any,
+) -> CompiledKernel:
+    """Compile, load on the current device, and refuse what intj cannot launch."""
+    from triton.compiler import compile as triton_compile
+
+    kernel = triton_compile(
+        compiler_input.ast_source(jit_func),
+        target=target,
+        options=canonical_options.__dict__,
+    )
+    kernel._init_handles()
+    md = kernel.metadata
+    if md.num_ctas != 1:
+        raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
+    if md.launch_cooperative_grid:
+        raise UnsupportedKernel("intj: launch_cooperative_grid is not supported")
+    if getattr(md, "launch_pdl", False):  # nvidia only
+        raise UnsupportedKernel("intj: launch_pdl is not supported")
+    if getattr(md, "global_scratch_size", 0) or md.profile_scratch_size:
+        raise UnsupportedKernel(
+            "intj: kernels requiring scratch memory are not supported"
+        )
+    return kernel
+
+
+def _refuse_module_compile(*args: Any) -> Any:
+    """A tuned module's own callback: tuned launches compile through their bound
+    launcher and never read this one."""
+    del args
+    raise RuntimeError("intj: tuned modules compile through their bound launcher")
+
+
 def _make_compile_callback(
     jit_func: JitFunction,
     params: Sequence[Param],
@@ -1258,7 +1450,7 @@ def _make_compile_callback(
     ..., tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]
 ]:
     """Called from C on a spec-key miss, with the key blob and the original args."""
-    from triton.compiler import compile as triton_compile, make_backend
+    from triton.compiler import make_backend
 
     target = _current_target()
     backend = make_backend(target)
@@ -1295,25 +1487,8 @@ def _make_compile_callback(
             raise RuntimeError(
                 "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
             )
-        kernel = triton_compile(
-            compiler_input.ast_source(jit_func),
-            target=target,
-            options=canonical_options.__dict__,
-        )
-        kernel._init_handles()
-
+        kernel = _checked_compile(jit_func, compiler_input, target, canonical_options)
         md = kernel.metadata
-        if md.num_ctas != 1:
-            raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
-        if md.launch_cooperative_grid:
-            raise UnsupportedKernel("intj: launch_cooperative_grid is not supported")
-        if getattr(md, "launch_pdl", False):  # nvidia only
-            raise UnsupportedKernel("intj: launch_pdl is not supported")
-        if getattr(md, "global_scratch_size", 0) or md.profile_scratch_size:
-            raise UnsupportedKernel(
-                "intj: kernels requiring scratch memory are not supported"
-            )
-
         expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
         if expected != nparams:
             raise RuntimeError(

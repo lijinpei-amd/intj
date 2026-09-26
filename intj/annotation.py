@@ -201,6 +201,10 @@ class CanonicalAnnotation:
     bind_value: str | None
     baked_value: tuple[object, ...]
     key_fields: tuple[KeyField, ...] = ()
+    #: assigned by an autotune/heuristics layer: never passed, never keyed
+    tuned: bool = False
+    #: a caller var an autotune layer keys on: keyed by its exact value
+    exact_key: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -391,7 +395,7 @@ def _applicable(name: str | None, field: str) -> bool:
 def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     annotation: CanonicalAnnotation,
 ) -> tuple[KeyField, ...]:
-    if annotation.baked_value or annotation.bind_value is not None:
+    if annotation.tuned or annotation.baked_value or annotation.bind_value is not None:
         return ()
     types = annotation.types
     if annotation.kind == "constexpr":
@@ -432,7 +436,10 @@ def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launche
             )
         )
     )
-    return (KeyField("descriptor", 1),) if descriptor else ()
+    fields = (KeyField("descriptor", 1),) if descriptor else ()
+    if annotation.exact_key:
+        fields += (KeyField("exact_kind", 1), KeyField("exact", 8))
+    return fields
 
 
 def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher

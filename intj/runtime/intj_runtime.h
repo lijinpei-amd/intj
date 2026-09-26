@@ -67,6 +67,19 @@ intj_grid_input_bool(PyObject *o, const char *name, int64_t *out) {
   return 0;
 }
 
+/* A dependent value from a tuned record: (value, 1 if it was a bool). */
+static INTJ_ALWAYS_INLINE int
+intj_grid_input_dep(int64_t value, int64_t is_bool, int want_bool,
+                    const char *name, int64_t *out) {
+  if (INTJ_UNLIKELY(is_bool != want_bool)) {
+    PyErr_Format(PyExc_TypeError, "intj: grid argument '%s' must be %s", name,
+                 want_bool ? "a bool" : "an int");
+    return -1;
+  }
+  *out = value;
+  return 0;
+}
+
 static INTJ_ALWAYS_INLINE int intj_grid_add(int64_t a, int64_t b,
                                             int64_t *out) {
   return INTJ_UNLIKELY(__builtin_add_overflow(a, b, out)) ? intj_grid_overflow()
@@ -600,6 +613,9 @@ typedef struct intj_bound_launcher {
 #ifdef INTJ_GRID_PY
   PyObject *grid_py;
   PyObject *grid_hidden;
+#endif
+#ifdef INTJ_TUNED
+  PyObject *tuned_cb;
 #endif
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
