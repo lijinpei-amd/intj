@@ -173,3 +173,20 @@ def test_heuristic_calling_triton_is_located_and_lowered():
     h = parse_heuristic("K", lambda a: triton.cdiv(a["N"], 2))
     assert h.inputs == ("N",)
     assert "intj_grid_cdiv" in lower([(h, 0)], {"N": Source("arg", 0)}, 1)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: triton.heuristics({"ALIGNED": lambda a: a["N"] % a["BLOCK"] == 0})(
+            triton.autotune(configs=[triton.Config({"BLOCK": 64})], key=["N"])(strided)
+        ),
+        lambda: triton.autotune(
+            configs=[triton.Config({"BLOCK": 64})], key=["ALIGNED"]
+        )(triton.heuristics({"ALIGNED": lambda a: a["N"] % 2 == 0})(strided)),
+    ],
+    ids=["heuristic", "autotune_key"],
+)
+def test_refuses_reading_a_value_an_inner_layer_assigns(build):
+    with pytest.raises(UnsupportedKernel, match="inner layer"):
+        analyze(build())

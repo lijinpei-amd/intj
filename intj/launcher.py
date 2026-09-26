@@ -1195,13 +1195,14 @@ def _tuning_render(
     dependent_level: dict[str, int] = {d.name: d.level for d in plan.dependent}
     computed = tuple(sorted(plan.computed, key=lambda c: c.level))
     # A lowered read of a dependent value comes from a record walked before
-    # its level's key is computed (Task 2 levels it so).
-    assert all(
-        dependent_level[n] < c.level
-        for c in computed
-        for n in c.heuristic.inputs
-        if n in dependent_level
-    )
+    # its level's key is computed; `analyze` levels it so.
+    for c in computed:
+        for n in c.heuristic.inputs:
+            if n in dependent_level and dependent_level[n] >= c.level:
+                raise UnsupportedKernel(
+                    f"intj: heuristic {c.name!r} reads {n!r} before it is known; "
+                    "this is an intj bug"
+                )
     wanted = [n for c in computed for n in c.heuristic.inputs if n in dependent_level]
     computed_reads = sorted({c.name for c in computed} & set(grid_reads))
     if computed_reads:

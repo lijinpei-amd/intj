@@ -95,12 +95,30 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             )
         assigned.add(name)
 
-    for layer in layers:
+    def assigns(layer: Any) -> set[str]:
+        if type(layer) is Autotuner:
+            return {str(n) for config in layer.configs for n in config.all_kwargs()}
+        return set(layer.values)
+
+    # inner_assigned[i]: names the layers inside layers[i] assign. An outer
+    # layer runs first, so it cannot read them (Triton cannot either).
+    inner_assigned: list[set[str]] = [set() for _ in layers]
+    for i in range(len(layers) - 2, -1, -1):
+        inner_assigned[i] = inner_assigned[i + 1] | assigns(layers[i + 1])
+
+    def check_not_inner(name: str, read: str, i: int) -> None:
+        if read in inner_assigned[i]:
+            raise UnsupportedKernel(
+                f"intj: {name} reads {read!r}, which an inner layer assigns"
+            )
+
+    for i, layer in enumerate(layers):
         if type(layer) is Autotuner:
             level = 0
             for key in layer.keys:
                 if key not in params:
                     continue  # Triton filters keys to parameter names too
+                check_not_inner("the autotune key", key, i)
                 exact, _, known = info[key]
                 if not exact:
                     info[key] = (True, known, known)
@@ -121,6 +139,7 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             except HeuristicError as error:
                 raise UnsupportedKernel(f"intj: {error}") from error
             for read in heuristic.inputs:
+                check_not_inner(f"heuristic {name!r}", read, i)
                 if read not in info:
                     raise UnsupportedKernel(
                         f"intj: heuristic {name!r} reads {read!r}, which is neither a "
