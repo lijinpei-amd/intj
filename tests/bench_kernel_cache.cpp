@@ -44,7 +44,7 @@
 
 static void release(intj_kernel *) {}
 INTJ_DEFINE_CACHE(intj_kernel)
-INTJ_DEFINE_MAP(bench_child, 1, intj_kernel, 4)
+INTJ_DEFINE_MAP(bench_child, 2, intj_kernel, 4)
 
 #ifndef INTJ_CACHE_NAME
 #define INTJ_CACHE_NAME "unknown"
@@ -141,15 +141,16 @@ void hash_only(benchmark::State &state) {
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
-/* A child level keyed by one computed bool: what a heuristic like
- * `N % BLOCK == 0` adds to a launch after its level-0 lookup. */
+/* A child level keyed by one computed bool, two words (value, is_bool) as
+ * entry.c.jinja lays it out: what a heuristic like `N % BLOCK == 0` adds to a
+ * launch after its level-0 lookup. */
 void hit_child(benchmark::State &state) {
   bench_child map;
   if (bench_child_init(&map) != 0) {
     state.SkipWithError("init failed");
     return;
   }
-  uint64_t keys[2][1] = {{0}, {1}};
+  uint64_t keys[2][2] = {{0, 1}, {1, 1}};
   for (int i = 0; i < 2; i++) {
     intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
     bench_child_put(&map, keys[i], &k);
