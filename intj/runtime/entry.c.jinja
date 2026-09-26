@@ -79,11 +79,25 @@
 {% endif %}
 #include "intj_map.h"
 
+{% set levels = tuning.levels if tuned else 1 %}
+{% set dep_offset = [] %}
+{% set comp_offset = [] %}
+{% set ns = namespace(d=0, c=0) %}
+{% for n in range(levels) %}
+{% set _ = dep_offset.append(ns.d) %}{% set _ = comp_offset.append(ns.c) %}
+{% set ns.d = ns.d + (tuning.deps[n] if tuned else 0) %}{% set ns.c = ns.c + (tuning.computed[n] if tuned else 0) %}
+{% endfor %}
+{% set ncomp = ns.c %}
+{# a named pointer type: the maps' `const V *` must mean a const slot, not a pointer to const #}
+{% macro rec_type(n) %}{{ 'intj_final' if n == levels - 1 else 'intj_rec_' ~ n ~ '_ref' }}{% endmacro %}
+{% macro rec_release(n) %}{{ 'intj_final_release' if n == levels - 1 else 'intj_rec_' ~ n ~ '_release' }}{% endmacro %}
+{% macro rec_collect(n) %}{{ 'intj_final_collect' if n == levels - 1 else 'intj_rec_' ~ n ~ '_collect' }}{% endmacro %}
 /* The final-level record, stored by value in whichever map holds it. */
 typedef struct {
   intj_kernel k;
 {% if tuned %}
-  int64_t dep[{{ [2 * ndeps, 1] | max }}]; /* (value, is_bool) per dependent value C reads */
+  /* (value, is_bool) per dependent value C reads, stored at this level */
+  int64_t dep[{{ [2 * tuning.deps[levels - 1], 1] | max }}];
 {% endif %}
 {% if tuned and grid_py_mode %}
   PyObject *meta; /* tuned parameter values, for grid_py */
@@ -101,8 +115,22 @@ static void intj_final_release(intj_final *f) {
   (void)f;
 }
 
-INTJ_DEFINE_CACHE(intj_final)
-#define INTJ_V0_RELEASE intj_final_release
+{% for n in range(levels - 1, 0, -1) %}
+INTJ_DEFINE_MAP(intj_map_{{ n }}, {{ 2 * tuning.computed[n] }}, {{ rec_type(n) }}, 4)
+/* Level {{ n - 1 }}: never moves once published, so a walk reads it unlocked. */
+typedef struct {
+  int64_t dep[{{ [2 * tuning.deps[n - 1], 1] | max }}];
+  intj_map_{{ n }} child;
+} intj_rec_{{ n - 1 }};
+typedef intj_rec_{{ n - 1 }} *intj_rec_{{ n - 1 }}_ref;
+static void intj_rec_{{ n - 1 }}_release(intj_rec_{{ n - 1 }} **p) {
+  intj_rec_{{ n - 1 }} *r = *p;
+  intj_map_{{ n }}_free(&r->child, {{ rec_release(n) }});
+  PyMem_RawFree(r);
+}
+{% endfor %}
+INTJ_DEFINE_CACHE({{ rec_type(0) }})
+#define INTJ_V0_RELEASE {{ rec_release(0) }}
 
 #include "intj_runtime.h"
 
@@ -134,6 +162,12 @@ typedef struct {
 static const char *const intj_param_names[{{ params | length + 1 }}] = {
 {% for p in params %}    "{{ p.name }}",
 {% endfor %}    NULL};
+{% if tuned %}
+
+/* Lowered computed heuristics, one function per level: (value, is_bool) pairs
+ * into comp.  Each runs with no lock held -- tensor reads call Python. */
+{{ tuning.source }}
+{% endif %}
 
 {% macro type_code(ty) -%}
 {% if ty is none -%}INTJ_B_NONE
@@ -280,7 +314,7 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
 /* The launch and diagnostic entry points use exactly the same packing path. */
 static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
                                        uint64_t *key, uint64_t *vals, int *nparams,
-                                       uint32_t device, intj_bound_launcher *bound) {
+                                       uint32_t device, intj_bound_launcher *bound{{ ', int64_t *comp' if tuned }}) {
 {% if bound_params %}
   if (INTJ_UNLIKELY(!bound)) {
     PyErr_SetString(PyExc_TypeError, "intj: this module requires a bound launcher");
@@ -478,6 +512,16 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
       (uint64_t)key_part_{{ part }}{% if part % 2 %} << 32{% endif %};
 {% endfor %}
 {% endif %}
+{% if tuned and tuning.computed[0] %}
+  if (intj_tuned_level_0(st, args, NULL, comp) != 0)
+    return -1;
+{% for value_offset, kind_offset in tuning.computed_fields %}
+  key_word_{{ value_offset // 8 }} |= (uint64_t)comp[{{ 2 * loop.index0 }}];
+  key_word_{{ kind_offset // 8 }} |= (uint64_t)(uint8_t)comp[{{ 2 * loop.index0 + 1 }}]{% if kind_offset % 8 %} << {{ (kind_offset % 8) * 8 }}{% endif %};
+{% endfor %}
+{% elif tuned %}
+  (void)comp;
+{% endif %}
 {% for word in range(nwords) %}  intj_key_store64(key + {{ word }}, key_word_{{ word }});
 {% endfor %}
   *nparams = np;
@@ -553,7 +597,12 @@ static inline int intj_final_collect(intj_final *f, void *ctx) {
 {% endif %}
   return 0;
 }
-#define INTJ_V0_COLLECT intj_final_collect
+{% for n in range(levels - 2, -1, -1) %}
+static inline int intj_rec_{{ n }}_collect(intj_rec_{{ n }} **p, void *ctx) {
+  return intj_map_{{ n + 1 }}_each(&(*p)->child, {{ rec_collect(n + 1) }}, ctx);
+}
+{% endfor %}
+#define INTJ_V0_COLLECT {{ rec_collect(0) }}
 
 static inline int intj_cache_traverse(intj_state *st, const intj_cache *c,
                                       visitproc visit, void *arg) {
@@ -689,6 +738,52 @@ static int intj_fill(intj_state *st, intj_cache *cache, intj_bound_launcher *bou
 {% endif %}
 
 {% if tuned %}
+/* The final record with the read lock held, or NULL with it released:
+ * *missed is then the first level without a record, or -1 if a heuristic
+ * raised.  Non-final records never move, so each is read after its lookup's
+ * unlock, and every heuristic runs unlocked.  `dep` receives every walked
+ * level's dependent values, `comp` every level's computed keys. */
+static INTJ_ALWAYS_INLINE intj_final *intj_walk(intj_state *st, intj_cache *cache,
+                                                PyObject *const *kargs, const uint64_t *key,
+                                                int64_t *comp, int64_t *dep, int *missed) {
+  (void)kargs; (void)comp; (void)dep;
+{% for n in range(levels) %}
+{% if n == 0 %}
+  INTJ_RDLOCK(&st->lock);
+  {{ rec_type(0) }} *s0 = intj_cache_lookup(cache, key);
+{% else %}
+  if (intj_tuned_level_{{ n }}(st, kargs, dep, comp) != 0) {
+    *missed = -1;
+    return NULL;
+  }
+  INTJ_RDLOCK(&st->lock);
+  {{ rec_type(n) }} *s{{ n }} =
+      intj_map_{{ n }}_lookup(&rec_{{ n - 1 }}->child, (const uint64_t *)(comp + {{ 2 * comp_offset[n] }}));
+{% endif %}
+  if (INTJ_UNLIKELY(!s{{ n }})) {
+    INTJ_RWUNLOCK(&st->lock);
+    *missed = {{ n }};
+    return NULL;
+  }
+{% if n < levels - 1 %}
+  intj_rec_{{ n }} *rec_{{ n }} = *s{{ n }};
+  INTJ_RWUNLOCK(&st->lock);
+{% if tuning.deps[n] %}
+  memcpy(dep + {{ 2 * dep_offset[n] }}, rec_{{ n }}->dep, sizeof(rec_{{ n }}->dep));
+{% endif %}
+{% else %}
+{% if tuning.deps[n] %}
+  memcpy(dep + {{ 2 * dep_offset[n] }}, s{{ n }}->dep, sizeof(s{{ n }}->dep));
+{% endif %}
+  return s{{ n }};
+{% endif %}
+{% endfor %}
+}
+
+static const char *const intj_computed_names[{{ ncomp + 1 }}] = {
+{% for name in tuning.computed_names %}    "{{ name }}",
+{% endfor %}    NULL};
+
 /* A dependent value from the callback: an exact int or a bool. */
 static int intj_dep_value(PyObject *o, int64_t *value, int64_t *is_bool) {
   if (o == Py_True || o == Py_False) {
@@ -709,7 +804,7 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_cache *cache,
                                  intj_bound_launcher *bound, const uint64_t *key,
                                  int np, int64_t device_ordinal, uint64_t stream,
                                  uint32_t gx, uint32_t gy, uint32_t gz,
-                                 PyObject *const *args) {
+                                 PyObject *const *args, int64_t *comp, int64_t *dep) {
 {% if grid_cpp_source %}
   PyObject *controls = PyTuple_New({{ grid_count }});
   if (!controls)
@@ -766,11 +861,43 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_cache *cache,
     return NULL;
   }
 {% endif %}
+  /* Every level's dependent values, in the slots the walk would fill. */
   for (int i = 0; i < {{ ndeps }}; i++)
-    if (intj_dep_value(PyTuple_GET_ITEM(deps, i), &fresh.dep[2 * i], &fresh.dep[2 * i + 1]) != 0) {
+    if (intj_dep_value(PyTuple_GET_ITEM(deps, i), &dep[2 * i], &dep[2 * i + 1]) != 0) {
       Py_DECREF(res);
       return NULL;
     }
+{% if tuning.deps[levels - 1] %}
+  memcpy(fresh.dep, dep + {{ 2 * dep_offset[levels - 1] }}, sizeof(fresh.dep));
+{% endif %}
+  /* Keys past level 0, from the values this run recorded; no lock is held. */
+{% for n in range(1, levels) %}
+  if (intj_tuned_level_{{ n }}(st, args + {{ grid_count }}, dep, comp) != 0) {
+    Py_DECREF(res);
+    return NULL;
+  }
+{% endfor %}
+  /* The lowering must agree with Triton's own evaluation, kind included. */
+  if (!PyTuple_CheckExact(computed) || PyTuple_GET_SIZE(computed) != {{ ncomp }}) {
+    Py_DECREF(res);
+    PyErr_SetString(PyExc_RuntimeError, "intj: tuned callback returned the wrong computed; this is an intj bug");
+    return NULL;
+  }
+  for (int i = 0; i < {{ ncomp }}; i++) {
+    PyObject *item = PyTuple_GET_ITEM(computed, i);
+    int64_t value = 0;
+    int same = item == Py_True || item == Py_False
+                   ? comp[2 * i + 1] == 1 && comp[2 * i] == (item == Py_True)
+                   : comp[2 * i + 1] == 0 && PyLong_CheckExact(item) &&
+                         intj_as_i64(item, &value) == 0 && value == comp[2 * i];
+    if (!same) {
+      PyErr_Format(PyExc_RuntimeError,
+                   "intj: heuristic '%s' lowered to %lld but Triton computed %R; this is an intj bug",
+                   intj_computed_names[i], (long long)comp[2 * i], item);
+      Py_DECREF(res);
+      return NULL;
+    }
+  }
   fresh.k.function = (void *)(uintptr_t)function;
   fresh.k.block_dim = block_dim;
   fresh.k.shared = shared;
@@ -781,11 +908,12 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_cache *cache,
 {% if grid_py_mode %}
   fresh.meta = Py_NewRef(meta);
 {% endif %}
-  (void)computed;
   Py_DECREF(res);
   int taken = 0, failed = 0, mismatch = 0;
   PyObject *out = NULL;
+  /* Every missing level is filled here; a present one must agree. */
   INTJ_WRLOCK(&st->lock);
+{% if levels == 1 %}
   intj_final *stored = intj_cache_lookup(cache, key);
   if (stored) {
     mismatch = memcmp(stored->dep, fresh.dep, sizeof(fresh.dep)) != 0;
@@ -794,10 +922,72 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_cache *cache,
     taken = stored != NULL;
     failed = stored == NULL;
   }
+{% else %}
+  {{ rec_type(0) }} *s0 = intj_cache_lookup(cache, key);
+  if (!s0) {
+    intj_rec_0 *r = (intj_rec_0 *)PyMem_RawCalloc(1, sizeof(intj_rec_0));
+    if (r && intj_map_1_init(&r->child) == 0) {
+{% if tuning.deps[0] %}
+      memcpy(r->dep, dep + {{ 2 * dep_offset[0] }}, sizeof(r->dep));
+{% endif %}
+      s0 = intj_cache_put(cache, key, &r);
+      if (!s0) {
+        intj_map_1_free(&r->child, {{ rec_release(1) }});
+        PyMem_RawFree(r);
+      }
+    } else {
+      PyMem_RawFree(r);
+    }
+    failed = !s0;
+{% if tuning.deps[0] %}
+  } else {
+    mismatch |= memcmp((*s0)->dep, dep + {{ 2 * dep_offset[0] }}, sizeof((*s0)->dep)) != 0;
+{% endif %}
+  }
+{% for n in range(1, levels) %}
+  {{ rec_type(n) }} *s{{ n }} = NULL;
+  if (!failed && !mismatch) { /* a disagreeing parent gets no children */
+    const uint64_t *k{{ n }} = (const uint64_t *)(comp + {{ 2 * comp_offset[n] }});
+    s{{ n }} = intj_map_{{ n }}_lookup(&(*s{{ n - 1 }})->child, k{{ n }});
+{% if n == levels - 1 %}
+    if (!s{{ n }}) {
+      s{{ n }} = intj_map_{{ n }}_put(&(*s{{ n - 1 }})->child, k{{ n }}, &fresh);
+      taken = s{{ n }} != NULL;
+      failed = !s{{ n }};
+    } else {
+      mismatch |= memcmp(s{{ n }}->dep, fresh.dep, sizeof(fresh.dep)) != 0;
+    }
+{% else %}
+    if (!s{{ n }}) {
+      intj_rec_{{ n }} *r = (intj_rec_{{ n }} *)PyMem_RawCalloc(1, sizeof(intj_rec_{{ n }}));
+      if (r && intj_map_{{ n + 1 }}_init(&r->child) == 0) {
+{% if tuning.deps[n] %}
+        memcpy(r->dep, dep + {{ 2 * dep_offset[n] }}, sizeof(r->dep));
+{% endif %}
+        s{{ n }} = intj_map_{{ n }}_put(&(*s{{ n - 1 }})->child, k{{ n }}, &r);
+        if (!s{{ n }}) {
+          intj_map_{{ n + 1 }}_free(&r->child, {{ rec_release(n + 1) }});
+          PyMem_RawFree(r);
+        }
+      } else {
+        PyMem_RawFree(r);
+      }
+      failed = !s{{ n }};
+{% if tuning.deps[n] %}
+    } else {
+      mismatch |= memcmp((*s{{ n }})->dep, dep + {{ 2 * dep_offset[n] }}, sizeof((*s{{ n }})->dep)) != 0;
+{% endif %}
+    }
+{% endif %}
+  }
+{% endfor %}
+  intj_final *stored = s{{ levels - 1 }};
+{% endif %}
 {% if return_compiled %}
   if (stored && !mismatch)
     out = Py_NewRef(stored->k.compiled);
 {% endif %}
+  (void)stored;
   INTJ_RWUNLOCK(&st->lock);
   if (!taken)
     intj_final_release(&fresh);
@@ -972,18 +1162,22 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
   uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
-  if (intj_pack(st, args + {{ grid_count }}, key, vals, &np, (uint32_t)device_ordinal, bound) != 0)
+{% if tuned %}
+  int64_t comp[{{ [2 * ncomp, 1] | max }}];
+{% endif %}
+  if (intj_pack(st, args + {{ grid_count }}, key, vals, &np, (uint32_t)device_ordinal, bound{{ ', comp' if tuned }}) != 0)
     return NULL;
 
 {% if tuned %}
-  INTJ_RDLOCK(&st->lock);
-  intj_final *kernel = intj_cache_lookup(cache, key);
+  int64_t dep[{{ [2 * ndeps, 1] | max }}];
+  int missed = 0;
+  intj_final *kernel = intj_walk(st, cache, args + {{ grid_count }}, key, comp, dep, &missed);
   if (INTJ_UNLIKELY(!kernel)) {
-    INTJ_RWUNLOCK(&st->lock);
+    if (missed < 0)
+      return NULL;
     return intj_tuned_fill(st, cache, bound, key, np, device_ordinal, stream,
-                           gx, gy, gz, args);
+                           gx, gy, gz, args, comp, dep);
   }
-  const int64_t *dep = kernel->dep;
   (void)dep;
 {% if grid_py_mode %}
   /* grid_py runs Python: leave the lock with a copy of the record. */
@@ -1397,10 +1591,67 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   uint32_t device = 0; /* no launch, so no device to key on */
-  if (intj_pack(st, args, key, vals, &np, device, NULL) != 0)
+{% if tuned %}
+  int64_t comp[{{ [2 * ncomp, 1] | max }}];
+{% endif %}
+  if (intj_pack(st, args, key, vals, &np, device, NULL{{ ', comp' if tuned }}) != 0)
     return NULL;
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)INTJ_KEY_BYTES, np);
 }
+
+{% if tuned %}
+/* Debug: the key of every level this call would walk, and whether its final
+ * record exists.  key_chain(launcher, device, *public_args) -> ((bytes, ...), found) */
+static PyObject *key_chain(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
+  intj_state *st = (intj_state *)PyModule_GetState(self);
+  int64_t device = 0;
+  if (nargs != 2 + INTJ_NPARAMS || !PyCFunction_Check(args[0]) ||
+      !PyLong_CheckExact(args[1]) || intj_as_i64(args[1], &device) != 0 ||
+      device < 0 || device > 255) {
+    PyErr_SetString(PyExc_TypeError, "intj: key_chain(launcher, device, *public_args)");
+    return NULL;
+  }
+  PyObject *owner = PyCFunction_GET_SELF(args[0]);
+  if (!owner || Py_TYPE(owner) != st->bound_type ||
+      ((intj_bound_launcher *)owner)->module != self ||
+      !((intj_bound_launcher *)owner)->cache_ready) {
+    PyErr_SetString(PyExc_TypeError, "intj: key_chain needs a live launcher of this module");
+    return NULL;
+  }
+  intj_bound_launcher *bound = (intj_bound_launcher *)owner;
+  uint64_t key[INTJ_NWORDS];
+  uint64_t vals[INTJ_NSLOTS];
+  int64_t comp[{{ [2 * ncomp, 1] | max }}];
+  int64_t dep[{{ [2 * ndeps, 1] | max }}];
+  int np = 0;
+  if (intj_pack(st, args + 2, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp) != 0)
+    return NULL;
+  int missed = 0;
+  intj_final *kernel = intj_walk(st, &bound->cache, args + 2, key, comp, dep, &missed);
+  if (kernel)
+    INTJ_RWUNLOCK(&st->lock);
+  else if (missed < 0)
+    return NULL;
+  int walked = kernel ? {{ levels }} : missed + 1;
+  static const int offsets[] = { {% for n in range(levels) %}{{ comp_offset[n] }}, {% endfor %}0 };
+  static const int counts[] = { {% for n in range(levels) %}{{ tuning.computed[n] }}, {% endfor %}0 };
+  (void)offsets; (void)counts;
+  PyObject *keys = PyTuple_New(walked);
+  if (!keys)
+    return NULL;
+  for (int n = 0; n < walked; n++) {
+    PyObject *item = n == 0 ? PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES)
+                            : PyBytes_FromStringAndSize((const char *)(comp + 2 * offsets[n]),
+                                                        16 * counts[n]);
+    if (!item) {
+      Py_DECREF(keys);
+      return NULL;
+    }
+    PyTuple_SET_ITEM(keys, n, item);
+  }
+  return Py_BuildValue("(NO)", keys, kernel ? Py_True : Py_False);
+}
+{% endif %}
 
 static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
@@ -1707,6 +1958,9 @@ static PyMethodDef intj_methods[] = {
     {"entry", (PyCFunction)(void (*)(void))entry, METH_FASTCALL, NULL},
     {"make_bound", (PyCFunction)(void (*)(void))make_bound, METH_FASTCALL, NULL},
     {"spec_key", (PyCFunction)(void (*)(void))spec_key, METH_FASTCALL, NULL},
+{% if tuned %}
+    {"key_chain", (PyCFunction)(void (*)(void))key_chain, METH_FASTCALL, NULL},
+{% endif %}
     {"set_compile_callback", set_compile_callback, METH_O, NULL},
     {"set_torch_version", (PyCFunction)(void (*)(void))set_torch_version,
      METH_FASTCALL, NULL},

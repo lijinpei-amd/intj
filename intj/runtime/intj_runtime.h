@@ -124,6 +124,95 @@ static INTJ_ALWAYS_INLINE int intj_grid_cdiv(int64_t a, int64_t b,
   return intj_grid_floor128((__int128)a + b - 1, b, out);
 }
 
+/* Heuristic inputs are Python values of either kind; C carries (value, is_bool)
+ * so that a result keys True apart from 1, as Triton's specialization does. */
+static INTJ_ALWAYS_INLINE int intj_heur_arg(PyObject *o, const char *name,
+                                            int64_t *value, int64_t *is_bool) {
+  if (o == Py_True || o == Py_False) {
+    *value = o == Py_True;
+    *is_bool = 1;
+    return 0;
+  }
+  *is_bool = 0;
+  if (INTJ_LIKELY(PyLong_CheckExact(o))) {
+    if (INTJ_UNLIKELY(intj_as_i64(o, value) != 0))
+      return intj_grid_overflow();
+    return 0;
+  }
+  PyErr_Format(PyExc_TypeError,
+               "intj: heuristic input '%s' must be an int or bool, got %s",
+               name, Py_TYPE(o)->tp_name);
+  return -1;
+}
+
+static INTJ_ALWAYS_INLINE int intj_grid_mod(int64_t a, int64_t b,
+                                            int64_t *out) {
+  int64_t q;
+  if (intj_grid_floor(a, b, &q) != 0)
+    return -1;
+  /* a - q*b cannot overflow once the floor quotient fits. */
+  *out = (int64_t)((__int128)a - (__int128)q * b);
+  return 0;
+}
+
+/* triton.next_power_of_2 on Python ints, bit for bit, within int64. */
+static INTJ_ALWAYS_INLINE int intj_grid_next_pow2(int64_t n, int64_t *out) {
+  if (INTJ_UNLIKELY(n == INT64_MIN)) /* n - 1 leaves int64 */
+    return intj_grid_overflow();
+  int64_t x = n - 1;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  x |= x >> 32;
+  return intj_grid_add(x, 1, out);
+}
+
+/* Tensor attributes a heuristic may read, through the interpreter: rare, and
+ * off the hit path's shape readers on purpose (ponytail: numel/size/stride
+ * come from TensorImpl directly if a tuned launch profiles hot here). */
+static inline int intj_heur_tensor(PyObject *o, PyTypeObject *tensor,
+                                   PyTypeObject *param, const char *name,
+                                   const char *method, int has_index,
+                                   long index, int64_t *out) {
+  if (Py_TYPE(o) != tensor && Py_TYPE(o) != param) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: heuristic reads '%s.%s' but '%s' is a %s", name, method,
+                 name, Py_TYPE(o)->tp_name);
+    return -1;
+  }
+  PyObject *r = has_index ? PyObject_CallMethod(o, method, "l", index)
+                          : PyObject_CallMethod(o, method, NULL);
+  if (!r)
+    return -1;
+  int rc = 0;
+  if (r == Py_True || r == Py_False)
+    *out = r == Py_True;
+  else if (!PyLong_CheckExact(r) || intj_as_i64(r, out) != 0)
+    rc = intj_grid_overflow();
+  Py_DECREF(r);
+  return rc;
+}
+
+/* dtype objects are torch singletons, so their addresses compare as identity. */
+static inline int intj_heur_dtype(PyObject *o, PyTypeObject *tensor,
+                                  PyTypeObject *param, const char *name,
+                                  int64_t *out) {
+  if (Py_TYPE(o) != tensor && Py_TYPE(o) != param) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: heuristic reads '%s.dtype' but '%s' is a %s", name,
+                 name, Py_TYPE(o)->tp_name);
+    return -1;
+  }
+  PyObject *d = PyObject_GetAttrString(o, "dtype");
+  if (!d)
+    return -1;
+  *out = (int64_t)(uintptr_t)d;
+  Py_DECREF(d);
+  return 0;
+}
+
 static INTJ_ALWAYS_INLINE int intj_grid_output(int64_t value, uint32_t *out) {
   if (INTJ_UNLIKELY(value < 0 || (uint64_t)value >= UINT64_C(4294967296))) {
     PyErr_SetString(PyExc_ValueError,

@@ -25,6 +25,7 @@ from ._version import __version__
 from .annotation import (
     CanonicalAnnotation,
     DeviceBinding,
+    KeyField,
     ResolvedParam,
     _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
@@ -462,43 +463,25 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
+    deps: Mapping[str, int] | None = None
+    if tuned is not None:
+        render = _tuning_render(tuned.plan, resolved, grid_cpp, grid_py)
+        tuned = dataclasses.replace(tuned, render=render)
+        deps = {n: i for i, n in enumerate(render.dep_names)}
     compiled_grid: GridCode | None = None
     if grid_cpp is not None:
         from .grid import GridError, compile_grid
 
         grid_params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
-        grid_code = getattr(grid_cpp, "__code__", None)
-        positional = grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()
-        dep_names = tuple(
-            n for n in positional if tuned is not None and n in tuned.plan.tuned
-        )
         try:
             compiled_grid = compile_grid(
                 grid_cpp,
                 grid_params,
                 {p.index: p.baked for p in resolved if p.annotation.baked_value},
-                {n: i for i, n in enumerate(dep_names)} if tuned is not None else None,
+                deps,
             )
         except GridError as error:
             raise UnsupportedKernel(f"intj: {error}") from error
-    else:
-        dep_names = ()
-    if tuned is not None:
-        tuned = dataclasses.replace(
-            tuned,
-            render=TuningRender(
-                levels=1,
-                computed=(0,),
-                computed_fields=(),
-                computed_names=(),
-                deps=(len(dep_names),),
-                dep_names=dep_names,
-                meta_names=tuple(p.name for p in resolved if p.annotation.tuned)
-                if grid_py is not None
-                else (),
-                source="",
-            ),
-        )
     if not no_gpu:
         from triton import knobs
 
@@ -585,7 +568,12 @@ def _materialize_module(
                 f"register() it (have: {', '.join(sorted(BACKENDS))})"
             )
         canonical_options = _canonical_options(target, options)
-    params, device_offset, nwords = _render_params(resolved, device_binding)
+    params, device_offset, nwords, computed_fields = _render_key(
+        resolved, device_binding, tuning.computed[0] if tuning is not None else 0
+    )
+    if tuning is not None:
+        # final only now: level-0 computed keys are placed with the spec fields
+        tuning = dataclasses.replace(tuning, computed_fields=computed_fields)
     # tuned levels always use a map
     nwords = max(nwords, 1) if tuning is not None else nwords
     # last, after every refusal above it: a kernel that is going to be rejected
@@ -1160,10 +1148,6 @@ def _plan_tuning(
             "intj: autotune/heuristics launchers need a GPU; no_gpu=True is not supported"
         )
     plan = analyze(chain, fixed=[p.name for p in resolved if p.annotation.baked_value])
-    if plan.computed:
-        raise UnsupportedKernel(
-            f"intj: computed heuristic keys {[c.name for c in plan.computed]} are not supported yet"
-        )
     for p in resolved:
         if p.annotation.bind_value is not None:
             raise UnsupportedKernel(
@@ -1191,12 +1175,93 @@ def _plan_tuning(
     return _Tuned(plan)
 
 
-def _render_params(
-    resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
-) -> tuple[tuple[Param, ...], int | None, int]:
-    """Place canonical key fields and number the arguments in the public call."""
+def _tuning_render(
+    plan: Any,
+    resolved: tuple[ResolvedParam, ...],
+    grid_cpp: object | None,
+    grid_py: object | None,
+) -> TuningRender:
+    """Dep and comp slots for the grid and the lowered heuristics, level-major.
+
+    `computed_fields` is left empty: `_materialize_module` places it."""
+    from .heuristic import HeuristicError, Source, lower
+
+    by_name = {p.name: p for p in _render_params(resolved, DeviceBinding.NOT_FIXED)[0]}
+    grid_code = getattr(grid_cpp, "__code__", None)
+    grid_reads: tuple[str, ...] = (
+        grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()
+    )
+    levels: int = plan.levels
+    dependent_level: dict[str, int] = {d.name: d.level for d in plan.dependent}
+    computed = tuple(sorted(plan.computed, key=lambda c: c.level))
+    # A lowered read of a dependent value comes from a record walked before
+    # its level's key is computed (Task 2 levels it so).
+    assert all(
+        dependent_level[n] < c.level
+        for c in computed
+        for n in c.heuristic.inputs
+        if n in dependent_level
+    )
+    wanted = [n for c in computed for n in c.heuristic.inputs if n in dependent_level]
+    computed_reads = sorted({c.name for c in computed} & set(grid_reads))
+    if computed_reads:
+        raise UnsupportedKernel(
+            f"intj: grid_cpp reads computed heuristic key(s) {computed_reads}; "
+            "use grid_py or compute them in the grid"
+        )
+    wanted += [n for n in grid_reads if n in plan.tuned]
+    # stable: level-major, first use within a level
+    dep_names = tuple(sorted(dict.fromkeys(wanted), key=lambda n: dependent_level[n]))
+    sources: dict[str, Source] = {}
+    for p in resolved:
+        if p.annotation.baked_value:
+            sources[p.name] = Source("fixed", value=p.baked)
+        elif not p.annotation.tuned:
+            sources[p.name] = Source("arg", by_name[p.name].call_index or 0)
+    for slot, name in enumerate(dep_names):
+        sources[name] = Source("dep", slot)
+    for slot, c in enumerate(computed):
+        sources[c.name] = Source("comp", slot)
+    try:
+        source = lower([(c.heuristic, c.level) for c in computed], sources, levels)
+    except HeuristicError as error:
+        raise UnsupportedKernel(f"intj: {error}") from error
+    return TuningRender(
+        levels=levels,
+        computed=tuple(
+            sum(c.level == level for c in computed) for level in range(levels)
+        ),
+        computed_fields=(),
+        computed_names=tuple(c.name for c in computed),
+        deps=tuple(
+            sum(dependent_level[n] == level for n in dep_names)
+            for level in range(levels)
+        ),
+        dep_names=dep_names,
+        meta_names=tuple(p.name for p in resolved if p.annotation.tuned)
+        if grid_py is not None
+        else (),
+        source=source,
+    )
+
+
+def _render_key(
+    resolved: tuple[ResolvedParam, ...],
+    device_binding: DeviceBinding,
+    computed0: int = 0,
+) -> tuple[tuple[Param, ...], int | None, int, tuple[tuple[int, int], ...]]:
+    """Place key fields, level-0 computed keys included, and number the call.
+
+    A computed key is a (value, kind) pair: payload and descriptor, the way a
+    constexpr is keyed, so True and 1 key apart.
+    """
     fields = tuple(
         (p.index, field) for p in resolved for field in _key_fields(p.annotation)
+    )
+    fields += tuple(
+        (-1 - j, KeyField(kind, width))
+        for j in range(computed0)
+        for kind, width in (("payload", 8), ("descriptor", 1))
     )
     layout = _layout_fields(fields, device_binding)
     params: list[Param] = []
@@ -1221,7 +1286,22 @@ def _render_params(
         )
         if public:
             call_index += 1
-    return tuple(params), layout.device_offset, layout.nwords
+    placed = {
+        (index, field.kind): field.offset for index, field in layout.fields if index < 0
+    }
+    computed_fields = tuple(
+        (placed[(-1 - j, "payload")], placed[(-1 - j, "descriptor")])
+        for j in range(computed0)
+    )
+    return tuple(params), layout.device_offset, layout.nwords, computed_fields
+
+
+def _render_params(
+    resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
+) -> tuple[tuple[Param, ...], int | None, int]:
+    """Place canonical key fields and number the arguments in the public call."""
+    params, device_offset, nwords, _ = _render_key(resolved, device_binding)
+    return params, device_offset, nwords
 
 
 def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:

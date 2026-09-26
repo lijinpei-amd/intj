@@ -309,15 +309,6 @@ def test_refusals(kwargs, match):
         make_launcher(kernel, **kwargs)
 
 
-def test_computed_keys_are_refused_until_task_4():
-    @triton.jit
-    def evens(out, n, EVEN: tl.constexpr):
-        tl.store(out, EVEN)
-
-    with pytest.raises(UnsupportedKernel, match="computed"):
-        make_launcher(triton.heuristics({"EVEN": lambda a: a["n"] % 2 == 0})(evens))
-
-
 def test_default_restore_and_reset_hooks_stay_private():
     @triton.jit
     def bump(x, acc, TAG: tl.constexpr):
@@ -346,3 +337,103 @@ def test_default_restore_and_reset_hooks_stay_private():
     assert "restore_copies" not in kernel.__dict__, (
         "the user's tuner must not be written"
     )
+
+
+@triton.jit
+def aligned_tag(x, out, N, stride, BLOCK: tl.constexpr, ALIGNED: tl.constexpr):
+    tl.store(out, BLOCK * 10 + ALIGNED + (N + stride) * 0)
+
+
+def test_two_level_chain():
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    class ByBlock(Bench):
+        def __call__(self, kernel_call, quantiles):
+            self.out.zero_()
+            kernel_call()
+            block = int(self.out.item()) // 10
+            self.calls.append(block)
+            return [1.0 if block == 64 else 2.0] * 3
+
+    bench = ByBlock(out, None)
+    kernel = triton.autotune(
+        configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
+        key=["N"],
+        do_bench=bench,
+    )(
+        triton.heuristics({"ALIGNED": lambda a: a["stride"] % a["BLOCK"] == 0})(
+            aligned_tag
+        )
+    )
+    launch = make_launcher(kernel)
+    device, stream = controls()
+    for stride, aligned in ((128, 1), (130, 0), (192, 1)):
+        launch(device, stream, 1, x, out, 8, stride)
+        torch.cuda.synchronize()
+        assert int(out.item()) == 640 + aligned
+    assert bench.calls == [32, 64], (
+        "one tuning run for N=8; strides only add level-1 keys"
+    )
+    module = launch.__self__.__self__
+    keys, found = module.key_chain(launch, device, x, out, 8, 256)
+    assert found and len(keys) == 2
+
+
+@triton.jit
+def even_store(out, n, EVEN: tl.constexpr):
+    tl.store(out, EVEN + n * 0)
+
+
+def test_heuristics_only_computed_key_shares_records():
+    kernel = triton.heuristics({"EVEN": lambda a: a["n"] % 2 == 0})(even_store)
+    launch = make_launcher(kernel, return_compiled=True)
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    a = launch(device, stream, 1, out, 2)
+    b = launch(device, stream, 1, out, 4)
+    c = launch(device, stream, 1, out, 3)
+    assert a is b and a is not c
+    torch.cuda.synchronize()
+    assert int(out.item()) == 0
+
+
+@triton.jit
+def maybe_strided(out, b, B_UNIT: tl.constexpr):
+    tl.store(out, B_UNIT)
+
+
+def test_computed_key_short_circuits_before_tensor_reads():
+    kernel = triton.heuristics(
+        {"B_UNIT": lambda a: a["b"] is not None and a["b"].stride(0) == 1}
+    )(maybe_strided)
+    launch = make_launcher(kernel)
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    launch(device, stream, 1, out, None)
+    torch.cuda.synchronize()
+    assert int(out.item()) == 0
+    launch(device, stream, 1, out, torch.zeros(4, device="cuda"))
+    torch.cuda.synchronize()
+    assert int(out.item()) == 1
+    launch(device, stream, 1, out, torch.zeros(4, 2, device="cuda").t()[0])
+    torch.cuda.synchronize()
+    assert int(out.item()) == 0
+
+
+@triton.jit
+def kinds(out, n, K: tl.constexpr):
+    tl.store(out, K + n * 0)
+
+
+def test_computed_key_keeps_bool_and_int_apart():
+    # n = 3 and n = 7 share a spec key; K is 1 for one and True for the other.
+    # A key holding only the value would launch the int-specialized binary for
+    # the bool (Triton compiles them apart).
+    kernel = triton.heuristics({"K": lambda a: a["n"] > 0 if a["n"] > 5 else 1})(kinds)
+    launch = make_launcher(kernel, return_compiled=True)
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    as_int = launch(device, stream, 1, out, 3)
+    as_bool = launch(device, stream, 1, out, 7)
+    assert as_int is not as_bool

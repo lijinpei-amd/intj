@@ -145,3 +145,31 @@ def test_parse_refuses_free_variables():
     limit = 4
     with pytest.raises(HeuristicError, match="free variables"):
         parse_heuristic("X", lambda a: a["N"] > limit)
+
+
+from intj.heuristic import Source, lower
+
+
+@pytest.mark.parametrize(
+    "fn,match",
+    [
+        (lambda a: a["N"] / 2, "operator"),
+        (lambda a: a["N"] < a["M"] < 4, "chained"),
+        (lambda a: len(a["x"]), "call"),
+        (lambda a: a["x"].stride(a["N"]), "literal"),
+        (lambda a: a["N"] ** 2, "operator"),
+    ],
+)
+def test_lowering_refusals(fn, match):
+    h = parse_heuristic("K", fn)
+    sources = {name: Source("arg", i) for i, name in enumerate(h.inputs)}
+    with pytest.raises(HeuristicError, match=match):
+        lower([(h, 0)], sources, 1)
+
+
+def test_heuristic_calling_triton_is_located_and_lowered():
+    # This file imports triton, so CPython compiles `triton.cdiv(...)` here
+    # differently from the lambda's node compiled alone.
+    h = parse_heuristic("K", lambda a: triton.cdiv(a["N"], 2))
+    assert h.inputs == ("N",)
+    assert "intj_grid_cdiv" in lower([(h, 0)], {"N": Source("arg", 0)}, 1)
