@@ -309,6 +309,15 @@ def test_refusals(kwargs, match):
         make_launcher(kernel, **kwargs)
 
 
+@pytest.mark.parametrize("block", [32.0, 1 << 63, "32"])
+def test_config_value_read_by_c_must_be_int_or_bool(block):
+    kernel = triton.autotune(
+        configs=[triton.Config({"TAG": 1, "BLOCK": block})], key=["n"]
+    )(tagged)
+    with pytest.raises(UnsupportedKernel, match="'BLOCK'.*only int and bool"):
+        make_launcher(kernel, grid_cpp=grid)
+
+
 def test_default_restore_and_reset_hooks_stay_private():
     @triton.jit
     def bump(x, acc, TAG: tl.constexpr):

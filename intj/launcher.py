@@ -1184,7 +1184,10 @@ def _tuning_render(
     """Dep and comp slots for the grid and the lowered heuristics, level-major.
 
     `computed_fields` is left empty: `_materialize_module` places it."""
+    from triton.runtime.autotuner import Autotuner
+
     from .heuristic import HeuristicError, Source, lower
+    from .tuning import c_scalar
 
     by_name = {p.name: p for p in _render_params(resolved, DeviceBinding.NOT_FIXED)[0]}
     grid_code = getattr(grid_cpp, "__code__", None)
@@ -1213,6 +1216,13 @@ def _tuning_render(
     wanted += [n for n in grid_reads if n in plan.tuned]
     # stable: level-major, first use within a level
     dep_names = tuple(sorted(dict.fromkeys(wanted), key=lambda n: dependent_level[n]))
+    # C reads these; config values are static, so check them now, not on a miss
+    for layer in plan.layers:
+        if type(layer) is Autotuner:
+            for config in layer.configs:
+                for name, value in config.all_kwargs().items():
+                    if name in dep_names:
+                        c_scalar(name, value)
     sources: dict[str, Source] = {}
     for p in resolved:
         if p.annotation.baked_value:

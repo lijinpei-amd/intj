@@ -274,7 +274,7 @@ def _copy_back(originals: tuple[Any, ...], private: list[Any]) -> None:
                 setattr(original, name, mine.__dict__[name])
 
 
-def _c_scalar(name: str, value: object) -> object:
+def c_scalar(name: str, value: object) -> object:
     if type(value) is bool or type(value) is int and -(1 << 63) <= value < (1 << 63):
         return value
     raise UnsupportedKernel(
@@ -408,7 +408,7 @@ def make_tuned_callback(
             md.shared,
             nparams,
             kernel,
-            tuple(_c_scalar(n, tuned_values[n]) for n in render.dep_names),
+            tuple(c_scalar(n, tuned_values[n]) for n in render.dep_names),
             tuple(tuned_values[n] for n in render.computed_names),
             tuple(values[n] for n in render.meta_names) if grid.mode == "py" else None,
         )
