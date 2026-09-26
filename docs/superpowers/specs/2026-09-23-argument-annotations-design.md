@@ -423,17 +423,17 @@ launch_b = factory.bind(x=tensor_b, ptr=pointer_b)
 ```
 
 Every bound parameter name is required exactly once; unknown and duplicate
-names are rejected. Each call creates a new native callable object containing
-strong ownership of the loaded extension and its bound values.
+names are rejected. Each call creates a new native callable with private bound
+state.
 
 When `bind_device=True`, `bind()` is not sufficient: the factory must be called
 through `bind_device(device_ordinal, **bound_values)` so the device and all bound
 kernel arguments are installed in one handle.
 
-The native callable is a custom C heap type implementing vectorcall. It stores
-its extension reference and bound state inline, introduces no Python frame or
-argument tuple on launch, and exposes signature metadata with bound parameters
-removed.
+The callable is a `METH_FASTCALL` builtin whose `__self__` is a private C heap
+`BoundLauncher` object. That object owns the extension and bound values; the
+builtin adds no Python frame or argument tuple for positional launches. Its
+`__text_signature__` omits bound parameters.
 
 When the device is not bound, bound callable instances use the loaded
 extension's normal cache, whose key still includes the runtime device. Actual
@@ -729,7 +729,7 @@ The host-only path performs:
 - Argument decoding and ABI packing.
 - Optional annotation verification.
 - Key construction and cache lookup, or the no-map nullable-pointer branch.
-- Bound vectorcall dispatch.
+- Bound `METH_FASTCALL` dispatch.
 - Dummy cache-miss installation.
 
 It does not discover an active GPU target, invoke Triton GPU compilation,
@@ -815,9 +815,9 @@ tensors and pointers, mutable tensor storage, null pointer behavior, device
 binding, constexpr widths, and positive/negative power-of-two encodings.
 
 Tests verify that each `bind()`/`bind_device()` call creates independent
-vectorcall state, bound parameters disappear from signature metadata, actual
-bound values do not change module identity, and fixed-device handles do not
-share kernel records.
+`BoundLauncher` state, bound parameters disappear from signature metadata,
+actual bound values do not change module identity, and fixed-device handles
+do not share kernel records.
 
 CUDA is compile-checked only because the development machine has no NVIDIA GPU.
 
@@ -838,7 +838,7 @@ python benchmarks/bench_launch.py --no-gpu
 ```
 
 The targeted matrix measures the current `AUTO` map path, reduced keys,
-verification off/on, baked arguments, bound tensor/pointer vectorcall, a
+verification off/on, baked arguments, bound tensor/pointer calls, a
 fixed-device map, and the fixed-device no-map path.
 
 Every launcher is warmed before timing. The benchmark reports the median of
