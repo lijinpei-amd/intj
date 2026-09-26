@@ -290,14 +290,15 @@ def make_tuned_callback(
     backend = make_backend(target)
     # every parameter public: the shim sees the full call Triton makes
     params = tuple(Param(p.name, p.index, p.index, p.annotation) for p in resolved)
-    compiled: dict[tuple[Any, str], Any] = {}  # keeps every CompiledKernel alive
+    # keeps every CompiledKernel alive; a CompiledKernel is loaded on one device
+    compiled: dict[tuple[Any, str, int], Any] = {}
 
     def compile_kernel(values: dict[str, Any], config_options: dict[str, Any]) -> Any:
         canonical = _canonical_options(target, {**options, **config_options})
         compiler_input = _compiler_input(
             jit_func, params, [values[p.name] for p in params], backend
         )
-        key = (compiler_input, canonical.hash())
+        key = (compiler_input, canonical.hash(), _current_device())
         kernel = compiled.get(key)
         if kernel is None:
             kernel = compiled[key] = _checked_compile(

@@ -619,3 +619,24 @@ def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
     monkeypatch.setattr("intj.launcher._key_fields", without_exact)
     with pytest.raises(AssertionError, match="collides"):
         check_tuned_invariant(_invariant_kernel, _invariant_cases())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_tuned_launcher_on_two_devices():
+    kernel = triton.autotune(
+        configs=[triton.Config({"TAG": 1, "BLOCK": 64})],
+        key=["n"],
+        do_bench=lambda call, quantiles: [call() or 1.0] * 3,
+    )(tagged)
+    launch = make_launcher(kernel, grid_cpp=grid)
+    previous = torch.cuda.current_device()
+    try:
+        for device in (0, 1):
+            torch.cuda.set_device(device)  # a miss runs on the current device
+            x = torch.zeros(256, device=f"cuda:{device}", dtype=torch.int32)
+            out = torch.zeros_like(x)
+            launch(device, torch.cuda.current_stream().cuda_stream, x, out, 256)
+            torch.cuda.synchronize()
+            assert int(out.sum().item()) == 256, f"device {device}"
+    finally:
+        torch.cuda.set_device(previous)
