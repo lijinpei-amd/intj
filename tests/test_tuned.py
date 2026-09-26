@@ -437,3 +437,80 @@ def test_computed_key_keeps_bool_and_int_apart():
     as_int = launch(device, stream, 1, out, 3)
     as_bool = launch(device, stream, 1, out, 7)
     assert as_int is not as_bool
+
+
+@triton.jit
+def lowered(out, x, y, n, m, K: tl.constexpr):
+    tl.store(out, K + (n + m) * 0)
+
+
+# (heuristic, (n, m) cases).  Cases are ordered so that a wrong lowering maps a
+# later case onto an earlier case's (value, kind) and hits its record, which
+# only the checks here catch: -7 // 2 truncated is -3, the value of -6 // 2;
+# 7 % -2 truncated is 1, the value of 7 % 2.
+LOWERED_SCALAR = [
+    (lambda a: a["n"] // a["m"], [(-6, 2), (-7, 2), (7, 2), (7, -2), (-7, -2), (0, 3)]),
+    (lambda a: a["n"] % a["m"], [(7, 2), (7, -2), (-7, 2), (-7, -2), (6, -2), (0, 3)]),
+    (
+        lambda a: min(a["n"], a["m"]),
+        [(1, True), (True, 1), (0, False), (False, 0), (5, 3), (-3, 5)],
+    ),
+    (lambda a: max(a["n"], a["m"]), [(1, True), (True, 1), (5, 3), (-3, -5)]),
+    (
+        lambda a: a["n"] and a["m"],
+        [(3, 5), (0, 5), (False, 5), (3, True), (3, 0), (True, 0)],
+    ),
+    (lambda a: a["n"] or a["m"], [(3, 5), (0, 5), (0, False), (False, 0), (True, 7)]),
+    (
+        lambda a: -a["n"] if a["m"] > 1 else not a["n"],
+        [(4, 2), (4, 0), (0, 0), (-3, 5)],
+    ),
+    (
+        lambda a: triton.next_power_of_2(a["n"]) * 1000 + triton.cdiv(a["n"], a["m"]),
+        [(5, 2), (0, 1), (1, 1), (-7, 3), (16, 16), (17, 16), (17, -4)],
+    ),
+    (lambda a: a["n"] < a["m"] or a["n"] == 7, [(1, 2), (2, 1), (7, 1), (2, 2)]),
+]
+
+
+def _check_lowered(h, cases):
+    launch = make_launcher(triton.heuristics({"K": h})(lowered), return_compiled=True)
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    for x, y, n, m in cases:
+        expected = h({"x": x, "y": y, "n": n, "m": m})
+        kernel = launch(device, stream, 1, out, x, y, n, m)
+        torch.cuda.synchronize()
+        got = kernel.src.constants[(5,)]
+        assert (got, type(got)) == (expected, type(expected)), (x, y, n, m)
+        assert int(out.item()) == int(expected), (x, y, n, m)
+
+
+@pytest.mark.parametrize("h,cases", LOWERED_SCALAR, ids=range(len(LOWERED_SCALAR)))
+def test_lowered_heuristic_matches_python(h, cases):
+    x = torch.zeros(1, device="cuda")
+    _check_lowered(h, [(x, None, n, m) for n, m in cases])
+
+
+LOWERED_TENSOR = [
+    lambda a: a["x"].shape[0] * 100 + a["x"].stride(0) * 10 + a["x"].dim(),
+    lambda a: a["x"].numel() * 10 + a["x"].element_size(),
+    lambda a: a["x"].is_contiguous(),
+    lambda a: a["x"].dtype == a["y"].dtype,
+    lambda a: a["y"] is not None and a["y"].size(0) > 2,
+]
+
+
+@pytest.mark.parametrize("h", LOWERED_TENSOR, ids=range(len(LOWERED_TENSOR)))
+def test_lowered_tensor_heuristic_matches_python(h):
+    flat = torch.zeros(8, device="cuda")
+    strided = torch.zeros(4, 2, device="cuda", dtype=torch.float16).t()[0]
+    pairs: list[tuple[torch.Tensor, object]] = [
+        (flat, flat),
+        (strided, flat),
+        (flat, strided),
+        (strided, strided),
+    ]
+    if h is LOWERED_TENSOR[-1]:  # the only one that reads y as optional
+        pairs.append((flat, None))
+    _check_lowered(h, [(x, y, 1, 2) for x, y in pairs])
