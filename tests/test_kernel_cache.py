@@ -24,7 +24,7 @@ import pytest
 import triton
 import triton.language as tl
 
-from intj import TorchAccessMode, make_launcher
+from intj import Constexpr, TorchAccessMode, make_launcher
 from intj.kernel_cache import KernelCache, toolchain_for
 from intj.python_intf import cpython_abi
 
@@ -173,3 +173,34 @@ def test_records_survive_rehash(cache):
         for k in range(100):
             launch(0, 0, 1, 0, k)
     assert compiled == list(range(100))
+
+
+@pytest.mark.parametrize("cache", list(KernelCache))
+def test_one_word_map_survives_rehash(cache):
+    """INTJ_NWORDS 1 is its own map instantiation; grow it past its 8 slots."""
+    launch = make_launcher(
+        keyed_store,
+        no_gpu=True,
+        kernel_cache=cache,
+        torch_access_mode=TorchAccessMode.INTERPRETER,
+        extra_annotation={"K": Constexpr(type=tl.int8)},
+    )
+    so = pathlib.Path(launch.__self__.__file__)
+    stem = so.name.split(".")[0]
+    (source,) = [
+        so.with_name(stem + ext)
+        for ext in (".c", ".cpp")
+        if so.with_name(stem + ext).exists()
+    ]
+    assert "#define INTJ_NWORDS 1\n" in source.read_text()
+    compiled = []
+
+    def compile_key(key, nparams, device, x, k):
+        compiled.append(k)
+        return 0, 1, 0, nparams
+
+    launch.__self__.set_compile_callback(compile_key)
+    for _ in range(2):
+        for k in range(20):
+            launch(0, 0, 1, 0, k)
+    assert compiled == list(range(20))
