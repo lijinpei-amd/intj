@@ -1,7 +1,7 @@
 # pyright: standard
 """Repeated per-launch timings for argument annotations and README comparisons.
 
-Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep] [--iters N] [--batches N]
+Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep | --last-key] [--iters N] [--batches N]
 
 The `--readme` rows report host time per launch for a trivial kernel:
 
@@ -65,6 +65,21 @@ def bench(fn, args, iters, batches, sync):
     return statistics.median(samples)
 
 
+def bench_pair(fn, first, second, iters, batches):
+    """Time two direct calls per iteration with prepared argument tuples."""
+    for _ in range(100):
+        fn(*first)
+        fn(*second)
+    samples = []
+    for _ in range(batches):
+        start = time.perf_counter_ns()
+        for _ in range(iters):
+            fn(*first)
+            fn(*second)
+        samples.append((time.perf_counter_ns() - start) / (2 * iters))
+    return statistics.median(samples)
+
+
 def bench_readme(iters, batches):
     n = 4096
     x = torch.randn(n, device="cuda")
@@ -124,6 +139,30 @@ def bench_sweep(iters, batches):
                 args = (0, 0, (1,)) + (value,) * count
                 elapsed = bench(launcher, args, iters, batches, lambda: None)
                 print(f"{count:5d} {kind:>6} {elapsed:10.1f}")
+
+
+def bench_last_key(iters, batches):
+    print(
+        f"mode=last-key; host-only; {2 * iters} calls × {batches} batches; median ns/call"
+    )
+    print(f"{'count':>5} {'pattern':>11} {'ns/call':>10}")
+    with tempfile.TemporaryDirectory() as tmp:
+        for count in (4, 16, 32):
+            path = pathlib.Path(tmp) / f"args_{count}.py"
+            names = ", ".join(f"x{i}" for i in range(count))
+            path.write_text(
+                f"import triton\n\n@triton.jit\ndef noop({names}):\n    pass\n"
+            )
+            spec = importlib.util.spec_from_file_location(path.stem, path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
+            launcher = make_launcher(module.noop, no_gpu=True)
+            first = (0, 0, (1,)) + (17,) * count
+            second = first[:-1] + (16,)
+            for pattern, other in (("repeat", first), ("alternate", second)):
+                elapsed = bench_pair(launcher, first, other, iters, batches)
+                print(f"{count:5d} {pattern:>11} {elapsed:10.1f}")
 
 
 def main(iters=20000, batches=7, no_gpu=False):
@@ -263,6 +302,11 @@ if __name__ == "__main__":
     modes.add_argument(
         "--sweep", action="store_true", help="compare argument counts on the host only"
     )
+    modes.add_argument(
+        "--last-key",
+        action="store_true",
+        help="compare repeated and alternating keys on the host",
+    )
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
     options = parser.parse_args()
@@ -274,5 +318,7 @@ if __name__ == "__main__":
         bench_readme(options.iters, options.batches)
     elif options.sweep:
         bench_sweep(options.iters, options.batches)
+    elif options.last_key:
+        bench_last_key(options.iters, options.batches)
     else:
         main(options.iters, options.batches, options.no_gpu)

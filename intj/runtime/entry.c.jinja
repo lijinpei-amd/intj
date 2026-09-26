@@ -595,9 +595,9 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
     return NULL;
 
 {% if nwords %}
-  uint64_t hash = intj_hash(key);
+  uint64_t hash;
   INTJ_LOCK(&st->mutex);
-  intj_kernel *kernel = intj_cache_get(cache, key, hash);
+  intj_kernel *kernel = intj_cache_lookup(cache, key, &hash);
   INTJ_UNLOCK(&st->mutex);
 {% else %}
   INTJ_LOCK(&st->mutex);
@@ -659,7 +659,7 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
     /* The callback ran Python, so another thread may have filled this key. */
     INTJ_LOCK(&st->mutex);
 {% if nwords %}
-    kernel = intj_cache_get(cache, key, hash);
+    kernel = intj_cache_lookup(cache, key, &hash);
 {% else %}
     kernel = bound->fixed_kernel;
 {% endif %}
@@ -689,6 +689,9 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 {% endif %}
       kernel = fresh;
     }
+{% if nwords %}
+    intj_cache_remember(cache, key, kernel);
+{% endif %}
     INTJ_UNLOCK(&st->mutex);
     Py_DECREF(res);
   }

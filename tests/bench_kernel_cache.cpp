@@ -1,4 +1,4 @@
-/* What `kernel_cache=` costs, measured through the same API the launcher uses.
+/* What the hash map behind `kernel_cache=` costs, without the last-key shortcut.
  *
  * Built once per backend, since INTJ_CACHE_* picks the implementation at
  * compile time and all three define `intj_cache`.  `tests/test_kernel_cache.py`
@@ -9,8 +9,8 @@
  *       -I intj/runtime $(python3-config --includes) tests/bench_kernel_cache.cpp \
  *       -lbenchmark -lpython3.12 -o bench
  *
- * The workload is intj's: a key of INTJ_NWORDS uint64 words, insert-only,
- * ~100% hit, and the hash already computed by the caller -- which is why the
+ * The workload is a key of INTJ_NWORDS uint64 words, insert-only, ~100% map
+ * hit, and the hash already computed by the caller -- which is why the
  * lookup takes it as an argument.  `entries` is how many specializations of one
  * kernel are live; real ones sit at 1-8, 512 is there to show the cache
  * behaviour.
@@ -20,7 +20,7 @@
  * hash is a bijection and the slot carries no key at all; 2, one multiply; and
  * 5, the loop.  Nothing here forks on INTJ_NWORDS -- `intj_hash` and
  * `intj_cache_*` keep one signature at every length, which is what lets this
- * file measure what the launcher actually runs.
+ * file measure the underlying map for every key size.
  *
  * Two things to keep in mind reading the output.  `hit/1` and `miss/1` index
  * with `& 0`, so they always touch element 0 and measure a permanently hot
@@ -130,8 +130,8 @@ void miss(benchmark::State &state) {
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
-/* The hash itself: the caller computes it either way, and only tsl can be
- * handed the result, so this is the floor the other two cannot reach. */
+/* The hash itself: the launcher computes it on a last-key miss, and only tsl
+ * can be handed the result, so this is the floor the other two cannot reach. */
 void hash_only(benchmark::State &state) {
   auto keys = make_keys(8);
   int i = 0;
