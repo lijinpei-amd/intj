@@ -139,6 +139,69 @@ Keyword arguments are not accepted, defaults are not filled in, and the launcher
 not read the current device or stream for you — that is where the launch overhead of
 `JITFunction` goes.
 
+## Autotune and heuristics
+
+`make_launcher` accepts a `@triton.jit` function wrapped in any nesting of
+`@triton.heuristics` layers and at most one `@triton.autotune` layer:
+
+```python
+launch = make_launcher(
+    triton.autotune(configs=[...], key=["N"])(
+        triton.heuristics({"EVEN": lambda a: a["N"] % a["BLOCK"] == 0})(kernel)
+    ),
+    grid_cpp=grid,   # may read tuned values such as BLOCK
+)
+launch(device, stream, x, out, N)   # tuned and heuristic values are not passed
+```
+
+On a miss, Triton tunes and launches through intj: pruning, `reset_to_zero`,
+`restore_value`, `do_bench` and disk caching all run as usual, and
+`best_config`, `bench_time` and `configs_timings` are copied back to your
+tuners. On a hit, intj launches without calling Triton or any heuristic
+written in Python. `Config.pre_hook` therefore runs on misses only.
+
+intj keys a hit on:
+
+- the exact value of every caller argument an autotune layer keys on
+  (`int`, `bool`, or `float` by its fp64 bits; a tensor there raises
+  `TypeError` at the call);
+- the result of every heuristic that reads a caller argument nothing else
+  keys. Those heuristics are compiled to C, which accepts ints and bools, `+ - * // %`,
+  comparisons, `and/or/not`, conditional expressions, `min`, `max`,
+  `triton.cdiv`, `triton.next_power_of_2`, `x is None`, and
+  `.numel() .size(i) .shape[i] .stride(i) .dim() .element_size()
+  .is_contiguous() .dtype` on tensor arguments. Scalar inputs must be `int` or
+  `bool` at runtime (`TypeError` otherwise, e.g. for a `float`). Tensor
+  attribute reads go through the interpreter, so they cost more than scalar
+  reads.
+
+Every other heuristic -- one that reads only autotune keys, tuned values or
+baked values -- runs in Python on a miss only, and its result is stored per
+key. Such a heuristic may call anything, but its result is frozen per key: do
+not read mutable globals. A heuristic whose result depends on a value only
+known after a lookup is keyed in a nested map, so one launch can take more
+than one lookup. Heuristic lambdas cannot close over locals; use module-level
+names or literals.
+
+Grids:
+
+- `grid_cpp` may read tuned values (such as `BLOCK`) but not a heuristic
+  result that is compiled to C (refused at `make_launcher`; use `grid_py`,
+  which sees every value in `meta`). Its grid is computed after the lookup,
+  and a zero-volume result skips the launch.
+- With the default grid or `grid_arg`, a zero-volume grid on a miss raises
+  `ValueError("intj: cannot tune on a zero-volume grid")`, even with
+  `return_compiled=True`.
+
+Refused with `UnsupportedKernel`: `no_gpu=True`, bound values,
+`extra_annotation` or `options` naming a tuned value, configs with
+`num_ctas != 1`, layers assigning a runtime (non-constexpr) parameter, a
+name assigned twice (including two nested `@triton.autotune` layers, which
+Triton itself cannot run), heuristics outside the subset above, and, on the
+miss, a tuned value read by C that is not an `int` or `bool`. Each
+`make_launcher` call owns its own tuner caches. CUDA is compile-checked
+only (untested); free-threaded Python builds are compile-untested.
+
 ## Triton-style migration bridge
 
 `intj.compat.launch(kernel, grid, /, *args, return_compiled=False, **kwargs)` accepts a direct
@@ -156,7 +219,8 @@ launch(kernel, (triton.cdiv(n, BLOCK),), out, n=n, BLOCK=BLOCK,
 The bridge binds Python arguments and reads the current device and stream on
 every call. Construct a `make_launcher` handle once for hot loops. Unsupported
 kernels and options still raise instead of falling back to Triton;
-`@triton.autotune` and `@triton.heuristics` wrappers are refused.
+`@triton.autotune` and `@triton.heuristics` wrappers are refused here (use
+`make_launcher`, see [Autotune and heuristics](#autotune-and-heuristics)).
 Pass `return_compiled=True` when the caller needs the cached Triton
 `CompiledKernel`. `intj.compat.launch_or_interpret` accepts the same flag and
 uses Triton's original launcher in interpreter mode.
@@ -304,7 +368,7 @@ hits it:
   launch symbol, error-string convention, whether it specializes pointers on a 2 GiB
   range) and calling `register()`. **CUDA is compile-checked but runtime-untested** --
   there is no NVIDIA GPU on the development machine.
-- `@triton.autotune` / `@triton.heuristics` wrappers, and `TRITON_INTERPRET=1`.
+- `TRITON_INTERPRET=1`.
 - `dynamic_grid=True` and per-launch options (`dynamic_options`). Use `grid_cpp`
   or `grid_py` for a callable grid.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.

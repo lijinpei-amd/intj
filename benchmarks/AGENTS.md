@@ -13,6 +13,7 @@ before timing when the benchmark writes data.
 - `bench_launch.py`: INTJ launcher matrix (`--no-gpu` for host-only decoding and
   cache work; default for GPU launches), `--readme` for Triton versus INTJ, and
   `--sweep` for 4, 16, and 32 integer or tensor arguments.
+  `--tuned` compares a warmed autotuned launcher with the same kernel baked.
 - `bench_ffi_compare.py`: cached INTJ versus preconverted TVM FFI no-ops and GPU
   kernel launches; `--sweep` measures 0, 3, 5, 8, 16, 32, and 64 arguments.
   Requires `apache-tvm-ffi` and a ROCm or CUDA GPU.

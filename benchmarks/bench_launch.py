@@ -1,7 +1,7 @@
 # pyright: standard
 """Repeated per-launch timings for argument annotations and README comparisons.
 
-Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep | --last-key] [--iters N] [--batches N]
+Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep | --last-key | --tuned] [--iters N] [--batches N]
 
 The `--readme` rows report host time per launch for a trivial kernel:
 
@@ -290,6 +290,36 @@ def main(iters=20000, batches=7, no_gpu=False):
     )
 
 
+def bench_tuned(iters, batches):
+    """A warmed autotuned launcher (hit path) against the same kernel with BLOCK baked."""
+    x = torch.zeros(1024, device="cuda")
+    device, stream = (
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+
+    def grid(n: int, BLOCK: int):
+        return (triton.cdiv(n, BLOCK) * 0 + 1,)
+
+    tuned = make_launcher(
+        triton.autotune(
+            configs=[triton.Config({"BLOCK": 64}), triton.Config({"BLOCK": 128})],
+            key=["n"],
+            do_bench=lambda call, quantiles: [call() or 1.0] * 3,
+        )(noop),
+        grid_cpp=grid,
+    )
+    plain = make_launcher(
+        noop,
+        extra_annotation={"BLOCK": Constexpr(type=tl.int32, value=64)},
+        grid_cpp=grid,
+    )
+    args = (device, stream, x, x, x, 1024, 1.0)
+    sync = torch.cuda.synchronize
+    for name, fn in (("tuned hit", tuned), ("plain", plain)):
+        print(f"{name:>10}: {bench(fn, args, iters, batches, sync):7.1f} ns/launch")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -307,18 +337,25 @@ if __name__ == "__main__":
         action="store_true",
         help="compare repeated and alternating keys on the host",
     )
+    modes.add_argument(
+        "--tuned",
+        action="store_true",
+        help="compare a warmed autotuned launcher with the same kernel baked",
+    )
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
     options = parser.parse_args()
     if options.iters < 1 or options.batches < 1:
         parser.error("--iters and --batches must be positive")
-    if options.readme and options.no_gpu:
-        parser.error("--readme and --no-gpu are mutually exclusive")
+    if (options.readme or options.tuned) and options.no_gpu:
+        parser.error("--readme and --tuned need the GPU; drop --no-gpu")
     if options.readme:
         bench_readme(options.iters, options.batches)
     elif options.sweep:
         bench_sweep(options.iters, options.batches)
     elif options.last_key:
         bench_last_key(options.iters, options.batches)
+    elif options.tuned:
+        bench_tuned(options.iters, options.batches)
     else:
         main(options.iters, options.batches, options.no_gpu)

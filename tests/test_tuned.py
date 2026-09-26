@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
-from intj.launcher import UnsupportedKernel
+from intj.launcher import UnsupportedKernel, triton_specialization
 
 
 @triton.jit
@@ -514,3 +514,108 @@ def test_lowered_tensor_heuristic_matches_python(h):
     if h is LOWERED_TENSOR[-1]:  # the only one that reads y as optional
         pairs.append((flat, None))
     _check_lowered(h, [(x, y, 1, 2) for x, y in pairs])
+
+
+def _reference(kernel, args_by_name):
+    """What Triton itself decides for these arguments: its tuning keys, the
+    heuristic outputs and the final call, from a private chain whose innermost
+    layer records instead of launching."""
+    import copy
+
+    from triton.runtime.autotuner import Autotuner
+
+    layers, inner = [], kernel
+    while not hasattr(inner, "params"):
+        layers.append(copy.copy(inner))
+        inner = inner.fn
+    final = {}
+
+    class Record:
+        fn = inner
+
+        def run(self, *args, grid, warmup, **kwargs):
+            final.update(zip(inner.arg_names, args))
+            final.update(kwargs)
+
+    for outer, nxt in zip(layers, [*layers[1:], Record()]):
+        outer.fn = nxt
+    tuning_keys = []
+    for layer in layers:
+        if type(layer) is Autotuner:
+            layer.cache = {}
+    layers[0].run(grid=(1,), warmup=False, **args_by_name)
+    for layer in layers:
+        if type(layer) is Autotuner:
+            tuning_keys.append(tuple(layer.cache))
+    params = [final[n] for n in inner.arg_names]
+    options = {k: v for k, v in final.items() if k not in inner.arg_names}
+    # only what the layers decided; raw arguments like `stride` are not keyed
+    heuristics = tuple(
+        sorted((k, repr(v)) for k, v in final.items() if k not in args_by_name)
+    )
+    return (
+        repr(triton_specialization(inner, params, options)),
+        tuple(tuning_keys),
+        heuristics,
+    )
+
+
+def check_tuned_invariant(make_kernel, cases):
+    kernel = make_kernel()
+    launch = make_launcher(kernel)
+    module = launch.__self__.__self__
+    device, stream = controls()
+    seen = {}
+    for case in cases:
+        launch(device, stream, 1, *case.values())
+        chain, found = module.key_chain(launch, device, *case.values())
+        assert found
+        truth = _reference(make_kernel(), case)
+        assert seen.setdefault(chain, truth) == truth, (
+            "intj key chain collides across Triton decisions"
+        )
+
+
+def _invariant_kernel():
+    def bench(call, quantiles):  # first config wins, deterministically
+        return [1.0, 1.0, 1.0]
+
+    return triton.autotune(
+        configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
+        key=["N"],
+        do_bench=bench,
+    )(
+        triton.heuristics({"ALIGNED": lambda a: a["stride"] % a["BLOCK"] == 0})(
+            aligned_tag
+        )
+    )
+
+
+def _invariant_cases():
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    half = torch.zeros(1, device="cuda", dtype=torch.float16)
+    return [
+        {"x": t, "out": out, "N": n, "stride": s}
+        for t in (x, half)
+        for n in (1, 8, 16, 17, 2**31)
+        for s in (0, 32, 33, 64)
+    ]
+
+
+def test_tuned_key_chain_is_never_coarser_than_triton():
+    check_tuned_invariant(_invariant_kernel, _invariant_cases())
+
+
+def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
+    from intj import annotation
+
+    original = annotation._key_fields
+
+    def without_exact(a):
+        return tuple(f for f in original(a) if f.kind not in ("exact", "exact_kind"))
+
+    monkeypatch.setattr(annotation, "_key_fields", without_exact)
+    monkeypatch.setattr("intj.launcher._key_fields", without_exact)
+    with pytest.raises(AssertionError, match="collides"):
+        check_tuned_invariant(_invariant_kernel, _invariant_cases())

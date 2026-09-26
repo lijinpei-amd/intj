@@ -67,3 +67,5 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   steady-state loop).
 - Annotated fast paths: pinning a parameter's type skips the generic classifier
   (~185 ns vs ~275 ns measured upstream on a 10-arg kernel).
+- Tuned launches decode arguments on the generic path; the auto-decode macros do
+  not handle exact keys yet.
