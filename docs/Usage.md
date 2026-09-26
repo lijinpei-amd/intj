@@ -197,10 +197,13 @@ Refused with `UnsupportedKernel`: `no_gpu=True`, bound values,
 `extra_annotation` or `options` naming a tuned value, configs with
 `num_ctas != 1`, layers assigning a runtime (non-constexpr) parameter, a
 name assigned twice (including two nested `@triton.autotune` layers, which
-Triton itself cannot run), heuristics outside the subset above, and, on the
-miss, a tuned value read by C that is not an `int` or `bool`. Each
-`make_launcher` call owns its own tuner caches. CUDA is compile-checked
-only (untested); free-threaded Python builds are compile-untested.
+Triton itself cannot run), a heuristic or autotune key reading a value an
+inner layer assigns, heuristics outside the subset above, and a tuned value
+read by C that is not an `int` or `bool` (autotune config values at
+`make_launcher`, heuristic results on the miss). Each bound launcher (every
+`bind()`/`bind_device()`) owns its own tuner caches and tunes again. CUDA is
+compile-checked only (untested); free-threaded Python builds are
+compile-untested.
 
 ## Triton-style migration bridge
 

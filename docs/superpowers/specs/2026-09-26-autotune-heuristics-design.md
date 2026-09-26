@@ -3,11 +3,13 @@
 ## Goal
 
 Make the tuned launch path fast. `make_launcher` accepts a JIT function wrapped in
-any nesting of `@triton.autotune` and `@triton.heuristics`:
+at most one `@triton.autotune` and any number of `@triton.heuristics`, in any order
+(two nested autotune layers are refused: Triton itself cannot run them, the outer
+passes the inner a duplicate `num_warps` keyword):
 
 ```python
 @intj.make_launcher      # must be outermost
-@triton.autotune(...)    # any number, any order
+@triton.autotune(...)    # at most one; heuristics any number; any order
 @triton.heuristics(...)
 @triton.jit              # must be innermost
 def kernel(...): ...

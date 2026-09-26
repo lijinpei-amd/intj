@@ -75,7 +75,10 @@ silent fallback turns a 0.3 us call into a 14 us one with no signal.
 A key finer than triton's costs a redundant compile. A key coarser than triton's
 launches the wrong binary and does not crash. Every change to argument decoding or
 key layout must keep `test_spec_key_is_never_coarser_than_triton` passing, and that
-test must be able to fail: mutate the change away and check the test catches it.
+test must be able to fail: mutate the change away and check the test catches it. For
+tuned launchers the same holds for
+`tests/test_tuned.py::test_tuned_key_chain_is_never_coarser_than_triton`, whose
+mutation test `test_tuned_invariant_catches_a_dropped_exact_key` shows it can fail.
 
 ## Types
 
