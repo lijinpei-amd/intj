@@ -41,7 +41,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - Tuple / namedtuple arguments: `ARG_TUPLE` recursion in the decoder and the key.
 - Kernels reading globals: revalidate in C (`PyObject_RichCompareBool` per entry)
   instead of refusing.
-- `@triton.autotune` / `@triton.heuristics`: render per config, or pick in python.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
 - Parameter defaults: the launcher requires every argument positionally.

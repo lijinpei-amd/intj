@@ -63,12 +63,6 @@ def python_annotated_int(x, out, n: int):
     tl.store(out + i, value + 1, i < n)
 
 
-@triton.jit
-def autotuned_tag(out, n, TAG: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(out + i, TAG, i < n)
-
-
 def test_launch_binds_keywords_default_and_compile_option():
     x = torch.arange(129, device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -353,28 +347,13 @@ def test_launch_rejects_unpinned_cpu_tensor_before_gpu_driver_lookup():
         launch(unused_pointer, (1,), x)
 
 
-def test_launch_autotunes_through_native_launcher_and_reuses_choice():
-    out = torch.zeros(8, device="cuda", dtype=torch.int32)
-    bench_calls = []
-
-    def bench(call, quantiles):
-        call()
-        tag = int(out[0].item())
-        bench_calls.append(tag)
-        score = 2.0 if tag == 1 else 1.0
-        return (score, score, score)
-
-    configs = [
-        triton.Config({"TAG": 1, "BLOCK": 32}),
-        triton.Config({"TAG": 2, "BLOCK": 64}),
-    ]
-    tuned = triton.autotune(configs=configs, key=["n"], do_bench=bench)(autotuned_tag)
-    launch(tuned, (1,), out, n=8)
-    torch.testing.assert_close(out, torch.full_like(out, 2))
-    assert bench_calls == [1, 2]
-    assert tuned.best_config == configs[1]
-
-    out.zero_()
-    launch(tuned, (1,), out, n=8)
-    torch.testing.assert_close(out, torch.full_like(out, 2))
-    assert bench_calls == [1, 2]
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        triton.autotune(configs=[triton.Config({})], key=[]),
+        triton.heuristics({}),
+    ],
+)
+def test_launch_refuses_decorated_kernel(wrap):
+    with pytest.raises(UnsupportedKernel, match="expected a @triton.jit function"):
+        launch(wrap(unused_pointer), (1,), torch.empty(1, device="cuda"))

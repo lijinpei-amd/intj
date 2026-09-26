@@ -155,7 +155,8 @@ launch(kernel, (triton.cdiv(n, BLOCK),), out, n=n, BLOCK=BLOCK,
 
 The bridge binds Python arguments and reads the current device and stream on
 every call. Construct a `make_launcher` handle once for hot loops. Unsupported
-kernels and options still raise instead of falling back to Triton.
+kernels and options still raise instead of falling back to Triton;
+`@triton.autotune` and `@triton.heuristics` wrappers are refused.
 Pass `return_compiled=True` when the caller needs the cached Triton
 `CompiledKernel`. `intj.compat.launch_or_interpret` accepts the same flag and
 uses Triton's original launcher in interpreter mode.

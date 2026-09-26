@@ -6,15 +6,12 @@ sites should construct and call ``make_launcher`` directly.
 
 from __future__ import annotations
 
-from copy import copy
 from functools import lru_cache
-from types import SimpleNamespace
 from typing import Any
 
 from triton._utils import canonicalize_dtype
 from triton import knobs
 from triton import language as tl
-from triton.runtime.autotuner import Autotuner, Heuristics
 from triton.runtime.driver import driver
 from triton.runtime.jit import JITFunction, TensorWrapper
 
@@ -90,7 +87,7 @@ def _cached(
 def launch(
     kernel: Any, grid: Any, /, *args: Any, return_compiled: bool = False, **kwargs: Any
 ) -> Any:
-    """Launch a JIT function or decorated wrapper with Triton's call spelling.
+    """Launch a JIT function with Triton's call spelling.
 
     This is a migration bridge, not the low-overhead API: it binds Python
     keywords and reads the current device/stream on every call.  Unsupported
@@ -103,31 +100,6 @@ def launch(
     # HookChain is truthy even when no callbacks are registered.
     if any(getattr(hook, "calls", hook) for hook in hooks):
         raise UnsupportedKernel("intj: active Triton launch hooks are not supported")
-    while isinstance(kernel, Heuristics):
-        for name, heuristic in kernel.values.items():
-            kwargs[name] = heuristic({**dict(zip(kernel.arg_names, args)), **kwargs})
-        kernel = kernel.fn
-    if isinstance(kernel, Autotuner):
-        # Reuse Triton's selection and hooks, redirecting only its inner launch.
-        tuned = copy(kernel)
-
-        def run_native(*run_args: Any, **run_kwargs: Any) -> Any:
-            return launch(
-                kernel.fn,
-                run_kwargs.pop("grid"),
-                *run_args,
-                return_compiled=return_compiled,
-                **run_kwargs,
-            )
-
-        tuned.fn = SimpleNamespace(fn=kernel.fn, run=run_native)
-        try:
-            result = tuned.run(*args, **kwargs, grid=grid)
-        finally:
-            for name in ("best_config", "bench_time", "configs_timings"):
-                if name in tuned.__dict__:
-                    setattr(kernel, name, getattr(tuned, name))
-        return result
     if not isinstance(kernel, JITFunction):
         raise UnsupportedKernel(
             f"intj: expected a @triton.jit function, got {type(kernel).__name__}"
