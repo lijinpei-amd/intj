@@ -64,6 +64,12 @@
 {% endif %}
 {% if return_compiled %}#define INTJ_RETURN_COMPILED 1
 {% endif %}
+{% if fixed_device %}#define INTJ_FIXED_DEVICE 1
+{% endif %}
+{% if fixed_device and nwords %}#define INTJ_BOUND_CACHE 1
+{% endif %}
+{% if not nwords %}#define INTJ_BOUND_FIXED_KERNEL 1
+{% endif %}
 #include "intj_runtime.h"
 
 #define INTJ_NPARAMS {{ params | rejectattr('call_index', 'none') | list | length }}
@@ -952,7 +958,6 @@ static PyObject *make_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     bound->grid_hidden = Py_NewRef(args[1]);
 {% endif %}
 {% if fixed_device %}
-    bound->fixed_device = 1;
     bound->device_ordinal = ordinal;
 {% if no_gpu %}
     bound->device_handle = (int32_t)ordinal;

@@ -973,12 +973,18 @@ typedef struct intj_bound_launcher {
 #endif
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
+  /* Each handle carries only the kernel store its module uses. */
+#ifdef INTJ_BOUND_CACHE
   intj_cache cache;
   int cache_ready;
+#endif
+#ifdef INTJ_BOUND_FIXED_KERNEL
   intj_kernel *fixed_kernel;
-  int fixed_device;
+#endif
+#ifdef INTJ_FIXED_DEVICE
   int64_t device_ordinal;
   int32_t device_handle;
+#endif
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   at::Tensor *tensors[INTJ_BOUND_SLOTS];
 #endif
