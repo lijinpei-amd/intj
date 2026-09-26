@@ -165,6 +165,11 @@ typedef struct {
   uint32_t nparams;   /* kernel params, scratch slots excluded */
 } intj_kernel;
 
+typedef struct {
+  uint64_t key[INTJ_NWORDS];
+  intj_kernel *kernel; /* borrowed from the owning map */
+} intj_last_key;
+
 /* At one word `intj_hash` is a bijection, so `hash == h` IS key equality and the
  * slot has no reason to carry the key: 16 bytes, four to a cache line, against
  * 8 + 8 + INTJ_NWORDS * 8.  A probe is a cache miss, and the slot size is what
@@ -205,6 +210,7 @@ typedef struct {
   intj_slot *slots;
   uint32_t mask;
   uint32_t used;
+  intj_last_key last;
 } intj_map;
 
 /* memcmp, not a word loop: the loop has to exit early, so it compiles to one
@@ -243,6 +249,7 @@ static int intj_map_init(intj_map *m, uint32_t cap) {
     return -1;
   m->mask = cap - 1;
   m->used = 0;
+  m->last.kernel = NULL;
   return 0;
 }
 
@@ -328,10 +335,12 @@ using intj_cache_map = absl::flat_hash_map<intj_key, intj_kernel *, intj_key_has
 
 typedef struct {
   intj_cache_map *map;
+  intj_last_key last;
 } intj_cache;
 
 static inline int intj_cache_init(intj_cache *c) {
   c->map = new (std::nothrow) intj_cache_map();
+  c->last.kernel = NULL;
   return c->map ? 0 : -1;
 }
 
@@ -370,6 +379,7 @@ static inline void intj_cache_free(intj_cache *c) {
     PyMem_RawFree(entry.second);
   delete c->map;
   c->map = NULL;
+  c->last.kernel = NULL;
 }
 
 #else /* INTJ_CACHE_INTJ */
@@ -397,9 +407,28 @@ static inline void intj_cache_free(intj_cache *c) {
     PyMem_RawFree(c->slots[i].val);
   PyMem_RawFree(c->slots);
   c->slots = NULL;
+  c->last.kernel = NULL;
 }
 
 #endif
+
+static inline void intj_cache_remember(intj_cache *c, const uint64_t *key,
+                                       intj_kernel *kernel) {
+  memcpy(c->last.key, key, sizeof(c->last.key));
+  c->last.kernel = kernel;
+}
+
+/* The common launch lookup: a repeated key skips both hash and map probe. */
+static inline intj_kernel *intj_cache_lookup(intj_cache *c, const uint64_t *key,
+                                             uint64_t *hash) {
+  if (c->last.kernel && memcmp(c->last.key, key, sizeof(c->last.key)) == 0)
+    return c->last.kernel;
+  *hash = intj_hash(key);
+  intj_kernel *kernel = intj_cache_get(c, key, *hash);
+  if (kernel)
+    intj_cache_remember(c, key, kernel);
+  return kernel;
+}
 
 /* intj reads three things off a tensor: the data pointer, the dtype (as an
  * opaque int32 discriminator) and, where the backend specializes on pointer

@@ -39,11 +39,13 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 
 ## The kernel cache is swappable, and intj's own is the default
 
-`intj_cache_{init,get,put,free}` in `runtime/intj_runtime.h` is the whole
-interface; the entry template never names an implementation. A backend owns the
-kernel records it is given (`intj_cache_free` releases them) and must not let an
-exception escape -- the C++ maps throw where intj returns -1. Numbers live in
-`tests/bench_kernel_cache.cpp`; add a backend there when you add one.
+`intj_cache_{init,lookup,remember,get,put,free}` in `runtime/intj_runtime.h` is
+the whole interface; the entry template never names an implementation. `lookup`
+checks the one-entry last key before hashing or probing the map. A backend owns
+the kernel records it is given (`intj_cache_free` releases them) and must not let
+an exception escape -- the C++ maps throw where intj returns -1. Map-only
+numbers live in `tests/bench_kernel_cache.cpp`; add a backend there when you add
+one. `benchmarks/bench_launch.py --last-key` measures the full host launch path.
 
 A backend's library is downloaded at a pinned version and checksum into
 `$TRITON_HOME/.triton/intj/deps/`, never taken from the host: what a module was

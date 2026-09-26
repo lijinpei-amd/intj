@@ -308,6 +308,33 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
     assert "intj_cache_init(&st->cache)" not in source
 
 
+@pytest.mark.parametrize("bind_device", [False, True])
+def test_repeated_key_uses_last_lookup_before_hash(device_kernel, bind_device):
+    factory = make_launcher(device_kernel, bind_device=bind_device, no_gpu=True,
+                            extra_annotation={"x": Constexpr(type=tl.int32)},
+                            torch_access=TorchAccess.CPYTHON)
+    launch = factory.bind_device(0) if bind_device else factory
+    module = launch.__self__.__self__ if bind_device else launch.__self__
+    compiled = []
+
+    def compile_key(key, nparams, device, value):
+        compiled.append(value)
+        return 0, 1, 0, nparams
+
+    module.set_compile_callback(compile_key)
+    for value in (7, 7, 9, 9, 7):
+        if bind_device:
+            launch(0, 1, value)
+        else:
+            launch(0, 0, 1, value)
+    assert compiled == [7, 9]
+
+    source = pathlib.Path(module.__file__).with_name("device_kernel.c").read_text()
+    call = source[source.index("static PyObject *intj_call"):source.index("static PyObject *entry")]
+    assert "intj_cache_lookup(cache, key, &hash)" in call
+    assert "intj_hash(key)" not in call
+
+
 @pytest.mark.parametrize("mode,cache", [
     (TorchAccess.CPYTHON, KernelCache.INTJ), (TorchAccess.CXX, KernelCache.INTJ),
     (TorchAccess.CPYTHON, KernelCache.TSL), (TorchAccess.CPYTHON, KernelCache.ABSL),
@@ -891,7 +918,7 @@ def test_binding_checked_source_checks_only_where_values_change(bound_kernel, mo
         pack = source[source.index("static INTJ_ALWAYS_INLINE int intj_pack"):source.index("/* Parse one grid")]
         bind = source[source.index("static PyObject *make_bound"):source.index("/* Debug/test entry")]
         call = source[source.index("static PyObject *intj_call"):source.index("static PyObject *entry")]
-        lookup = "kernel = bound->fixed_kernel" if cache_owner == "no-map" else "intj_cache_get("
+        lookup = "kernel = bound->fixed_kernel" if cache_owner == "no-map" else "intj_cache_lookup("
         assert call.index("intj_pack(") < call.index(lookup), \
             "argument validation must precede cache lookup"
         for i, body in ((0, pack), (1, bind), (2, pack)):

@@ -1,9 +1,10 @@
 """Which hash map a generated module uses for its kernel cache.
 
-The map is on the launch path: it turns a spec key into a compiled kernel, once
-per launch.  Measured on this workload -- key of N uint64 words, insert-only,
-~100% hit, hash already computed by the caller -- the three are within a few ns
-of each other, and `INTJ` wins at the sizes a kernel cache actually reaches:
+The map turns a spec key into a compiled kernel when the key differs from the
+previous launch. Measured on this map-only workload -- key of N uint64 words,
+insert-only, ~100% hit, hash already computed by the caller -- the three are
+within a few ns of each other, and `INTJ` wins at the sizes a kernel cache
+actually reaches:
 
     ns/lookup, 8-byte key          1 entry   8 entries   512 entries
     INTJ                              1.39        1.56          2.05

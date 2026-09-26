@@ -517,8 +517,8 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
     return NULL;
 
 {% if nwords %}
-  uint64_t hash = intj_hash(key);
-  intj_kernel *kernel = intj_cache_get(cache, key, hash);
+  uint64_t hash;
+  intj_kernel *kernel = intj_cache_lookup(cache, key, &hash);
   if (INTJ_UNLIKELY(!kernel)) {
 {% else %}
   intj_kernel *kernel = bound->fixed_kernel;
@@ -568,7 +568,7 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
     Py_DECREF(res);
     /* The callback ran python, so another thread may have filled this key. */
 {% if nwords %}
-    kernel = intj_cache_get(cache, key, hash);
+    kernel = intj_cache_lookup(cache, key, &hash);
 {% else %}
     kernel = bound->fixed_kernel;
 {% endif %}
@@ -589,6 +589,9 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
       bound->fixed_kernel = kernel;
 {% endif %}
     }
+{% if nwords %}
+    intj_cache_remember(cache, key, kernel);
+{% endif %}
   }
 
   if (INTJ_UNLIKELY((uint32_t)np != kernel->nparams)) {
