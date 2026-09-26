@@ -70,6 +70,25 @@
 {% endif %}
 {% if not nwords %}#define INTJ_BOUND_FIXED_KERNEL 1
 {% endif %}
+#include "intj_map.h"
+
+/* The final-level record, stored by value in whichever map holds it. */
+typedef struct {
+  intj_kernel k;
+} intj_final;
+
+/* Outside any lock: dropping a CompiledKernel may run a finalizer. */
+static void intj_final_release(intj_final *f) {
+{% if return_compiled %}
+  Py_XDECREF(f->k.compiled);
+{% else %}
+  (void)f;
+{% endif %}
+}
+
+INTJ_DEFINE_CACHE(intj_final)
+#define INTJ_V0_RELEASE intj_final_release
+
 #include "intj_runtime.h"
 
 #define INTJ_NPARAMS {{ params | rejectattr('call_index', 'none') | list | length }}
@@ -94,7 +113,7 @@ typedef struct {
 {% endif %}
 {% if not fixed_device %}  intj_cache cache;
 {% endif %}
-  intj_mutex mutex; /* every cache and compile_cb, on a free-threaded build */
+  intj_rwlock lock; /* every cache and compile_cb, on a free-threaded build */
 } intj_state;
 
 static const char *const intj_param_names[{{ params | length + 1 }}] = {
@@ -495,6 +514,148 @@ static int intj_grid_object(PyObject *g, uint32_t *gx, uint32_t *gy, uint32_t *g
 }
 {% endif %}
 
+static inline int intj_final_collect(intj_final *f, void *ctx) {
+  intj_snapshot *s = (intj_snapshot *)ctx;
+  (void)s;
+{% if return_compiled %}
+  if (intj_snapshot_add(s, f->k.compiled) != 0)
+    return -1;
+{% endif %}
+  return 0;
+}
+#define INTJ_V0_COLLECT intj_final_collect
+
+static inline int intj_cache_traverse(intj_state *st, const intj_cache *c,
+                                      visitproc visit, void *arg) {
+  intj_snapshot s = {NULL, 0, 0};
+  INTJ_RDLOCK(&st->lock);
+  int failed = intj_cache_each(c, INTJ_V0_COLLECT, &s);
+  INTJ_RWUNLOCK(&st->lock);
+  return intj_snapshot_visit(&s, failed, visit, arg);
+}
+
+{% if not no_gpu %}
+/* Two trailing scratch slots are mandatory on AMD; intj refuses kernels that
+ * need non-empty scratch, so they are always null. */
+static INTJ_ALWAYS_INLINE int32_t intj_launch(intj_state *st, const intj_kernel *k,
+                                              uint32_t gx, uint32_t gy, uint32_t gz,
+                                              uint64_t stream, uint64_t *vals, int np) {
+  void *params[INTJ_NSLOTS + 2];
+  for (int i = 0; i < np; i++)
+    params[i] = &vals[i];
+  uint64_t scratch[2] = {0, 0};
+  params[np] = &scratch[0];
+  params[np + 1] = &scratch[1];
+  return st->launch(k->function, gx, gy, gz, k->block_dim, 1, 1, k->shared,
+                    (void *)(uintptr_t)stream, params, NULL);
+}
+
+static PyObject *intj_launch_error(intj_state *st, int32_t status) {
+  const char *message = NULL;
+{% if error_style == 'return' %}
+  if (st->error_string)
+    message = st->error_string(status);
+{% else %}
+  if (st->error_string)
+    st->error_string(status, &message);
+{% endif %}
+  PyErr_Format(PyExc_RuntimeError, "intj: {{ launch_symbol }} failed: %s",
+               message ? message : "unknown error");
+  return NULL;
+}
+{% endif %}
+
+/* Cold path: Python assembles the final canonical ASTSource from the public
+ * arguments and fixed annotations.  No lock is held while Python runs; another
+ * thread may fill this key meanwhile, and the put rechecks. */
+static int intj_fill(intj_state *st, intj_cache *cache, intj_bound_launcher *bound,
+                     const uint64_t *key, int np, int64_t device_ordinal,
+                     PyObject *const *kernel_args) {
+  (void)cache;
+  (void)bound;
+  INTJ_RDLOCK(&st->lock);
+  PyObject *cb = st->compile_cb;
+  Py_XINCREF(cb);
+  INTJ_RWUNLOCK(&st->lock);
+  if (!cb) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: compile callback is not set");
+    return -1;
+  }
+  PyObject *blob = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
+  PyObject *nparams_obj = blob ? PyLong_FromLong(np) : NULL;
+  PyObject *device_obj = nparams_obj ? PyLong_FromLongLong(device_ordinal) : NULL;
+  if (!device_obj) {
+    Py_XDECREF(blob);
+    Py_XDECREF(nparams_obj);
+    Py_DECREF(cb);
+    return -1;
+  }
+  PyObject *cb_args[3 + INTJ_NPARAMS];
+  cb_args[0] = blob;
+  cb_args[1] = nparams_obj;
+  cb_args[2] = device_obj;
+  for (int i = 0; i < INTJ_NPARAMS; i++)
+    cb_args[3 + i] = kernel_args[i];
+  PyObject *res = PyObject_Vectorcall(cb, cb_args, 3 + INTJ_NPARAMS, NULL);
+  Py_DECREF(cb);
+  Py_DECREF(blob);
+  Py_DECREF(nparams_obj);
+  Py_DECREF(device_obj);
+  if (!res)
+    return -1;
+  unsigned long long function;
+  unsigned int block_dim, shared, nparams;
+{% if return_compiled %}
+  PyObject *compiled;
+  if (!PyArg_ParseTuple(res, "KIIIO", &function, &block_dim, &shared, &nparams,
+                        &compiled)) {
+{% else %}
+  if (!PyArg_ParseTuple(res, "KIII", &function, &block_dim, &shared, &nparams)) {
+{% endif %}
+    Py_DECREF(res);
+    return -1;
+  }
+  intj_final fresh;
+  memset(&fresh, 0, sizeof(fresh));
+  fresh.k.function = (void *)(uintptr_t)function;
+  fresh.k.block_dim = block_dim;
+  fresh.k.shared = shared;
+  fresh.k.nparams = nparams;
+{% if return_compiled %}
+  fresh.k.compiled = Py_NewRef(compiled);
+{% endif %}
+  Py_DECREF(res);
+  int taken = 0, failed = 0;
+  INTJ_WRLOCK(&st->lock);
+{% if nwords %}
+  if (!intj_cache_lookup(cache, key)) {
+    if (intj_cache_put(cache, key, &fresh))
+      taken = 1;
+    else
+      failed = 1;
+  }
+{% else %}
+  if (!bound->fixed_kernel) {
+    intj_final *heap = (intj_final *)PyMem_RawMalloc(sizeof(intj_final));
+    if (heap) {
+      *heap = fresh;
+      bound->fixed_kernel = heap;
+      taken = 1;
+    } else {
+      failed = 1;
+    }
+  }
+{% endif %}
+  INTJ_RWUNLOCK(&st->lock);
+  if (!taken)
+    intj_final_release(&fresh);
+  if (failed) {
+    PyErr_NoMemory();
+    return -1;
+  }
+  return 0;
+}
+
 {% if grid_cpp_source %}
 {{ grid_cpp_source }}
 {% endif %}
@@ -600,153 +761,57 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
   if (intj_pack(st, args + {{ grid_count }}, key, vals, &np, (uint32_t)device_ordinal, bound) != 0)
     return NULL;
 
+  INTJ_RDLOCK(&st->lock);
 {% if nwords %}
-  uint64_t hash;
-  INTJ_LOCK(&st->mutex);
-  intj_kernel *kernel = intj_cache_lookup(cache, key, &hash);
-  INTJ_UNLOCK(&st->mutex);
+  intj_final *kernel = intj_cache_lookup(cache, key);
 {% else %}
-  INTJ_LOCK(&st->mutex);
-  intj_kernel *kernel = bound->fixed_kernel;
-  INTJ_UNLOCK(&st->mutex);
+  intj_final *kernel = bound->fixed_kernel;
 {% endif %}
   if (INTJ_UNLIKELY(!kernel)) {
-    /* Cold path: Python assembles the final canonical ASTSource from the
-     * public arguments and fixed annotations. Never hold the mutex while
-     * invoking Python; another thread may fill this key meanwhile. */
-    INTJ_LOCK(&st->mutex);
-    PyObject *cb = st->compile_cb;
-    Py_XINCREF(cb);
-    INTJ_UNLOCK(&st->mutex);
-    if (!cb) {
-      PyErr_SetString(PyExc_RuntimeError, "intj: compile callback is not set");
+    INTJ_RWUNLOCK(&st->lock);
+    if (intj_fill(st, cache, bound, key, np, device_ordinal, args + {{ grid_count }}) != 0)
       return NULL;
-    }
-    PyObject *blob = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
-    PyObject *nparams_obj = blob ? PyLong_FromLong(np) : NULL;
-    if (!nparams_obj) {
-      Py_XDECREF(blob);
-      Py_DECREF(cb);
-      return NULL;
-    }
-    PyObject *device_obj = PyLong_FromLongLong(device_ordinal);
-    if (!device_obj) {
-      Py_DECREF(blob);
-      Py_DECREF(nparams_obj);
-      Py_DECREF(cb);
-      return NULL;
-    }
-    PyObject *cb_args[3 + INTJ_NPARAMS];
-    cb_args[0] = blob;
-    cb_args[1] = nparams_obj;
-    cb_args[2] = device_obj;
-    for (int i = 0; i < INTJ_NPARAMS; i++)
-      cb_args[3 + i] = args[{{ grid_count }} + i];
-    PyObject *res = PyObject_Vectorcall(cb, cb_args, 3 + INTJ_NPARAMS, NULL);
-    Py_DECREF(cb);
-    Py_DECREF(blob);
-    Py_DECREF(nparams_obj);
-    Py_DECREF(device_obj);
-    if (!res)
-      return NULL;
-    unsigned long long function;
-    unsigned int block_dim, shared, nparams;
-{% if return_compiled %}
-    PyObject *compiled;
-    if (!PyArg_ParseTuple(res, "KIIIO", &function, &block_dim, &shared,
-                          &nparams, &compiled)) {
-{% else %}
-    if (!PyArg_ParseTuple(res, "KIII", &function, &block_dim, &shared,
-                          &nparams)) {
-{% endif %}
-      Py_DECREF(res);
-      return NULL;
-    }
-    /* The callback ran Python, so another thread may have filled this key. */
-    INTJ_LOCK(&st->mutex);
+    INTJ_RDLOCK(&st->lock);
 {% if nwords %}
-    kernel = intj_cache_lookup(cache, key, &hash);
+    kernel = intj_cache_lookup(cache, key);
 {% else %}
     kernel = bound->fixed_kernel;
 {% endif %}
-    if (!kernel) {
-      intj_kernel *fresh = (intj_kernel *)PyMem_RawMalloc(sizeof(intj_kernel));
-      if (!fresh) {
-        INTJ_UNLOCK(&st->mutex);
-        Py_DECREF(res);
-        return PyErr_NoMemory();
-      }
-      fresh->function = (void *)(uintptr_t)function;
-      fresh->block_dim = block_dim;
-      fresh->shared = shared;
-      fresh->nparams = nparams;
-{% if return_compiled %}
-      fresh->compiled = Py_NewRef(compiled);
-{% endif %}
-{% if nwords %}
-      if (intj_cache_put(cache, key, hash, fresh) != 0) {
-        INTJ_UNLOCK(&st->mutex);
-        intj_kernel_free(fresh);
-        Py_DECREF(res);
-        return PyErr_NoMemory();
-      }
-{% else %}
-      bound->fixed_kernel = fresh;
-{% endif %}
-      kernel = fresh;
-    }
-{% if nwords %}
-    intj_cache_remember(cache, key, kernel);
-{% endif %}
-    INTJ_UNLOCK(&st->mutex);
-    Py_DECREF(res);
   }
 
-  if (INTJ_UNLIKELY((uint32_t)np != kernel->nparams)) {
+  /* Held through the launch: `kernel` lives in the map.  Errors are raised
+   * after the unlock, because raising allocates and can run Python. */
+  PyObject *result = NULL;
+  uint32_t recorded_np = kernel->k.nparams;
+  int32_t status = 0;
+  if (INTJ_LIKELY((uint32_t)np == recorded_np)) {
+{% if not no_gpu %}
+{% if return_compiled %}
+    if (gx && gy && gz)
+{% endif %}
+      status = intj_launch(st, &kernel->k, gx, gy, gz, stream, vals, np);
+{% endif %}
+{% if return_compiled %}
+    if (!status)
+      result = Py_NewRef(kernel->k.compiled);
+{% else %}
+    if (!status)
+      result = Py_NewRef(Py_None);
+{% endif %}
+  }
+  INTJ_RWUNLOCK(&st->lock);
+  if (INTJ_UNLIKELY((uint32_t)np != recorded_np)) {
     PyErr_Format(PyExc_RuntimeError,
                  "intj: kernel argument count changed for an identical spec "
                  "key (%d vs %u); this is an intj bug",
-                 np, kernel->nparams);
+                 np, recorded_np);
     return NULL;
   }
-
-{% if return_compiled %}
-  if (INTJ_UNLIKELY(!gx || !gy || !gz))
-    return Py_NewRef(kernel->compiled);
-{% endif %}
-
 {% if not no_gpu %}
-  /* Launch. Two trailing scratch slots are mandatory on AMD; intj refuses
-   * kernels that need non-empty scratch, so they are always null. */
-  void *params[INTJ_NSLOTS + 2];
-  for (int i = 0; i < np; i++)
-    params[i] = &vals[i];
-  uint64_t scratch[2] = {0, 0};
-  params[np] = &scratch[0];
-  params[np + 1] = &scratch[1];
-
-  int32_t status =
-      st->launch(kernel->function, gx, gy, gz, kernel->block_dim, 1, 1,
-                 kernel->shared, (void *)(uintptr_t)stream, params, NULL);
-  if (INTJ_UNLIKELY(status != 0)) {
-    const char *message = NULL;
-{% if error_style == 'return' %}
-    if (st->error_string)
-      message = st->error_string(status);
-{% else %}
-    if (st->error_string)
-      st->error_string(status, &message);
+  if (INTJ_UNLIKELY(status != 0))
+    return intj_launch_error(st, status);
 {% endif %}
-    PyErr_Format(PyExc_RuntimeError, "intj: {{ launch_symbol }} failed: %s",
-                 message ? message : "unknown error");
-    return NULL;
-  }
-{% endif %}
-{% if return_compiled %}
-  return Py_NewRef(kernel->compiled);
-{% else %}
-  Py_RETURN_NONE;
-{% endif %}
+  return result;
 }
 
 static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
@@ -832,21 +897,16 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
 {% if return_compiled and fixed_device and nwords %}
   if (bound->cache_ready && bound->module) {
     intj_state *st = (intj_state *)PyModule_GetState(bound->module);
-    return intj_cache_traverse(&bound->cache, &st->mutex, visit, arg);
+    return intj_cache_traverse(st, &bound->cache, visit, arg);
   }
 {% elif return_compiled and fixed_device %}
   if (bound->module) {
     intj_state *st = (intj_state *)PyModule_GetState(bound->module);
-    INTJ_LOCK(&st->mutex);
-    PyObject *compiled = bound->fixed_kernel
-                             ? Py_NewRef(bound->fixed_kernel->compiled)
-                             : NULL;
-    INTJ_UNLOCK(&st->mutex);
-    if (compiled) {
-      int result = visit(compiled, arg);
-      Py_DECREF(compiled);
-      return result;
-    }
+    intj_snapshot s = {NULL, 0, 0};
+    INTJ_RDLOCK(&st->lock);
+    int failed = bound->fixed_kernel ? intj_final_collect(bound->fixed_kernel, &s) : 0;
+    INTJ_RWUNLOCK(&st->lock);
+    return intj_snapshot_visit(&s, failed, visit, arg);
   }
 {% endif %}
   return 0;
@@ -870,12 +930,15 @@ static int intj_bound_clear(PyObject *self) {
 {% if fixed_device and nwords %}
   if (bound->cache_ready) {
     bound->cache_ready = 0;
-    intj_cache_free(&bound->cache);
+    intj_cache_free(&bound->cache, INTJ_V0_RELEASE);
   }
 {% elif fixed_device %}
-  intj_kernel *kernel = bound->fixed_kernel;
+  intj_final *kernel = bound->fixed_kernel;
   bound->fixed_kernel = NULL;
-  intj_kernel_free(kernel);
+  if (kernel) {
+    intj_final_release(kernel);
+    PyMem_RawFree(kernel);
+  }
 {% endif %}
   return 0;
 }
@@ -1071,10 +1134,10 @@ static PyObject *spec_key(PyObject *self, PyObject *const *args,
 static PyObject *set_compile_callback(PyObject *self, PyObject *cb) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   Py_INCREF(cb);
-  INTJ_LOCK(&st->mutex);
+  INTJ_WRLOCK(&st->lock);
   PyObject *old = st->compile_cb;
   st->compile_cb = cb;
-  INTJ_UNLOCK(&st->mutex);
+  INTJ_RWUNLOCK(&st->lock);
   Py_XDECREF(old); /* outside the lock: a finalizer runs python */
   Py_RETURN_NONE;
 }
@@ -1252,6 +1315,7 @@ static void *intj_dlsym(void *handle, const char *name) {
 
 static int intj_exec(PyObject *m) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
+  INTJ_RWLOCK_INIT(&st->lock);
 
   PyObject *torch = PyImport_ImportModule("torch");
   if (!torch)
@@ -1320,10 +1384,10 @@ static int intj_exec(PyObject *m) {
 
 static int intj_traverse(PyObject *m, visitproc visit, void *arg) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
-  INTJ_LOCK(&st->mutex);
+  INTJ_RDLOCK(&st->lock);
   PyObject *compile_cb = st->compile_cb;
   Py_XINCREF(compile_cb);
-  INTJ_UNLOCK(&st->mutex);
+  INTJ_RWUNLOCK(&st->lock);
   if (compile_cb) {
     int result = visit(compile_cb, arg);
     Py_DECREF(compile_cb);
@@ -1334,7 +1398,7 @@ static int intj_traverse(PyObject *m, visitproc visit, void *arg) {
   Py_VISIT(st->param_type);
   Py_VISIT(st->bound_type);
 {% if return_compiled and not fixed_device %}
-  return intj_cache_traverse(&st->cache, &st->mutex, visit, arg);
+  return intj_cache_traverse(st, &st->cache, visit, arg);
 {% else %}
   return 0;
 {% endif %}
@@ -1350,7 +1414,7 @@ static int intj_clear(PyObject *m) {
   Py_CLEAR(st->param_type);
   Py_CLEAR(st->bound_type);
 {% if return_compiled and not fixed_device %}
-  intj_cache_free(&st->cache);
+  intj_cache_free(&st->cache, INTJ_V0_RELEASE);
 {% endif %}
   return 0;
 }
@@ -1358,13 +1422,14 @@ static int intj_clear(PyObject *m) {
 /* Cache records release their CompiledKernels when return_compiled is enabled.
  * Triton unloads the function handles when the last owner goes away. */
 static void intj_free(void *module) {
-{% if not fixed_device %}
   intj_state *st = (intj_state *)PyModule_GetState((PyObject *)module);
+{% if not fixed_device %}
 {% if return_compiled %}
   st->abi.ready = 0;
 {% endif %}
-  intj_cache_free(&st->cache);
+  intj_cache_free(&st->cache, INTJ_V0_RELEASE);
 {% endif %}
+  INTJ_RWLOCK_DESTROY(&st->lock);
 }
 
 static PyMethodDef intj_methods[] = {

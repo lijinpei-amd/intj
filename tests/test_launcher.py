@@ -416,7 +416,7 @@ def test_repeated_key_uses_last_lookup_before_hash(device_kernel, bind_device):
             "static PyObject *entry"
         )
     ]
-    assert "intj_cache_lookup(cache, key, &hash)" in call
+    assert "intj_cache_lookup(cache, key)" in call
     assert "intj_hash(key)" not in call
 
 

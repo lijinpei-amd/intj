@@ -125,19 +125,25 @@ static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
 #define INTJ_FLOAT_VALUE(o) (((PyFloatObject *)(o))->ob_fval)
 
 /* The module's one lock, for what the GIL guards on a default build: the kernel
- * cache and the compile callback.  Compiled out with the GIL, so a default build
- * pays nothing.  PyMutex is zero-initialized unlocked, as module state is.
- * ponytail: every launch takes it on a free-threaded build, so concurrent
- * launchers serialize on the lookup (~20 ns); lock-free readers over an
- * insert-only table, with writers under this lock, if that shows up. */
+ * caches and the compile callback.  Launches take it shared across their
+ * lookups and the launch, because records live in the map and a put can move
+ * them; a put takes it exclusive.  Compiled out with the GIL, so a default
+ * build pays nothing.  CPython's own rwlock is private, hence pthread. */
 #ifdef Py_GIL_DISABLED
-typedef PyMutex intj_mutex;
-#define INTJ_LOCK(m) PyMutex_Lock(m)
-#define INTJ_UNLOCK(m) PyMutex_Unlock(m)
+#include <pthread.h>
+typedef pthread_rwlock_t intj_rwlock;
+#define INTJ_RWLOCK_INIT(l) pthread_rwlock_init((l), NULL)
+#define INTJ_RWLOCK_DESTROY(l) pthread_rwlock_destroy(l)
+#define INTJ_RDLOCK(l) pthread_rwlock_rdlock(l)
+#define INTJ_WRLOCK(l) pthread_rwlock_wrlock(l)
+#define INTJ_RWUNLOCK(l) pthread_rwlock_unlock(l)
 #else
-typedef char intj_mutex;
-#define INTJ_LOCK(m) ((void)(m))
-#define INTJ_UNLOCK(m) ((void)(m))
+typedef char intj_rwlock;
+#define INTJ_RWLOCK_INIT(l) ((void)(l))
+#define INTJ_RWLOCK_DESTROY(l) ((void)(l))
+#define INTJ_RDLOCK(l) ((void)(l))
+#define INTJ_WRLOCK(l) ((void)(l))
+#define INTJ_RWUNLOCK(l) ((void)(l))
 #endif
 
 /* Public calls the older interpreters predate. */

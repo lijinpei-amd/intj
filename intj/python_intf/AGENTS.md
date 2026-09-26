@@ -108,13 +108,14 @@ branches out of callers. Guard each shim by the version that added its call.
 ## Free-threaded modules
 
 Generated modules declare `Py_MOD_GIL_NOT_USED` on Python 3.13+, so loading them
-does not require CPython to enable the GIL. On a free-threaded build,
-`intj_mutex` is a `PyMutex` owned by the module. `INTJ_LOCK` and `INTJ_UNLOCK`
-protect kernel-cache lookup/insertion and access to the compile-callback
-reference. The lock is released before calling Python or the GPU driver. A
-cache miss checks again under the lock before inserting its result because
-another thread may have filled the same key during compilation. On a regular
-build, the lock operations compile away.
+does not require CPython to enable the GIL. `intj_rwlock`,
+owned by the module, is a pthread rwlock on free-threaded builds and a no-op
+otherwise. Launches take it shared (`INTJ_RDLOCK`) across their lookups and the
+GPU launch, because cache records live in the map and a put can move them;
+puts and `set_compile_callback` take it exclusive (`INTJ_WRLOCK`). It is never
+held while Python runs. A cache miss checks again under the write lock before
+inserting its result because another thread may have filled the same key
+during compilation.
 
 For Torch's `RUNTIME_SHIM` mode, `pyobject_size()` supplies the detecting
 interpreter's header size and lets `layout_for()` refuse an unrepresentable

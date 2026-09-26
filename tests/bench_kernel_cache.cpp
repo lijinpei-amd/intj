@@ -16,9 +16,8 @@
  * behaviour.
  *
  * It is built at three key lengths, which are the three the packed layout
- * produces and so also the three specializations in the header: 1, where the
- * hash is a bijection and the slot carries no key at all; 2, one multiply; and
- * 5, the loop.  Nothing here forks on INTJ_NWORDS -- `intj_hash` and
+ * produces and so also the three hash specializations in the header: 1, the
+ * splitmix64 finalizer; 2, one multiply; and 5, the loop.  Nothing here forks on INTJ_NWORDS -- `intj_hash` and
  * `intj_cache_*` keep one signature at every length, which is what lets this
  * file measure the underlying map for every key size.
  *
@@ -31,7 +30,7 @@
  * If you build this by hand at `-O1` with `-fsanitize=undefined` and
  * `INTJ_NWORDS=1`, every `hit/*` reports "lookup returned the wrong kernel".
  * That is a gcc 13.3.0 wrong-code bug, not a bug in the cache -- see the note
- * above `intj_slot` in intj_runtime.h for what was ruled out.  `-O2` and `-O3`,
+ * above `INTJ_DEFINE_MAP` in intj_map.h.  `-O2` and `-O3`,
  * which is what everything intj actually builds uses, are clean.
  */
 #include <benchmark/benchmark.h>
@@ -41,8 +40,11 @@
 #include <random>
 #include <vector>
 
-#define INTJ_TORCH_ACCESS_RUNTIME_SHIM /* the cache does not touch the tensor reader */
-#include "intj_runtime.h"
+#include "intj_map.h"
+
+static void release(intj_kernel *) {}
+INTJ_DEFINE_CACHE(intj_kernel)
+INTJ_DEFINE_MAP(bench_child, 1, intj_kernel, 4)
 
 #ifndef INTJ_CACHE_NAME
 #define INTJ_CACHE_NAME "unknown"
@@ -67,8 +69,6 @@ void hit(benchmark::State &state) {
   std::vector<uint64_t> hashes;
   for (auto &key : keys)
     hashes.push_back(intj_hash(key.data()));
-  /* the cache frees these: the records are its, per intj_cache_free */
-  std::vector<intj_kernel *> kernels(n);
 
   intj_cache cache;
   if (intj_cache_init(&cache) != 0) {
@@ -76,10 +76,10 @@ void hit(benchmark::State &state) {
     return;
   }
   for (int i = 0; i < n; i++) {
-    kernels[i] = (intj_kernel *)PyMem_RawCalloc(1, sizeof(intj_kernel));
-    if (intj_cache_put(&cache, keys[i].data(), hashes[i], kernels[i]) != 0) {
+    intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
+    if (!intj_cache_put(&cache, keys[i].data(), &k)) {
       state.SkipWithError("intj_cache_put failed");
-      intj_cache_free(&cache);
+      intj_cache_free(&cache, release);
       return;
     }
   }
@@ -89,10 +89,10 @@ void hit(benchmark::State &state) {
     const int j = i++ & (n - 1);
     intj_kernel *found = intj_cache_get(&cache, keys[j].data(), hashes[j]);
     benchmark::DoNotOptimize(found);
-    if (found != kernels[j])
+    if (!found || found->function != (void *)(uintptr_t)(j + 1))
       state.SkipWithError("lookup returned the wrong kernel");
   }
-  intj_cache_free(&cache);
+  intj_cache_free(&cache, release);
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
@@ -103,9 +103,7 @@ void miss(benchmark::State &state) {
   auto absent = make_keys(n);
   for (auto &key : absent)
     key[0] ^= 0x9e3779b97f4a7c15ull; /* same shape, not in the table */
-  std::vector<uint64_t> hashes, absent_hashes;
-  for (auto &key : keys)
-    hashes.push_back(intj_hash(key.data()));
+  std::vector<uint64_t> absent_hashes;
   for (auto &key : absent)
     absent_hashes.push_back(intj_hash(key.data()));
   intj_cache cache;
@@ -113,9 +111,10 @@ void miss(benchmark::State &state) {
     state.SkipWithError("intj_cache_init failed");
     return;
   }
-  for (int i = 0; i < n; i++)
-    intj_cache_put(&cache, keys[i].data(), hashes[i],
-                   (intj_kernel *)PyMem_RawCalloc(1, sizeof(intj_kernel)));
+  for (int i = 0; i < n; i++) {
+    intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
+    intj_cache_put(&cache, keys[i].data(), &k);
+  }
 
   int i = 0;
   for (auto _ : state) {
@@ -126,7 +125,7 @@ void miss(benchmark::State &state) {
     if (found != NULL)
       state.SkipWithError("a key that was never inserted was found");
   }
-  intj_cache_free(&cache);
+  intj_cache_free(&cache, release);
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
@@ -142,10 +141,33 @@ void hash_only(benchmark::State &state) {
   state.SetLabel(INTJ_CACHE_NAME);
 }
 
+/* A child level keyed by one computed bool: what a heuristic like
+ * `N % BLOCK == 0` adds to a launch after its level-0 lookup. */
+void hit_child(benchmark::State &state) {
+  bench_child map;
+  if (bench_child_init(&map) != 0) {
+    state.SkipWithError("init failed");
+    return;
+  }
+  uint64_t keys[2][1] = {{0}, {1}};
+  for (int i = 0; i < 2; i++) {
+    intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
+    bench_child_put(&map, keys[i], &k);
+  }
+  int i = 0;
+  for (auto _ : state) {
+    intj_kernel *found = bench_child_lookup(&map, keys[i++ & 1]);
+    benchmark::DoNotOptimize(found);
+  }
+  bench_child_free(&map, release);
+  state.SetLabel(INTJ_CACHE_NAME);
+}
+
 } // namespace
 
 BENCHMARK(hit)->Arg(1)->Arg(8)->Arg(64)->Arg(512);
 BENCHMARK(miss)->Arg(1)->Arg(8)->Arg(64)->Arg(512);
 BENCHMARK(hash_only);
+BENCHMARK(hit_child);
 
 BENCHMARK_MAIN();

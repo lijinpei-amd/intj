@@ -424,3 +424,20 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
 
     gc.collect()
     assert owner_ref() is None
+
+
+@triton.jit
+def keyed_value(x, K: tl.constexpr):
+    tl.store(x, K)
+
+
+def test_compiled_objects_survive_rehash():
+    launch = make_launcher(keyed_value, return_compiled=True)
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    first = [launch(device, stream, 1, x, k) for k in range(40)]
+    again = [launch(device, stream, 1, x, k) for k in range(40)]
+    assert all(a is b for a, b in zip(first, again))
+    torch.cuda.synchronize()
+    assert int(x.item()) == 39

@@ -21,7 +21,10 @@ import subprocess
 import sysconfig
 
 import pytest
+import triton
+import triton.language as tl
 
+from intj import TorchAccessMode, make_launcher
 from intj.kernel_cache import KernelCache, toolchain_for
 from intj.python_intf import cpython_abi
 
@@ -29,8 +32,8 @@ _RUNTIME = pathlib.Path(__import__("intj").__file__).parent / "runtime"
 _PYTHON_INTF = _RUNTIME.parent / "python_intf"
 _SOURCE = pathlib.Path(__file__).parent / "bench_kernel_cache.cpp"
 #: The three key lengths the packed layout actually produces, which are also the
-#: three hash and slot specializations: 1 = no constexpr and at most 7 params,
-#: where the hash is a bijection and the slot stores no key; 2 =
+#: three hash specializations: 1 = no constexpr and at most 7 params, the
+#: splitmix64 finalizer; 2 =
 #: add_kernel(x, y, out, n, BLOCK_SIZE); 5 = six tensors, three ints, three
 #: constexpr.  All three have to compile and self-check, not just the one a
 #: given kernel happens to hit.
@@ -143,3 +146,30 @@ def test_kernel_cache_benchmark(capsys):
     for (nwords, name), row in results.items():
         for backend, ns in row.items():
             assert 0.0 < ns < 1000.0, f"{backend} {name} at {nwords} words = {ns} ns"
+
+
+@triton.jit
+def keyed_store(x, K: tl.constexpr):
+    tl.store(x, K)
+
+
+@pytest.mark.parametrize("cache", list(KernelCache))
+def test_records_survive_rehash(cache):
+    """Records live in the slots now, so every growth moves them."""
+    launch = make_launcher(
+        keyed_store,
+        no_gpu=True,
+        kernel_cache=cache,
+        torch_access_mode=TorchAccessMode.INTERPRETER,
+    )
+    compiled = []
+
+    def compile_key(key, nparams, device, x, k):
+        compiled.append(k)
+        return 0, 1, 0, nparams
+
+    launch.__self__.set_compile_callback(compile_key)
+    for _ in range(2):
+        for k in range(100):
+            launch(0, 0, 1, 0, k)
+    assert compiled == list(range(100))

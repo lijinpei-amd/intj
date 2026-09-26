@@ -1,7 +1,7 @@
 /* INTJ launcher runtime: helpers shared by every rendered entry module.
  *
- * The rendered module must define INTJ_NWORDS (spec-key length in uint64 words)
- * before including this header.
+ * The rendered module defines INTJ_NWORDS, its record types and its cache
+ * (`INTJ_DEFINE_CACHE`, from intj_map.h) before including this header.
  */
 #pragma once
 
@@ -17,19 +17,7 @@
 #include <new>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define INTJ_ALWAYS_INLINE __attribute__((always_inline)) inline
-/* Only for branches whose outcome is a property of the design, not a guess
- * about the caller: a bad argument, a launch failure, a cold cache.  The
- * argument *types* are deliberately not marked -- the render cannot know
- * whether a parameter is usually a tensor or an int. */
-#define INTJ_LIKELY(x) __builtin_expect(!!(x), 1)
-#define INTJ_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define INTJ_ALWAYS_INLINE inline
-#define INTJ_LIKELY(x) (x)
-#define INTJ_UNLIKELY(x) (x)
-#endif
+#include "intj_map.h"
 
 /* CPYTHON_ACCESS_MODE.STATIC_COMPILE selects its layout by PY_VERSION_HEX. */
 #ifndef INTJ_CPYTHON_STATIC_COMPILE_HEADER
@@ -133,401 +121,43 @@ static INTJ_ALWAYS_INLINE int intj_grid_output(int64_t value, uint32_t *out) {
   return 0;
 }
 
-static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
-  __uint128_t r = (__uint128_t)a * b;
-  return (uint64_t)(r >> 64) ^ (uint64_t)r;
-}
-
-/* The renderer knows INTJ_NWORDS, so the shape is chosen rather than looped.
- * The signature is the same at every length: `tests/bench_kernel_cache.cpp` and
- * the entry template both call this, and a per-length signature would fork both
- * callers for nothing.
- *
- * At one word the mix is replaced by a bijection -- xorshift-right and an odd
- * multiply both are -- which makes hash equality key equality and lets the slot
- * drop the key altogether (see intj_slot).  At two, one multiply suffices, the
- * way wyhash handles a short input.  Above that the chain is split across two
- * lanes: a mix is a ~4-cycle multiply and the whole chain sits between the last
- * argument decode and the first table probe, so five words is ~20 cycles of
- * pure latency serially and ~12 in pairs.  Same reason wyhash runs three lanes
- * over a 48-byte block.
- */
-#if INTJ_NWORDS == 1
-static inline uint64_t intj_hash(const uint64_t *w) {
-  uint64_t x = w[0];
-  x ^= x >> 30;
-  x *= 0xbf58476d1ce4e5b9ull;
-  x ^= x >> 27;
-  x *= 0x94d049bb133111ebull;
-  x ^= x >> 31;
-  return x;
-}
-#elif INTJ_NWORDS == 2
-static inline uint64_t intj_hash(const uint64_t *w) {
-  const uint64_t s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull;
-  return intj_mix(intj_mix(w[0] ^ s0, w[1] ^ s1), 2 * 8 + s1);
-}
-#else
-static inline uint64_t intj_hash(const uint64_t *w) {
-  const uint64_t s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull;
-  uint64_t h0 = s0, h1 = s1;
-  int i = 0;
-  for (; i + 1 < INTJ_NWORDS; i += 2) {
-    h0 = intj_mix(h0 ^ s1, w[i] ^ s0);
-    h1 = intj_mix(h1 ^ s0, w[i + 1] ^ s1);
-  }
-  if (i < INTJ_NWORDS)
-    h0 = intj_mix(h0 ^ s1, w[i] ^ s0);
-  return intj_mix(h0 ^ h1, INTJ_NWORDS * 8 + s1);
-}
-#endif
-
+/* Objects a GC traverse visits, collected under the read lock.  A visitor can
+ * reenter Python and grow the cache, so the visits happen after the lock is
+ * released, with every object kept alive through the last visit. */
 typedef struct {
-  void *function;     /* hipFunction_t / CUfunction */
-  uint32_t block_dim; /* warp_size * num_warps */
-  uint32_t shared;    /* dynamic LDS bytes */
-  uint32_t nparams;   /* kernel params, scratch slots excluded */
-#ifdef INTJ_RETURN_COMPILED
-  PyObject *compiled; /* owns the CompiledKernel behind function */
-#endif
-} intj_kernel;
+  PyObject **items;
+  size_t n, cap;
+} intj_snapshot;
 
-static inline void intj_kernel_free(intj_kernel *kernel) {
-  if (!kernel)
-    return;
-#ifdef INTJ_RETURN_COMPILED
-  Py_XDECREF(kernel->compiled);
-#endif
-  PyMem_RawFree(kernel);
-}
-
-typedef struct {
-  uint64_t key[INTJ_NWORDS];
-  intj_kernel *kernel; /* borrowed from the owning map */
-} intj_last_key;
-
-/* At one word `intj_hash` is a bijection, so `hash == h` IS key equality and the
- * slot has no reason to carry the key: 16 bytes, four to a cache line, against
- * 8 + 8 + INTJ_NWORDS * 8.  A probe is a cache miss, and the slot size is what
- * decides how many lines that miss costs.
- *
- * gcc 13.3.0 miscompiles the lookup below at `-O1 -fsanitize=undefined` (or
- * `=null`, or `=alignment`, each alone) when this branch is taken: the inlined
- * `intj_map_get` returns NULL for a key that is present, while an immediately
- * following identical call returns it.  Ruled out as a bug here rather than in
- * intj: UBSan reports no diagnostic at all -- it silently changes behaviour,
- * which is what a wrong-code bug looks like and a real null/alignment violation
- * does not; the keyed slot at INTJ_NWORDS==1 with this same hash is clean under
- * identical flags; -O0, -O2, -O3, every level without a sanitizer, and clang
- * are all clean; and no rephrasing of the loop (hoisting the loads, dropping
- * the INTJ_LIKELY hints) changes it.  It would not reduce to a standalone file,
- * so there is no upstream report yet.
- *
- * Nothing intj builds is affected: triton compiles rendered modules at `-O3`
- * with no sanitizer (`triton/runtime/build.py`), and so does
- * `tests/test_kernel_cache.py`.  It is recorded because the benchmark is the
- * only GPU-free coverage of this code, and someone will eventually build it by
- * hand with sanitizers and go looking for the bug in here.
- */
-#if INTJ_NWORDS == 1
-typedef struct {
-  uint64_t hash;
-  intj_kernel *val; /* NULL => empty slot */
-} intj_slot;
-#else
-typedef struct {
-  uint64_t hash;
-  intj_kernel *val; /* NULL => empty slot */
-  uint64_t key[INTJ_NWORDS];
-} intj_slot;
-#endif
-
-typedef struct {
-  intj_slot *slots;
-  uint32_t mask;
-  uint32_t used;
-  intj_last_key last;
-} intj_map;
-
-/* memcmp, not a word loop: the loop has to exit early, so it compiles to one
- * mov/cmp/jne per word, while memcmp of a compile-time size vectorizes -- three
- * vpxor/vptest cover 88 bytes.  Measured on an 11-word key: 33 instructions and
- * 11 dependent branches down to 12 and 3. */
-#if INTJ_NWORDS > 1 /* at one word the hash settles it; see intj_slot */
-static inline int intj_key_eq(const uint64_t *a, const uint64_t *b) {
-  return memcmp(a, b, INTJ_NWORDS * sizeof(uint64_t)) == 0;
-}
-#endif
-
-static inline intj_kernel *intj_map_get(const intj_map *m, const uint64_t *k,
-                                        uint64_t h) {
-#if INTJ_NWORDS == 1
-  (void)k;
-#endif
-  uint32_t i = (uint32_t)h & m->mask;
-  for (;;) {
-    const intj_slot *s = &m->slots[i];
-    if (INTJ_UNLIKELY(!s->val))
-      return NULL;
-#if INTJ_NWORDS == 1
-    if (INTJ_LIKELY(s->hash == h))
-#else
-    if (INTJ_LIKELY(s->hash == h && intj_key_eq(s->key, k)))
-#endif
-      return s->val;
-    i = (i + 1) & m->mask;
-  }
-}
-
-static int intj_map_init(intj_map *m, uint32_t cap) {
-  m->slots = (intj_slot *)PyMem_RawCalloc(cap, sizeof(intj_slot));
-  if (!m->slots)
-    return -1;
-  m->mask = cap - 1;
-  m->used = 0;
-  m->last.kernel = NULL;
-  return 0;
-}
-
-static void intj_map_insert(intj_map *m, const uint64_t *k, uint64_t h,
-                            intj_kernel *val) {
-#if INTJ_NWORDS == 1
-  (void)k;
-#endif
-  uint32_t i = (uint32_t)h & m->mask;
-  while (m->slots[i].val)
-    i = (i + 1) & m->mask;
-  m->slots[i].hash = h;
-  m->slots[i].val = val;
-#if INTJ_NWORDS > 1
-  memcpy(m->slots[i].key, k, INTJ_NWORDS * sizeof(uint64_t));
-#endif
-  m->used++;
-}
-
-/* Returns -1 on allocation failure (with no python error set). */
-static int intj_map_put(intj_map *m, const uint64_t *k, uint64_t h,
-                        intj_kernel *val) {
-  if ((m->used + 1) * 2 > m->mask + 1) {
-    uint32_t cap = (m->mask + 1) * 2;
-    intj_map grown;
-    if (intj_map_init(&grown, cap) != 0)
+static inline int intj_snapshot_add(intj_snapshot *s, PyObject *o) {
+  if (!o)
+    return 0;
+  if (s->n == s->cap) {
+    size_t cap = s->cap ? 2 * s->cap : 16;
+    PyObject **items =
+        (PyObject **)PyMem_RawRealloc(s->items, cap * sizeof(*items));
+    if (!items)
       return -1;
-    for (uint32_t i = 0; i <= m->mask; i++)
-      if (m->slots[i].val)
-#if INTJ_NWORDS == 1 /* no key to carry over: the hash is the key */
-        intj_map_insert(&grown, NULL, m->slots[i].hash, m->slots[i].val);
-#else
-        intj_map_insert(&grown, m->slots[i].key, m->slots[i].hash,
-                        m->slots[i].val);
-#endif
-    PyMem_RawFree(m->slots);
-    *m = grown;
+    s->items = items;
+    s->cap = cap;
   }
-  intj_map_insert(m, k, h, val);
+  s->items[s->n++] = Py_NewRef(o);
   return 0;
 }
 
-#ifdef INTJ_RETURN_COMPILED
-/* A visitor can reenter Python and grow the cache. Release the lock before
- * visiting, while keeping every CompiledKernel alive through the last visit. */
-static inline int intj_visit_snapshot(PyObject **objects, size_t count,
+static inline int intj_snapshot_visit(intj_snapshot *s, int failed,
                                       visitproc visit, void *arg) {
   int result = 0;
-  for (size_t i = 0; i < count; i++) {
-    result = visit(objects[i], arg);
-    if (result)
-      break;
+  if (failed) {
+    PyErr_NoMemory();
+    result = -1;
   }
-  for (size_t i = 0; i < count; i++)
-    Py_DECREF(objects[i]);
-  PyMem_RawFree(objects);
+  for (size_t i = 0; !result && i < s->n; i++)
+    result = visit(s->items[i], arg);
+  for (size_t i = 0; i < s->n; i++)
+    Py_DECREF(s->items[i]);
+  PyMem_RawFree(s->items);
   return result;
-}
-#endif
-
-/* The kernel cache behind four calls, so the entry template never names an
- * implementation.  INTJ_CACHE_{INTJ,TSL,ABSL} selects one; the last two are
- * C++ and so force the module to be compiled as C++.
- *
- * `intj_cache` is POD in every mode -- it lives in module state, which CPython
- * hands out as zeroed memory, so a member with a constructor would need a
- * placement new the template should not have to know about.  The C++ maps are
- * held by pointer for the same reason.
- *
- * Lookups are handed the hash the caller already computed.  Only tsl can take
- * it; abseil has no such API and re-computes it, which is the measured cost of
- * that option rather than an oversight.
- */
-#if defined(INTJ_CACHE_TSL) || defined(INTJ_CACHE_ABSL)
-
-#include <cstring>
-#include <new>
-#if defined(INTJ_CACHE_TSL)
-#include <tsl/robin_map.h>
-#else
-#include <absl/container/flat_hash_map.h>
-#endif
-
-struct intj_key {
-  uint64_t w[INTJ_NWORDS];
-  bool operator==(const intj_key &o) const {
-    return memcmp(w, o.w, sizeof(w)) == 0;
-  }
-};
-
-struct intj_key_hash {
-  using is_avalanching = void; /* wyhash output: no further mixing wanted */
-  size_t operator()(const intj_key &k) const { return (size_t)intj_hash(k.w); }
-};
-
-#if defined(INTJ_CACHE_TSL)
-using intj_cache_map = tsl::robin_map<intj_key, intj_kernel *, intj_key_hash>;
-#else
-using intj_cache_map =
-    absl::flat_hash_map<intj_key, intj_kernel *, intj_key_hash>;
-#endif
-
-typedef struct {
-  intj_cache_map *map;
-  intj_last_key last;
-} intj_cache;
-
-static inline int intj_cache_init(intj_cache *c) {
-  c->map = new (std::nothrow) intj_cache_map();
-  c->last.kernel = NULL;
-  return c->map ? 0 : -1;
-}
-
-static inline intj_kernel *intj_cache_get(const intj_cache *c,
-                                          const uint64_t *k, uint64_t h) {
-  const intj_key *key = (const intj_key *)k;
-#if defined(INTJ_CACHE_TSL)
-  auto it = c->map->find(*key, (size_t)h);
-#else
-  (void)h;
-  auto it = c->map->find(*key);
-#endif
-  return it == c->map->end() ? NULL : it->second;
-}
-
-/* Returns -1 on allocation failure (with no python error set).  The maps throw
- * where intj returns, and an exception reaching CPython's C frames is
- * std::terminate, so the throw stops here. */
-static inline int intj_cache_put(intj_cache *c, const uint64_t *k, uint64_t h,
-                                 intj_kernel *val) {
-  (void)h;
-  try {
-    (*c->map)[*(const intj_key *)k] = val;
-  } catch (...) {
-    return -1;
-  }
-  return 0;
-}
-
-#ifdef INTJ_RETURN_COMPILED
-static inline int intj_cache_traverse(const intj_cache *c, intj_mutex *mutex,
-                                      visitproc visit, void *arg) {
-  INTJ_LOCK(mutex);
-  size_t count = c->map ? c->map->size() : 0;
-  PyObject **objects = (PyObject **)PyMem_RawMalloc(count * sizeof(*objects));
-  if (count && !objects) {
-    INTJ_UNLOCK(mutex);
-    PyErr_NoMemory();
-    return -1;
-  }
-  size_t i = 0;
-  if (c->map)
-    for (const auto &entry : *c->map)
-      objects[i++] = Py_NewRef(entry.second->compiled);
-  INTJ_UNLOCK(mutex);
-  return intj_visit_snapshot(objects, count, visit, arg);
-}
-#endif
-
-/* Detach before DECREF: a CompiledKernel finalizer may reenter GC. */
-static inline void intj_cache_free(intj_cache *c) {
-  intj_cache_map *map = c->map;
-  c->map = NULL;
-  c->last.kernel = NULL;
-  if (!map)
-    return;
-  for (auto &entry : *map)
-    intj_kernel_free(entry.second);
-  delete map;
-}
-
-#else /* INTJ_CACHE_INTJ */
-
-typedef intj_map intj_cache;
-
-static inline int intj_cache_init(intj_cache *c) {
-  return intj_map_init(c, 16);
-}
-
-static inline intj_kernel *intj_cache_get(const intj_cache *c,
-                                          const uint64_t *k, uint64_t h) {
-  return intj_map_get(c, k, h);
-}
-
-static inline int intj_cache_put(intj_cache *c, const uint64_t *k, uint64_t h,
-                                 intj_kernel *val) {
-  return intj_map_put(c, k, h, val);
-}
-
-#ifdef INTJ_RETURN_COMPILED
-static inline int intj_cache_traverse(const intj_cache *c, intj_mutex *mutex,
-                                      visitproc visit, void *arg) {
-  INTJ_LOCK(mutex);
-  size_t count = c->slots ? c->used : 0;
-  PyObject **objects = (PyObject **)PyMem_RawMalloc(count * sizeof(*objects));
-  if (count && !objects) {
-    INTJ_UNLOCK(mutex);
-    PyErr_NoMemory();
-    return -1;
-  }
-  size_t n = 0;
-  if (c->slots)
-    for (uint32_t i = 0; i <= c->mask; i++) {
-      intj_kernel *kernel = c->slots[i].val;
-      if (kernel)
-        objects[n++] = Py_NewRef(kernel->compiled);
-    }
-  INTJ_UNLOCK(mutex);
-  return intj_visit_snapshot(objects, count, visit, arg);
-}
-#endif
-
-/* Detach before DECREF: a CompiledKernel finalizer may reenter GC. */
-static inline void intj_cache_free(intj_cache *c) {
-  intj_slot *slots = c->slots;
-  c->slots = NULL;
-  c->last.kernel = NULL;
-  if (!slots)
-    return;
-  for (uint32_t i = 0; i <= c->mask; i++)
-    intj_kernel_free(slots[i].val);
-  PyMem_RawFree(slots);
-}
-
-#endif
-
-static inline void intj_cache_remember(intj_cache *c, const uint64_t *key,
-                                       intj_kernel *kernel) {
-  memcpy(c->last.key, key, sizeof(c->last.key));
-  c->last.kernel = kernel;
-}
-
-/* The common launch lookup: a repeated key skips both hash and map probe. */
-static inline intj_kernel *intj_cache_lookup(intj_cache *c, const uint64_t *key,
-                                             uint64_t *hash) {
-  if (c->last.kernel && memcmp(c->last.key, key, sizeof(c->last.key)) == 0)
-    return c->last.kernel;
-  *hash = intj_hash(key);
-  intj_kernel *kernel = intj_cache_get(c, key, *hash);
-  if (kernel)
-    intj_cache_remember(c, key, kernel);
-  return kernel;
 }
 
 /* intj reads three things off a tensor: the data pointer, the dtype (as an
@@ -979,7 +609,7 @@ typedef struct intj_bound_launcher {
   int cache_ready;
 #endif
 #ifdef INTJ_BOUND_FIXED_KERNEL
-  intj_kernel *fixed_kernel;
+  intj_final *fixed_kernel;
 #endif
 #ifdef INTJ_FIXED_DEVICE
   int64_t device_ordinal;
