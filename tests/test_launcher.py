@@ -3186,6 +3186,7 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
         None,
         True,
         1.0,
+        "int32",  # a str spelling a dtype name is still a str
         tl.int32,
         tl.float32,
         tl.dtype("int32"),
@@ -3978,7 +3979,11 @@ def test_module_key_tracks_cache_compiler_language(
 
 @pytest.mark.parametrize(
     "build,differing",
-    [(_render_context, {"nwords": 5}), (_module_key, {"cache_key": "d"})],
+    [
+        (_render_context, {"nwords": 5}),
+        (_render_context, {"dynamic": (launcher.DynamicSlot("num_warps", 8, 16, 0),)}),
+        (_module_key, {"cache_key": "d"}),
+    ],
 )
 def test_value_types_compare_hash_and_serialize(build, differing):
     """Both carry only immutable fields, so they behave as values.
@@ -5036,3 +5041,117 @@ def test_failed_first_call_leaves_the_launcher_unbuilt(scalar_kernel, monkeypatc
         launch(0, 0, 1, 7)
     assert launch(0, 0, 1, 7) is None
     assert len(calls) == 2
+
+
+def test_dynamic_num_warps_keys_separate_records():
+    launch = make_launcher(
+        act_store, dynamic_options=("num_warps",), return_compiled=True
+    )
+    o = torch.zeros(1, device="cuda")
+    two = launch(*_gpu_controls(), 2, o, 1.0, "pos")
+    four = launch(*_gpu_controls(), 4, o, 1.0, "pos")
+    assert two.metadata.num_warps == 2 and four.metadata.num_warps == 4
+    assert launch(*_gpu_controls(), 2, o, 1.0, "pos") is two
+    assert tuple(inspect.signature(launch).parameters) == (
+        "device",
+        "stream",
+        "grid",
+        "num_warps",
+        "o",
+        "x",
+        "ACT",
+    )
+    with pytest.raises(
+        AssertionError
+    ):  # parse_options: not a power of two, raised on this miss
+        launch(*_gpu_controls(), 3, o, 1.0, "pos")
+
+
+def test_declared_knob_is_set_for_the_compile_and_restored(monkeypatch):
+    import intj.launcher as launcher
+    from triton import knobs
+
+    before = knobs.runtime.debug
+    seen, real = [], launcher._checked_compile
+
+    def spy(*args, **kwargs):
+        seen.append(knobs.runtime.debug)
+        if len(seen) == 1:
+            raise RuntimeError("compile failed")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_checked_compile", spy)
+    launch = make_launcher(
+        act_store, dynamic_options=("knobs.runtime.debug",), return_compiled=True
+    )
+    o = torch.zeros(1, device="cuda")
+    with pytest.raises(RuntimeError, match="compile failed"):
+        launch(*_gpu_controls(), not before, o, 1.0, "pos")
+    assert knobs.runtime.debug == before
+    kernel = launch(*_gpu_controls(), not before, o, 1.0, "pos")
+    assert seen == [not before, not before] and knobs.runtime.debug == before
+    assert kernel.metadata.debug == (act_store.debug or not before)
+
+
+def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
+    """The live value of a declared knob is not read into the ModuleKey, so
+    flipping it before the first call builds no second module."""
+    from triton import knobs
+
+    def build():
+        launch = make_launcher(act_store, dynamic_options=("knobs.runtime.debug",))
+        return module_of(launch)
+
+    first = build()
+    monkeypatch.setattr(knobs.runtime, "debug", not knobs.runtime.debug)
+    assert build() is first
+
+
+@pytest.mark.skipif(
+    getattr(triton.runtime.driver.active.get_current_target(), "backend", None)
+    != "hip",
+    reason="knobs.amd.use_buffer_ops is a HIP knob",
+)
+def test_declared_knob_reaches_the_specialization():
+    """HIP's pointer specialization reads knobs.amd.use_buffer_ops, so the
+    compiler input is built under the call's knob values, like the compile."""
+    from triton import knobs
+
+    before = knobs.amd.use_buffer_ops
+    launch = make_launcher(
+        act_store, dynamic_options=("knobs.amd.use_buffer_ops",), return_compiled=True
+    )
+    o = torch.zeros(1, device="cuda")
+    on = launch(*_gpu_controls(), True, o, 1.0, "pos")
+    off = launch(*_gpu_controls(), False, o, 1.0, "pos")
+    assert knobs.amd.use_buffer_ops == before
+    assert "tt.pointer_range" in str(on.src.attrs)
+    assert "tt.pointer_range" not in str(off.src.attrs)
+    assert launch(*_gpu_controls(), False, o, 1.0, "pos") is off
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"dynamic_options": ("knobs.nope.x",)}, "unknown knob"),
+        ({"dynamic_options": ("knobs.runtime.nope",)}, "unknown knob"),
+        ({"dynamic_options": ("num_warps",), "options": {"num_warps": 4}}, "both"),
+        (
+            {"dynamic_options": ("knobs.runtime.debug",), "options": {"debug": True}},
+            "both",
+        ),
+        ({"dynamic_options": ("num_warps", "num_warps")}, "repeats"),
+        ({"dynamic_options": ("x",)}, "kernel parameter"),
+        ({"dynamic_options": ("stream",)}, "not allowed"),
+        ({"dynamic_options": ("num_warps",), "no_gpu": True}, "GPU"),
+    ],
+)
+def test_dynamic_option_refusals(kwargs, match):
+    with pytest.raises(UnsupportedKernel, match=match):
+        make_launcher(act_store, **kwargs)
+
+
+def test_unknown_dynamic_option_is_refused_on_the_first_call():
+    launch = make_launcher(act_store, dynamic_options=("num_warpz",))
+    with pytest.raises(UnsupportedKernel, match="unknown compile option"):
+        launch(*_gpu_controls(), 4, torch.zeros(1, device="cuda"), 1.0, "pos")

@@ -36,11 +36,14 @@ def compile_grid(
     params: Sequence[Param],
     baked: Mapping[int, object],
     deps: Mapping[str, int] | None = None,
+    offset: int = 0,
 ) -> GridCode:
     """Validate `fn` without executing it and emit one checked native evaluator.
 
     `deps` maps tuned parameter names to their slot in the record's dependent
     values. When it is given, the evaluator takes them as `const int64_t *dep`.
+    `offset` counts the dynamic values between the grid extras and the public
+    arguments.
     """
     if type(fn) is not types.FunctionType:
         raise GridError("grid_cpp requires a Python def function")
@@ -161,7 +164,7 @@ def compile_grid(
                     f"{1 if kind == 'bool' else 0}, {json.dumps(name)}, &{var}) != 0) return -1;"
                 )
             elif param.call_index is not None:
-                index = len(extras) + param.call_index
+                index = len(extras) + offset + param.call_index
                 lines.append(f"  int64_t {var};")
                 lines.append(
                     f"  if (intj_grid_input_{kind}(args[{index}], {json.dumps(name)}, &{var}) != 0) return -1;"

@@ -8,7 +8,7 @@ from intj import KernelCache, TorchAccessMode, make_launcher
 launcher = make_launcher(
     jit_func,              # a @triton.jit function
     dynamic_grid=False,    # reserved, must be False
-    dynamic_options=(),    # reserved, must be empty
+    dynamic_options=(),    # compile options / knobs.<group>.<name> passed per call
     extra_annotation=None, # parameter name -> annotation or shorthand
     options=None,          # triton compile options, e.g. {"num_warps": 8}
     torch_access_mode=None, # automatic; pass a TorchAccessMode to select one
@@ -117,6 +117,39 @@ launch. With `return_compiled=True`, it returns the cached Triton
 `CompiledKernel`; a zero-volume grid still compiles or finds that kernel, but
 does not dispatch it. Repeated calls for the same specialization return the
 same object. This mode requires GPU compilation and rejects `no_gpu=True`.
+
+### Per-call compile options and knobs: `dynamic_options`
+
+```python
+@intj.make_launcher(grid_cpp=grid, dynamic_options=("num_warps", "knobs.runtime.debug"))
+@triton.jit
+def k(x, out, n, ACT: tl.constexpr, BLOCK: tl.constexpr): ...
+
+k(device, stream, 8, False, x, out, n, "gelu", 128)   # num_warps=8, debug off
+```
+
+Each name becomes a positional argument right after the grid controls, in
+the declared order, and its value is part of the key: an `int`, `bool` or
+`float` by value and kind, a `str` (e.g. `knobs.compilation.instrumentation_mode`)
+through the same id table as object constexprs. A name is either a compile
+option (`num_warps`, `num_stages`, `waves_per_eu`, ...) or a Triton knob path
+`knobs.<group>.<name>` (`knobs.runtime.debug`, `knobs.amd.use_buffer_ops`, ...).
+On a miss, options merge into `options=` and go through `parse_options` per
+kernel (an invalid value such as `num_warps=3` raises on that call); knobs are
+set to the call's values with Triton's `knobs` scope for the duration of the
+compile, then restored. The knobs are process globals, so a compile running on
+another thread meanwhile sees the declared values too. With `triton.autotune`,
+the values reach every config.
+
+Refused at `make_launcher` with `UnsupportedKernel`: an unknown knob path, a
+repeated name, a name also given in `options=` (for knobs, the option the knob
+feeds, e.g. `debug`), a kernel parameter name, `device`/`stream`/`device_type`/
+`warp_size`, a name an autotune config sets, and `no_gpu=True`. An unknown
+compile-option name raises on the first call, where the target is known.
+
+Knobs you do not declare are read once, at the first call, and fixed for that
+launcher (`debug`, `instrumentation_mode`, fpsan casts feed its options). Other
+cache-invalidating knobs are not keyed; see `TODO.md`.
 
 ### Compiled grid: `grid_cpp`
 
@@ -399,7 +432,8 @@ An untyped, unbaked `tl.constexpr` also takes a `str`, a `tl.dtype`, or a
 one kernel, and two JIT functions with the same source share one kernel. Each value gets a
 small id from a table owned by the launcher (never persisted, never in the
 module digest); each argument slot remembers its last object, so passing the
-same object again costs one pointer compare. A JIT function's `cache_key` is
+same object again costs one pointer compare (free-threaded builds also take
+the launcher's read lock for it). A JIT function's `cache_key` is
 read when the function is first seen, so later edits to a callee are not seen
 -- Triton has the same limitation. Baking the value with `extra_annotation`
 still works and removes it from the call.
@@ -421,8 +455,7 @@ hits it:
   range) and calling `register()`. **CUDA is compile-checked but runtime-untested** --
   there is no NVIDIA GPU on the development machine.
 - `TRITON_INTERPRET=1`.
-- `dynamic_grid=True` and per-launch options (`dynamic_options`). Use `grid_cpp`
-  or `grid_py` for a callable grid.
+- `dynamic_grid=True`. Use `grid_cpp` or `grid_py` for a callable grid.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
 - Tuple, `tl.constexpr` object and `TensorDescriptor` arguments, and `str` /
   `tl.dtype` / JIT-function values for anything but an untyped `tl.constexpr`.

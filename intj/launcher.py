@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -18,7 +19,14 @@ import threading
 import types
 import warnings
 import weakref
-from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import (
+    Callable,
+    Generator,
+    Iterable,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, overload
 
@@ -109,6 +117,16 @@ class TuningRender:
 
 
 @dataclasses.dataclass(frozen=True)
+class DynamicSlot:
+    """One `dynamic_options` entry as `entry.c.jinja` renders it."""
+
+    name: str  # compile option or `knobs.<group>.<name>`
+    value_offset: int | None  # None only under an invariant test's mutation
+    kind_offset: int | None
+    memo: int  # its intj_memo in the launcher's trailing arrays
+
+
+@dataclasses.dataclass(frozen=True)
 class CompilerInput:
     """The final annotated ASTSource identity, with its original Python constants."""
 
@@ -185,6 +203,8 @@ class RenderContext:
     grid_extra: tuple[str, ...] = ()
     return_compiled: bool = False
     tuning: TuningRender | None = None
+    #: `dynamic_options`, in call order: they shape the call and the key
+    dynamic: tuple[DynamicSlot, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,6 +252,7 @@ class LauncherFactory:
     return_compiled: bool = False
     tuned: _Tuned | None = None
     grid_fn: object | None = None
+    dynamic: tuple[str, ...] = ()
 
     def bind(self, /, **values: object) -> Callable[..., Any]:
         if self.bind_device_requested:
@@ -315,12 +336,13 @@ class LauncherFactory:
             self.grid_arg,
             self.grid_cpp,
             self.grid_py is not None,
+            dynamic=self.dynamic,
         )
 
         def build(header: object) -> int:
             return self._build(header, state, args, hidden)
 
-        nmemo = sum(p.memo is not None for p in params)
+        nmemo = sum(p.memo is not None for p in params) + len(self.dynamic)
         return _stub().new_launcher(_tail_bytes(nmemo, len(bound_values)), doc, build)
 
     def _build(
@@ -332,7 +354,13 @@ class LauncherFactory:
     ) -> int:
         """The first call: query the target, render, compile, load, fill `header`.
         Returns the rendered entry's address for `_intj_lazy` to swap in."""
-        knob_values = None if self.no_gpu else _live_knobs()
+        # a declared knob is per call: leaving its live value out keeps it out
+        # of the ModuleKey, so it cannot build a module per value
+        knob_values = (
+            None
+            if self.no_gpu
+            else {k: v for k, v in _live_knobs().items() if k not in self.dynamic}
+        )
         if self.tuned is not None:
             assert knob_values is not None, "_plan_tuning refuses no_gpu"
             _check_tuned_configs(
@@ -353,6 +381,7 @@ class LauncherFactory:
             return_compiled=self.return_compiled,
             tuning=self.tuned.render if self.tuned else None,
             knob_values=knob_values,
+            dynamic=self.dynamic,
         )
         if self.tuned is None:
             callback: Callable[..., Any] = _launcher_compile(module)
@@ -380,6 +409,7 @@ class LauncherFactory:
                 self.tuned.render,
                 self.return_compiled,
                 knob_values,
+                self.dynamic,
             )
         grid_py = () if self.grid_py is None else (self.grid_py, hidden)
         return module.init_bound(header, callback, _Interner(), *grid_py, *args)
@@ -409,9 +439,11 @@ def _validate_grid_kwargs(
         raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
     if grid_py is not None and not callable(grid_py):
         raise TypeError("intj: grid_py must be callable")
-    if dynamic_options:
+    if isinstance(dynamic_options, str):
+        raise TypeError("intj: dynamic_options is a sequence of names, not one string")
+    if dynamic_options and no_gpu:
         raise UnsupportedKernel(
-            "intj: dynamic_options is not implemented; pass options=... instead"
+            "intj: dynamic_options needs GPU mode; no_gpu=True compiles nothing"
         )
     if return_compiled and no_gpu:
         raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
@@ -515,7 +547,9 @@ def make_launcher(
     None selects automatically. See `TorchAccessMode`. `kernel_cache` picks the
     hash map behind the kernel cache; see `KernelCache`. `no_gpu=True` decodes
     and caches on the host without compiling or launching a GPU kernel.
-    `dynamic_grid` and `dynamic_options` are reserved and unsupported.
+    `dynamic_options` names compile options and `knobs.<group>.<name>` paths
+    passed per call, right after the grid controls, and keyed; `dynamic_grid`
+    is reserved.
     `verify_annotation=True` checks declared types, ranges and assumed facts;
     otherwise these are caller promises.
     `return_compiled=True` returns the cached Triton CompiledKernel after a
@@ -597,6 +631,8 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
+    dynamic = tuple(dynamic_options)
+    _check_dynamic(dynamic, options, kernel, tuned)
     deps: Mapping[str, int] | None = None
     if tuned is not None:
         render = _tuning_render(tuned.plan, resolved, grid_cpp, grid_py)
@@ -613,6 +649,7 @@ def make_launcher(
                 grid_params,
                 {p.index: p.baked for p in resolved if p.annotation.baked_value},
                 deps,
+                offset=len(dynamic),
             )
         except GridError as error:
             raise UnsupportedKernel(f"intj: {error}") from error
@@ -649,6 +686,7 @@ def make_launcher(
         bool(return_compiled),
         tuned,
         grid_cpp,
+        dynamic=dynamic,
     )
     return factory if needs_binding else factory.bind()
 
@@ -668,6 +706,7 @@ def _materialize_module(
     return_compiled: bool = False,
     tuning: TuningRender | None = None,
     knob_values: Mapping[str, object] | None = None,
+    dynamic: tuple[str, ...] = (),
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -685,8 +724,15 @@ def _materialize_module(
         canonical_options = _canonical_options(
             target, _knob_options(jit_func, options, knob_values)
         )
-    params, device_offset, nwords, computed_fields = _render_key(
-        resolved, device_binding, tuning.computed[0] if tuning is not None else 0
+        # the names only: each value is canonicalized on its own miss
+        _refuse_unknown_options(
+            canonical_options, [n for n in dynamic if not n.startswith("knobs.")]
+        )
+    params, device_offset, nwords, computed_fields, slots = _render_key(
+        resolved,
+        device_binding,
+        tuning.computed[0] if tuning is not None else 0,
+        dynamic,
     )
     if tuning is not None:
         # final only now: level-0 computed keys are placed with the spec fields
@@ -742,6 +788,7 @@ def _materialize_module(
         grid_extra=grid_cpp.extras if grid_cpp else (),
         return_compiled=return_compiled,
         tuning=tuning,
+        dynamic=slots,
     )
 
     # The rendered source is a pure function of the template, the runtime header
@@ -773,7 +820,15 @@ def _materialize_module(
     )
     baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
     return _loaded_module(
-        key, jit_func, context, params, options, layout, baked_values, knob_values
+        key,
+        jit_func,
+        context,
+        params,
+        options,
+        layout,
+        baked_values,
+        knob_values,
+        dynamic,
     )
 
 
@@ -878,18 +933,109 @@ def _knob_options(
     jit_func: JitFunction, options: Mapping[str, Any], knob_values: Mapping[str, object]
 ) -> dict[str, Any]:
     """`options` plus what triton derives from knobs: an explicit `debug`
-    overrides the kernel's default, and the runtime knob can still enable it."""
+    overrides the kernel's default, and the runtime knob can still enable it.
+    A knob missing from `knob_values` (a declared dynamic one, outside its
+    miss) takes triton's default."""
     merged = dict(options)
-    merged["debug"] = (
-        options.get("debug", jit_func.debug) or knob_values["knobs.runtime.debug"]
+    merged["debug"] = options.get("debug", jit_func.debug) or knob_values.get(
+        "knobs.runtime.debug", False
     )
-    merged["instrumentation_mode"] = knob_values[
-        "knobs.compilation.instrumentation_mode"
-    ]
-    casts = knob_values["knobs.compilation.fpsan_homomorphic_casts"]
+    merged["instrumentation_mode"] = knob_values.get(
+        "knobs.compilation.instrumentation_mode", ""
+    )
+    casts = knob_values.get("knobs.compilation.fpsan_homomorphic_casts")
     if casts is not None:
         merged["fpsan_homomorphic_casts"] = casts
     return merged
+
+
+def _dynamic_key_fields(name: str) -> tuple[KeyField, ...]:
+    """One dynamic value's key: a kind byte and 8 value bytes, like an exact
+    key.  `name` picks nothing here; the invariant tests' mutation checks drop
+    one value's fields by name."""
+    del name
+    return (KeyField("exact_kind", 1), KeyField("exact", 8))
+
+
+def _check_dynamic(
+    dynamic: tuple[str, ...],
+    options: Mapping[str, Any],
+    kernel: JitFunction,
+    tuned: _Tuned | None,
+) -> None:
+    """GPU-free refusals for `dynamic_options`.  Unknown compile-option names
+    wait for the target, in `_materialize_module`."""
+    from triton import knobs
+
+    for name in dynamic:
+        if type(name) is not str:
+            raise TypeError(f"intj: dynamic_options names must be str, got {name!r}")
+    if len(set(dynamic)) != len(dynamic):
+        raise UnsupportedKernel(
+            f"intj: dynamic_options repeats a name: {list(dynamic)}"
+        )
+    for name in dynamic:
+        if name.startswith("knobs."):
+            parts = name.split(".")
+            group = getattr(knobs, parts[1], None) if len(parts) == 3 else None
+            attr = (
+                type(group).__dict__.get(parts[2])
+                if isinstance(group, knobs.base_knobs)
+                else None
+            )
+            if not (
+                isinstance(attr, knobs.env_base)
+                or type(attr) in (bool, int, float, str)
+            ):
+                raise UnsupportedKernel(
+                    f"intj: unknown knob {name!r}; expected knobs.<group>.<name>, "
+                    "e.g. knobs.runtime.debug"
+                )
+        elif name in _FORBIDDEN_OPTIONS:
+            raise UnsupportedKernel(f"intj: option {name!r} is not allowed")
+        elif name in kernel.arg_names:
+            raise UnsupportedKernel(
+                f"intj: dynamic option {name!r} is a kernel parameter"
+            )
+    derived = dict(_KNOB_OPTIONS)
+    both = sorted(n for n in dynamic if n in options or derived.get(n) in options)
+    if both:
+        raise UnsupportedKernel(
+            f"intj: {both} given both in options= and dynamic_options; "
+            "a value is fixed or per call, not both"
+        )
+    owned = sorted(set(dynamic) & tuned.plan.tuned) if tuned is not None else []
+    if owned:
+        raise UnsupportedKernel(
+            f"intj: dynamic_options {owned} are set by the autotune configs"
+        )
+
+
+def _split_dynamic(
+    names: Sequence[str], values: Sequence[object]
+) -> tuple[dict[str, object], dict[str, object]]:
+    """(compile options, knob paths) of one call's dynamic values."""
+    pairs = list(zip(names, values))
+    return (
+        {n: v for n, v in pairs if not n.startswith("knobs.")},
+        {n: v for n, v in pairs if n.startswith("knobs.")},
+    )
+
+
+@contextlib.contextmanager
+def _knob_scope(values: Mapping[str, object]) -> Generator[None, None, None]:
+    """Set declared knobs to one call's values for one compile, then restore
+    them, through triton's own per-group `scope()`.  The knobs are process
+    globals: a compile on another thread meanwhile sees these values."""
+    from triton import knobs
+
+    with contextlib.ExitStack() as stack:
+        for group in sorted({path.split(".")[1] for path in values}):
+            stack.enter_context(getattr(knobs, group).scope())
+        for path, value in values.items():
+            _, group, name = path.split(".")
+            setattr(getattr(knobs, group), name, value)
+        yield
 
 
 def get_full_name(fn: Any) -> str:
@@ -990,6 +1136,7 @@ def _loaded_module(
     layout: TensorABI | None,
     baked_values: Mapping[int, object],
     knob_values: Mapping[str, object] | None = None,
+    dynamic: tuple[str, ...] = (),
 ) -> types.ModuleType:
     """One module per `ModuleKey`, for the life of the process.
 
@@ -1026,6 +1173,7 @@ def _loaded_module(
                     baked_values,
                     return_compiled=context.return_compiled,
                     knob_values=knob_values or {},
+                    dynamic=dynamic,
                 ),
             )
             # Pass relative cdata; the compiled setter saves the absolute offset
@@ -1315,10 +1463,19 @@ def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
     from triton.compiler import make_backend
 
     parsed: Any = make_backend(target).parse_options(dict(options))
-    unknown = set(options) - {f.name for f in dataclasses.fields(parsed)}
+    _refuse_unknown_options(parsed, options)
+    return parsed
+
+
+def _refuse_unknown_options(parsed: Any, names: Iterable[str]) -> None:
+    """Refuse the names that are no field of `parsed` (triton's options)."""
+    unknown = set(names) - {f.name for f in dataclasses.fields(parsed)}
     if unknown:
         raise UnsupportedKernel(f"intj: unknown compile option(s) {sorted(unknown)}")
-    return parsed
+
+
+#: options a launch fixes itself; never `options=` or `dynamic_options`
+_FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
 
 
 def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunction:
@@ -1341,7 +1498,7 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
             f"intj: kernel reads global variable(s) {names}, which intj cannot revalidate; "
             "pass them as arguments instead"
         )
-    for key in ("device", "stream", "device_type", "warp_size"):
+    for key in _FORBIDDEN_OPTIONS:
         if key in options:
             raise UnsupportedKernel(f"intj: option {key!r} is not allowed")
     return jit_func
@@ -1502,11 +1659,20 @@ def _render_key(
     resolved: tuple[ResolvedParam, ...],
     device_binding: DeviceBinding,
     computed0: int = 0,
-) -> tuple[tuple[Param, ...], int | None, int, tuple[tuple[int, int], ...]]:
-    """Place key fields, level-0 computed keys included, and number the call.
+    dynamic: Sequence[str] = (),
+) -> tuple[
+    tuple[Param, ...],
+    int | None,
+    int,
+    tuple[tuple[int, int], ...],
+    tuple[DynamicSlot, ...],
+]:
+    """Place key fields, level-0 computed keys and dynamic values included,
+    and number the call.
 
     A computed key is a (value, kind) pair: payload and descriptor, the way a
-    constexpr is keyed, so True and 1 key apart.
+    constexpr is keyed, so True and 1 key apart.  A dynamic value is keyed
+    like an exact key, and its memo follows the parameters'.
     """
     fields = tuple(
         (p.index, field) for p in resolved for field in _key_fields(p.annotation)
@@ -1515,6 +1681,11 @@ def _render_key(
         (-1 - j, KeyField(kind, width))
         for j in range(computed0)
         for kind, width in (("payload", 8), ("descriptor", 1))
+    )
+    fields += tuple(
+        (-1 - computed0 - j, field)
+        for j, name in enumerate(dynamic)
+        for field in _dynamic_key_fields(name)
     )
     layout = _layout_fields(fields, device_binding)
     params: list[Param] = []
@@ -1550,14 +1721,29 @@ def _render_key(
         (placed[(-1 - j, "payload")], placed[(-1 - j, "descriptor")])
         for j in range(computed0)
     )
-    return tuple(params), layout.device_offset, layout.nwords, computed_fields
+    slots = tuple(
+        DynamicSlot(
+            name,
+            placed.get((-1 - computed0 - j, "exact")),
+            placed.get((-1 - computed0 - j, "exact_kind")),
+            memo + j,
+        )
+        for j, name in enumerate(dynamic)
+    )
+    return (
+        tuple(params),
+        layout.device_offset,
+        layout.nwords,
+        computed_fields,
+        slots,
+    )
 
 
 def _render_params(
     resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
 ) -> tuple[tuple[Param, ...], int | None, int]:
     """Place canonical key fields and number the arguments in the public call."""
-    params, device_offset, nwords, _ = _render_key(resolved, device_binding)
+    params, device_offset, nwords, _, _ = _render_key(resolved, device_binding)
     return params, device_offset, nwords
 
 
@@ -1846,17 +2032,22 @@ def _make_compile_callback(
     *,
     return_compiled: bool = False,
     knob_values: Mapping[str, object],
+    dynamic: Sequence[str] = (),
 ) -> Callable[
     ..., tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]
 ]:
     """The module's compile function, called from C on a spec-key miss through
-    the missing launcher's callback: `(seen, keyblob, nparams, device, *args)`."""
+    the missing launcher's callback: `(seen, keyblob, nparams, device, *args)`,
+    `args` being the dynamic values, then the public arguments."""
     from triton.compiler import make_backend
 
     target = _current_target()
     backend = make_backend(target)
-    canonical_options = _canonical_options(
-        target, _knob_options(jit_func, options, knob_values)
+    # without dynamic values every record has the same options
+    fixed_options = (
+        None
+        if dynamic
+        else _canonical_options(target, _knob_options(jit_func, options, knob_values))
     )
     # The module's compile cache: a sibling launcher's miss reuses the kernel
     # and only builds its own C record.  With return_compiled the records own
@@ -1881,24 +2072,46 @@ def _make_compile_callback(
                 f"intj: launching on device {device} while device {current} is current; "
                 "make the target device current before the first launch"
             )
-        compiler_input = _compiler_input(
-            jit_func, params, args, backend, baked_values=baked_values
-        )
-        # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
-        if seen.setdefault(keyblob, compiler_input) != compiler_input:
-            raise RuntimeError(
-                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
+        values, args = args[: len(dynamic)], args[len(dynamic) :]
+        dyn_options, dyn_knobs = _split_dynamic(dynamic, values)
+        canonical = (
+            fixed_options
+            if fixed_options is not None
+            else _canonical_options(
+                target,
+                _knob_options(
+                    jit_func,
+                    {**options, **dyn_options},
+                    {**knob_values, **dyn_knobs},
+                ),
             )
-        cache_key = (compiler_input, canonical_options.hash(), current)
-        with lock:
-            kernel = compiled.get(cache_key)
-            if kernel is None:
-                fresh = _checked_compile(
-                    jit_func, compiler_input, target, canonical_options
+        )
+        # triton's specialization reads knobs too (knobs.amd.use_buffer_ops)
+        with _knob_scope(dyn_knobs) if dyn_knobs else contextlib.nullcontext():
+            compiler_input = _compiler_input(
+                jit_func, params, args, backend, baked_values=baked_values
+            )
+            # knobs feeding no option change the binary too
+            identity = (
+                compiler_input,
+                canonical.hash(),
+                tuple(sorted(dyn_knobs.items())),
+            )
+            # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
+            if seen.setdefault(keyblob, identity) != identity:
+                raise RuntimeError(
+                    "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
                 )
-                # a nested miss may have stored one meanwhile; its record may
-                # already be cached, so its kernel is the one that must stay
-                kernel = compiled.setdefault(cache_key, fresh)
+            cache_key = (*identity, current)
+            with lock:
+                kernel = compiled.get(cache_key)
+                if kernel is None:
+                    fresh = _checked_compile(
+                        jit_func, compiler_input, target, canonical
+                    )
+                    # a nested miss may have stored one meanwhile; its record may
+                    # already be cached, so its kernel is the one that must stay
+                    kernel = compiled.setdefault(cache_key, fresh)
         md = kernel.metadata
         expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
         if expected != nparams:

@@ -705,6 +705,31 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module):
         assert ref() is None, f"leaked (called first: {call_first})"
 
 
+def test_memo_referent_cycle_is_collected(built, stub_module):
+    """The memo's object can reach its own launcher; GC must see the memo."""
+    module, _, _ = built
+
+    class Value:
+        launch: Callable[..., object]
+
+    def compile_cb(_key, nparams, _device, *_args):  # keeps no argument
+        return (0x1000 + nparams, 128, 0, nparams)
+
+    value = Value()
+    value.launch = stub_module.new_launcher(
+        _TAIL,
+        b"",
+        lambda h: module.init_bound(
+            h, compile_cb, lambda v: 0 if type(v) is Value else None
+        ),
+    )
+    value.launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, value)  # memoized
+    ref = weakref.ref(value)
+    del value
+    gc.collect()
+    assert ref() is None
+
+
 def test_str_constexpr_keys_by_value(built, stub_module):
     module, _, _ = built
     launch = stub_module.new_launcher(

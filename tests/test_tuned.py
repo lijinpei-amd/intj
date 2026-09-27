@@ -870,3 +870,62 @@ def test_tuned_decoration_needs_no_gpu(monkeypatch):
     launch(*controls(), x, out, 256)
     torch.cuda.synchronize()
     assert int(out[0].item()) in (1, 2)
+
+
+def test_dynamic_option_clashing_with_a_config_is_refused():
+    kernel = triton.autotune(configs=configs(), key=["n"])(tagged)
+    with pytest.raises(UnsupportedKernel, match="set by the autotune configs"):
+        make_launcher(kernel, grid_cpp=grid, dynamic_options=("num_warps",))
+
+
+_needs_hip = pytest.mark.skipif(
+    getattr(triton.runtime.driver.active.get_current_target(), "backend", None)
+    != "hip",
+    reason="waves_per_eu is a HIP option",
+)
+
+
+@_needs_hip
+def test_tuned_dynamic_option_reaches_every_config():
+    kernel = triton.autotune(
+        configs=configs(),
+        key=["n"],
+        do_bench=lambda call, quantiles: [call() or 1.0] * 3,
+    )(tagged)
+    launch = make_launcher(
+        kernel, grid_cpp=grid, dynamic_options=("waves_per_eu",), return_compiled=True
+    )
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    one = launch(*controls(), 1, x, out, 256)
+    two = launch(*controls(), 2, x, out, 256)
+    assert one.metadata.waves_per_eu == 1 and two.metadata.waves_per_eu == 2
+    assert launch(*controls(), 1, x, out, 256) is one
+
+
+def test_tuned_dynamic_knob_without_an_option_compiles_per_value():
+    """knobs.compilation.disable_line_info feeds neither a compile option nor
+    the specialization: only the knob values in the tuned compile cache key
+    keep its two values apart."""
+    from triton import knobs
+
+    before = knobs.compilation.disable_line_info
+    kernel = triton.autotune(
+        configs=configs()[:1], key=["n"], do_bench=lambda call, quantiles: [1.0] * 3
+    )(tagged)
+    launch = make_launcher(
+        kernel,
+        grid_cpp=grid,
+        dynamic_options=("knobs.compilation.disable_line_info",),
+        return_compiled=True,
+    )
+    x = torch.ones(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    lines = launch(*controls(), False, x, out, 256)
+    bare = launch(*controls(), True, x, out, 256)
+    torch.cuda.synchronize()
+    assert int(out[0].item()) == 2
+    assert knobs.compilation.disable_line_info == before
+    assert launch(*controls(), True, x, out, 256) is bare
+    asm = "amdgcn" if "amdgcn" in lines.asm else "ptx"
+    assert ".loc" in lines.asm[asm] and ".loc" not in bare.asm[asm]
