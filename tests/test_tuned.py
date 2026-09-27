@@ -1,7 +1,9 @@
 # pyright: standard
 """Autotuned and heuristic kernels through make_launcher, on the GPU."""
 
+import gc
 import threading
+import weakref
 
 import pytest
 import torch
@@ -1051,3 +1053,66 @@ def test_tuned_dynamic_knob_mismatch_raises_and_records_nothing(monkeypatch):
     assert not module_of(launch).key_chain(launch, controls()[0], True, x, out, 256)[1]
     off = launch(*controls(), False, x, out, 256)
     assert knobs.runtime.debug is False and not off.metadata.debug
+
+
+@triton.jit
+def _double(v):
+    return v * 2
+
+
+@triton.jit
+def _triple(v):
+    return v * 3
+
+
+@triton.jit
+def act_apply(o, x, ACT: tl.constexpr, FN: tl.constexpr):
+    v = FN(tl.load(x))
+    if ACT == "neg":
+        v = -v
+    tl.store(o, v)
+
+
+def test_tuned_dynamic_waves_per_eu_object_constexprs_return_compiled():
+    """Final review minor 1: a tuned launcher with a dynamic waves_per_eu, two
+    object constexprs, and return_compiled -- distinct records per variant, a
+    hit for an equal-but-different constexpr object, and clean GC after."""
+    kernel = triton.autotune(
+        configs=[triton.Config({}, num_stages=1), triton.Config({}, num_stages=2)],
+        key=[],
+    )(act_apply)
+    launch = make_launcher(
+        kernel, dynamic_options=("waves_per_eu",), return_compiled=True
+    )
+    x = torch.tensor([2.0], device="cuda")
+    o = torch.zeros(1, device="cuda")
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+
+    neg_one = launch(device, stream, 1, 1, o, x, "neg", _double)
+    torch.cuda.synchronize()
+    assert o.item() == -4.0 and neg_one.metadata.waves_per_eu == 1
+
+    pos_two = launch(device, stream, 1, 2, o, x, "pos", _triple)
+    torch.cuda.synchronize()
+    assert o.item() == 6.0 and pos_two.metadata.waves_per_eu == 2
+    assert pos_two is not neg_one
+
+    # equal-valued str, another object: a hit on the same record
+    neg_one_again = launch(
+        device, stream, 1, 1, o, x, "".join(["n", "e", "g"]), _double
+    )
+    torch.cuda.synchronize()
+    assert o.item() == -4.0 and neg_one_again is neg_one
+
+    # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
+    # what makes the rest -- launcher, records, interned constexprs -- collectible.
+    from intj.launcher import _LOADED
+
+    module = module_of(launch)
+    loaded_key = next(key for key, loaded in _LOADED.items() if loaded is module)
+    _LOADED.pop(loaded_key)
+    module_ref, launch_ref = weakref.ref(module), weakref.ref(launch)
+    del launch, module, neg_one, pos_two, neg_one_again
+    gc.collect()
+    assert module_ref() is None and launch_ref() is None

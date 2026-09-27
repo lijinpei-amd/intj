@@ -914,6 +914,14 @@ _KNOB_OPTIONS: tuple[tuple[str, str], ...] = (
     ("knobs.compilation.fpsan_homomorphic_casts", "fpsan_homomorphic_casts"),
 )
 
+#: option name -> knob path, for options `_knob_options` replaces outright
+#: (unlike "debug", which only ORs a knob's value into a passed one, these
+#: overwrite whatever was passed; declaring them as `dynamic_options` would
+#: key a per-call value that never reaches the compile).
+_KNOB_OVERWRITES: dict[str, str] = {
+    option: path for path, option in _KNOB_OPTIONS if option != "debug"
+}
+
 
 def _live_knobs() -> dict[str, object]:
     """The knobs triton turns into compile options, as they are now.  Read at
@@ -991,6 +999,11 @@ def _check_dynamic(
                 )
         elif name in _FORBIDDEN_OPTIONS:
             raise UnsupportedKernel(f"intj: option {name!r} is not allowed")
+        elif name in _KNOB_OVERWRITES:
+            raise UnsupportedKernel(
+                f"intj: dynamic option {name!r} is overwritten by "
+                f"{_KNOB_OVERWRITES[name]!r}; declare that knob path instead"
+            )
         elif name in kernel.arg_names:
             raise UnsupportedKernel(
                 f"intj: dynamic option {name!r} is a kernel parameter"

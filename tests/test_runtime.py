@@ -537,6 +537,30 @@ def test_verified_python_versions_share_one_header():
     assert None not in headers and len(headers) == 1
 
 
+def test_load_stub_reports_a_missing_compiler_as_unsupported(tmp_path_factory):
+    """Final review minor 3: a decoration-time build must never raise a bare
+    subprocess error -- refusals are loud, per AGENTS.md."""
+    root = tmp_path_factory.mktemp("lazy_missing_cc")
+    with pytest.raises(launcher.UnsupportedKernel, match="host compiler") as excinfo:
+        lazy.load_stub(root, "intj-test-nonexistent-cc")
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def test_load_stub_reports_a_compile_failure_as_unsupported(
+    tmp_path_factory, monkeypatch
+):
+    def fail(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 1, stdout=b"", stderr=b"intj_lazy.c:1:1: error: bad token\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    root = tmp_path_factory.mktemp("lazy_failing_cc")
+    with pytest.raises(launcher.UnsupportedKernel, match="bad token") as excinfo:
+        lazy.load_stub(root, _cc("c"))
+    assert isinstance(excinfo.value.__cause__, subprocess.CalledProcessError)
+
+
 @pytest.fixture(scope="module")
 def stub_module(tmp_path_factory):
     return lazy.load_stub(tmp_path_factory.mktemp("lazy"), _cc("c"))

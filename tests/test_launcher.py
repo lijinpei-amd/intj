@@ -3238,6 +3238,123 @@ def test_dtype_and_jit_constexprs():
     assert o.item() == 9.0
 
 
+@triton.jit
+def act_apply_store(o, x, ACT: tl.constexpr, FN: tl.constexpr):
+    v = FN(x)
+    if ACT == "neg":
+        v = -v
+    tl.store(o, v)
+
+
+def test_grid_py_dynamic_options_with_str_and_jit_constexprs(monkeypatch):
+    """Final review minor 1: grid_py plus two dynamic_options (a compile
+    option and a knob) plus str/JIT constexprs -- correct outputs, a separate
+    record per variant, and clean GC after."""
+    from triton import knobs
+
+    launch = make_launcher(
+        act_apply_store,
+        grid_py=lambda meta: (1,),
+        dynamic_options=("num_warps", "knobs.compilation.disable_line_info"),
+        return_compiled=True,
+    )
+    module = module_of(launch)
+    o = torch.zeros(1, device="cuda")
+    device, stream = (
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+    monkeypatch.setattr(knobs.compilation, "disable_line_info", False)
+
+    neg = launch(device, stream, 2, False, o, 2.0, "neg", _twice)
+    torch.cuda.synchronize()
+    assert o.item() == -4.0 and neg.metadata.num_warps == 2
+
+    same_neg = launch(
+        device, stream, 2, False, o, 2.0, "".join(["n", "e", "g"]), _twice
+    )
+    torch.cuda.synchronize()
+    assert same_neg is neg and o.item() == -4.0  # a hit: equal value, another object
+
+    pos = launch(device, stream, 4, False, o, 2.0, "pos", _thrice)
+    torch.cuda.synchronize()
+    assert o.item() == 6.0
+    assert pos is not neg and pos.metadata.num_warps == 4
+
+    monkeypatch.setattr(knobs.compilation, "disable_line_info", True)
+    neg_lines = launch(device, stream, 2, True, o, 2.0, "neg", _twice)
+    torch.cuda.synchronize()
+    assert o.item() == -4.0 and neg_lines is not neg  # separate record per knob value
+
+    # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
+    # what makes the rest -- launcher, records, interned constexprs -- collectible.
+    from intj.launcher import _LOADED
+
+    key = next(key for key, loaded in _LOADED.items() if loaded is module)
+    _LOADED.pop(key)
+    module_ref, launch_ref = weakref.ref(module), weakref.ref(launch)
+    del launch, module, neg, same_neg, pos, neg_lines
+    gc.collect()
+    assert module_ref() is None and launch_ref() is None
+
+
+@triton.jit
+def bound_apply_store(o, x, FN: tl.constexpr):
+    tl.store(o, FN(tl.load(x)))
+
+
+def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
+    """Final review minor 1: bind_device with a bound tensor, a dynamic
+    num_warps and object constexprs -- correct outputs, distinct spec_keys
+    and records per num_warps, and clean GC after."""
+    factory = make_launcher(
+        bound_apply_store,
+        bind_device=True,
+        extra_annotation={
+            "x": Argument(
+                type=tl.pointer_type(tl.float32),
+                specialize=NEVER,
+                bind_value=BindValue.TENSOR,
+            ),
+        },
+        dynamic_options=("num_warps",),
+        return_compiled=True,
+    )
+    x = torch.tensor([3.0], device="cuda")
+    bound = factory.bind_device(torch.cuda.current_device(), x=x)
+    module = module_of(bound)
+    o = torch.zeros(1, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+
+    two = bound(stream, 1, 2, o, _twice)
+    torch.cuda.synchronize()
+    assert o.item() == 6.0 and two.metadata.num_warps == 2
+
+    four = bound(stream, 1, 4, o, _thrice)
+    torch.cuda.synchronize()
+    assert o.item() == 9.0 and four.metadata.num_warps == 4
+    assert two is not four
+
+    key_two, _ = module.spec_key(bound, 0, 2, o, _twice)
+    key_four, _ = module.spec_key(bound, 0, 4, o, _twice)
+    assert key_two != key_four
+
+    # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
+    # what makes the rest -- factory, bound handle, records -- collectible.
+    from intj.launcher import _LOADED
+
+    loaded_key = next(key for key, loaded in _LOADED.items() if loaded is module)
+    _LOADED.pop(loaded_key)
+    factory_ref, bound_ref, module_ref = (
+        weakref.ref(factory),
+        weakref.ref(bound),
+        weakref.ref(module),
+    )
+    del factory, bound, module, two, four
+    gc.collect()
+    assert factory_ref() is None and bound_ref() is None and module_ref() is None
+
+
 def test_sibling_launchers_intern_independently(monkeypatch):
     """Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
     and the module's compile cache compiles each variant once."""
@@ -5177,6 +5294,16 @@ def test_declared_knob_reaches_the_specialization(monkeypatch):
         ({"dynamic_options": ("x",)}, "kernel parameter"),
         ({"dynamic_options": ("stream",)}, "not allowed"),
         ({"dynamic_options": ("num_warps",), "no_gpu": True}, "GPU"),
+        # final review minor 2: a knob overwrites these outright, so a
+        # per-call value would be keyed but never reach the compile
+        (
+            {"dynamic_options": ("instrumentation_mode",)},
+            r"overwritten by 'knobs\.compilation\.instrumentation_mode'",
+        ),
+        (
+            {"dynamic_options": ("fpsan_homomorphic_casts",)},
+            r"overwritten by 'knobs\.compilation\.fpsan_homomorphic_casts'",
+        ),
     ],
 )
 def test_dynamic_option_refusals(kwargs, match):

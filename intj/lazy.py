@@ -54,20 +54,36 @@ def load_stub(root: Path, cc: str) -> types.ModuleType:
         so.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=so.parent) as staging:
             built = Path(staging) / so.name
-            subprocess.check_call(
-                [
-                    cc,
-                    "-O2",
-                    "-shared",
-                    "-fPIC",
-                    f"-I{_RUNTIME}",
-                    f"-I{python_include()}",
-                    str(_SOURCE),
-                    "-o",
-                    str(built),
-                ],
-                stdout=subprocess.DEVNULL,
-            )
+            try:
+                result = subprocess.run(
+                    [
+                        cc,
+                        "-O2",
+                        "-shared",
+                        "-fPIC",
+                        f"-I{_RUNTIME}",
+                        f"-I{python_include()}",
+                        str(_SOURCE),
+                        "-o",
+                        str(built),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                result.check_returncode()
+            except (subprocess.CalledProcessError, OSError) as error:
+                # Deferred: launcher imports lazy, so lazy cannot import
+                # launcher at module scope.
+                from .launcher import UnsupportedKernel
+
+                stderr = (
+                    error.stderr.decode(errors="replace")
+                    if isinstance(error, subprocess.CalledProcessError) and error.stderr
+                    else str(error)
+                )
+                raise UnsupportedKernel(
+                    f"intj: host compiler {cc!r} failed to build _intj_lazy: {stderr}"
+                ) from error
             os.replace(built, so)  # atomic: a racing loader sees all of it or none
     spec = importlib.util.spec_from_file_location("_intj_lazy", so)
     if spec is None or spec.loader is None:
