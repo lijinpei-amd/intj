@@ -1,0 +1,340 @@
+# Lazy, Per-Call-Variant `make_launcher`
+
+## Goal
+
+Every launch site now on `intj.compat.launch`, aiter's `launch_tuned`, or
+aiter's lazy `intj_handle` can use one `make_launcher` handle, written as a
+decorator on the kernel.
+
+Two things block that today:
+
+- **Building needs the GPU.** `make_launcher` queries the GPU target when it
+  is called, so decorating at module level forces GPU work at import.
+- **Per-call variants.** Compile options, Triton knobs, and `str` / `tl.dtype`
+  / JIT-function constexprs are fixed when a launcher is built. A call site
+  that varies any of them needs a separate launcher per variant.
+
+This spec makes the build lazy and lets one handle key those variants. The hit
+path stays at today's cost. The key invariant is unchanged: same intj key
+implies same Triton specialization.
+
+## API and call contract
+
+```python
+@intj.make_launcher(grid_cpp=grid, dynamic_options=("num_warps", "knobs.compilation.instrumentation_mode"))
+@triton.autotune(...)          # optional, heuristics too
+@triton.jit
+def k(x, out, n, ACT: tl.constexpr, BLOCK: tl.constexpr): ...
+
+k(device, stream, 8, "", x, out, n, "gelu")   # device (omitted with bind_device), stream, grid controls
+                                              # (none for grid_cpp), dynamic values, public args
+```
+
+### Lazy build
+
+`make_launcher(...)`, whether used as a decorator or called directly, returns
+a launcher right away without touching the GPU. At that point it does only
+the GPU-free work:
+
+- validating arguments
+- resolving annotations
+- analyzing the tuning chain
+- lowering the grid
+- computing the bound-object layout
+
+The first call builds the module:
+
+1. query the target
+2. render
+3. compile
+4. load
+5. bind
+
+After that, the launcher's entry points at the built module. If the build
+fails, that call raises and the next call retries.
+
+Why the build needs a GPU at all: `driver.active.get_current_target()` asks
+the driver for the visible device's architecture and warp size. The target
+decides four things:
+
+- **The backend:** driver library, launch symbol, error style, and the
+  pointer-range key bit.
+- **Canonical compile options,** through `parse_options` defaults.
+- **The `ModuleKey` target field.**
+- **Early validation of tuned configs.**
+
+Compiling the C module needs only the host compiler. Loading the `.so` needs
+the driver library to be installed, but no visible device.
+
+### `dynamic_options`
+
+`dynamic_options=(name, ...)` takes compile-option names (`"num_warps"`) and
+Triton knob paths (`"knobs.<group>.<name>"`, for example
+`"knobs.compilation.instrumentation_mode"`, `"knobs.runtime.debug"`,
+`"knobs.amd.use_buffer_ops"`).
+
+- **Passing:** each declared entry becomes a positional argument right after
+  the grid controls, in the declared order. Its value is part of the key.
+- **Refused with `UnsupportedKernel`:**
+  - an unknown option or knob path;
+  - a name that is also given in `options=` (it can't be both fixed and per
+    call);
+  - a name a tuning layer assigns.
+
+### Object constexprs
+
+`str`, `tl.dtype`, and JIT-function constexprs become ordinary public
+arguments, keyed by value. Baking one through `extra_annotation` still works
+and removes it from the call.
+
+### Unchanged
+
+- **Grid:** the default grid already takes a tuple of 1–3 elements per call.
+  `grid_arg`, `grid_cpp` and `grid_py` behave as today.
+- **Also as today:** `bind_device`, `return_compiled`, tuning, and every
+  refusal not listed here.
+- **Fallback:** `intj.compat.launch` remains for what is still refused: tuple
+  arguments, keyword-only calls, and sites that cannot be verified.
+
+## Lazy build in C
+
+### The stub module
+
+`_intj_lazy` is a small generic C extension. It is:
+
+- compiled once per interpreter and intj version, with the host compiler only;
+- cached on disk like rendered modules;
+- loaded by hand, not through `import`;
+- free of kernel code, so building or loading it needs no GPU.
+
+### Uniform bound-launcher layout
+
+`intj_bound_launcher` becomes a fixed header shared by all launchers, followed
+by trailing arrays whose length is `NBOUND`: bound owners, pointer bits, and
+static-compile tensor slots. `NBOUND` is known without a GPU.
+
+- **Cache storage:** the header holds fixed-size, opaque storage for the level-0
+  cache, large enough for every backend (intj map, tsl, absl).
+- **Field order:** fields the warmed launch reads sit in the first 64-byte
+  cache line after `PyObject_HEAD`:
+  - device ordinal and handle
+  - the cache storage, including its memo
+  - the fixed-kernel pointer
+  - the dynamic-value slot memos
+
+  Cold fields come after them: the build lock, the builder, GC hooks,
+  `tuned_cb`, `grid_py`, `grid_hidden`, and the module pointer.
+  `offsetof` static asserts pin this order.
+- **Layout check:** the rendered module `static_assert`s the same header. At
+  load it checks the header size the stub reports and raises `ImportError` on
+  a mismatch.
+
+### Decoration
+
+`make_launcher` allocates the bound object from the stub type at its final
+size. It stores a Python builder closure in the header. It returns a real
+`PyCFunction` whose `self` is that bound object, created from a heap-allocated
+`PyMethodDef` that the bound object owns:
+
+- flags `METH_FASTCALL`;
+- `ml_meth` set to the stub's build shim.
+
+### First call
+
+The shim:
+
+1. takes the header's build lock;
+2. calls the builder, which renders and loads the module (or reuses one
+   already loaded for the same `ModuleKey`) and calls the rendered module's
+   `init_bound(self, ...)`. That call fills the header in place (module
+   reference, device handle, cache init, `tuned_cb`, `grid_py`, GC hooks) and
+   returns the rendered entry function pointer;
+3. stores the entry with one release store to `def->ml_meth`;
+4. drops the builder;
+5. forwards the current call.
+
+Threads that race the first call wait on the lock, then forward. A builder
+exception propagates and leaves the launcher unbuilt, so the next call
+retries.
+
+### After the build
+
+CPython reads `m_ml->ml_meth` on every call. So every caller reaches the
+rendered `intj_bound_entry(self, args, nargs)` directly, including references
+taken before the build:
+
+- It takes `self` as its bound launcher, with no indirection.
+- `CALL_BUILTIN_FAST` specialization still applies.
+- `self` never changes, and the swap is a single pointer store. On
+  free-threaded builds a reader cannot pair a new function with an old `self`.
+
+### GC
+
+The stub type's traverse and clear visit the builder and the module reference,
+then call the rendered module's hooks once they are installed. The hooks reach
+cache records, compiled objects, `tuned_cb`, and grid objects.
+
+### Uniform shape
+
+Launchers without bindings return the module's `entry` today, with
+`self = module`. They become bound-style lazy launchers too. `.bind()` and
+`.bind_device()` return lazy launchers.
+
+The kernel cache, locking, key layout, and tuned paths are unchanged, apart
+from where the bound object comes from.
+
+## Keying dynamic values
+
+### Scalar values
+
+Dynamic options and knobs, and constexprs, that are `int`, `bool`, or `float`
+are keyed like exact autotune keys: a kind byte plus 8 bytes of value (int64,
+uint64, or fp64 bits). A `str` option or knob value, such as
+`instrumentation_mode`, goes through the intern table below.
+
+### Object values
+
+`str`, `tl.dtype`, and JIT-function values reduce to a canonical tuple, the
+same one `_canonical_value` produces for baked values:
+
+- `("str", s)`
+- `("dtype", dtype.name)`
+- `("jit", module, qualname, cache_key)`
+
+A per-launcher intern table maps each canonical tuple to a small `uint32` id,
+and the key carries the id.
+
+- **Per-slot memo:** each argument slot keeps a strong reference to the last
+  object it saw, plus that object's id. Holding the reference means the
+  object's address cannot be reused while it is memoized. When the same
+  object arrives again, one pointer compare returns the id, with no Python
+  code and no lock. This covers literals, interned strings, dtype singletons,
+  and repeated JIT objects.
+- **New object:**
+  - Python computes the canonical tuple outside any lock. For a JIT function
+    this reads `cache_key`.
+  - It then probes a plain dict of canonical tuple → id:
+    - `str` content hashes use CPython's cached hash, so this is cheap.
+    - Equality is by value.
+  - A new tuple takes the next id under the write lock.
+  - The memo moves to the new object, and the old reference is released
+    outside the lock.
+- **Equality:** equal content gets the same id whichever object carries it,
+  which matches Triton's constexpr semantics.
+- **Scope:** ids are per launcher and per process. They are never persisted
+  and never enter the module key.
+- **Limitation:** a JIT function's `cache_key` is read once and cached. Edits
+  to a callee's source or globals after first use are not seen. Triton has the
+  same limitation.
+
+### Module key
+
+The declared dynamic names and their order enter `RenderContext` and
+`ModuleKey`, because they shape the rendered call signature. Per-call values
+never do.
+
+Baked values keep today's hashing: their canonical tuple is JSON-serialized
+into `ModuleKey` and SHA-256-hashed. A JIT function's `cache_key` is a content
+hash, so the on-disk module cache stays valid across processes.
+
+### Miss path
+
+The compile callback receives the dynamic values.
+
+- **Options:** it merges them into `options=` and canonicalizes per record
+  with `parse_options`. Today this happens once per module. An invalid value,
+  such as `num_warps=3`, raises on that miss.
+- **Knobs:** it sets the declared knobs to the call's values with Triton's
+  `knobs` scope for the duration of the compile, then restores them.
+- **Object constexprs:** these reach the compiler as the Python objects from
+  the call.
+- **Tuned launchers:** dynamic values sit in the level-0 key, and the shim
+  merges option values with each config's options. Overlap is refused up
+  front.
+
+### Undeclared knobs
+
+Knobs that are not declared are read once, at the first call, and fixed for
+that launcher. This moves today's `debug` / instrumentation read from
+`make_launcher` to the first call. Keying the cache-invalidating environment
+knobs stays a TODO.
+
+## Testing
+
+### intj
+
+- **Lazy build:**
+  - With `_current_target` patched to raise, decoration still succeeds.
+  - The first call builds.
+  - A failing build raises, and the next call retries.
+- **Swap:**
+  - A reference taken before the build (`f = k`) reaches the real entry
+    afterwards.
+  - After warm-up, `dis` with adaptive specialization shows
+    `CALL_BUILTIN_FAST` at the call site.
+  - `offsetof` asserts pin the hot fields to the first cache line.
+- **Concurrency:** N threads make the first call together on 3.13t and 3.14t
+  (both installed via uv). There is exactly one build, and every call returns
+  correctly.
+- **Dynamic options and knobs:**
+  - Varying `num_warps` gives separate records with the right
+    `metadata.num_warps`.
+  - A declared knob changes the compile, and is restored afterwards.
+  - Each refusal raises `UnsupportedKernel`.
+- **Object constexprs:**
+  - Two equal strings at different addresses share one record, and different
+    strings get separate records.
+  - `tl.dtype` works.
+  - A JIT function works, and the same `cache_key` shares a record.
+  - A freed-and-reused address cannot alias another value.
+- **Invariant:**
+  - The untuned and tuned invariant tests vary each dynamic option, knob, and
+    object constexpr.
+  - Each has a mutation check: dropping its key field makes the test fail.
+
+### Benchmarks
+
+The full gate from `benchmarks/AGENTS.md` runs against the baseline and the
+latest journal. It adds rows for:
+
+- a warmed lazy launcher;
+- a launcher with 2 dynamic options;
+- a launcher with a `str` constexpr.
+
+Acceptance: an untuned launcher without dynamic values is within 1 ns of
+today on `bench_launch.py --no-gpu`, measured interleaved.
+
+## Migration (follow-up plans, after intj lands)
+
+- **Triton tree:**
+  - Move the 24 per-call-variant sites and the 39 fpsan sites to
+    `@make_launcher(dynamic_options=...)`.
+  - Move existing handles and the `partial` stacks to the decorator.
+  - Leave the 107 hardware-gated sites until they can be verified.
+- **aiter:**
+  - Replace the 228 `intj_handle` handles with `@make_launcher` decorators.
+    This is safe at import, because the build is lazy.
+  - Move the 47 `launch_tuned` sites and the 134 `compat.launch` sites to the
+    decorator, using `dynamic_options` or constexpr arguments.
+  - Delete `intj_tuned.py` and `intj_handle.py` once nothing uses them.
+- **Both trees:** `compat.launch` remains only for tuple arguments,
+  keyword-only calls, and unverified sites.
+
+## Docs
+
+`docs/Usage.md` covers:
+
+- lazy build and what the first call does;
+- `dynamic_options`, including the knob paths;
+- object constexprs.
+
+Remove the per-call-variant entry from `TODO.md`.
+
+## Out of scope
+
+These are already on `TODO.md`:
+
+- keyword arguments at launch
+- mirroring `Autotuner.cache`
+- keying cache-invalidating knobs
+- tuple arguments
