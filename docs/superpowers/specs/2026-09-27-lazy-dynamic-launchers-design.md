@@ -75,6 +75,9 @@ Triton knob paths (`"knobs.<group>.<name>"`, for example
 
 - **Passing:** each declared entry becomes a positional argument right after
   the grid controls, in the declared order. Its value is part of the key.
+- **Knobs only key:** intj never sets a knob. The caller sets it through
+  Triton and passes its current value; a declared path is left out of the
+  `ModuleKey`, so the live value at the first call builds no extra module.
 - **Refused with `UnsupportedKernel`:**
   - an unknown option or knob path;
   - a name that is also given in `options=` (it can't be both fixed and per
@@ -281,8 +284,15 @@ The compile callback receives the dynamic values.
 - **Options:** it merges them into `options=` and canonicalizes per record
   with `parse_options`. Today this happens once per module. An invalid value,
   such as `num_warps=3`, raises on that miss.
-- **Knobs:** it sets the declared knobs to the call's values with Triton's
-  `knobs` scope for the duration of the compile, then restores them.
+- **Knobs:** before building the compiler input, it compares each declared
+  knob's passed value with the live knob. A mismatch raises `ValueError`
+  (`intj: dynamic knob '<path>' passed <v> but the current value is <w>`)
+  and records nothing. Otherwise the compile runs under the live knobs, which
+  equal the key's values. The knob values stay in both compile-cache keys
+  (untuned identity, tuned `compiled` key): a knob that feeds no option, such
+  as `knobs.compilation.disable_line_info`, must not reuse another value's
+  kernel. A hit only compares keys, so an old value keeps hitting the record
+  compiled under it after the knob changes.
 - **Object constexprs:** these reach the compiler as the Python objects from
   the call.
 - **Tuned launchers:** dynamic values sit in the level-0 key, and the shim
@@ -319,7 +329,8 @@ knobs stays a TODO.
 - **Dynamic options and knobs:**
   - Varying `num_warps` gives separate records with the right
     `metadata.num_warps`.
-  - A declared knob changes the compile, and is restored afterwards.
+  - A declared knob's value keys the record; a value that differs from the
+    live knob raises on a miss and records nothing; intj never modifies a knob.
   - Each refusal raises `UnsupportedKernel`.
 - **Object constexprs:**
   - Two equal strings at different addresses share one record, and different

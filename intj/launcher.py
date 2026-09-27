@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import abc
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -21,7 +20,6 @@ import warnings
 import weakref
 from collections.abc import (
     Callable,
-    Generator,
     Iterable,
     Mapping,
     MutableMapping,
@@ -1022,37 +1020,19 @@ def _split_dynamic(
     )
 
 
-#: One declared-knob scope at a time, process-wide.  Triton's `scope()`
-#: restores the snapshot it took on entry, so two interleaved scopes would
-#: leave a knob changed for good, and one thread's values would reach the
-#: other's compile.  Reentrant: a compile can miss again on its own thread.
-#: Lock order, always: this, then a tuned launcher's lock, then a module's
-#: compile lock.  An untuned miss takes it only for declared knobs; every
-#: tuned miss takes it first, knobs or not, because tuning runs user hooks
-#: (pre_hook, prune, perf_model) that may launch another tuned launcher.
-#: Cost: tuned misses serialize process-wide, and a declared-knob untuned
-#: compile waits while any tuning runs.
-_KNOB_LOCK = threading.RLock()
-
-
-@contextlib.contextmanager
-def _knob_scope(values: Mapping[str, object]) -> Generator[None, None, None]:
-    """Set declared knobs to one call's values for one compile, then restore
-    them, through triton's own per-group `scope()`.  Scopes are serialized
-    by `_KNOB_LOCK`, but the knobs are process globals: a compile of an
-    undeclared launcher on another thread meanwhile sees these values."""
-    if not values:
-        yield
-        return
+def _check_live_knobs(values: Mapping[str, object]) -> None:
+    """A declared knob only keys: its passed value must be the live one,
+    because the miss compiles under the live knobs.  intj never sets one."""
     from triton import knobs
 
-    with _KNOB_LOCK, contextlib.ExitStack() as stack:
-        for group in sorted({path.split(".")[1] for path in values}):
-            stack.enter_context(getattr(knobs, group).scope())
-        for path, value in values.items():
-            _, group, name = path.split(".")
-            setattr(getattr(knobs, group), name, value)
-        yield
+    for path, passed in values.items():
+        _, group, name = path.split(".")
+        live = getattr(getattr(knobs, group), name)
+        if passed != live:
+            raise ValueError(
+                f"intj: dynamic knob {path!r} passed {passed!r} but the current "
+                f"value is {live!r}"
+            )
 
 
 def get_full_name(fn: Any) -> str:
@@ -2091,6 +2071,7 @@ def _make_compile_callback(
             )
         values, args = args[: len(dynamic)], args[len(dynamic) :]
         dyn_options, dyn_knobs = _split_dynamic(dynamic, values)
+        _check_live_knobs(dyn_knobs)
         canonical = (
             fixed_options
             if fixed_options is not None
@@ -2103,32 +2084,24 @@ def _make_compile_callback(
                 ),
             )
         )
-        # triton's specialization reads knobs too (knobs.amd.use_buffer_ops)
-        with _knob_scope(dyn_knobs) if dyn_knobs else contextlib.nullcontext():
-            compiler_input = _compiler_input(
-                jit_func, params, args, backend, baked_values=baked_values
+        compiler_input = _compiler_input(
+            jit_func, params, args, backend, baked_values=baked_values
+        )
+        # knobs feeding no option change the binary too
+        identity = (compiler_input, canonical.hash(), tuple(sorted(dyn_knobs.items())))
+        # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
+        if seen.setdefault(keyblob, identity) != identity:
+            raise RuntimeError(
+                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
             )
-            # knobs feeding no option change the binary too
-            identity = (
-                compiler_input,
-                canonical.hash(),
-                tuple(sorted(dyn_knobs.items())),
-            )
-            # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
-            if seen.setdefault(keyblob, identity) != identity:
-                raise RuntimeError(
-                    "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
-                )
-            cache_key = (*identity, current)
-            with lock:
-                kernel = compiled.get(cache_key)
-                if kernel is None:
-                    fresh = _checked_compile(
-                        jit_func, compiler_input, target, canonical
-                    )
-                    # a nested miss may have stored one meanwhile; its record may
-                    # already be cached, so its kernel is the one that must stay
-                    kernel = compiled.setdefault(cache_key, fresh)
+        cache_key = (*identity, current)
+        with lock:
+            kernel = compiled.get(cache_key)
+            if kernel is None:
+                fresh = _checked_compile(jit_func, compiler_input, target, canonical)
+                # a nested miss may have stored one meanwhile; its record may
+                # already be cached, so its kernel is the one that must stay
+                kernel = compiled.setdefault(cache_key, fresh)
         md = kernel.metadata
         expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
         if expected != nparams:

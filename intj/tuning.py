@@ -301,13 +301,12 @@ def make_tuned_callback(
     from .launcher import (
         Param,
         _canonical_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _KNOB_LOCK,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _current_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _current_target,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _knob_scope,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _split_dynamic,  # pyright: ignore[reportPrivateUsage]  # launcher internals
     )
 
@@ -368,8 +367,7 @@ def make_tuned_callback(
         *args: Any,
     ) -> tuple[Any, ...]:
         del keyblob
-        # the knob lock first, always: see _KNOB_LOCK for the order
-        with _KNOB_LOCK, lock:
+        with lock:
             if running[0]:
                 raise UnsupportedKernel(
                     "intj: a tuned launcher was re-entered while tuning"
@@ -394,6 +392,7 @@ def make_tuned_callback(
             )
         dyn_values, args = args[: len(dynamic)], args[len(dynamic) :]
         dyn_options, dyn_knobs = _split_dynamic(dynamic, dyn_values)
+        _check_live_knobs(dyn_knobs)
         call_knobs[0] = dyn_knobs
         named = {**dict(zip(public, args)), **baked}
         # Positional up to the first tuned parameter, as a Triton caller would
@@ -420,10 +419,9 @@ def make_tuned_callback(
         try:
             # option values reach every config through the shim's kwargs
             with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=device)):
-                with _knob_scope(dyn_knobs):
-                    private[0].run(
-                        *prefix, grid=triton_grid, warmup=False, **named, **dyn_options
-                    )
+                private[0].run(
+                    *prefix, grid=triton_grid, warmup=False, **named, **dyn_options
+                )
             _copy_back(plan.layers, private)
             assert shim.final is not None, "Triton finished without a final launch"
             values, config_options, kernel = shim.final

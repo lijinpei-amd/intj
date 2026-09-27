@@ -180,7 +180,7 @@ for row in sorted({r for r, _ in per}):
 1. **The first call fails after `init_bound` has filled part of the header** (a bound pointer of `2**64`, a failing `hipDeviceGet`). Expect the error to propagate, no leaked owner references, and a clean retry. Pinned in Task 2 (`test_bind_native_failure_releases_partial_owners`, rewritten).
 2. **A launcher is never called, and its builder closure sits in a reference cycle** (a module-level handle that is dropped, or an object holding its own launcher). Expect GC to collect it before and after the build. Pinned in Task 2 (`test_unbuilt_and_built_launchers_are_collected`).
 3. **An object constexpr of an unsupported kind** (a `list`, a `str` subclass, a tensor). Expect a `TypeError` that names the parameter, with the launcher still usable afterwards. Pinned in Task 3 (`test_unsupported_object_constexpr_names_the_parameter`).
-4. **A compile fails while a declared knob is set.** Expect the knob restored, no record, and a next call that retries. Pinned in Task 4 (`test_declared_knob_is_set_for_the_compile_and_restored`).
+4. **A declared knob's passed value differs from the live knob on a miss.** Expect `ValueError`, the knob untouched (intj never sets knobs), no record, and a later call with the live value that compiles; an old value still hits its record after the knob changes. Pinned in Task 4 (`test_declared_knob_only_keys_and_must_match_the_live_value`, `test_tuned_dynamic_knob_mismatch_raises_and_records_nothing`).
 5. **Two launchers of one module intern different strings first**, so the same id means different values in each. Expect every value to launch its own binary through either handle, and each variant to compile once across both, through the module's compile cache. Pinned in Task 3 (`test_sibling_launchers_intern_independently`).
 
 ## File Map
@@ -2211,6 +2211,12 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 About 1 day.
 
+> **Amended after implementation (Task 4b).** Declared knobs only key: intj never sets a
+> knob, so `_knob_scope` below no longer exists. On a miss (untuned and tuned) each
+> declared knob's passed value must equal the live knob, else `ValueError` and no record;
+> the compile runs under the live knobs. The knob values stay in both compile-cache keys.
+> The knob tests below were replaced accordingly (see the Task 4 report).
+
 **Files:**
 - Modify: `intj/launcher.py`:
   - new `DynamicSlot` after `TuningRender`;
@@ -2695,7 +2701,7 @@ About half a day.
 - Modify: `benchmarks/bench_launch.py` (`--dynamic`), `benchmarks/AGENTS.md`, `TODO.md`
 
 **Interfaces:**
-- Consumes: `spec_key(launcher, device, *dynamic, *public)`, `key_chain(launcher, device, *dynamic, *public)` (tuned), `_dynamic_key_fields`, `_Interner`, `_knob_options`, `_live_knobs`, `_knob_scope`, `_split_dynamic`, `module_of`
+- Consumes: `spec_key(launcher, device, *dynamic, *public)`, `key_chain(launcher, device, *dynamic, *public)` (tuned), `_dynamic_key_fields`, `_Interner`, `_knob_options`, `_live_knobs`, `_split_dynamic`, `module_of`
 
 - [ ] **Step 1: Untuned invariant with mutation checks**
 
@@ -2784,13 +2790,13 @@ def _reference(kernel, args_by_name, dynamic=None):
 
     from triton.runtime.autotuner import Autotuner
 
-    from intj.launcher import _knob_scope, _split_dynamic
+    from intj.launcher import _split_dynamic
 
     dynamic = dynamic or {}
     run_options, run_knobs = _split_dynamic(tuple(dynamic), tuple(dynamic.values()))
     # <layers/Record setup unchanged>
-    with _knob_scope(run_knobs):
-        layers[0].run(grid=(1,), warmup=False, **args_by_name, **run_options)
+    # the caller set the live knobs to `run_knobs`: declared knobs only key
+    layers[0].run(grid=(1,), warmup=False, **args_by_name, **run_options)
     # <tuning_keys, params, options, heuristics unchanged>
     return (
         repr(triton_specialization(inner, params, options)),
@@ -2801,18 +2807,31 @@ def _reference(kernel, args_by_name, dynamic=None):
 
 
 def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
+    from triton import knobs
+
+    from intj.launcher import _split_dynamic
+
     launch = make_launcher(make_kernel(), dynamic_options=dynamic)
     device, stream = controls()
-    seen = {}
-    for dyn in dyn_values:
-        for case in cases:
-            launch(device, stream, 1, *dyn, *case.values())
-            chain, found = module_of(launch).key_chain(launch, device, *dyn, *case.values())
-            assert found
-            truth = _reference(make_kernel(), case, dict(zip(dynamic, dyn)))
-            assert seen.setdefault(chain, truth) == truth, (
-                "intj key chain collides across Triton decisions"
-            )
+    seen, before = {}, {}
+    try:
+        for dyn in dyn_values:
+            # a declared knob only keys: set the live value the call passes
+            for path, value in _split_dynamic(dynamic, dyn)[1].items():
+                _, group, name = path.split(".")
+                before.setdefault((group, name), getattr(getattr(knobs, group), name))
+                setattr(getattr(knobs, group), name, value)
+            for case in cases:
+                launch(device, stream, 1, *dyn, *case.values())
+                chain, found = module_of(launch).key_chain(launch, device, *dyn, *case.values())
+                assert found
+                truth = _reference(make_kernel(), case, dict(zip(dynamic, dyn)))
+                assert seen.setdefault(chain, truth) == truth, (
+                    "intj key chain collides across Triton decisions"
+                )
+    finally:
+        for (group, name), value in before.items():
+            setattr(getattr(knobs, group), name, value)
 
 
 @triton.jit

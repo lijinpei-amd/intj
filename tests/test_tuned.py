@@ -903,13 +903,12 @@ def test_tuned_dynamic_option_reaches_every_config():
     assert launch(*controls(), 1, x, out, 256) is one
 
 
-def test_tuned_dynamic_knob_without_an_option_compiles_per_value():
+def test_tuned_dynamic_knob_without_an_option_compiles_per_value(monkeypatch):
     """knobs.compilation.disable_line_info feeds neither a compile option nor
     the specialization: only the knob values in the tuned compile cache key
     keep its two values apart."""
     from triton import knobs
 
-    before = knobs.compilation.disable_line_info
     kernel = triton.autotune(
         configs=configs()[:1], key=["n"], do_bench=lambda call, quantiles: [1.0] * 3
     )(tagged)
@@ -921,71 +920,36 @@ def test_tuned_dynamic_knob_without_an_option_compiles_per_value():
     )
     x = torch.ones(256, device="cuda", dtype=torch.int32)
     out = torch.zeros_like(x)
+    monkeypatch.setattr(knobs.compilation, "disable_line_info", False)
     lines = launch(*controls(), False, x, out, 256)
+    monkeypatch.setattr(knobs.compilation, "disable_line_info", True)
     bare = launch(*controls(), True, x, out, 256)
     torch.cuda.synchronize()
     assert int(out[0].item()) == 2
-    assert knobs.compilation.disable_line_info == before
     assert launch(*controls(), True, x, out, 256) is bare
+    assert launch(*controls(), False, x, out, 256) is lines  # a hit: no check
     asm = "amdgcn" if "amdgcn" in lines.asm else "ptx"
     assert ".loc" in lines.asm[asm] and ".loc" not in bare.asm[asm]
 
 
-def test_tuning_hook_launching_another_tuned_launcher_does_not_deadlock():
-    """Thread 1 tunes T1, whose pre_hook launches T2; thread 2 misses T2 with a
-    declared knob meanwhile.  Every tuned miss takes the knob lock before its
-    launcher lock, so neither thread holds one lock while waiting on the other."""
-    import time
+def test_tuned_dynamic_knob_mismatch_raises_and_records_nothing(monkeypatch):
+    from triton import knobs
 
-    knob = "knobs.compilation.disable_line_info"
+    kernel = triton.autotune(
+        configs=configs()[:1], key=["n"], do_bench=lambda call, quantiles: [1.0] * 3
+    )(tagged)
+    launch = make_launcher(
+        kernel,
+        grid_cpp=grid,
+        dynamic_options=("knobs.runtime.debug",),
+        return_compiled=True,
+    )
     x = torch.ones(256, device="cuda", dtype=torch.int32)
-    out, other = torch.zeros_like(x), torch.zeros_like(x)
-    device = torch.cuda.current_device()
-    hooked = threading.Event()
-    t2 = make_launcher(
-        triton.autotune(configs=configs()[:1], key=["n"])(tagged),
-        grid_cpp=grid,
-        dynamic_options=(knob,),
-    )
-
-    def pre_hook(nargs):
-        if not hooked.is_set():
-            hooked.set()
-            time.sleep(0.3)  # thread 2 takes T2's lock first, without the fix
-            t2(*controls(), False, x, other, 256)
-
-    t1 = make_launcher(
-        triton.autotune(
-            configs=[triton.Config({"TAG": 1, "BLOCK": 32}, pre_hook=pre_hook)],
-            key=["n"],
-        )(tagged),
-        grid_cpp=grid,
-        dynamic_options=(knob,),
-    )
-    errors = []
-
-    def run(fn):
-        try:
-            torch.cuda.set_device(device)
-            fn()
-        except Exception as error:  # pragma: no cover - reported below
-            errors.append(error)
-
-    def second():
-        hooked.wait(60)
-        t2(*controls(), True, x, other, 256)
-
-    threads = [
-        threading.Thread(
-            target=run, args=(lambda: t1(*controls(), False, x, out, 256),), daemon=True
-        ),
-        threading.Thread(target=run, args=(second,), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(120)
-    assert not any(t.is_alive() for t in threads), "deadlocked"
-    assert errors == []
-    torch.cuda.synchronize()
-    assert int(out[0].item()) == 2 and int(other[0].item()) == 2
+    out = torch.zeros_like(x)
+    monkeypatch.setattr(knobs.runtime, "debug", False)
+    with pytest.raises(ValueError, match="passed True but the current value is False"):
+        launch(*controls(), True, x, out, 256)
+    assert knobs.runtime.debug is False
+    assert not module_of(launch).key_chain(launch, controls()[0], True, x, out, 256)[1]
+    off = launch(*controls(), False, x, out, 256)
+    assert knobs.runtime.debug is False and not off.metadata.debug

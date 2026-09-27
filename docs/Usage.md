@@ -125,6 +125,7 @@ same object. This mode requires GPU compilation and rejects `no_gpu=True`.
 @triton.jit
 def k(x, out, n, ACT: tl.constexpr, BLOCK: tl.constexpr): ...
 
+knobs.runtime.debug = False   # a declared knob's value must be the live one
 k(device, stream, 8, False, x, out, n, "gelu", 128)   # num_warps=8, debug off
 ```
 
@@ -135,14 +136,16 @@ through the same id table as object constexprs. A name is either a compile
 option (`num_warps`, `num_stages`, `waves_per_eu`, ...) or a Triton knob path
 `knobs.<group>.<name>` (`knobs.runtime.debug`, `knobs.amd.use_buffer_ops`, ...).
 On a miss, options merge into `options=` and go through `parse_options` per
-kernel (an invalid value such as `num_warps=3` raises on that call); knobs are
-set to the call's values with Triton's `knobs` scope for the duration of the
-compile, then restored. The knobs are process globals, so a compile running on
-another thread meanwhile sees the declared values too. Declared-knob compiles
-and every autotune/heuristics miss share one process-wide lock (so tuning hooks
-that launch other launchers cannot deadlock): tuned misses run one at a time,
-and a declared-knob compile waits while any tuning runs. With `triton.autotune`,
-the values reach every config.
+kernel (an invalid value such as `num_warps=3` raises on that call). With
+`triton.autotune`, option values reach every config.
+
+A declared knob only keys: intj never sets a knob. You set it through
+Triton as usual and pass its current value, so a change of the knob reaches
+a fresh record instead of an old binary. On a miss, a passed value that
+differs from the live knob raises `ValueError` and caches nothing; the
+compile then runs under the live knobs. A hit only compares keys, so
+passing an old value after the knob changed launches the record compiled
+under that value.
 
 Refused at `make_launcher` with `UnsupportedKernel`: an unknown knob path, a
 repeated name, a name also given in `options=` (for knobs, the option the knob

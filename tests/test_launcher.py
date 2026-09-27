@@ -5067,32 +5067,6 @@ def test_dynamic_num_warps_keys_separate_records():
         launch(*_gpu_controls(), 3, o, 1.0, "pos")
 
 
-def test_declared_knob_is_set_for_the_compile_and_restored(monkeypatch):
-    import intj.launcher as launcher
-    from triton import knobs
-
-    before = knobs.runtime.debug
-    seen, real = [], launcher._checked_compile
-
-    def spy(*args, **kwargs):
-        seen.append(knobs.runtime.debug)
-        if len(seen) == 1:
-            raise RuntimeError("compile failed")
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(launcher, "_checked_compile", spy)
-    launch = make_launcher(
-        act_store, dynamic_options=("knobs.runtime.debug",), return_compiled=True
-    )
-    o = torch.zeros(1, device="cuda")
-    with pytest.raises(RuntimeError, match="compile failed"):
-        launch(*_gpu_controls(), not before, o, 1.0, "pos")
-    assert knobs.runtime.debug == before
-    kernel = launch(*_gpu_controls(), not before, o, 1.0, "pos")
-    assert seen == [not before, not before] and knobs.runtime.debug == before
-    assert kernel.metadata.debug == (act_store.debug or not before)
-
-
 def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
     """The live value of a declared knob is not read into the ModuleKey, so
     flipping it before the first call builds no second module."""
@@ -5107,79 +5081,63 @@ def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
     assert build() is first
 
 
-def test_declared_knob_without_an_option_compiles_per_value():
+def test_declared_knob_only_keys_and_must_match_the_live_value(monkeypatch):
+    """intj never sets a declared knob.  A miss whose value differs from the
+    live knob raises and records nothing; each live value compiles its own
+    record, and an old value still hits its record after the knob changed."""
+    import intj.launcher as launcher
+    from triton import knobs
+
+    monkeypatch.setattr(knobs.runtime, "debug", False)
+    compiles, real = [], launcher._checked_compile
+
+    def spy(*args, **kwargs):
+        compiles.append(knobs.runtime.debug)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_checked_compile", spy)
+    launch = make_launcher(
+        act_store,
+        dynamic_options=("knobs.runtime.debug",),
+        options={"num_stages": 1},  # a module of its own: every value compiles here
+        return_compiled=True,
+    )
+    o = torch.zeros(1, device="cuda")
+    with pytest.raises(
+        ValueError,
+        match="dynamic knob 'knobs.runtime.debug' passed True but the current value is False",
+    ):
+        launch(*_gpu_controls(), True, o, 1.0, "pos")
+    assert knobs.runtime.debug is False and compiles == []
+    off = launch(*_gpu_controls(), False, o, 1.0, "pos")
+    assert compiles == [False] and knobs.runtime.debug is False
+    monkeypatch.setattr(knobs.runtime, "debug", True)
+    on = launch(*_gpu_controls(), True, o, 1.0, "pos")  # the refused key, now live
+    assert compiles == [False, True] and knobs.runtime.debug is True
+    assert on is not off and on.metadata.debug and not off.metadata.debug
+    assert launch(*_gpu_controls(), False, o, 1.0, "pos") is off  # a hit: no check
+    assert compiles == [False, True]
+
+
+def test_declared_knob_without_an_option_compiles_per_value(monkeypatch):
     """knobs.compilation.disable_line_info feeds neither a compile option nor
     the specialization: only the knob values in the compile identity keep
     its two values apart."""
     from triton import knobs
 
-    before = knobs.compilation.disable_line_info
     launch = make_launcher(
         act_store,
         dynamic_options=("knobs.compilation.disable_line_info",),
         return_compiled=True,
     )
     o = torch.zeros(1, device="cuda")
+    monkeypatch.setattr(knobs.compilation, "disable_line_info", False)
     lines = launch(*_gpu_controls(), False, o, 1.0, "pos")
+    monkeypatch.setattr(knobs.compilation, "disable_line_info", True)
     bare = launch(*_gpu_controls(), True, o, 1.0, "pos")
-    assert knobs.compilation.disable_line_info == before
     assert launch(*_gpu_controls(), True, o, 1.0, "pos") is bare
     asm = "amdgcn" if "amdgcn" in lines.asm else "ptx"
     assert ".loc" in lines.asm[asm] and ".loc" not in bare.asm[asm]
-
-
-def test_concurrent_declared_knob_compiles_each_see_their_own_value(monkeypatch):
-    """Two threads' knob scopes never interleave: each compile runs under its
-    own call's value, and the knob is restored once both are done."""
-    import threading
-
-    import intj.launcher as launcher
-    from triton import knobs
-
-    before = knobs.runtime.debug
-    real = launcher._checked_compile
-    # With the knob lock only one thread reaches the spy at a time, so the
-    # barrier times out; without it both meet and the second scope's value
-    # is what both compiles see.
-    barrier = threading.Barrier(2, timeout=0.2)
-    seen = {}
-
-    def spy(jit_func, compiler_input, target, options):
-        try:
-            barrier.wait()
-        except threading.BrokenBarrierError:
-            pass
-        seen[options.debug] = knobs.runtime.debug
-        return real(jit_func, compiler_input, target, options)
-
-    monkeypatch.setattr(launcher, "_checked_compile", spy)
-    launch = make_launcher(
-        act_store,
-        dynamic_options=("knobs.runtime.debug",),
-        options={"num_stages": 1},  # a module of its own: both calls compile
-    )
-    o = torch.zeros(1, device="cuda")
-    device, stream = (
-        torch.cuda.current_device(),
-        torch.cuda.current_stream().cuda_stream,
-    )
-    errors = []
-
-    def call(value):
-        try:
-            torch.cuda.set_device(device)
-            launch(device, stream, 1, value, o, 1.0, "pos")
-        except Exception as error:  # pragma: no cover - reported below
-            errors.append(error)
-
-    threads = [threading.Thread(target=call, args=(v,)) for v in (True, False)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert errors == []
-    assert seen == {True: True, False: False}
-    assert knobs.runtime.debug == before
 
 
 @pytest.mark.skipif(
@@ -5187,19 +5145,19 @@ def test_concurrent_declared_knob_compiles_each_see_their_own_value(monkeypatch)
     != "hip",
     reason="knobs.amd.use_buffer_ops is a HIP knob",
 )
-def test_declared_knob_reaches_the_specialization():
-    """HIP's pointer specialization reads knobs.amd.use_buffer_ops, so the
-    compiler input is built under the call's knob values, like the compile."""
+def test_declared_knob_reaches_the_specialization(monkeypatch):
+    """HIP's pointer specialization reads knobs.amd.use_buffer_ops: with the
+    live knob matching the passed value, the compiler input follows it."""
     from triton import knobs
 
-    before = knobs.amd.use_buffer_ops
     launch = make_launcher(
         act_store, dynamic_options=("knobs.amd.use_buffer_ops",), return_compiled=True
     )
     o = torch.zeros(1, device="cuda")
+    monkeypatch.setattr(knobs.amd, "use_buffer_ops", True)
     on = launch(*_gpu_controls(), True, o, 1.0, "pos")
+    monkeypatch.setattr(knobs.amd, "use_buffer_ops", False)
     off = launch(*_gpu_controls(), False, o, 1.0, "pos")
-    assert knobs.amd.use_buffer_ops == before
     assert "tt.pointer_range" in str(on.src.attrs)
     assert "tt.pointer_range" not in str(off.src.attrs)
     assert launch(*_gpu_controls(), False, o, 1.0, "pos") is off
