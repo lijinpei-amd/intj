@@ -290,6 +290,7 @@ def make_tuned_callback(
     grid: TunedGrid,
     render: Any,
     return_compiled: bool,
+    knob_values: Mapping[str, object],
 ) -> Callable[..., tuple[Any, ...]]:
     """The C miss callback for one bound launcher, which owns its private tuners."""
     from triton.compiler import make_backend
@@ -301,6 +302,7 @@ def make_tuned_callback(
         _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _current_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _current_target,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
     )
 
     del return_compiled  # C decides whether the record keeps the object
@@ -313,7 +315,10 @@ def make_tuned_callback(
     compiled: dict[tuple[Any, str, int], Any] = {}
 
     def compile_kernel(values: dict[str, Any], config_options: dict[str, Any]) -> Any:
-        canonical = _canonical_options(target, {**options, **config_options})
+        canonical = _canonical_options(
+            target,
+            _knob_options(jit_func, {**options, **config_options}, knob_values),
+        )
         compiler_input = _compiler_input(
             jit_func, params, [values[p.name] for p in params], backend
         )

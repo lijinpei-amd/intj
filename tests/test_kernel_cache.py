@@ -26,6 +26,7 @@ import triton.language as tl
 
 from intj import Constexpr, TorchAccessMode, make_launcher
 from intj.kernel_cache import KernelCache, toolchain_for
+from intj.launcher import module_of, override_compile
 from intj.python_intf import cpython_abi
 
 _RUNTIME = pathlib.Path(__import__("intj").__file__).parent / "runtime"
@@ -161,7 +162,7 @@ def test_block_dim_zero_is_refused():
     launch = make_launcher(
         keyed_store, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
     )
-    launch.__self__.set_compile_callback(lambda key, nparams, *_: (0, 0, 0, nparams))
+    override_compile(module_of(launch), lambda key, nparams, *_: (0, 0, 0, nparams))
     with pytest.raises(ValueError, match="block_dim 0"):
         launch(0, 0, 1, 0, 1)
 
@@ -181,7 +182,7 @@ def test_records_survive_rehash(cache):
         compiled.append(k)
         return 0, 1, 0, nparams
 
-    launch.__self__.set_compile_callback(compile_key)
+    override_compile(module_of(launch), compile_key)
     for _ in range(2):
         for k in range(100):
             launch(0, 0, 1, 0, k)
@@ -198,7 +199,7 @@ def test_one_word_map_survives_rehash(cache):
         torch_access_mode=TorchAccessMode.INTERPRETER,
         extra_annotation={"K": Constexpr(type=tl.int8)},
     )
-    so = pathlib.Path(launch.__self__.__file__)
+    so = pathlib.Path(str(module_of(launch).__file__))
     stem = so.name.split(".")[0]
     (source,) = [
         so.with_name(stem + ext)
@@ -212,7 +213,7 @@ def test_one_word_map_survives_rehash(cache):
         compiled.append(k)
         return 0, 1, 0, nparams
 
-    launch.__self__.set_compile_callback(compile_key)
+    override_compile(module_of(launch), compile_key)
     for _ in range(2):
         for k in range(20):
             launch(0, 0, 1, 0, k)

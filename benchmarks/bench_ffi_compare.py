@@ -22,6 +22,7 @@ import tvm_ffi
 import tvm_ffi.cpp
 
 from intj import Argument, NEVER, TorchAccessMode, make_launcher
+from intj.launcher import module_of
 from bench_launch import bench
 
 
@@ -199,7 +200,7 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
                     bind_device=True,
                     torch_access_mode=mode,
                 ).bind_device(device)
-                assert launch.__self__.__self__.spec_key(*args) == (b"", count)
+                assert module_of(launch).spec_key(launch, 0, *args) == (b"", count)
                 cases.append(
                     (count, f"INTJ {mode.value} kernel", launch, (stream, (1,), *args))
                 )
@@ -260,8 +261,12 @@ def main(iters: int, batches: int) -> None:
     mixed_args = (*tensors, 1, 1.5)
     mixed_converted = (*converted, 1, 1.5)
     other_args = (*(tensor[1:] for tensor in tensors), 7, 2.0)
-    spec_key = intj_mixed_bound.__self__.__self__.spec_key
-    assert spec_key(*mixed_args) == spec_key(*other_args) == (b"", 5)
+    spec_key = module_of(intj_mixed_bound).spec_key
+    assert (
+        spec_key(intj_mixed_bound, 0, *mixed_args)
+        == spec_key(intj_mixed_bound, 0, *other_args)
+        == (b"", 5)
+    )
 
     cases = [
         ("FFI packed nop", packed_nop, converted),

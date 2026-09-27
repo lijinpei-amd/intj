@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
-from intj.launcher import UnsupportedKernel, triton_specialization
+from intj.launcher import UnsupportedKernel, module_of, triton_specialization
 
 
 @triton.jit
@@ -491,7 +491,7 @@ def test_two_level_chain():
     assert bench.calls == [32, 64], (
         "one tuning run for N=8; strides only add level-1 keys"
     )
-    module = launch.__self__.__self__
+    module = module_of(launch)
     keys, found = module.key_chain(launch, device, x, out, 8, 256)
     assert found and len(keys) == 2
 
@@ -530,7 +530,7 @@ def test_child_map_grows_past_four_slots(monkeypatch):
     )(triton.heuristics({"REM": lambda a: a["stride"] % a["BLOCK"]})(strided_tag))
     launch = make_launcher(kernel)
     device, stream = controls()
-    module = launch.__self__.__self__
+    module = module_of(launch)
     cases = [(32, 0), (33, 1), (34, 2), (35, 3), (36, 4)]  # remainders mod BLOCK=32
     # Insert all 5 first: the 3rd distinct REM triggers the child map's only
     # grow, which must rehash the 2 entries already there. Checking a value
@@ -770,7 +770,7 @@ def _reference(kernel, args_by_name):
 def check_tuned_invariant(make_kernel, cases):
     kernel = make_kernel()
     launch = make_launcher(kernel)
-    module = launch.__self__.__self__
+    module = module_of(launch)
     device, stream = controls()
     seen = {}
     for case in cases:
@@ -847,3 +847,26 @@ def test_tuned_launcher_on_two_devices():
             assert int(out.sum().item()) == 256, f"device {device}"
     finally:
         torch.cuda.set_device(previous)
+
+
+def test_tuned_decoration_needs_no_gpu(monkeypatch):
+    from intj import launcher as launcher_mod
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("decoration touched the GPU")
+
+    monkeypatch.setattr(launcher_mod, "_current_target", forbidden)
+    launch = make_launcher(
+        triton.autotune(
+            configs=configs(),
+            key=["n"],
+            do_bench=lambda call, quantiles: [call() or 1.0] * 3,
+        )(tagged),
+        grid_cpp=grid,
+    )
+    monkeypatch.undo()
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    launch(*controls(), x, out, 256)
+    torch.cuda.synchronize()
+    assert int(out[0].item()) in (1, 2)

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
+import dis
+import gc
 import importlib.util
 import os
 import struct
@@ -20,12 +22,15 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import time
+import weakref
+from collections.abc import Callable
 
 import jinja2
 import pytest
 import torch
 
-from intj import launcher
+from intj import launcher, lazy
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
 from intj.launcher import RenderContext
 from intj.python_intf import cpython_abi
@@ -188,7 +193,7 @@ def built(request, stub, tmp_path_factory):
         compiles.append(args[-1])
         return (0xBAD if args[-1] == 999 else 0x1000 + nparams, 128, 0, nparams)
 
-    module.set_compile_callback(compile_cb)
+    launcher.override_compile(module, compile_cb)
     layout = layout_for().as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
     # every torch code its own 5-bit index; the real one comes from triton
     module.set_torch_version(
@@ -272,7 +277,7 @@ def test_runtime_shim_probe_refuses_slot_before_header():
     assert probe_layout(torch.Tensor.__basicsize__ + 1) is None
 
 
-def test_runtime_shim_rejects_rebased_cdata_overflow(built):
+def test_runtime_shim_rejects_rebased_cdata_overflow(built, launch):
     module, stub, _ = built
     if module.__name__ != "rt_runtime_shim":
         pytest.skip("only RUNTIME_SHIM installs cdata")
@@ -280,7 +285,7 @@ def test_runtime_shim_rejects_rebased_cdata_overflow(built):
     assert layout is not None
     x = torch.arange(8, dtype=torch.float32)
     args = (0, 0, 1, x, 5, 0, 0.0, False, 64)
-    module.entry(*args)
+    launch(*args)
     assert stub.last(5)[3][0] == x.data_ptr()
 
     relative = (1 << 16) - cpython_abi.pyobject_size()
@@ -290,7 +295,7 @@ def test_runtime_shim_rejects_rebased_cdata_overflow(built):
     with pytest.raises(ValueError, match="16-bit"):
         module.set_torch_version(torch_version(), bad, index)
 
-    module.entry(*args)
+    launch(*args)
     assert stub.last(5)[3][0] == x.data_ptr()
 
 
@@ -324,15 +329,15 @@ def test_gil_stays_off_on_a_free_threaded_build(built):
 
 
 @pytest.mark.parametrize("grid", [(2, 3), [2, 3]])
-def test_arguments_reach_the_launch(built, grid):
+def test_arguments_reach_the_launch(built, launch, grid):
     module, stub, compiles = built
     x = torch.arange(8, dtype=torch.float32)
-    module.entry(0, 77, grid, x, 5, -7, 1.5, True, 64)
+    launch(0, 77, grid, x, 5, -7, 1.5, True, 64)
     grid, block, stream, params = stub.last(5)
     assert (grid, block, stream) == ((2, 3, 1), 128, 77)
     assert params == [x.data_ptr(), 5, 2**64 - 7, _f32(1.5), 1]
     before = len(compiles)
-    module.entry(0, 0, 4, x, 5, -7, 1.5, True, 64)
+    launch(0, 0, 4, x, 5, -7, 1.5, True, 64)
     assert len(compiles) == before  # a hit: no second compile
     assert stub.last(0)[0] == (4, 1, 1)
 
@@ -359,30 +364,30 @@ def test_arguments_reach_the_launch(built, grid):
         2**100,
     ],
 )
-def test_int_values(built, value):
+def test_int_values(built, launch, value):
     module, stub, _ = built
     x = torch.zeros(4)
     if not -(2**63) <= value < 2**64:
         with pytest.raises(OverflowError):
-            module.entry(0, 0, 1, x, value, 0, 0.0, False, 64)
+            launch(0, 0, 1, x, value, 0, 0.0, False, 64)
         return
-    module.entry(0, 0, 1, x, value, value, 0.0, False, 64)
+    launch(0, 0, 1, x, value, value, 0.0, False, 64)
     assert stub.last(3)[3] == [x.data_ptr(), value % 2**64, value % 2**64]
 
 
-def test_int_one_is_folded_into_the_key(built):
+def test_int_one_is_folded_into_the_key(built, launch):
     module, stub, _ = built
     x = torch.zeros(4)
-    module.entry(0, 0, 1, x, 1, 9, 0.0, False, 64)
+    launch(0, 0, 1, x, 1, 9, 0.0, False, 64)
     assert stub.last(2)[3] == [x.data_ptr(), 9]
 
 
-def test_spec_key_buckets(built):
+def test_spec_key_buckets(built, launch):
     module, _, _ = built
     x = torch.zeros(64)
 
     def key(*args):
-        return module.spec_key(*args)[0]
+        return module.spec_key(launch, 0, *args)[0]
 
     ints = [key(x, v, 0, 0.0, False, 64) for v in (17, 16, 2**31, 2**63, 1)]
     assert len(set(ints)) == len(ints)
@@ -398,27 +403,27 @@ def test_spec_key_buckets(built):
     assert key(x, 17, 0, 0.0, False, 2**64 - 1) != key(x, 17, 0, 0.0, False, 2**63 - 1)
 
 
-def test_bad_arguments(built):
+def test_bad_arguments(built, launch):
     module, stub, _ = built
     x = torch.zeros(4)
     with pytest.raises(TypeError):
-        module.entry(0, 0, 1, x, 5, 0, 0.0, False)
+        launch(0, 0, 1, x, 5, 0, 0.0, False)
     with pytest.raises(TypeError, match="unsupported argument 'n'"):
-        module.entry(0, 0, 1, x, "5", 0, 0.0, False, 64)
+        launch(0, 0, 1, x, "5", 0, 0.0, False, 64)
     with pytest.raises(TypeError, match="device"):
-        module.entry(256, 0, 1, x, 5, 0, 0.0, False, 64)
+        launch(256, 0, 1, x, 5, 0, 0.0, False, 64)
     for grid in ((1, 1, 1, 1), [], [1, 1, 1, 1], [-1], [2**32], [None]):
         with pytest.raises(ValueError, match="grid"):
-            module.entry(0, 0, grid, x, 5, 0, 0.0, False, 64)
+            launch(0, 0, grid, x, 5, 0, 0.0, False, 64)
     calls = stub.calls()
-    assert module.entry(0, 0, (4, 0), x, 5, 0, 0.0, False, 64) is None
+    assert launch(0, 0, (4, 0), x, 5, 0, 0.0, False, 64) is None
     assert stub.calls() == calls  # an empty grid launches nothing
 
 
 @pytest.mark.skipif(
     not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="requires free threading"
 )
-def test_list_grid_survives_concurrent_resize(built):
+def test_list_grid_survives_concurrent_resize(built, stub_module):
     """A list resize must not invalidate the grid parser's borrowed item array."""
     module, _, _ = built
     layout = layout_for() if module.__name__ == "rt_runtime_shim" else None
@@ -433,6 +438,10 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.set_torch_version({torch_version()!r}, {layout.as_args() if layout else None!r},
                          {bytes(c if c < 32 else 0xFF for c in range(NDTYPES))!r})
+spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
+lazy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lazy)
+launch = lazy.new_launcher({_TAIL!r}, b"", lambda header: module.init_bound(header, print))
 assert not sys._is_gil_enabled()
 grid = [0, 1000, 1000]
 stop = threading.Event()
@@ -449,7 +458,7 @@ try:
     for _ in range(200_000):
         try:
             # Every valid snapshot has zero volume, so no kernel is needed.
-            assert module.entry(0, 0, grid, None, 5, 0, 0.0, False, 64) is None
+            assert launch(0, 0, grid, None, 5, 0, 0.0, False, 64) is None
         except ValueError as error:
             assert "between 1 and 3 dimensions" in str(error)
 finally:
@@ -465,13 +474,13 @@ finally:
     assert result.returncode == 0, result.stderr
 
 
-def test_launch_failure_is_reported(built):
+def test_launch_failure_is_reported(built, launch):
     module, _, _ = built
     with pytest.raises(RuntimeError, match="stub_launch failed: stub failure"):
-        module.entry(0, 0, 1, torch.zeros(4), 5, 0, 0.0, False, 999)
+        launch(0, 0, 1, torch.zeros(4), 5, 0, 0.0, False, 999)
 
 
-def test_unreadable_tensor_names_the_argument(built):
+def test_unreadable_tensor_names_the_argument(built, launch):
     """The reader's error is re-raised naming the argument, with its own as the cause.
 
     Goes through `PyErr_GetRaisedException`, which is a shim below 3.12.
@@ -481,11 +490,11 @@ def test_unreadable_tensor_names_the_argument(built):
         pytest.skip("only the interpreter tensor reader calls into torch")
     sparse = torch.zeros(4).to_sparse()
     with pytest.raises(RuntimeError, match="tensor argument 'x'") as info:
-        module.entry(0, 0, 1, sparse, 5, 0, 0.0, False, 64)
+        launch(0, 0, 1, sparse, 5, 0, 0.0, False, 64)
     assert info.value.__cause__ is not None
 
 
-def test_concurrent_launches(built):
+def test_concurrent_launches(built, launch):
     """Cold fills and hits from many threads at once.  With the GIL this is
     interleaving only; on a free-threaded build it is the cache lock's test."""
     module, stub, _ = built
@@ -498,7 +507,7 @@ def test_concurrent_launches(built):
         try:
             barrier.wait()
             for i in range(iters):
-                module.entry(0, 0, 1, x, 5, t, 0.0, False, 1000 + (i * 7 + t) % 64)
+                launch(0, 0, 1, x, 5, t, 0.0, False, 1000 + (i * 7 + t) % 64)
         except BaseException as e:  # noqa: BLE001 - reported below
             errors.append(e)
 
@@ -526,3 +535,154 @@ def test_cpython_layer_matches_this_python():
 def test_verified_python_versions_share_one_header():
     headers = {cpython_abi.header_for((3, minor)) for minor in range(8, 15)}
     assert None not in headers and len(headers) == 1
+
+
+@pytest.fixture(scope="module")
+def stub_module(tmp_path_factory):
+    return lazy.load_stub(tmp_path_factory.mktemp("lazy"), _cc("c"))
+
+
+_CALL = (0, 0, 1)  # device, stream, grid
+_TAIL = launcher._tail_bytes(0, 0)
+
+
+@pytest.fixture(scope="module")
+def launch(built, stub_module):
+    """A built launcher over the fixture module: what `module.entry` used to be."""
+    module, _, _ = built
+    fn = stub_module.new_launcher(
+        _TAIL,
+        b"",
+        lambda header: module.init_bound(header, launcher._launcher_compile(module)),
+    )
+    fn(*_args())
+    return fn
+
+
+def _args():
+    return (*_CALL, torch.zeros(4), 5, -7, 1.5, True, 64)
+
+
+def test_stub_stays_out_of_sys_modules_and_matches_the_header(built, stub_module):
+    module, _, _ = built
+    assert "_intj_lazy" not in sys.modules
+    assert stub_module.header_size() == module.header_size()
+
+
+def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
+    module, _, _ = built
+    builds = []
+
+    def build(header):
+        builds.append(1)
+        return module.init_bound(header, launcher._launcher_compile(module))
+
+    launch = stub_module.new_launcher(_TAIL, b"launch(a, /)\n--\n\n", build)
+    before = launch  # a reference taken before the build
+    function = ctypes.pythonapi.PyCFunction_GetFunction
+    function.argtypes, function.restype = [ctypes.py_object], ctypes.c_void_p
+    shim = function(launch)
+    assert launch.__self__.__self__ is None and builds == []
+    args = _args()
+    assert launch(*args) is None
+    assert builds == [1] and function(before) != shim
+    assert launch.__self__.__self__ is module and launch.__self__.build() is module
+    a, b, c, d, e, f, g, h, i = args
+
+    def call():
+        # explicit positionals: `before(*args)` is CALL_FUNCTION_EX, never specialized
+        return before(a, b, c, d, e, f, g, h, i)
+
+    for _ in range(100):
+        assert call() is None
+    assert builds == [1]
+    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    if sys.version_info >= (3, 11) and not (
+        free_threaded and sys.version_info[:2] == (3, 13)
+    ):
+        names = {i.opname for i in dis.get_instructions(call, adaptive=True)}  # pyright: ignore[reportCallIssue]
+        assert names & {
+            "PRECALL_NO_KW_BUILTIN_FAST",
+            "CALL_NO_KW_BUILTIN_FAST",
+            "CALL_BUILTIN_FAST",
+        }
+
+
+def test_failed_build_raises_and_the_next_call_retries(built, stub_module):
+    module, _, _ = built
+    attempts = []
+
+    def build(header):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("first build fails")
+        return module.init_bound(header, launcher._launcher_compile(module))
+
+    launch = stub_module.new_launcher(_TAIL, b"", build)
+    with pytest.raises(RuntimeError, match="first build fails"):
+        launch(*_args())
+    assert launch(*_args()) is None and len(attempts) == 2
+
+
+def test_concurrent_first_calls_build_once(built, stub_module):
+    module, _, _ = built
+    builds = []
+
+    def build(header):
+        builds.append(1)
+        time.sleep(0.05)  # hold the build lock while the others arrive
+        return module.init_bound(header, launcher._launcher_compile(module))
+
+    launch = stub_module.new_launcher(_TAIL, b"", build)
+    barrier, results, errors = threading.Barrier(8), [], []
+
+    def worker():
+        barrier.wait()
+        try:
+            results.append(launch(*_args()))
+        except BaseException as error:  # noqa: BLE001  report, do not hang
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and results == [None] * 8 and builds == [1]
+
+
+def test_call_during_build_is_refused(built, stub_module):
+    module, _, _ = built
+    seen = []
+
+    def build(header):
+        try:
+            launch(*_args())
+        except RuntimeError as error:
+            seen.append(str(error))
+        return module.init_bound(header, launcher._launcher_compile(module))
+
+    launch = stub_module.new_launcher(_TAIL, b"", build)
+    assert launch(*_args()) is None
+    assert seen and "while it was being built" in seen[0]
+
+
+def test_unbuilt_and_built_launchers_are_collected(built, stub_module):
+    module, _, _ = built
+
+    class Owner:
+        launch: Callable[..., object]
+
+    for call_first in (False, True):
+        owner = Owner()
+
+        def build(header, owner=owner):  # the builder holds its owner: a cycle
+            return module.init_bound(header, launcher._launcher_compile(module))
+
+        owner.launch = stub_module.new_launcher(_TAIL, b"", build)
+        if call_first:
+            owner.launch(*_args())
+        ref = weakref.ref(owner)
+        del owner, build
+        gc.collect()
+        assert ref() is None, f"leaked (called first: {call_first})"

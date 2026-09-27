@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from intj.compat import launch
-from intj.launcher import UnsupportedKernel
+from intj.launcher import UnsupportedKernel, override_compile
 
 
 @triton.jit
@@ -257,6 +257,9 @@ def test_callable_grid_bridge_reuses_kernel_cache(monkeypatch):
             active=SimpleNamespace(
                 get_current_device=lambda: 0,
                 get_current_stream=lambda device: 0,
+                get_current_target=lambda: SimpleNamespace(
+                    backend="hip", arch="host", warp_size=64
+                ),
             )
         ),
     )
@@ -275,7 +278,7 @@ def test_callable_grid_bridge_reuses_kernel_cache(monkeypatch):
         misses.append(bytes(key))
         return 0, 1, 0, nparams
 
-    module.set_compile_callback(compile_once)
+    override_compile(module, compile_once)
     dimensions[0] = 1
     compat.launch(unused_pointer, grid, 7)
     compat.launch(unused_pointer, grid, 7)

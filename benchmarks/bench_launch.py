@@ -36,6 +36,7 @@ from intj import (
     TorchAccessMode,
     make_launcher,
 )
+from intj.launcher import module_of
 
 
 @triton.jit
@@ -95,9 +96,10 @@ def bench_readme(iters, batches):
         TorchAccessMode.INTERPRETER,
     ):
         start = time.perf_counter_ns()
-        module = getattr(make_launcher(noop, torch_access_mode=mode), "__self__")
+        keyed = make_launcher(noop, torch_access_mode=mode)
+        module = module_of(keyed)  # builds: make_launcher alone no longer does
         build_s = (time.perf_counter_ns() - start) / 1e9
-        decode_ns = bench(module.spec_key, args, iters, batches, sync)
+        decode_ns = bench(module.spec_key, (keyed, 0, *args), iters, batches, sync)
         access_rows.append((mode.name.lower(), decode_ns, build_s))
 
     launcher = make_launcher(noop)
@@ -232,6 +234,9 @@ def main(iters=20000, batches=7, no_gpu=False):
             bind_ms = (time.perf_counter_ns() - start) / 1e6
         else:
             launcher = factory
+        start = time.perf_counter_ns()
+        module_of(launcher)  # the build, which make_launcher leaves to the first call
+        build_ms += (time.perf_counter_ns() - start) / 1e6
         call_args = args[1:] if binding else args
         if baked_n:
             call_args = (

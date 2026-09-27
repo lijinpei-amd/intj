@@ -18,6 +18,7 @@ import tvm_ffi
 import tvm_ffi.cpp
 
 from intj import make_launcher
+from intj.launcher import module_of, override_compile
 from bench_launch import bench
 
 
@@ -99,7 +100,7 @@ def main(iters: int, batches: int) -> None:
         assert ordinal == device and nparams == 4
         return compiled.function, block_threads, compiled.metadata.shared, nparams
 
-    bound.__self__.__self__.set_compile_callback(compiled_function)
+    override_compile(module_of(bound), compiled_function)
     cases = [
         ("TVM FFI HIP HSACO", mod.launch_empty, ffi_args),
         ("Triton same HSACO", native, (*tensors, 128, 128)),

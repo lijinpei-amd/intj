@@ -39,12 +39,20 @@ multi-phase (`PyModuleDef_Init`): a single-phase `m_size = -1` module gets cache
 the interpreter per (name, path), and two launchers would then share one module's
 state. `test_modules_stay_out_of_the_import_system` guards both halves.
 
+`_intj_lazy` (`intj/lazy.py`, `runtime/intj_lazy.c`), the stub every launcher
+starts as, follows the same rule. Every launcher is a `PyCFunction` over a
+`PyMethodDef` embedded in its `_intj_lazy.Launcher`. The first call swaps its
+`ml_meth` from the build shim to the rendered entry, and GC reaches the module's
+state through the `traverse`/`clear` hooks that `init_bound` installs. All
+mutable launch state (cache, lock, miss callback) is the launcher's; the
+module's C state is written once, at load.
+
 ## The kernel cache is swappable, and intj's own is the default
 
 `intj_cache_{init,lookup,get,put,each,free}`, instantiated by
 `INTJ_DEFINE_CACHE(V)` in `runtime/intj_map.h`, is the whole interface; the entry
 template never names an implementation. Every backend stores records by value,
-so a record pointer is valid only while the module's read lock is held; `lookup`
+so a record pointer is valid only while the launcher's read lock is held; `lookup`
 checks a one-entry memo before hashing or probing, and a put clears it. A
 backend owns the records it is given (`intj_cache_free` hands each to a release
 function) and must not let an exception escape -- the C++ maps throw where intj
@@ -59,7 +67,8 @@ A backend's library is downloaded at a pinned version and checksum into
 `$TRITON_HOME/.triton/intj/deps/`, never taken from the host: what a module was
 built against has to be a property of intj's cache, or the same digest means
 different binaries on two machines. `make_launcher` provisions on demand,
-once, after every refusal it could have made instead, and announces it on stderr;
+once, after every GPU-free refusal it could have made instead (target-dependent
+ones wait for the first call), and announces it on stderr;
 `python -m intj.kernel_cache <name>` does the same thing ahead of time. A flock
 keeps it to one installer per machine, and a tree is only visible to
 `toolchain_for` once it is complete. Anything that reaches the network belongs

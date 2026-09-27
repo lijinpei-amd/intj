@@ -23,11 +23,31 @@ launcher = make_launcher(
 )
 ```
 
-`make_launcher` renders a C python extension for `jit_func`, builds it once with
-a local compiler, caches it on disk under intj's module digest, loads it, and
-returns a callable launcher when no value or device binding requires a factory.
-With bindings, the factory materializes the extension when bound. Construction
-is slow; call it once, outside any hot loop.
+`make_launcher` returns a callable launcher when no value or device binding
+requires a factory; with bindings, `.bind()`/`.bind_device()` return it. Call it
+once, outside any hot loop.
+
+### Lazy build
+
+`make_launcher` returns a launcher at once, without touching the GPU. It
+validates arguments, resolves annotations, analyzes an autotune/heuristics
+chain, lowers `grid_cpp`, and provisions a non-default `kernel_cache`. The
+**first call** builds: it queries the GPU target, renders the C extension,
+compiles it with the host compiler (cached on disk under intj's module digest),
+loads it, fills the launcher, and swaps its entry. After that, every reference
+to the launcher, including ones taken before the build, calls the native entry
+directly. If the build raises, that call raises and the next call retries.
+Concurrent first calls build once.
+
+Decorating a module-level kernel is therefore safe at import on a machine
+without a GPU. A few checks need the target and surface on the first call: an
+unknown `options=` name, an invalid compile option in an autotune config, and
+the C-side checks on bound values (an out-of-range pointer, a failing
+`hipDeviceGet`). Triton's `debug`, `instrumentation_mode` and
+`fpsan_homomorphic_casts` knobs are read then too, and fixed for the launcher.
+Every launcher is a builtin function whose `__self__` is an
+`_intj_lazy.Launcher`, whatever it binds; `intj.launcher.module_of(launcher)`
+builds if needed and returns the rendered module, for debugging.
 
 Called without `jit_func` (keyword arguments only), `make_launcher` is a
 decorator factory instead, so a kernel -- plain or stacked under
@@ -43,9 +63,8 @@ def k(x, o, n, BLOCK: tl.constexpr):
 ```
 
 This is equivalent to calling `make_launcher(k, grid_cpp=grid)` on the already
-autotuned/heuristic-wrapped `k`. The kernel still needs building at decoration
-time -- i.e. at import, for a module-level kernel -- so a GPU must be available
-then; a plain `@make_launcher` (no parens) keeps working exactly as before.
+autotuned/heuristic-wrapped `k`. A plain `@make_launcher` (no parens) keeps
+working exactly as before.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
 values for binding. `verify_annotation=True` checks declared promises before
 cache lookup; the default trusts them. `bind_device=True` fixes a device on a
@@ -57,7 +76,8 @@ choices are described below.
 `options` must be valid triton compile options (`num_warps`, `num_stages`,
 `waves_per_eu`, ...) and are fixed for the lifetime of the launcher. `device`,
 `stream`, `device_type` and `warp_size` are rejected, and an unknown option name
-is an error here rather than a silent fall back to the default.
+is an error (on the first call, where the target is known) rather than a silent
+fall back to the default.
 
 They are canonicalized through the compiler backend's `parse_options`, so spellings
 that mean the same thing — `{}` and `{"num_warps": 4}` on AMD — share one rendered
@@ -345,12 +365,13 @@ from the native callable's signature, whose remaining arguments are positional
 only. Both methods return a `METH_FASTCALL` builtin, allowing CPython to specialize
 explicit positional calls. `inspect.signature(handle)` reads its generated
 `__text_signature__`. Each handle keeps its bound objects and extension alive
-through its private state at `handle.__self__`; the extension module is
-`handle.__self__.__self__` (an unbound launcher's module is `launcher.__self__`).
+through its private state at `handle.__self__` (an `_intj_lazy.Launcher`, as for
+every launcher); `module_of(handle)` returns the extension module.
 Kernel calls support Unicode parameter names, but CPython 3.12's builtin signature
 parser limits `inspect.signature(handle)` to ASCII parameter names.
-Each fixed-device handle has its own kernel cache. With no dynamic key fields,
-it stores one nullable kernel directly: no hash or map operation occurs.
+Every launcher and handle has its own kernel cache. A fixed-device handle with
+no dynamic key fields stores one nullable kernel directly: no hash or map
+operation occurs.
 
 With `verify_annotation=True`, intj checks declared types, ranges, and assumed
 facts before a cold or hot lookup. Bound pointer checks happen once when the
@@ -519,17 +540,21 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 
 ## How a launch works
 
+0. The first call builds the module and swaps the launcher's entry; later calls
+   start at step 1.
 1. Parse `device` and `stream`, compute the selected grid, and return early on a
    zero-volume grid.
 2. Decode each public or bound argument, checking annotations if requested, and
    pack the dynamic key fields. How tensor fields are read is `torch_access_mode`'s
    choice; no mode calls an `aoti_torch_*` shim. The direct `AUTO` path accumulates
    descriptor bytes in 32-bit registers.
-3. Hash and look up the key in the module cache, or in the bound handle's cache
-   when the device is fixed. A fixed-device handle with no dynamic key fields
-   reads its one nullable kernel directly, without hashing or a map.
+3. Hash and look up the key in the launcher's own cache. A fixed-device handle
+   with no dynamic key fields reads its one nullable kernel directly, without
+   hashing or a map.
 4. On a miss, call back into Python: build the annotated `CompilerInput`, compare
-   it with any input previously recorded for that key, and pass its
+   it with any input this launcher previously recorded for that key, and, unless
+   the module's compile cache already holds that kernel (a sibling launcher
+   missed first), pass its
    `triton.compiler.ASTSource` (or `GluonASTSource`) and canonical options to
    `triton.compiler.compile`.
    `_init_handles` loads the GPU module; the entry records the function handle,
@@ -537,8 +562,9 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 5. Pack the param array (plus the two mandatory trailing scratch slots) and call
    `hipModuleLaunchKernel` / `cuLaunchKernel` (identical argument lists).
 
-Each cached `CompiledKernel` is kept alive by the launcher, so its GPU module stays
-loaded for the lifetime of the process.
+Each cached `CompiledKernel` is kept alive by the module's compile cache (with
+`return_compiled=True`, by the launcher records that return it), so its GPU
+module stays loaded for as long as that owner lives.
 
 ## Correctness
 
@@ -558,7 +584,8 @@ The invariant intj must not break is:
 
 A coarser key does not crash — it launches, say, a `tt.divisibility = 16` binary on an
 unaligned pointer. `tests/test_launcher.py::test_spec_key_is_never_coarser_than_triton`
-checks it directly through the module's `spec_key(*args)` debug entry point, and every
+checks it directly through the module's `spec_key(launcher, device, *args)` debug entry
+point, and every
 GPU cache miss builds a `CompilerInput` containing the final annotated
 `ASTSource` signature, tagged constexpr values, and attributes. The callback
 compares it with any input previously recorded for the same key and rejects a
@@ -601,7 +628,7 @@ is just the kernel's, a label rather than a lookup key — two builds of one ker
 it and are told apart by `__file__`.
 
 `make_launcher` looks for its module in three places, in order: the process-level
-`ModuleKey` dict (same module, so the same kernel cache), the `.so` on disk (loaded
+`ModuleKey` dict (same module, so the same compile cache), the `.so` on disk (loaded
 as-is, nothing rendered or compiled), and only then renders and builds. A warm
 process takes ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build.
 

@@ -15,7 +15,7 @@ import triton.language as tl
 from triton.compiler import CompiledKernel
 
 from intj import Argument, BindValue, KernelCache, NEVER, make_launcher
-from intj.launcher import UnsupportedKernel
+from intj.launcher import UnsupportedKernel, module_of, override_compile
 
 
 @triton.jit
@@ -67,8 +67,10 @@ def test_zero_grid_returns_kernel_without_dispatch_and_mode_changes_module():
     default = make_launcher(store_value)
     returning = make_launcher(store_value, return_compiled=True)
 
-    assert default.__self__.__file__ != returning.__self__.__file__
-    assert default.__self__.spec_key(x, 7) == returning.__self__.spec_key(x, 7)
+    assert module_of(default).__file__ != module_of(returning).__file__
+    assert module_of(default).spec_key(default, 0, x, 7) == module_of(
+        returning
+    ).spec_key(returning, 0, x, 7)
     assert default(device, stream, (0,), x, 7) is None
     kernel = returning(device, stream, (0,), x, 7)
     assert kernel.asm["ttir"]
@@ -119,8 +121,9 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
     bound = factory.bind_device(device, x=x)
     import intj.launcher as launcher_module
 
+    built = module_of(bound)
     assert any(
-        key.context.nwords == 0 and module.__file__ == bound.__self__.__self__.__file__
+        key.context.nwords == 0 and module.__file__ == built.__file__
         for key, module in launcher_module._LOADED.items()
     )
     kernel = bound(stream, (1,), 11)
@@ -166,31 +169,31 @@ def test_reentrant_cache_miss_returns_winning_record(monkeypatch):
 
 
 @pytest.mark.parametrize("cache", list(KernelCache), ids=lambda cache: cache.value)
-def test_module_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
+def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
     import intj.launcher as launcher_module
 
     monkeypatch.setattr(launcher_module, "_LOADED", {})
     launch = make_launcher(gc_cycle_store, kernel_cache=cache, return_compiled=True)
-    module = launch.__self__
+    module = module_of(launch)
     module_ref = weakref.ref(module)
 
     class Owner:
-        module: object
+        launch: object
 
     owner = Owner()
-    owner.module = module
+    owner.launch = launch  # launcher -> record -> owner -> launcher: a cycle
     owner_ref = weakref.ref(owner)
 
     def compile_fake(_key, nparams, _device, *_args):
         return 0, 1, 0, nparams, owner
 
-    module.set_compile_callback(compile_fake)
+    override_compile(module, compile_fake)
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     result = launch(
         torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream, (0,), x, 9
     )
     assert result is owner
-    module.set_compile_callback(lambda *_args: None)
+    override_compile(module, lambda *_args: None)
     launcher_module._LOADED.clear()
     del result, owner, compile_fake, launch, module
 
@@ -240,30 +243,6 @@ int traverse_count(PyObject *owner, PyObject *trigger, PyObject *callback) {
   return context.seen;
 }
 
-static int visit_callback(PyObject *object, void *opaque) {
-  visit_context *context = (visit_context *)opaque;
-  if (object != PyWeakref_GetObject(context->trigger))
-    return 0;
-  context->seen = 1;
-  PyObject *result = PyObject_CallObject(context->callback, NULL);
-  if (!result)
-    return -1;
-  Py_DECREF(result);
-  context->inserted = PyWeakref_GetObject(context->trigger) != Py_None;
-  return 0;
-}
-
-int traverse_callback_alive(PyObject *owner, PyObject *weakref, PyObject *callback) {
-  visit_context context = {weakref, callback, 0, 0};
-  if (Py_TYPE(owner)->tp_traverse(owner, visit_callback, &context))
-    return -1;
-  if (!context.seen) {
-    PyErr_SetString(PyExc_AssertionError, "callback was not visited");
-    return -1;
-  }
-  return context.inserted;
-}
-
 static int fail_on_owner(PyObject *object, void *opaque) {
   return Py_TYPE(object) == Py_TYPE((PyObject *)opaque) ? 77 : 0;
 }
@@ -286,10 +265,8 @@ int traverse_fail(PyObject *owner, PyObject *trigger) {
         check=True,
     )
     lib = ctypes.PyDLL(str(library))
-    for name in ("traverse_count", "traverse_callback_alive"):
-        method = getattr(lib, name)
-        method.argtypes = [ctypes.py_object] * 3
-        method.restype = ctypes.c_int
+    lib.traverse_count.argtypes = [ctypes.py_object] * 3
+    lib.traverse_count.restype = ctypes.c_int
     lib.traverse_fail.argtypes = [ctypes.py_object] * 2
     lib.traverse_fail.restype = ctypes.c_int
     return lib
@@ -323,14 +300,14 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
     if fixed_device:
         bound = factory.bind_device(device, x=x)
         owner = bound.__self__
-        module = owner.__self__
+        module = module_of(bound)
 
         def launch(value):
             return bound(stream, (0,), value)
 
     else:
-        module = factory.__self__
-        owner = module
+        owner = factory.__self__
+        module = module_of(factory)
 
         def launch(value):
             return factory(device, stream, (0,), x, value)
@@ -345,7 +322,7 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
         owners.append(owner)
         return 0, 1, 0, nparams, owner
 
-    module.set_compile_callback(compile_fake)
+    override_compile(module, compile_fake)
     for value in range(8):
         assert launch(value) is owners[-1]
     assert sum(type(ref) is Owner for ref in gc.get_referents(owner)) == 8
@@ -359,27 +336,6 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
 
     assert traversal_helpers.traverse_count(owner, owners[0], grow_cache) == 8
     assert len(owners) == 32
-
-
-def test_compile_callback_survives_reentrant_traversal(traversal_helpers):
-    launch = make_launcher(gc_resize_store, grid_arg=1, return_compiled=True)
-    module = launch.__self__
-
-    class OldCallback:
-        def __call__(self, *_args):
-            pytest.fail("callback should not run")
-
-    old = OldCallback()
-    old_ref = weakref.ref(old)
-    module.set_compile_callback(old)
-    del old
-    assert old_ref() is not None
-
-    def replace_callback():
-        module.set_compile_callback(lambda *_args: None)
-
-    assert traversal_helpers.traverse_callback_alive(module, old_ref, replace_callback)
-    assert old_ref() is None
 
 
 def test_bound_no_map_compiled_reference_is_gc_traversed():
@@ -400,10 +356,11 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
         },
     )
     bound = factory.bind_device(torch.cuda.current_device(), x=x)
+    built = module_of(bound)
     module = next(
         module
         for module in launcher_module._LOADED.values()
-        if module.__file__ == bound.__self__.__self__.__file__
+        if module.__file__ == built.__file__
     )
 
     class Owner:
@@ -416,10 +373,10 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
     def compile_fake(_key, nparams, _device, *_args):
         return 0, 1, 0, nparams, owner
 
-    module.set_compile_callback(compile_fake)
+    override_compile(module, compile_fake)
     result = bound(torch.cuda.current_stream().cuda_stream, (0,), 9)
     assert result is owner
-    module.set_compile_callback(lambda *_args: None)
+    override_compile(module, lambda *_args: None)
     del result, owner, compile_fake, bound
 
     gc.collect()
@@ -441,3 +398,15 @@ def test_compiled_objects_survive_rehash():
     assert all(a is b for a, b in zip(first, again))
     torch.cuda.synchronize()
     assert int(x.item()) == 39
+
+
+def test_undeclared_knobs_are_read_at_the_first_call(monkeypatch):
+    from triton import knobs
+
+    launch = make_launcher(store_value, return_compiled=True)
+    monkeypatch.setattr(knobs.runtime, "debug", True)  # after make_launcher
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    kernel = launch(
+        torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream, 1, x, 5
+    )
+    assert kernel.metadata.debug is True

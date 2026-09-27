@@ -115,8 +115,8 @@ static-compile tensor slots. `NBOUND` is known without a GPU.
 
 - **Cache storage:** the header holds fixed-size, opaque storage for the level-0
   cache, large enough for every backend (intj map, tsl, absl).
-- **Field order:** fields the warmed launch reads sit in the first 64-byte
-  cache line after `PyObject_HEAD`:
+- **Field order:** fields the warmed launch reads sit within 64 bytes after
+  `PyObject_HEAD` (not one aligned cache line: GC objects are not 64-aligned):
   - device ordinal and handle
   - the cache storage, including its memo
   - the fixed-kernel pointer
@@ -309,7 +309,7 @@ knobs stays a TODO.
     afterwards.
   - After warm-up, `dis` with adaptive specialization shows
     `CALL_BUILTIN_FAST` at the call site.
-  - `offsetof` asserts pin the hot fields to the first cache line.
+  - `offsetof` asserts pin the hot fields within 64 bytes after the object head.
 - **Per-launcher state:** two launchers of one `ModuleKey` compile a key
   once; the second's first call only builds its C record. The key self-check
   raises for a key that maps to two compiler inputs, object values included.

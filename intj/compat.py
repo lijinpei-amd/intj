@@ -6,6 +6,7 @@ sites should construct and call ``make_launcher`` directly.
 
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -84,6 +85,55 @@ def _cached(
     )
 
 
+#: the TensorWrappers of the `launch` running on this thread, for its grid
+_WRAPPERS = threading.local()
+
+
+@lru_cache(maxsize=256)
+def _cached_grid_py(
+    kernel: Any,
+    source_key: str,
+    grid: Any,
+    options: tuple[tuple[str, Any], ...],
+    baked: tuple[tuple[str, Any], ...],
+    wrapped_types: tuple[tuple[str, Any], ...],
+    return_compiled: bool,
+    target: tuple[str, str, int],
+    debug: object,
+    instrumentation: object,
+    fpsan_casts: object,
+) -> Any:
+    """A callable-grid launcher, reused across calls like `_cached`'s: each
+    launcher owns its kernel cache, so a fresh one per call would miss every time."""
+    del source_key, target, debug, instrumentation, fpsan_casts
+    return _make_grid_py(kernel, grid, options, baked, wrapped_types, return_compiled)
+
+
+def _make_grid_py(
+    kernel: Any,
+    grid: Any,
+    options: tuple[tuple[str, Any], ...],
+    baked: tuple[tuple[str, Any], ...],
+    wrapped_types: tuple[tuple[str, Any], ...],
+    return_compiled: bool,
+) -> Any:
+    grid_py = grid
+    if wrapped_types:
+
+        def wrapped_grid(meta: dict[str, object]) -> object:
+            # the calling launch's own wrappers: the launcher outlives them
+            return grid({**meta, **_WRAPPERS.current})
+
+        grid_py = wrapped_grid
+    return make_launcher(
+        kernel,
+        grid_py=grid_py,
+        options=dict(options),
+        extra_annotation=_annotations(baked, wrapped_types),
+        return_compiled=return_compiled,
+    )
+
+
 def launch(
     kernel: Any, grid: Any, /, *args: Any, return_compiled: bool = False, **kwargs: Any
 ) -> Any:
@@ -158,19 +208,33 @@ def launch(
     device = driver.active.get_current_device()  # pyright: ignore[reportAttributeAccessIssue]  # concrete drivers provide it
     stream = driver.active.get_current_stream(device)  # pyright: ignore[reportAttributeAccessIssue]  # concrete drivers provide it
     if callable(grid):
-
-        def wrapped_grid(meta: dict[str, object]) -> object:
-            return grid({**meta, **wrapped})
-
-        grid_py = wrapped_grid if wrapped else grid
-        native = make_launcher(
+        key = (
             kernel,
-            grid_py=grid_py,
-            options=dict(options),
-            extra_annotation=_annotations(baked, wrapped_types),
-            return_compiled=return_compiled,
+            kernel.cache_key,
+            grid,
+            options,
+            baked,
+            wrapped_types,
+            return_compiled,
+            _target_key(),
+            *_knob_key(),
         )
-        return native(device, stream, *values)
+        try:
+            hash(key)
+        except TypeError:
+            native = _make_grid_py(
+                kernel, grid, options, baked, wrapped_types, return_compiled
+            )
+        else:
+            native = _cached_grid_py(*key)
+        if not wrapped:
+            return native(device, stream, *values)
+        previous = getattr(_WRAPPERS, "current", None)
+        _WRAPPERS.current = wrapped  # the grid may launch again: restore after
+        try:
+            return native(device, stream, *values)
+        finally:
+            _WRAPPERS.current = previous
     if type(grid) is int:
         dimensions = (grid,)
     elif type(grid) in (tuple, list):
@@ -180,10 +244,6 @@ def launch(
     if not 1 <= len(dimensions) <= 3:
         raise ValueError("intj: grid must have between 1 and 3 dimensions")
 
-    target = driver.active.get_current_target()
-    if target is None:
-        raise UnsupportedKernel("intj: no active Triton target")
-    target_key = (target.backend, repr(target.arch), target.warp_size)
     cache_key = (
         kernel,
         kernel.cache_key,
@@ -193,10 +253,8 @@ def launch(
         baked,
         wrapped_types,
         return_compiled,
-        target_key,
-        knobs.runtime.debug,
-        knobs.compilation.instrumentation_mode,
-        getattr(knobs.compilation, "fpsan_homomorphic_casts", None),
+        _target_key(),
+        *_knob_key(),
     )
     try:
         hash(cache_key)
@@ -213,6 +271,22 @@ def launch(
     else:
         native = _cached(*cache_key)
     return native(stream, *dimensions, *values)
+
+
+def _target_key() -> tuple[str, str, int]:
+    target = driver.active.get_current_target()
+    if target is None:
+        raise UnsupportedKernel("intj: no active Triton target")
+    return (target.backend, repr(target.arch), target.warp_size)
+
+
+def _knob_key() -> tuple[object, object, object]:
+    """The knobs a launcher reads at its first call: a change selects another."""
+    return (
+        knobs.runtime.debug,
+        knobs.compilation.instrumentation_mode,
+        getattr(knobs.compilation, "fpsan_homomorphic_casts", None),
+    )
 
 
 def launch_or_interpret(

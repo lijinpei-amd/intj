@@ -17,10 +17,12 @@ import tempfile
 import threading
 import types
 import warnings
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import weakref
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, overload
 
+from . import lazy
 from ._version import __version__
 from .annotation import (
     CanonicalAnnotation,
@@ -242,9 +244,21 @@ class LauncherFactory:
             raise TypeError(
                 "intj: bind_device requires exactly one positional device ordinal"
             )
-        return self._bind(args[0], values)
+        ordinal = args[0]
+        # here, not on the first call, so a bad ordinal fails where it is written
+        if type(ordinal) is not int or not 0 <= ordinal <= 2**31 - 1:
+            raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
+        return self._bind(ordinal, values)
+
+    def _binding(self) -> DeviceBinding:
+        return (
+            DeviceBinding.FIXED
+            if self.bind_device_requested
+            else DeviceBinding.NOT_FIXED
+        )
 
     def _bind(self, device: object, values: Mapping[str, object]) -> Callable[..., Any]:
+        """A lazy launcher.  Everything here is GPU-free; `_build` runs on its first call."""
         names = {p.name for p in self.params if p.annotation.bind_value is not None}
         unknown = values.keys() - names
         if unknown:
@@ -285,29 +299,65 @@ class LauncherFactory:
                         ty = "*" + dtype
                     annotation = dataclasses.replace(annotation, types=(ty,))
             resolved.append(dataclasses.replace(p, annotation=annotation))
+        state = tuple(resolved)
+        bound_values = tuple(values[p.name] for p in state if p.name in names)
+        hidden = tuple(
+            values[p.name] if p.name in names else p.baked
+            for p in state
+            if p.annotation.bind_value is not None or p.annotation.baked_value
+        )
+        args = (*((device,) if self.bind_device_requested else ()), *bound_values)
+        params, _, _ = _render_params(state, self._binding())
+        doc = _launch_doc(
+            params,
+            self.bind_device_requested,
+            self.grid_arg,
+            self.grid_cpp,
+            self.grid_py is not None,
+        )
+
+        def build(header: object) -> int:
+            return self._build(header, state, args, hidden)
+
+        return _stub().new_launcher(_tail_bytes(0, len(bound_values)), doc, build)
+
+    def _build(
+        self,
+        header: object,
+        resolved: tuple[ResolvedParam, ...],
+        args: tuple[object, ...],
+        hidden: tuple[object, ...],
+    ) -> int:
+        """The first call: query the target, render, compile, load, fill `header`.
+        Returns the rendered entry's address for `_intj_lazy` to swap in."""
+        knob_values = None if self.no_gpu else _live_knobs()
+        if self.tuned is not None:
+            assert knob_values is not None, "_plan_tuning refuses no_gpu"
+            _check_tuned_configs(
+                self.tuned.plan, resolved, dict(self.options), knob_values
+            )
         module = _materialize_module(
             self.jit_func,
-            tuple(resolved),
+            resolved,
             dict(self.options),
             self.torch_access_mode,
             self.kernel_cache,
             self.no_gpu,
             self.verify_annotation,
-            DeviceBinding.FIXED
-            if self.bind_device_requested
-            else DeviceBinding.NOT_FIXED,
+            self._binding(),
             grid_arg=self.grid_arg,
             grid_py_mode=self.grid_py is not None,
             grid_cpp=self.grid_cpp,
             return_compiled=self.return_compiled,
             tuning=self.tuned.render if self.tuned else None,
+            knob_values=knob_values,
         )
-        bound_values = tuple(values[p.name] for p in resolved if p.name in names)
-        prefix: tuple[object, ...] = ()
-        if self.tuned is not None:
+        if self.tuned is None:
+            callback: Callable[..., Any] = _launcher_compile(module)
+        else:
             from .tuning import TunedGrid, make_tuned_callback
 
-            assert self.tuned.render is not None
+            assert self.tuned.render is not None and knob_values is not None
             if self.grid_py is not None:
                 grid = TunedGrid("py", self.grid_py)
             elif self.grid_cpp is not None:
@@ -320,34 +370,17 @@ class LauncherFactory:
                 )
             else:
                 grid = TunedGrid("dims")
-            prefix = (
-                make_tuned_callback(
-                    self.tuned.plan,
-                    tuple(resolved),
-                    dict(self.options),
-                    grid,
-                    self.tuned.render,
-                    self.return_compiled,
-                ),
+            callback = make_tuned_callback(
+                self.tuned.plan,
+                resolved,
+                dict(self.options),
+                grid,
+                self.tuned.render,
+                self.return_compiled,
+                knob_values,
             )
-        if self.grid_py is not None:
-            hidden = tuple(
-                values[p.name] if p.name in names else p.baked
-                for p in resolved
-                if p.annotation.bind_value is not None or p.annotation.baked_value
-            )
-            return module.make_bound(
-                *prefix,
-                self.grid_py,
-                hidden,
-                *((device,) if self.bind_device_requested else ()),
-                *bound_values,
-            )
-        return module.make_bound(
-            *prefix,
-            *((device,) if self.bind_device_requested else ()),
-            *bound_values,
-        )
+        grid_py = () if self.grid_py is None else (self.grid_py, hidden)
+        return module.init_bound(header, callback, *grid_py, *args)
 
 
 def _validate_grid_kwargs(
@@ -452,9 +485,8 @@ def make_launcher(
         def k(...): ...
 
     The cheap keyword checks below (grid option ranges and exclusivity) run at
-    decoration time; everything that needs the kernel -- annotation
-    resolution, compilation, the GPU -- waits for the inner call, i.e. import
-    time for a module-level kernel, so a GPU must be available then.
+    decoration time.  make_launcher does no GPU work: the returned launcher
+    builds its module on its first call (see docs/Usage.md, "Lazy build").
 
     Without bindings, the returned callable is a C function:
 
@@ -582,62 +614,41 @@ def make_launcher(
             )
         except GridError as error:
             raise UnsupportedKernel(f"intj: {error}") from error
-    if not no_gpu:
-        from triton import knobs
-
-        options["debug"] = options.get("debug", kernel.debug) or knobs.runtime.debug
-        options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
-        fpsan_casts = getattr(knobs.compilation, "fpsan_homomorphic_casts", None)
-        if fpsan_casts is not None:
-            options["fpsan_homomorphic_casts"] = fpsan_casts
     access = _resolve_torch_access_mode(torch_access_mode)
     needs_binding = bind_device or any(
         p.annotation.bind_value is not None for p in resolved
     )
-    if needs_binding or grid_py is not None or tuned is not None:
-        if not no_gpu:
-            _canonical_options(_current_target(), options)
-        if verify_annotation:
-            for p in resolved:
-                if (
-                    p.annotation.bind_value == "pointer"
-                    and p.annotation.pointer_range_32 == "assume"
-                ):
-                    warnings.warn(
-                        f"intj: pointer-range assumption for bound pointer {p.name!r} "
-                        "cannot be verified from an address and will be trusted",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-        factory = LauncherFactory(
-            kernel,
-            resolved,
-            tuple(options.items()),
-            access,
-            kernel_cache,
-            bool(verify_annotation),
-            no_gpu,
-            bool(bind_device),
-            grid_arg,
-            grid_py,
-            compiled_grid,
-            bool(return_compiled),
-            tuned,
-            grid_cpp,
-        )
-        return factory if needs_binding else factory.bind()
-    return _materialize_module(
+    if needs_binding and verify_annotation:
+        for p in resolved:
+            if (
+                p.annotation.bind_value == "pointer"
+                and p.annotation.pointer_range_32 == "assume"
+            ):
+                warnings.warn(
+                    f"intj: pointer-range assumption for bound pointer {p.name!r} "
+                    "cannot be verified from an address and will be trusted",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+    # GPU-free but may reach the network: here, never on a call
+    _provision(kernel_cache)
+    factory = LauncherFactory(
         kernel,
         resolved,
-        options,
+        tuple(options.items()),
         access,
         kernel_cache,
-        no_gpu,
         bool(verify_annotation),
-        grid_arg=grid_arg,
-        grid_cpp=compiled_grid,
-        return_compiled=bool(return_compiled),
-    ).entry
+        no_gpu,
+        bool(bind_device),
+        grid_arg,
+        grid_py,
+        compiled_grid,
+        bool(return_compiled),
+        tuned,
+        grid_cpp,
+    )
+    return factory if needs_binding else factory.bind()
 
 
 def _materialize_module(
@@ -654,6 +665,7 @@ def _materialize_module(
     grid_cpp: GridCode | None = None,
     return_compiled: bool = False,
     tuning: TuningRender | None = None,
+    knob_values: Mapping[str, object] | None = None,
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -667,7 +679,10 @@ def _materialize_module(
                 f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
                 f"register() it (have: {', '.join(sorted(BACKENDS))})"
             )
-        canonical_options = _canonical_options(target, options)
+        assert knob_values is not None, "GPU builds read knobs at the first call"
+        canonical_options = _canonical_options(
+            target, _knob_options(jit_func, options, knob_values)
+        )
     params, device_offset, nwords, computed_fields = _render_key(
         resolved, device_binding, tuning.computed[0] if tuning is not None else 0
     )
@@ -676,8 +691,8 @@ def _materialize_module(
         tuning = dataclasses.replace(tuning, computed_fields=computed_fields)
     # tuned levels always use a map
     nwords = max(nwords, 1) if tuning is not None else nwords
-    # last, after every refusal above it: a kernel that is going to be rejected
-    # anyway must not pay for a download and an abseil build first
+    # make_launcher provisioned already: this is the idempotent, no-network
+    # lookup of the toolchain it installed
     cache_toolchain = _provision(kernel_cache)
     # the kernel's own name, unless python allows something C does not
     module_name = jit_func.__name__
@@ -755,7 +770,9 @@ def _materialize_module(
         else None
     )
     baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
-    return _loaded_module(key, jit_func, context, params, options, layout, baked_values)
+    return _loaded_module(
+        key, jit_func, context, params, options, layout, baked_values, knob_values
+    )
 
 
 _INSTALL_FAILED: dict[KernelCache, Exception] = {}
@@ -781,6 +798,96 @@ def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
             _INSTALL_FAILED[cache] = error
     failure = _INSTALL_FAILED[cache]
     raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
+
+
+@functools.lru_cache(maxsize=1)
+def _stub() -> types.ModuleType:
+    """The process's one `_intj_lazy`, beside the modules intj renders."""
+    from triton import knobs
+
+    return lazy.load_stub(
+        Path(knobs.cache.get_triton_dir("intj")) / "lazy", _compiler_path("c")
+    )
+
+
+def _tail_bytes(nmemo: int, nbound: int) -> int:
+    """sizeof(intj_bound_tail) in intj_runtime.h: 16 per memo and 24 per bound
+    slot, each at least one.  The rendered module static_asserts the same."""
+    return 16 * max(nmemo, 1) + 24 * max(nbound, 1)
+
+
+def module_of(launcher: Callable[..., Any]) -> types.ModuleType:
+    """The rendered module behind `launcher`, building it now if its first
+    call has not.  For tests and debugging: `module_of(k).spec_key(k, ...)`."""
+    return getattr(launcher, "__self__").build()
+
+
+def _launch_doc(
+    params: Sequence[Param],
+    fixed_device: bool,
+    grid_arg: int | None,
+    grid_cpp: GridCode | None,
+    grid_py: bool,
+    dynamic: Sequence[str] = (),
+) -> bytes:
+    """The launcher's `__text_signature__`: controls renamed away from kernel names."""
+    public = [p.name for p in params if p.call_index is not None]
+    extras = list(grid_cpp.extras) if grid_cpp else []
+    values = [name.replace(".", "_") for name in dynamic]
+    grid = (
+        []
+        if grid_cpp or grid_py
+        else ["grid"]
+        if grid_arg is None
+        else ["grid_x", "grid_y", "grid_z"][:grid_arg]
+    )
+    occupied = set(public) | set(extras) | set(values)
+    controls: list[str] = []
+    for name in (["stream"] if fixed_device else ["device", "stream"]) + grid:
+        while name in occupied or name in controls:
+            name += "_"
+        controls.append(name)
+    return (
+        f"launch({', '.join(controls + extras + values + public)}, /)\n--\n\n".encode()
+    )
+
+
+#: knob path -> the compile option triton derives from it
+_KNOB_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("knobs.runtime.debug", "debug"),
+    ("knobs.compilation.instrumentation_mode", "instrumentation_mode"),
+    ("knobs.compilation.fpsan_homomorphic_casts", "fpsan_homomorphic_casts"),
+)
+
+
+def _live_knobs() -> dict[str, object]:
+    """The knobs triton turns into compile options, as they are now.  Read at
+    a launcher's first call and fixed for it."""
+    from triton import knobs
+
+    values: dict[str, object] = {}
+    for path, _ in _KNOB_OPTIONS:
+        _, group, name = path.split(".")
+        values[path] = getattr(getattr(knobs, group), name, None)
+    return values
+
+
+def _knob_options(
+    jit_func: JitFunction, options: Mapping[str, Any], knob_values: Mapping[str, object]
+) -> dict[str, Any]:
+    """`options` plus what triton derives from knobs: an explicit `debug`
+    overrides the kernel's default, and the runtime knob can still enable it."""
+    merged = dict(options)
+    merged["debug"] = (
+        options.get("debug", jit_func.debug) or knob_values["knobs.runtime.debug"]
+    )
+    merged["instrumentation_mode"] = knob_values[
+        "knobs.compilation.instrumentation_mode"
+    ]
+    casts = knob_values["knobs.compilation.fpsan_homomorphic_casts"]
+    if casts is not None:
+        merged["fpsan_homomorphic_casts"] = casts
+    return merged
 
 
 def get_full_name(fn: Any) -> str:
@@ -880,13 +987,15 @@ def _loaded_module(
     options: Mapping[str, Any],
     layout: TensorABI | None,
     baked_values: Mapping[int, object],
+    knob_values: Mapping[str, object] | None = None,
 ) -> types.ModuleType:
     """One module per `ModuleKey`, for the life of the process.
 
-    Reusing the module reuses its compile callback, which owns the
-    `CompiledKernel`s the C kernel cache points into -- installing a second
-    callback would drop the first, freeing kernels whose function handles are
-    still in that cache. So a hit returns the module untouched.
+    Reusing the module reuses its compile function (`_intj_compile`), whose
+    compile cache owns the `CompiledKernel`s its launchers' records point
+    into -- installing a second one would drop the first, freeing kernels
+    whose function handles are still cached. So a hit returns the module
+    untouched.
 
     The lock matters: without it two threads both compile and both load, and the
     loser's module (with its own kernel cache) is silently dropped.
@@ -895,7 +1004,15 @@ def _loaded_module(
         module = _LOADED.get(key)
         if module is None:
             module = _load(key, jit_func, context)
-            module.set_compile_callback(
+            if module.header_size() != _stub().header_size():
+                raise ImportError(
+                    f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
+                    "header; it was built by another intj -- delete it to rebuild"
+                )
+            # the module object's dict, written once under _LOAD_LOCK; not C state
+            setattr(
+                module,
+                "_intj_compile",
                 _refuse_module_compile
                 if context.tuning is not None
                 else _make_host_compile_callback()
@@ -906,7 +1023,8 @@ def _loaded_module(
                     options,
                     baked_values,
                     return_compiled=context.return_compiled,
-                )
+                    knob_values=knob_values or {},
+                ),
             )
             # Pass relative cdata; the compiled setter saves the absolute offset
             # for the torch running now before exposing the module.
@@ -988,13 +1106,10 @@ def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
         source.write_text(src)
         suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
         binary = Path(directory) / f"{name}{suffix}"
-        scheme = sysconfig.get_default_scheme()
-        if scheme == "posix_local":
-            scheme = "posix_prefix"
         includes = [
             *flags.get("include_dirs", ()),
             directory,
-            sysconfig.get_paths(scheme=scheme)["include"],
+            lazy.python_include(),
             *knobs.build.backend_dirs,
         ]
         command = [
@@ -1243,8 +1358,6 @@ def _plan_tuning(
     options: Mapping[str, Any],
     no_gpu: bool,
 ) -> _Tuned:
-    from triton.runtime.autotuner import Autotuner
-
     from .tuning import analyze
 
     if no_gpu:
@@ -1265,18 +1378,41 @@ def _plan_tuning(
         raise UnsupportedKernel(
             f"intj: options {owned} are set by the autotune configs"
         )
-    target = _current_target()
+    for config_options in _config_options(plan, resolved):
+        if config_options.get("num_ctas", 1) != 1:
+            raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
+    return _Tuned(plan)
+
+
+def _config_options(
+    plan: Any, resolved: tuple[ResolvedParam, ...]
+) -> Iterable[dict[str, Any]]:
+    """Each autotune config's compile options: its kwargs that name no parameter."""
+    from triton.runtime.autotuner import Autotuner
+
     names = {p.name for p in resolved}
     for layer in plan.layers:
         if type(layer) is Autotuner:
             for config in layer.configs:
-                config_options: dict[str, Any] = {
+                yield {
                     str(k): v for k, v in config.all_kwargs().items() if k not in names
                 }
-                if config_options.get("num_ctas", 1) != 1:
-                    raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
-                _canonical_options(target, {**options, **config_options})
-    return _Tuned(plan)
+
+
+def _check_tuned_configs(
+    plan: Any,
+    resolved: tuple[ResolvedParam, ...],
+    options: Mapping[str, Any],
+    knob_values: Mapping[str, object],
+) -> None:
+    """Every config's options through the target's `parse_options`: on the
+    first call, because the target is a GPU query."""
+    target = _current_target()
+    for config_options in _config_options(plan, resolved):
+        _canonical_options(
+            target,
+            _knob_options(plan.jit_func, {**options, **config_options}, knob_values),
+        )
 
 
 def _tuning_render(
@@ -1634,6 +1770,32 @@ def _refuse_module_compile(*args: Any) -> Any:
     raise RuntimeError("intj: tuned modules compile through their bound launcher")
 
 
+def _launcher_compile(module: types.ModuleType) -> Callable[..., Any]:
+    """One launcher's miss callback: its own `seen` map, then the module's
+    compile function, looked up per miss so `override_compile` reaches built
+    launchers too."""
+    seen: dict[bytes, object] = {}
+
+    def callback(*call: Any) -> Any:
+        return getattr(module, "_intj_compile")(seen, *call)
+
+    return callback
+
+
+def override_compile(module: types.ModuleType, fn: Callable[..., Any]) -> Any:
+    """Tests and benchmarks: compile misses of `module`'s launchers with
+    `fn(keyblob, nparams, device, *args)`.  Returns the previous function;
+    restore it with `setattr(module, "_intj_compile", previous)`."""
+    previous = getattr(module, "_intj_compile", None)
+
+    def compile_function(seen: dict[bytes, object], *call: Any) -> Any:
+        del seen
+        return fn(*call)
+
+    setattr(module, "_intj_compile", compile_function)
+    return previous
+
+
 def _make_compile_callback(
     jit_func: JitFunction,
     params: Sequence[Param],
@@ -1641,29 +1803,37 @@ def _make_compile_callback(
     baked_values: Mapping[int, object] | None = None,
     *,
     return_compiled: bool = False,
+    knob_values: Mapping[str, object],
 ) -> Callable[
     ..., tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]
 ]:
-    """Called from C on a spec-key miss, with the key blob and the original args."""
+    """The module's compile function, called from C on a spec-key miss through
+    the missing launcher's callback: `(seen, keyblob, nparams, device, *args)`."""
     from triton.compiler import make_backend
 
     target = _current_target()
     backend = make_backend(target)
-    canonical_options = _canonical_options(target, options)
-    kernels: list[
-        CompiledKernel
-    ] = []  # keeps every CompiledKernel, and so its GPU module, alive
-    seen: dict[bytes, CompilerInput] = {}
-    no_key_input: CompilerInput | None = None
+    canonical_options = _canonical_options(
+        target, _knob_options(jit_func, options, knob_values)
+    )
+    # The module's compile cache: a sibling launcher's miss reuses the kernel
+    # and only builds its own C record.  With return_compiled the records own
+    # their CompiledKernel, so the cache must not keep it alive past them.
+    compiled: MutableMapping[tuple[object, ...], CompiledKernel] = (
+        weakref.WeakValueDictionary() if return_compiled else {}
+    )
+    # One compile per input across the module's launchers.  Reentrant: a
+    # compile can launch this kernel again (a nested miss on the same thread).
+    lock = threading.RLock()
 
     def compile_callback(
-        keyblob: bytes, nparams: int, device: int, *args: Any
+        seen: dict[bytes, object], keyblob: bytes, nparams: int, device: int, *args: Any
     ) -> tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]:
-        nonlocal no_key_input
+        """`seen` is the calling launcher's own key -> input map."""
         current = _current_device()
         if device != current:
-            # _init_handles() loads the binary on the *current*
-            # device; launching that function on another device's stream is a
+            # _init_handles() loads the binary on the *current* device;
+            # launching that function on another device's stream is a
             # wrong-context launch, so refuse instead.
             raise UnsupportedKernel(
                 f"intj: launching on device {device} while device {current} is current; "
@@ -1672,17 +1842,21 @@ def _make_compile_callback(
         compiler_input = _compiler_input(
             jit_func, params, args, backend, baked_values=baked_values
         )
-        if keyblob:
-            previous = seen.setdefault(keyblob, compiler_input)
-        else:
-            if no_key_input is None:
-                no_key_input = compiler_input
-            previous = no_key_input
-        if previous != compiler_input:
+        # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
+        if seen.setdefault(keyblob, compiler_input) != compiler_input:
             raise RuntimeError(
                 "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
             )
-        kernel = _checked_compile(jit_func, compiler_input, target, canonical_options)
+        cache_key = (compiler_input, canonical_options.hash(), current)
+        with lock:
+            kernel = compiled.get(cache_key)
+            if kernel is None:
+                fresh = _checked_compile(
+                    jit_func, compiler_input, target, canonical_options
+                )
+                # a nested miss may have stored one meanwhile; its record may
+                # already be cached, so its kernel is the one that must stay
+                kernel = compiled.setdefault(cache_key, fresh)
         md = kernel.metadata
         expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
         if expected != nparams:
@@ -1691,19 +1865,16 @@ def _make_compile_callback(
                 "this is an intj bug"
             )
         result = (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
-        if return_compiled:
-            return (*result, kernel)
-        kernels.append(kernel)
-        return result
+        return (*result, kernel) if return_compiled else result
 
     return compile_callback
 
 
 def _make_host_compile_callback() -> Callable[..., tuple[int, int, int, int]]:
     def compile_callback(
-        keyblob: bytes, nparams: int, device: int, *args: Any
+        seen: dict[bytes, object], keyblob: bytes, nparams: int, device: int, *args: Any
     ) -> tuple[int, int, int, int]:
-        del keyblob, device, args
+        del seen, keyblob, device, args
         return 0, 1, 0, nparams
 
     return compile_callback
@@ -1713,10 +1884,6 @@ def triton_specialization(
     jit_func: JitFunction, args: Iterable[Any], options: Mapping[str, Any] | None = None
 ) -> list[tuple[str, Any]]:
     """The `list[(type_str, key)]` triton would compute for these arguments."""
-    from triton import knobs
-
     binder = jit_func.device_caches[_current_device()][4]
-    kwargs = dict(options or {})
-    kwargs["debug"] = kwargs.get("debug", jit_func.debug) or knobs.runtime.debug
-    kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+    kwargs = _knob_options(jit_func, options or {}, _live_knobs())
     return binder(*args, **kwargs)[1]

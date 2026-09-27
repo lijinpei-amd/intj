@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 
 from intj import Argument, BindValue, Constexpr, NEVER, TorchAccessMode, make_launcher
-from intj.launcher import UnsupportedKernel
+from intj.launcher import UnsupportedKernel, module_of, override_compile
 
 
 GLOBAL_GRID_OFFSET = 1
@@ -120,9 +120,10 @@ def test_grid_modes_validate_options_and_keep_separate_modules():
     second = make_launcher(write_programs, grid_cpp=second_grid, no_gpu=True)
     one_dim = make_launcher(write_programs, grid_arg=1, no_gpu=True)
     two_dim = make_launcher(write_programs, grid_arg=2, no_gpu=True)
-    assert first.__self__ is again.__self__
+    assert module_of(first) is module_of(again)
     assert (
-        len({id(launch.__self__) for launch in (first, second, one_dim, two_dim)}) == 4
+        len({id(module_of(launch)) for launch in (first, second, one_dim, two_dim)})
+        == 4
     )
 
 
@@ -141,21 +142,22 @@ def test_grid_py_receives_current_meta_on_every_call_and_owns_callback():
     first_launch = make_launcher(write_programs, grid_py=first, no_gpu=True)
     second_launch = make_launcher(write_programs, grid_py=second, no_gpu=True)
     assert first_launch.__self__ is not second_launch.__self__
-    assert first_launch.__self__.__self__ is second_launch.__self__.__self__
+    assert module_of(first_launch) is module_of(second_launch)
     compiled = []
 
     def compile_once(key, nparams, device, *args):
         compiled.append(bytes(key))
         return 0, 1, 0, nparams
 
-    first_launch.__self__.__self__.set_compile_callback(compile_once)
+    override_compile(module_of(first_launch), compile_once)
     for x in (3, 4):
         assert first_launch(0, 0, 0, x, 2) is None
     misses = len(compiled)
     assert misses >= 1
     assert first_launch(0, 0, 0, 4, 2) is None
-    assert second_launch(0, 0, 0, 4, 2) is None
     assert len(compiled) == misses
+    assert second_launch(0, 0, 0, 4, 2) is None
+    assert len(compiled) == misses + 1  # each launcher owns its cache
     assert second_launch(0, 0, 0, 7, 2) is None
     assert [meta["X"] for meta in first_seen] == [3, 4, 4]
     assert [meta["X"] for meta in second_seen] == [4, 7]
@@ -338,7 +340,7 @@ def test_grid_controls_do_not_change_kernel_specialization():
             misses.append(bytes(key))
             return 0, 1, 0, nparams
 
-        launcher.__self__.set_compile_callback(compile_once)
+        override_compile(module_of(launcher), compile_once)
         for value in calls:
             assert launcher(0, 0, value, 0, 3, 2) is None
         assert len(misses) == 1
@@ -369,7 +371,7 @@ def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
     }
     backend = BACKENDS["cuda"]
     for name, launcher in launchers.items():
-        module = launcher.__self__.__self__ if name == "grid_py" else launcher.__self__
+        module = module_of(launcher)
         context = next(key.context for key, value in _LOADED.items() if value is module)
         context = dataclasses.replace(
             context,

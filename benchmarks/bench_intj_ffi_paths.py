@@ -21,6 +21,7 @@ from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
 from tvm_ffi.utils.unpack_dataclass import unpack_dataclass_to_tuple
 
 from intj import make_launcher
+from intj.launcher import module_of, override_compile
 
 
 @triton.jit
@@ -74,7 +75,7 @@ def callback(iters: int, batches: int) -> None:
     launch = make_launcher(callback_kernel, bind_device=True, no_gpu=True).bind_device(
         0
     )
-    module = launch.__self__.__self__
+    module = module_of(launch)
     count = 0
 
     def compile_callback(_key, nparams, _device, *_args):
@@ -82,7 +83,7 @@ def callback(iters: int, batches: int) -> None:
         count += 1
         return 0, 1, 0, nparams  # fake handle: no_gpu skips the driver launch
 
-    module.set_compile_callback(compile_callback)
+    override_compile(module, compile_callback)
     for i in range(100):
         launch(0, 1, *tensors, -(i + 1))
     samples = []

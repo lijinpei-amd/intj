@@ -70,7 +70,8 @@ static_assert(offsetof(intj_bound_header, state) == sizeof(PyVarObject),
               "intj: state leads the hot fields");
 static_assert(offsetof(intj_bound_header, fixed_kernel) + sizeof(void *) <=
                   sizeof(PyVarObject) + 64,
-              "intj: hot fields fit the 64 bytes after the object header");
+              "intj: hot fields sit within 64 bytes after the object head "
+              "(a span, not an aligned line: GC objects are not 64-aligned)");
 static_assert(offsetof(intj_bound_header, def) >=
                   offsetof(intj_bound_header, fixed_kernel) + sizeof(void *),
               "intj: cold fields follow the hot ones");

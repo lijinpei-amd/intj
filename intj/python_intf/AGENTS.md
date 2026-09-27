@@ -105,15 +105,24 @@ vectorcall and `PyObject_CallMethodNoArgs` before 3.9, `Py_NewRef` before 3.10,
 and the raised-exception get/set functions before 3.12. This keeps version
 branches out of callers. Guard each shim by the version that added its call.
 
+Lazy launchers rely on CPython reading `PyCFunctionObject.m_ml->ml_meth` at
+every call, including from specialized call sites (3.11
+`PRECALL_NO_KW_BUILTIN_FAST`, 3.12 `CALL_NO_KW_BUILTIN_FAST`, 3.13+
+`CALL_BUILTIN_FAST`; 3.13t does not specialize). They also rely on
+`meth_dealloc` not reading `m_ml` after dropping `m_self`.
+`test_first_call_builds_and_swaps_for_old_references` pins both on the matrix.
+Recheck it first when adding a Python version.
+
 ## Free-threaded modules
 
 Generated modules declare `Py_MOD_GIL_NOT_USED` on Python 3.13+, so loading them
 does not require CPython to enable the GIL. `intj_rwlock` (in
 `runtime/intj_lazy.h`), owned by each launcher, is a pthread rwlock on
-free-threaded builds and a no-op otherwise. Launches take it shared (`INTJ_RDLOCK`) across their lookups and the
-GPU launch, because cache records live in the map and a put can move them;
-puts and `set_compile_callback` take it exclusive (`INTJ_WRLOCK`). It is never
-held while Python runs. A cache miss checks again under the write lock before
+free-threaded builds and a no-op otherwise. Launches take it shared
+(`INTJ_RDLOCK`) across their lookups and the GPU launch, because cache records
+live in the map and a put can move them; puts take it exclusive
+(`INTJ_WRLOCK`). It is never held while Python runs. The module's C state needs
+no lock: it is written once, before the module is reachable. A cache miss checks again under the write lock before
 inserting its result because another thread may have filled the same key
 during compilation.
 
