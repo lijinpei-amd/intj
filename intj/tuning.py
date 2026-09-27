@@ -360,6 +360,7 @@ def make_tuned_callback(
         nparams: int, device: int, stream: int, controls: Any, args: tuple[Any, ...]
     ) -> tuple[Any, ...]:
         import torch
+        from triton.runtime.autotuner import Autotuner
 
         current = _current_device()
         if device != current:
@@ -389,28 +390,46 @@ def make_tuned_callback(
         else:
             triton_grid = grid.fn
         shim.reset()
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=device)):
-            private[0].run(*prefix, grid=triton_grid, warmup=False, **named)
-        _copy_back(plan.layers, private)
-        assert shim.final is not None, "Triton finished without a final launch"
-        values, config_options, kernel = shim.final
-        tuned_values = {**values, **config_options}
-        md = kernel.metadata
-        expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
-        if expected != nparams:
-            raise RuntimeError(
-                f"intj: packed {nparams} kernel arguments but triton compiled {expected}; "
-                "this is an intj bug"
+        try:
+            with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=device)):
+                private[0].run(*prefix, grid=triton_grid, warmup=False, **named)
+            _copy_back(plan.layers, private)
+            assert shim.final is not None, "Triton finished without a final launch"
+            values, config_options, kernel = shim.final
+            tuned_values = {**values, **config_options}
+            md = kernel.metadata
+            expected = sum(
+                1 for ty in kernel.src.signature.values() if ty != "constexpr"
             )
-        return (
-            kernel.function,
-            md.warp_size * md.num_warps,
-            md.shared,
-            nparams,
-            kernel,
-            tuple(c_scalar(n, tuned_values[n]) for n in render.dep_names),
-            tuple(tuned_values[n] for n in render.computed_names),
-            tuple(values[n] for n in render.meta_names) if grid.mode == "py" else None,
-        )
+            if expected != nparams:
+                raise RuntimeError(
+                    f"intj: packed {nparams} kernel arguments but triton compiled "
+                    f"{expected}; this is an intj bug"
+                )
+            return (
+                kernel.function,
+                md.warp_size * md.num_warps,
+                md.shared,
+                nparams,
+                kernel,
+                tuple(c_scalar(n, tuned_values[n]) for n in render.dep_names),
+                tuple(tuned_values[n] for n in render.computed_names),
+                tuple(values[n] for n in render.meta_names)
+                if grid.mode == "py"
+                else None,
+            )
+        finally:
+            # Triton's own layers hold per-call scratch (args, tensor clones) on
+            # `private` between the start and end of `run`; on the happy path
+            # Autotuner.run already clears its `nargs`, but nothing clears it on
+            # an exception, and `restore_copies` is only ever cleared by a
+            # post_hook that never runs for a single matching config. `private`
+            # outlives this call (it is reused for every future miss), so leaving
+            # either set keeps this call's tensors alive until the next miss.
+            shim.final = None
+            for layer in private:
+                if type(layer) is Autotuner:
+                    layer.nargs = None
+                    layer.restore_copies = {}  # pyright: ignore[reportAttributeAccessIssue]  # set by a closure in Autotuner.__init__, not a direct self-assignment
 
     return callback

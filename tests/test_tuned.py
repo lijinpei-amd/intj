@@ -77,6 +77,50 @@ def test_tunes_on_miss_and_launches_natively_on_hit():
     assert bench.calls == [1, 2, 1, 2], "a hit must not reach Triton"
 
 
+def test_autotune_miss_does_not_retain_call_tensors():
+    """A miss's argument tensors must die when the caller drops them, not linger
+    until the launcher's next miss (the private tuner chain outlives the call)."""
+    import gc
+    import weakref
+
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    bench = Bench(out, {16: {1: 1.0, 2: 2.0}})
+    bench.key = 16
+    kernel, launch = tuned_launcher(bench)
+    device, stream = controls()
+    ref = weakref.ref(x)
+    launch(device, stream, x, out, 16)
+    torch.cuda.synchronize()
+    del x
+    gc.collect()
+    assert ref() is None
+
+
+def test_heuristics_only_miss_does_not_retain_call_tensors():
+    """Same as above, for a heuristics-only launcher (no Autotuner layer)."""
+    import gc
+    import weakref
+
+    @triton.jit
+    def heuristic_store(dst, src, n, EVEN: tl.constexpr):
+        tl.store(dst, EVEN + n * 0)
+
+    kernel = triton.heuristics({"EVEN": lambda a: a["src"].data_ptr() % 2 == 0})(
+        heuristic_store
+    )
+    launch = make_launcher(kernel)
+    dst = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    src = torch.zeros(8, device="cuda", dtype=torch.uint8)
+    ref = weakref.ref(src)
+    launch(device, stream, 1, dst, src, 8)
+    torch.cuda.synchronize()
+    del src
+    gc.collect()
+    assert ref() is None
+
+
 def test_float_autotune_key_is_exact():
     @triton.jit
     def scaled(x, out, s, TAG: tl.constexpr):
