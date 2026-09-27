@@ -124,28 +124,6 @@ static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
  * are the same field read, in every CPython. */
 #define INTJ_FLOAT_VALUE(o) (((PyFloatObject *)(o))->ob_fval)
 
-/* The module's one lock, for what the GIL guards on a default build: the kernel
- * caches and the compile callback.  Launches take it shared across their
- * lookups and the launch, because records live in the map and a put can move
- * them; a put takes it exclusive.  Compiled out with the GIL, so a default
- * build pays nothing.  CPython's own rwlock is private, hence pthread. */
-#ifdef Py_GIL_DISABLED
-#include <pthread.h>
-typedef pthread_rwlock_t intj_rwlock;
-#define INTJ_RWLOCK_INIT(l) pthread_rwlock_init((l), NULL)
-#define INTJ_RWLOCK_DESTROY(l) pthread_rwlock_destroy(l)
-#define INTJ_RDLOCK(l) pthread_rwlock_rdlock(l)
-#define INTJ_WRLOCK(l) pthread_rwlock_wrlock(l)
-#define INTJ_RWUNLOCK(l) pthread_rwlock_unlock(l)
-#else
-typedef char intj_rwlock;
-#define INTJ_RWLOCK_INIT(l) ((void)(l))
-#define INTJ_RWLOCK_DESTROY(l) ((void)(l))
-#define INTJ_RDLOCK(l) ((void)(l))
-#define INTJ_WRLOCK(l) ((void)(l))
-#define INTJ_RWUNLOCK(l) ((void)(l))
-#endif
-
 /* Public calls the older interpreters predate. */
 #if PY_VERSION_HEX < 0x030C0000
 #if PY_VERSION_HEX < 0x03090000

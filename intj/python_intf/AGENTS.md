@@ -108,9 +108,9 @@ branches out of callers. Guard each shim by the version that added its call.
 ## Free-threaded modules
 
 Generated modules declare `Py_MOD_GIL_NOT_USED` on Python 3.13+, so loading them
-does not require CPython to enable the GIL. `intj_rwlock`,
-owned by the module, is a pthread rwlock on free-threaded builds and a no-op
-otherwise. Launches take it shared (`INTJ_RDLOCK`) across their lookups and the
+does not require CPython to enable the GIL. `intj_rwlock` (in
+`runtime/intj_lazy.h`), owned by each launcher, is a pthread rwlock on
+free-threaded builds and a no-op otherwise. Launches take it shared (`INTJ_RDLOCK`) across their lookups and the
 GPU launch, because cache records live in the map and a put can move them;
 puts and `set_compile_callback` take it exclusive (`INTJ_WRLOCK`). It is never
 held while Python runs. A cache miss checks again under the write lock before

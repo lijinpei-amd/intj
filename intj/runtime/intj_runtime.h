@@ -25,6 +25,7 @@
     "define INTJ_CPYTHON_STATIC_COMPILE_HEADER to a header from intj/python_intf"
 #endif
 #include INTJ_CPYTHON_STATIC_COMPILE_HEADER
+#include "intj_lazy.h"
 
 #if defined(__clang__)
 #define INTJ_ASSUME(x) __builtin_assume(x)
@@ -694,36 +695,37 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
 #ifndef INTJ_NBOUND
 #define INTJ_NBOUND 0
 #endif
+#ifndef INTJ_NMEMO
+#define INTJ_NMEMO 0
+#endif
 #define INTJ_BOUND_SLOTS (INTJ_NBOUND ? INTJ_NBOUND : 1)
+#define INTJ_MEMO_SLOTS (INTJ_NMEMO ? INTJ_NMEMO : 1)
 
-typedef struct intj_bound_launcher {
-  PyObject_HEAD
-  PyObject *module;
-#ifdef INTJ_GRID_PY
-  PyObject *grid_py;
-  PyObject *grid_hidden;
-#endif
-#ifdef INTJ_TUNED
-  PyObject *tuned_cb;
-#endif
+typedef intj_bound_header intj_bound_launcher;
+
+/* An object-valued slot's last object and its interned id. */
+typedef struct {
+  PyObject *obj;
+  uint64_t id;
+} intj_memo;
+
+/* The trailing arrays: memos first, then one entry per bound parameter. */
+typedef struct {
+  intj_memo memo[INTJ_MEMO_SLOTS];
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
-  /* Each handle carries only the kernel store its module uses. */
-#ifdef INTJ_BOUND_CACHE
-  intj_cache cache;
-  int cache_ready;
-#endif
-#ifdef INTJ_BOUND_FIXED_KERNEL
-  intj_final *fixed_kernel;
-#endif
-#ifdef INTJ_FIXED_DEVICE
-  int64_t device_ordinal;
-  int32_t device_handle;
-#endif
-#if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
-  at::Tensor *tensors[INTJ_BOUND_SLOTS];
-#endif
-} intj_bound_launcher;
+  void *tensors[INTJ_BOUND_SLOTS]; /* at::Tensor * in STATIC_COMPILE */
+} intj_bound_tail;
+/* launcher._tail_bytes computes the same size for _intj_lazy's allocation. */
+static_assert(sizeof(intj_bound_tail) ==
+                  16 * INTJ_MEMO_SLOTS + 24 * INTJ_BOUND_SLOTS,
+              "intj: bound tail layout");
+#define INTJ_TAIL(b)                                                           \
+  ((intj_bound_tail *)((char *)(b) + sizeof(intj_bound_header)))
+
+/* The header's cache storage, typed.  Never accessed any other way.  The
+ * rendered module asserts that intj_cache fits, after defining it. */
+#define INTJ_BOUND_CACHE_OF(b) ((intj_cache *)(void *)(b)->cache)
 
 static inline int intj_bind_tensor(intj_bound_launcher *bound, int index,
                                    PyObject *value, PyTypeObject *tensor_type,
@@ -737,14 +739,15 @@ static inline int intj_bind_tensor(intj_bound_launcher *bound, int index,
   }
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   if (value != Py_None) {
-    bound->tensors[index] = new (std::nothrow) at::Tensor(intj_cdata(value));
-    if (!bound->tensors[index]) {
+    at::Tensor *tensor = new (std::nothrow) at::Tensor(intj_cdata(value));
+    if (!tensor) {
       PyErr_NoMemory();
       return -1;
     }
+    INTJ_TAIL(bound)->tensors[index] = tensor;
   }
 #else
-  bound->owners[index] = Py_NewRef(value);
+  INTJ_TAIL(bound)->owners[index] = Py_NewRef(value);
 #endif
   return 0;
 }
@@ -756,13 +759,14 @@ intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
                          intj_decoded *out) {
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   memset(out, 0, sizeof(*out));
-  if (!bound->tensors[index]) {
+  at::Tensor *tensor = (at::Tensor *)INTJ_TAIL(bound)->tensors[index];
+  if (!tensor) {
     out->kind = INTJ_VALUE_NONE;
     return 0;
   }
   int32_t dtype = -1;
-  if (INTJ_UNLIKELY(intj_read_cxx_tensor(abi, *bound->tensors[index],
-                                         &out->pointer, &dtype, want_size,
+  if (INTJ_UNLIKELY(intj_read_cxx_tensor(abi, *tensor, &out->pointer, &dtype,
+                                         want_size,
                                          &out->storage_nbytes) != 0)) {
     intj_note_param(pname);
     return -1;
@@ -770,7 +774,8 @@ intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
   return intj_finish_tensor(abi, dtype, pname, out);
 #else
   return intj_decode_argument(abi, tensor_type, param_type,
-                              bound->owners[index], want_size, pname, out);
+                              INTJ_TAIL(bound)->owners[index], want_size, pname,
+                              out);
 #endif
 }
 

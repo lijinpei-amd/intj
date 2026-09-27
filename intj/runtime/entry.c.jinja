@@ -65,17 +65,7 @@
 #define INTJ_HAS_KEY {{ 1 if nwords else 0 }}
 #define INTJ_KEY_BYTES {{ nwords * 8 }}
 #define INTJ_TORCH_ACCESS_{{ torch_access_mode | upper }} 1
-{% if grid_py_mode %}#define INTJ_GRID_PY 1
-{% endif %}
 {% if return_compiled %}#define INTJ_RETURN_COMPILED 1
-{% endif %}
-{% if fixed_device %}#define INTJ_FIXED_DEVICE 1
-{% endif %}
-{% if tuned %}#define INTJ_TUNED 1
-{% endif %}
-{% if (fixed_device and nwords) or tuned %}#define INTJ_BOUND_CACHE 1
-{% endif %}
-{% if not nwords %}#define INTJ_BOUND_FIXED_KERNEL 1
 {% endif %}
 #include "intj_map.h"
 
@@ -142,6 +132,8 @@ static_assert(sizeof(intj_cache_slot) == 8 * (INTJ_NWORDS + (INTJ_NWORDS > 2)) +
 #define INTJ_V0_RELEASE {{ rec_release(0) }}
 
 #include "intj_runtime.h"
+static_assert(sizeof(intj_cache) <= sizeof(((intj_bound_header *)0)->cache),
+              "intj: intj_cache fits the header's storage");
 
 #define INTJ_NPARAMS {{ params | rejectattr('call_index', 'none') | list | length }}
 #define INTJ_NSLOTS {{ [max_slots, 1] | max }}
@@ -368,7 +360,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
 {% else %}
   intj_decoded {{ d }};
 {% if a.bind_value == 'pointer' %}
-  {{ d }} = (intj_decoded){INTJ_VALUE_TENSOR, bound->pointer_bits[{{ bound_params.index(p) }}], NULL, 0, 0};
+  {{ d }} = (intj_decoded){INTJ_VALUE_TENSOR, INTJ_TAIL(bound)->pointer_bits[{{ bound_params.index(p) }}], NULL, 0, 0};
 {% elif a.bind_value == 'tensor' %}
   if (intj_decode_bound_tensor(&st->abi, st->tensor_type, st->param_type,
                                bound, {{ bound_params.index(p) }},
@@ -847,7 +839,7 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_cache *cache,
   cb_args[3] = stream_obj; cb_args[4] = controls;
   for (int i = 0; i < INTJ_NPARAMS; i++)
     cb_args[5 + i] = args[{{ grid_count }} + i];
-  PyObject *cb = Py_NewRef(bound->tuned_cb);
+  PyObject *cb = Py_NewRef(bound->compile_cb);
   PyObject *res = PyObject_Vectorcall(cb, cb_args, 5 + INTJ_NPARAMS, NULL);
   Py_DECREF(cb); Py_DECREF(blob); Py_DECREF(nparams_obj);
   Py_DECREF(device_obj); Py_DECREF(stream_obj); Py_DECREF(controls);
@@ -1231,7 +1223,7 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 {% if nwords %}
   intj_final *kernel = intj_cache_lookup(cache, key);
 {% else %}
-  intj_final *kernel = bound->fixed_kernel;
+  intj_final *kernel = (intj_final *)bound->fixed_kernel;
 {% endif %}
   if (INTJ_UNLIKELY(!kernel)) {
     INTJ_RWUNLOCK(&st->lock);
@@ -1241,7 +1233,7 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 {% if nwords %}
     kernel = intj_cache_lookup(cache, key);
 {% else %}
-    kernel = bound->fixed_kernel;
+    kernel = (intj_final *)bound->fixed_kernel;
 {% endif %}
   }
 {% endif %}
@@ -1308,11 +1300,11 @@ static PyObject *entry(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
 static PyObject *intj_bound_entry(PyObject *self, PyObject *const *args,
                                  Py_ssize_t nargs) {
   intj_bound_launcher *bound = (intj_bound_launcher *)self;
-  if (INTJ_UNLIKELY(!bound->module)) {
+  intj_state *st = (intj_state *)bound->state;
+  if (INTJ_UNLIKELY(!st)) {
     PyErr_SetString(PyExc_RuntimeError, "intj: bound launcher has been cleared");
     return NULL;
   }
-  intj_state *st = (intj_state *)PyModule_GetState(bound->module);
   int64_t device{{ ' = bound->device_ordinal' if fixed_device }};
   uint64_t stream;
   if (intj_parse_call(st, args, nargs, &device, &stream) != 0)
@@ -1324,7 +1316,7 @@ static PyObject *intj_bound_entry(PyObject *self, PyObject *const *args,
 #ifdef __cplusplus
   try {
 #endif
-    result = intj_call(st, {{ '&bound->cache' if (fixed_device and nwords) or tuned else 'NULL' if fixed_device else '&st->cache' }},
+    result = intj_call(st, {{ 'INTJ_BOUND_CACHE_OF(bound)' if (fixed_device and nwords) or tuned else 'NULL' if fixed_device else '&st->cache' }},
                         device, stream, args + {{ 1 if fixed_device else 2 }},
                         nargs - {{ 1 if fixed_device else 2 }}, bound);
 #ifdef __cplusplus
@@ -1360,28 +1352,23 @@ static PyMethodDef intj_bound_method = {
 
 static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
   intj_bound_launcher *bound = (intj_bound_launcher *)self;
+  intj_bound_tail *tail = INTJ_TAIL(bound);
   Py_VISIT(Py_TYPE(self));
   Py_VISIT(bound->module);
-{% if grid_py_mode %}
   Py_VISIT(bound->grid_py);
   Py_VISIT(bound->grid_hidden);
-{% endif %}
-{% if tuned %}
-  Py_VISIT(bound->tuned_cb);
-{% endif %}
+  Py_VISIT(bound->compile_cb);
   for (int i = 0; i < INTJ_NBOUND; i++)
-    Py_VISIT(bound->owners[i]);
+    Py_VISIT(tail->owners[i]);
 {% if (return_compiled or (tuned and grid_py_mode)) and ((fixed_device and nwords) or tuned) %}
-  if (bound->cache_ready && bound->module) {
-    intj_state *st = (intj_state *)PyModule_GetState(bound->module);
-    return intj_cache_traverse(st, &bound->cache, visit, arg);
-  }
+  if (bound->cache_ready && bound->state)
+    return intj_cache_traverse((intj_state *)bound->state, INTJ_BOUND_CACHE_OF(bound), visit, arg);
 {% elif return_compiled and fixed_device %}
-  if (bound->module) {
-    intj_state *st = (intj_state *)PyModule_GetState(bound->module);
+  if (bound->state) {
+    intj_state *st = (intj_state *)bound->state;
     intj_snapshot s = {NULL, 0, 0};
     INTJ_RDLOCK(&st->lock);
-    int failed = bound->fixed_kernel ? intj_final_collect(bound->fixed_kernel, &s) : 0;
+    int failed = bound->fixed_kernel ? intj_final_collect((intj_final *)bound->fixed_kernel, &s) : 0;
     INTJ_RWUNLOCK(&st->lock);
     return intj_snapshot_visit(&s, failed, visit, arg);
   }
@@ -1391,29 +1378,27 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
 
 static int intj_bound_clear(PyObject *self) {
   intj_bound_launcher *bound = (intj_bound_launcher *)self;
+  intj_bound_tail *tail = INTJ_TAIL(bound);
   /* Mark closed before dropping owners whose finalizers can reenter Python. */
+  bound->state = NULL;
   Py_CLEAR(bound->module);
-{% if grid_py_mode %}
   Py_CLEAR(bound->grid_py);
   Py_CLEAR(bound->grid_hidden);
-{% endif %}
-{% if tuned %}
-  Py_CLEAR(bound->tuned_cb);
-{% endif %}
+  Py_CLEAR(bound->compile_cb);
   for (int i = 0; i < INTJ_NBOUND; i++) {
-    Py_CLEAR(bound->owners[i]);
+    Py_CLEAR(tail->owners[i]);
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
-    delete bound->tensors[i];
-    bound->tensors[i] = NULL;
+    delete (at::Tensor *)tail->tensors[i];
+    tail->tensors[i] = NULL;
 #endif
   }
 {% if (fixed_device and nwords) or tuned %}
   if (bound->cache_ready) {
     bound->cache_ready = 0;
-    intj_cache_free(&bound->cache, INTJ_V0_RELEASE);
+    intj_cache_free(INTJ_BOUND_CACHE_OF(bound), INTJ_V0_RELEASE);
   }
 {% elif fixed_device %}
-  intj_final *kernel = bound->fixed_kernel;
+  intj_final *kernel = (intj_final *)bound->fixed_kernel;
   bound->fixed_kernel = NULL;
   if (kernel) {
     intj_final_release(kernel);
@@ -1449,7 +1434,7 @@ static PyType_Slot intj_bound_slots[] = {
     {0, NULL}};
 
 static PyType_Spec intj_bound_spec = {
-    "{{ module_name }}.BoundLauncher", sizeof(intj_bound_launcher), 0,
+    "{{ module_name }}.BoundLauncher", sizeof(intj_bound_launcher), 1,
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
 #ifdef Py_TPFLAGS_IMMUTABLETYPE
         | Py_TPFLAGS_IMMUTABLETYPE
@@ -1498,12 +1483,12 @@ static PyObject *make_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
 #ifdef __cplusplus
   try {
 #endif
-    bound = (intj_bound_launcher *)st->bound_type->tp_alloc(st->bound_type, 0);
+    bound = (intj_bound_launcher *)st->bound_type->tp_alloc(st->bound_type, (Py_ssize_t)sizeof(intj_bound_tail));
     if (!bound)
       return NULL;
     bound->module = Py_NewRef(self);
 {% if tuned %}
-    bound->tuned_cb = Py_NewRef(args[0]);
+    bound->compile_cb = Py_NewRef(args[0]);
 {% endif %}
 {% if grid_py_mode %}
     bound->grid_py = Py_NewRef(args[{{ tuned_offset }}]);
@@ -1531,7 +1516,7 @@ static PyObject *make_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
 {% endif %}
 {% endif %}
 {% if (fixed_device and nwords) or tuned %}
-    if (intj_cache_init(&bound->cache) != 0) {
+    if (intj_cache_init(INTJ_BOUND_CACHE_OF(bound)) != 0) {
       PyErr_NoMemory();
       goto fail;
     }
@@ -1571,11 +1556,12 @@ static PyObject *make_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     }
     INTJ_ASSUME(valid_{{ i }});
 {% endif %}
-    bound->pointer_bits[{{ loop.index0 }}] = decoded_{{ i }}.bits;
+    INTJ_TAIL(bound)->pointer_bits[{{ loop.index0 }}] = decoded_{{ i }}.bits;
     if (!PyLong_CheckExact(args[{{ arg_index }}]))
-      bound->owners[{{ loop.index0 }}] = Py_NewRef(args[{{ arg_index }}]);
+      INTJ_TAIL(bound)->owners[{{ loop.index0 }}] = Py_NewRef(args[{{ arg_index }}]);
 {% endif %}
 {% endfor %}
+    bound->state = st;
     PyObject *result = PyCFunction_New(&intj_bound_method, (PyObject *)bound);
     Py_DECREF((PyObject *)bound);
     return result;
@@ -1651,7 +1637,7 @@ static PyObject *key_chain(PyObject *self, PyObject *const *args, Py_ssize_t nar
   if (intj_pack(st, args + 2, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp) != 0)
     return NULL;
   int missed = 0;
-  intj_final *kernel = intj_walk(st, &bound->cache, args + 2, key, comp, dep, &missed);
+  intj_final *kernel = intj_walk(st, INTJ_BOUND_CACHE_OF(bound), args + 2, key, comp, dep, &missed);
   if (kernel)
     INTJ_RWUNLOCK(&st->lock);
   else if (missed < 0)

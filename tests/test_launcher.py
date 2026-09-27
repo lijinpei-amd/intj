@@ -381,7 +381,7 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
         .with_name("device_kernel.c")
         .read_text()
     )
-    assert "intj_cache_init(&bound->cache)" in source
+    assert "intj_cache_init(INTJ_BOUND_CACHE_OF(bound))" in source
     assert "intj_cache_init(&st->cache)" not in source
 
 
@@ -1343,7 +1343,7 @@ def test_binding_checked_source_checks_only_where_values_change(
             )
         ]
         lookup = (
-            "kernel = bound->fixed_kernel"
+            "kernel = (intj_final *)bound->fixed_kernel"
             if cache_owner == "no-map"
             else "intj_cache_lookup("
         )
@@ -4716,3 +4716,28 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
         module = getattr(make_launcher(scale, torch_access_mode=m), "__self__")
         with pytest.raises(RuntimeError):
             module.spec_key(mkl, o, 16, 2.0, 128)
+
+
+def test_bound_handles_share_one_header_layout(bound_kernel, device_kernel):
+    """Every bound object is one fixed header plus trailing arrays sized per module."""
+    pointer = Argument(
+        type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER
+    )
+    two = make_launcher(
+        bound_kernel,
+        extra_annotation={"x": pointer, "p": pointer},
+        no_gpu=True,
+        torch_access_mode=TorchAccessMode.INTERPRETER,
+    ).bind(x=0, p=0)
+    none = make_launcher(
+        device_kernel,
+        bind_device=True,
+        no_gpu=True,
+        torch_access_mode=TorchAccessMode.INTERPRETER,
+    ).bind_device(0)
+    assert two(0, 0, 1, 7) is None and none(0, 1, 7) is None
+    t2, t0 = type(two.__self__), type(none.__self__)
+    assert t2.__basicsize__ == t0.__basicsize__
+    assert t2.__itemsize__ == t0.__itemsize__ == 1
+    # tail: 16 bytes per memo slot and 24 per bound slot, each at least one
+    assert sys.getsizeof(two.__self__) - sys.getsizeof(none.__self__) == 24
