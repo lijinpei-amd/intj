@@ -48,6 +48,17 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   `bench_time` and `configs_timings` after tuning, but not `cache` itself, so
   code inspecting `len(kernel.cache)` sees 0 even after a tuned launch; either
   mirror entries back per key or warm-start intj's own cache from it.
+- **Keyword arguments at launch.** Launchers are `METH_FASTCALL` (positional
+  only); `METH_FASTCALL | METH_KEYWORDS` (vectorcall `kwnames`) would accept
+  keywords with no cost for positional calls (`kwnames` `NULL`) -- needs a
+  name-to-slot map. E.g. Triton's `test_prune_configs` passes `N=N` and
+  expects it in the pruner's kwargs.
+- **Per-call variants.** Compile options, baked constexprs (`str` / `tl.dtype`
+  / JIT-function constexprs) and grid mode/rank are fixed when `make_launcher`
+  builds a launcher, so a call site whose Triton config changes per call
+  (e.g. aiter's `**_get_config(M, N, K)` with `num_warps`) needs one launcher
+  per variant or `intj.compat.launch`; key these into the launcher (spec-key
+  or a variant table) to serve them from one handle.
 
 ## Performance
 
