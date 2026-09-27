@@ -408,6 +408,35 @@ def test_heuristics_only_computed_key_shares_records():
 
 
 @triton.jit
+def even_src(dst, src, n, EVEN_src: tl.constexpr):
+    tl.store(dst, EVEN_src + n * 0)
+
+
+def test_triton_heuristic_data_ptr_key():
+    """Mirrors triton's test_decorator.py::test_triton_heuristic: a heuristic
+    reading src.data_ptr() must be accepted by make_launcher and key on
+    pointer parity, one record per parity."""
+    kernel = triton.heuristics({"EVEN_src": lambda a: a["src"].data_ptr() % 2 == 0})(
+        even_src
+    )
+    launch = make_launcher(kernel, return_compiled=True)
+    dst = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    base = torch.zeros(9, device="cuda", dtype=torch.uint8)
+    aligned, offset = base[0:8], base[1:9]
+    assert aligned.data_ptr() % 2 == 0 and offset.data_ptr() % 2 == 1
+    even = launch(device, stream, 1, dst, aligned, 8)
+    torch.cuda.synchronize()
+    assert int(dst.item()) == 1
+    odd = launch(device, stream, 1, dst, offset, 8)
+    torch.cuda.synchronize()
+    assert int(dst.item()) == 0
+    assert even is not odd
+    again = launch(device, stream, 1, dst, aligned, 8)
+    assert again is even, "same parity shares the record"
+
+
+@triton.jit
 def maybe_strided(out, b, B_UNIT: tl.constexpr):
     tl.store(out, B_UNIT)
 
@@ -505,6 +534,7 @@ LOWERED_TENSOR = [
     lambda a: a["x"].shape[0] * 100 + a["x"].stride(0) * 10 + a["x"].dim(),
     lambda a: a["x"].numel() * 10 + a["x"].element_size(),
     lambda a: a["x"].is_contiguous(),
+    lambda a: a["x"].data_ptr() % 2 == 0,
     lambda a: a["x"].dtype == a["y"].dtype,
     lambda a: a["y"] is not None and a["y"].size(0) > 2,
 ]

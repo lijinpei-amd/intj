@@ -170,7 +170,7 @@ intj keys a hit on:
   comparisons, `and/or/not`, conditional expressions, `min`, `max`,
   `triton.cdiv`, `triton.next_power_of_2`, `x is None`, and
   `.numel() .size(i) .shape[i] .stride(i) .dim() .element_size()
-  .is_contiguous() .dtype` on tensor arguments. Scalar inputs must be `int` or
+  .is_contiguous() .data_ptr() .dtype` on tensor arguments. Scalar inputs must be `int` or
   `bool` at runtime (`TypeError` otherwise, e.g. for a `float`). Tensor
   attribute reads go through the interpreter, so they cost more than scalar
   reads.

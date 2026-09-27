@@ -170,6 +170,7 @@ _TENSOR_METHODS = {
     "dim": False,
     "element_size": False,
     "is_contiguous": False,
+    "data_ptr": False,
 }
 _ARITH: dict[type[ast.operator], str] = {
     ast.Add: "add",

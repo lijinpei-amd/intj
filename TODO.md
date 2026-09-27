@@ -44,6 +44,10 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
 - Parameter defaults: the launcher requires every argument positionally.
+- **`Autotuner.cache` is not mirrored.** intj copies back `best_config`,
+  `bench_time` and `configs_timings` after tuning, but not `cache` itself, so
+  code inspecting `len(kernel.cache)` sees 0 even after a tuned launch; either
+  mirror entries back per key or warm-start intj's own cache from it.
 
 ## Performance
 
