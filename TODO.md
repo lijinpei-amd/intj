@@ -59,6 +59,12 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   (e.g. aiter's `**_get_config(M, N, K)` with `num_warps`) needs one launcher
   per variant or `intj.compat.launch`; key these into the launcher (spec-key
   or a variant table) to serve them from one handle.
+- **Cache-invalidating knobs are not keyed.** Triton's cache key includes
+  `get_cache_invalidating_env_vars()` (e.g. AMD buffer-ops / pingpong knobs);
+  intj's module and spec keys capture only `debug`, instrumentation mode and
+  fpsan casts, so flipping another such knob after a launcher exists keeps
+  launching the binary compiled under the old value -- a coarser key than
+  Triton's. Freeze them into the module identity at build.
 
 ## Performance
 
