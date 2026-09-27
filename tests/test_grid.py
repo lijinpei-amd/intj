@@ -46,6 +46,32 @@ def test_grid_arg_passes_each_requested_dimension(dimensions, shape):
     torch.testing.assert_close(out[count:], torch.zeros_like(out[count:]))
 
 
+def test_decorator_factory_form_matches_call_form_with_grid_arg():
+    """`@make_launcher(grid_arg=1)` on a stacked def builds the same launcher as
+    `make_launcher(kernel, grid_arg=1)`."""
+
+    @make_launcher(grid_arg=1)
+    @triton.jit
+    def deco_write_programs(out, X, Y):
+        x = tl.program_id(0)
+        y = tl.program_id(1)
+        z = tl.program_id(2)
+        tl.store(out + x + X * (y + Y * z), 1)
+
+    out = torch.zeros(24, device="cuda", dtype=torch.int32)
+    deco_write_programs(
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+        3,
+        out,
+        3,
+        2,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[:3], torch.ones_like(out[:3]))
+    torch.testing.assert_close(out[3:], torch.zeros_like(out[3:]))
+
+
 def test_grid_arg_zero_skips_launch_and_argument_decode():
     launcher = make_launcher(write_programs, grid_arg=2, no_gpu=True)
     assert launcher(0, 0, 0, 3, object(), object(), object()) is None
@@ -65,7 +91,11 @@ def test_grid_arg_zero_skips_launch_and_argument_decode():
 
 
 def test_grid_modes_validate_options_and_keep_separate_modules():
-    assert callable(make_launcher(write_programs, False, (), no_gpu=True))
+    assert callable(
+        make_launcher(
+            write_programs, dynamic_grid=False, dynamic_options=(), no_gpu=True
+        )
+    )
     for value in (0, 4, True, 1.0, "2"):
         with pytest.raises(ValueError, match="grid_arg must be 1, 2, or 3"):
             make_launcher(write_programs, grid_arg=value, no_gpu=True)  # pyright: ignore[reportArgumentType]

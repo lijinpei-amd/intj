@@ -2516,6 +2516,37 @@ def check_matches_triton(jit_func, launcher, grid, args, out_index):
     torch.testing.assert_close(reference, expected)
 
 
+def test_bare_decorator_matches_the_call_form():
+    """Plain `@make_launcher` (no parens) keeps working: same as `make_launcher(kernel)`."""
+
+    @make_launcher
+    @triton.jit
+    def deco_scale(x, o, n, s, BLOCK: tl.constexpr):
+        off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = off < n
+        tl.store(o + off, tl.load(x + off, mask=mask) * s, mask=mask)
+
+    x = torch.arange(8, device="cuda", dtype=torch.float32)
+    o = torch.empty_like(x)
+    deco_scale(
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+        (1,),
+        x,
+        o,
+        8,
+        2.0,
+        8,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(o, x * 2.0)
+
+
+def test_positional_arguments_beyond_the_kernel_are_rejected():
+    with pytest.raises(TypeError, match="no positional arguments"):
+        make_launcher(scale, False)  # pyright: ignore[reportCallIssue]
+
+
 @pytest.fixture(scope="module")
 def axpy_launcher():
     return make_launcher(axpy)

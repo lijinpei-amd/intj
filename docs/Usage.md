@@ -28,6 +28,24 @@ a local compiler, caches it on disk under intj's module digest, loads it, and
 returns a callable launcher when no value or device binding requires a factory.
 With bindings, the factory materializes the extension when bound. Construction
 is slow; call it once, outside any hot loop.
+
+Called without `jit_func` (keyword arguments only), `make_launcher` is a
+decorator factory instead, so a kernel -- plain or stacked under
+`triton.autotune`/`triton.heuristics` -- can be decorated directly:
+
+```python
+@make_launcher(grid_cpp=grid)
+@triton.autotune(configs=configs, key=["n"])
+@triton.heuristics({"BLOCK": lambda a: 128})
+@triton.jit
+def k(x, o, n, BLOCK: tl.constexpr):
+    ...
+```
+
+This is equivalent to calling `make_launcher(k, grid_cpp=grid)` on the already
+autotuned/heuristic-wrapped `k`. The kernel still needs building at decoration
+time -- i.e. at import, for a module-level kernel -- so a GPU must be available
+then; a plain `@make_launcher` (no parens) keeps working exactly as before.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
 values for binding. `verify_annotation=True` checks declared promises before
 cache lookup; the default trusts them. `bind_device=True` fixes a device on a

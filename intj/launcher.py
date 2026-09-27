@@ -19,7 +19,7 @@ import types
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from ._version import __version__
 from .annotation import (
@@ -350,8 +350,42 @@ class LauncherFactory:
         )
 
 
+def _validate_grid_kwargs(
+    dynamic_grid: bool,
+    dynamic_options: Sequence[str],
+    grid_arg: int | None,
+    grid_cpp: object | None,
+    grid_py: Callable[[dict[str, object]], object] | None,
+    return_compiled: bool,
+    no_gpu: bool,
+) -> None:
+    """The cheap checks on `make_launcher`'s grid/compile kwargs: no imports, no
+    GPU, no build. Run eagerly both in the factory form (at decoration time,
+    before the kernel exists) and in the direct-call form."""
+    if dynamic_grid:
+        raise UnsupportedKernel(
+            "intj: dynamic_grid is not implemented; pass an int or tuple grid"
+        )
+    if grid_arg is not None and (
+        type(grid_arg) is not int or grid_arg not in (1, 2, 3)
+    ):
+        raise ValueError("intj: grid_arg must be 1, 2, or 3")
+    if sum(value is not None for value in (grid_arg, grid_cpp, grid_py)) > 1:
+        raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
+    if grid_py is not None and not callable(grid_py):
+        raise TypeError("intj: grid_py must be callable")
+    if dynamic_options:
+        raise UnsupportedKernel(
+            "intj: dynamic_options is not implemented; pass options=... instead"
+        )
+    if return_compiled and no_gpu:
+        raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
+
+
+@overload
 def make_launcher(
     jit_func: JitFunction,
+    *,
     dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, object] | None = None,
@@ -361,13 +395,66 @@ def make_launcher(
     no_gpu: bool = False,
     verify_annotation: bool = False,
     bind_device: bool = False,
+    grid_arg: int | None = None,
+    grid_cpp: object | None = None,
+    grid_py: Callable[[dict[str, object]], object] | None = None,
+    return_compiled: bool = False,
+) -> Any: ...
+
+
+@overload
+def make_launcher(
     *,
+    dynamic_grid: bool = False,
+    dynamic_options: Sequence[str] = (),
+    extra_annotation: Mapping[str, object] | None = None,
+    options: Mapping[str, Any] | None = None,
+    torch_access_mode: TorchAccessMode | None = None,
+    kernel_cache: KernelCache = KernelCache.INTJ,
+    no_gpu: bool = False,
+    verify_annotation: bool = False,
+    bind_device: bool = False,
+    grid_arg: int | None = None,
+    grid_cpp: object | None = None,
+    grid_py: Callable[[dict[str, object]], object] | None = None,
+    return_compiled: bool = False,
+) -> Callable[[Any], Any]: ...
+
+
+def make_launcher(
+    jit_func: JitFunction | None = None,
+    *args: object,
+    dynamic_grid: bool = False,
+    dynamic_options: Sequence[str] = (),
+    extra_annotation: Mapping[str, object] | None = None,
+    options: Mapping[str, Any] | None = None,
+    torch_access_mode: TorchAccessMode | None = None,
+    kernel_cache: KernelCache = KernelCache.INTJ,
+    no_gpu: bool = False,
+    verify_annotation: bool = False,
+    bind_device: bool = False,
     grid_arg: int | None = None,
     grid_cpp: object | None = None,
     grid_py: Callable[[dict[str, object]], object] | None = None,
     return_compiled: bool = False,
 ) -> Any:
     """Build a fast launcher for `jit_func`.
+
+    Called without `jit_func` (keyword arguments only), this is a decorator
+    factory instead: `make_launcher(grid_cpp=grid)(kernel)` builds the same
+    launcher `make_launcher(kernel, grid_cpp=grid)` would, so a kernel (plain
+    or wrapped in `triton.autotune`/`triton.heuristics`) can be decorated
+    directly:
+
+        @intj.make_launcher(grid_cpp=grid)
+        @triton.autotune(...)
+        @triton.jit
+        def k(...): ...
+
+    The cheap keyword checks below (grid option ranges and exclusivity) run at
+    decoration time; everything that needs the kernel -- annotation
+    resolution, compilation, the GPU -- waits for the inner call, i.e. import
+    time for a module-level kernel, so a GPU must be available then.
 
     Without bindings, the returned callable is a C function:
 
@@ -400,24 +487,37 @@ def make_launcher(
     `return_compiled=True` returns the cached Triton CompiledKernel after a
     successful launch, including on a zero-volume grid, and requires GPU mode.
     """
-    if dynamic_grid:
-        raise UnsupportedKernel(
-            "intj: dynamic_grid is not implemented; pass an int or tuple grid"
+    if args:
+        raise TypeError(
+            "intj: make_launcher takes no positional arguments besides the kernel"
         )
-    if grid_arg is not None and (
-        type(grid_arg) is not int or grid_arg not in (1, 2, 3)
-    ):
-        raise ValueError("intj: grid_arg must be 1, 2, or 3")
-    if sum(value is not None for value in (grid_arg, grid_cpp, grid_py)) > 1:
-        raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
-    if grid_py is not None and not callable(grid_py):
-        raise TypeError("intj: grid_py must be callable")
-    if dynamic_options:
-        raise UnsupportedKernel(
-            "intj: dynamic_options is not implemented; pass options=... instead"
+    _validate_grid_kwargs(
+        dynamic_grid,
+        dynamic_options,
+        grid_arg,
+        grid_cpp,
+        grid_py,
+        return_compiled,
+        no_gpu,
+    )
+    if jit_func is None:
+        return functools.partial(
+            make_launcher,
+            dynamic_grid=dynamic_grid,
+            dynamic_options=dynamic_options,
+            extra_annotation=extra_annotation,
+            options=options,
+            torch_access_mode=torch_access_mode,
+            kernel_cache=kernel_cache,
+            no_gpu=no_gpu,
+            verify_annotation=verify_annotation,
+            bind_device=bind_device,
+            grid_arg=grid_arg,
+            grid_cpp=grid_cpp,
+            grid_py=grid_py,
+            return_compiled=return_compiled,
         )
-    if return_compiled and no_gpu:
-        raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
+    kernel: JitFunction = jit_func
     triton_hint = "intj: Triton >=3.7 is required; install `intj[launcher]`"
     try:
         import triton
@@ -435,13 +535,13 @@ def make_launcher(
         )
     from triton.runtime.autotuner import Autotuner, Heuristics
 
-    chain = jit_func
-    while type(jit_func) in (Autotuner, Heuristics):
-        jit_func = jit_func.fn
-    jit_func = _check_kernel(jit_func, options)
-    resolved = _resolve_annotations(jit_func, extra_annotation)
+    chain = kernel
+    while type(kernel) in (Autotuner, Heuristics):
+        kernel = kernel.fn
+    kernel = _check_kernel(kernel, options)
+    resolved = _resolve_annotations(kernel, extra_annotation)
     tuned: _Tuned | None = None
-    if chain is not jit_func:
+    if chain is not kernel:
         tuned = _plan_tuning(chain, resolved, extra_annotation, options, no_gpu)
         resolved = tuple(
             dataclasses.replace(
@@ -454,7 +554,7 @@ def make_launcher(
             )
             for p in resolved
         )
-    for p in jit_func.params:
+    for p in kernel.params:
         kind = p._param.kind
         if kind not in (
             inspect.Parameter.POSITIONAL_ONLY,
@@ -485,7 +585,7 @@ def make_launcher(
     if not no_gpu:
         from triton import knobs
 
-        options["debug"] = options.get("debug", jit_func.debug) or knobs.runtime.debug
+        options["debug"] = options.get("debug", kernel.debug) or knobs.runtime.debug
         options["instrumentation_mode"] = knobs.compilation.instrumentation_mode
         fpsan_casts = getattr(knobs.compilation, "fpsan_homomorphic_casts", None)
         if fpsan_casts is not None:
@@ -510,7 +610,7 @@ def make_launcher(
                         stacklevel=2,
                     )
         factory = LauncherFactory(
-            jit_func,
+            kernel,
             resolved,
             tuple(options.items()),
             access,
@@ -527,7 +627,7 @@ def make_launcher(
         )
         return factory if needs_binding else factory.bind()
     return _materialize_module(
-        jit_func,
+        kernel,
         resolved,
         options,
         access,

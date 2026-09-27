@@ -141,6 +141,39 @@ def test_float_autotune_key_is_exact():
     assert bench.calls == [1, 2, 1, 2]
 
 
+def test_decorator_factory_stacks_on_autotune_and_heuristics_with_grid_cpp():
+    """`@make_launcher(grid_cpp=grid)` on an autotune+heuristics stack builds the
+    same launcher as calling `make_launcher(kernel, grid_cpp=grid)` on the
+    already-wrapped chain."""
+
+    def grid(n: int, BLOCK: int):
+        return (triton.cdiv(n, BLOCK),)
+
+    out = torch.zeros(256, device="cuda", dtype=torch.int32)
+    # tags: TAG=1,BLOCK=32 -> HALF=0 -> 10; TAG=2,BLOCK=64 -> HALF=1 -> 21
+    bench = Bench(out, {16: {10: 1.0, 21: 2.0}, 64: {10: 2.0, 21: 1.0}})
+
+    @make_launcher(grid_cpp=grid)
+    @triton.autotune(configs=configs(), key=["n"], do_bench=bench)
+    @triton.heuristics({"HALF": lambda a: a["TAG"] // 2})
+    @triton.jit
+    def tagged_half(
+        x, out, n, TAG: tl.constexpr, BLOCK: tl.constexpr, HALF: tl.constexpr
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        tl.store(out + offs, TAG * 10 + HALF, mask=mask)
+
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    device, stream = controls()
+    for n, tag in ((16, 10), (64, 21)):
+        bench.key = n
+        out.zero_()
+        tagged_half(device, stream, x, out, n)
+        torch.cuda.synchronize()
+        assert int(out[0].item()) == tag
+
+
 def test_heuristic_over_tuned_value_is_stored_not_recomputed():
     @triton.jit
     def half(out, TAG: tl.constexpr, HALF: tl.constexpr):
