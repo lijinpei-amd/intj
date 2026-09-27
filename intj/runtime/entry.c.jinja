@@ -1230,7 +1230,9 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 
   /* Held through the launch: `kernel` lives in the map.  Errors are raised
    * after the unlock, because raising allocates and can run Python. */
+{% if return_compiled %}
   PyObject *out = NULL;
+{% endif %}
   uint32_t recorded_np = kernel->k.nparams;
   int32_t status = 0;
   if (INTJ_LIKELY((uint32_t)np == recorded_np)) {
@@ -1243,9 +1245,6 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
 {% if return_compiled %}
     if (!status)
       out = Py_NewRef(kernel->k.compiled);
-{% else %}
-    if (!status)
-      out = Py_NewRef(Py_None);
 {% endif %}
   }
   INTJ_RWUNLOCK(&st->lock);
@@ -1260,7 +1259,13 @@ static PyObject *intj_call(intj_state *st, intj_cache *cache,
   if (INTJ_UNLIKELY(status != 0))
     return intj_launch_error(st, status);
 {% endif %}
+{% if return_compiled %}
   return out;
+{% else %}
+  /* Not Py_NewRef(Py_None) under the lock: from 3.12 None is immortal and
+   * Py_RETURN_NONE is a plain return, where Py_NewRef still tests the count. */
+  Py_RETURN_NONE;
+{% endif %}
 {% endif %}
 }
 

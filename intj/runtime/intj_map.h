@@ -26,6 +26,18 @@
 #define INTJ_UNLIKELY(x) (x)
 #endif
 
+/* The memo `last` is read and written by concurrent readers only on a
+ * free-threaded build.  Under the GIL a plain access is enough, and an atomic
+ * one costs the hit path: gcc re-reads the just-built key from the stack after
+ * it instead of comparing it in a register. */
+#ifdef Py_GIL_DISABLED
+#define INTJ_MEMO_LOAD(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#define INTJ_MEMO_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+#else
+#define INTJ_MEMO_LOAD(p) (*(p))
+#define INTJ_MEMO_STORE(p, v) ((void)(*(p) = (v)))
+#endif
+
 static inline uint64_t intj_mix(uint64_t a, uint64_t b) {
   __uint128_t r = (__uint128_t)a * b;
   return (uint64_t)(r >> 64) ^ (uint64_t)r;
@@ -85,7 +97,8 @@ typedef struct {
  * rather than the hash lets the memo compare without hashing, which measured
  * ~1.3 ns on the launch path; keeping both costs a probe ~2 ns on a miss.
  *
- * `last` is the one-entry memo: the slot of the last hit.  Readers under the read lock store `last` with relaxed atomics; a slot cannot
+ * `last` is the one-entry memo: the slot of the last hit.  Readers under the
+ * read lock store it (INTJ_MEMO_STORE, atomic when free-threaded); a slot cannot
  * move while any reader holds the lock, and a put -- under the write lock --
  * clears it.
  *
@@ -137,14 +150,14 @@ typedef struct {
     return s ? &s->val : NULL;                                                 \
   }                                                                            \
   static INTJ_ALWAYS_INLINE V *P##_lookup(P *m, const uint64_t *k) {           \
-    P##_slot *s = __atomic_load_n(&m->last, __ATOMIC_RELAXED);                 \
+    P##_slot *s = INTJ_MEMO_LOAD(&m->last);                                    \
     if (s && memcmp(s->key, k, sizeof(s->key)) == 0)                           \
       return &s->val;                                                          \
     uint64_t h = intj_hash_n(k, (NW));                                         \
     s = P##_find(m, k, h);                                                     \
     if (!s)                                                                    \
       return NULL;                                                             \
-    __atomic_store_n(&m->last, s, __ATOMIC_RELAXED);                           \
+    INTJ_MEMO_STORE(&m->last, s);                                              \
     return &s->val;                                                            \
   }                                                                            \
   static inline V *P##_put(P *m, const uint64_t *k, const V *val) {            \
@@ -175,7 +188,7 @@ typedef struct {
     memcpy(s->key, k, sizeof(s->key));                                         \
     s->val = *val;                                                             \
     m->used++;                                                                 \
-    __atomic_store_n(&m->last, (P##_slot *)NULL, __ATOMIC_RELAXED);            \
+    INTJ_MEMO_STORE(&m->last, (P##_slot *)NULL);                               \
     return &s->val;                                                            \
   }                                                                            \
   static inline int P##_each(const P *m, int (*fn)(V *, void *), void *ctx) {  \
@@ -256,14 +269,14 @@ struct intj_key_hash {
   }                                                                             \
   static INTJ_ALWAYS_INLINE V *intj_cache_lookup(intj_cache *c,                 \
                                                  const uint64_t *k) {           \
-    const intj_cache_entry *e = __atomic_load_n(&c->last, __ATOMIC_RELAXED);    \
+    const intj_cache_entry *e = INTJ_MEMO_LOAD(&c->last);                       \
     if (e && memcmp(e->first.w, k, sizeof(e->first.w)) == 0)                    \
       return const_cast<V *>(&e->second);                                       \
     auto it = INTJ_CACHE_FIND(c->map, *(const intj_key *)k, intj_hash(k));      \
     if (it == c->map->end())                                                    \
       return NULL;                                                              \
     e = &*it;                                                                   \
-    __atomic_store_n(&c->last, e, __ATOMIC_RELAXED);                            \
+    INTJ_MEMO_STORE(&c->last, e);                                               \
     return const_cast<V *>(&e->second);                                         \
   }                                                                             \
   /* The maps throw where intj returns, and an exception reaching CPython's   \
@@ -272,8 +285,7 @@ struct intj_key_hash {
                                   const V *val) {                               \
     try {                                                                       \
       auto r = c->map->insert(intj_cache_entry(*(const intj_key *)k, *val));    \
-      __atomic_store_n(&c->last, (const intj_cache_entry *)NULL,                \
-                       __ATOMIC_RELAXED);                                       \
+      INTJ_MEMO_STORE(&c->last, (const intj_cache_entry *)NULL);                \
       return const_cast<V *>(&r.first->second);                                 \
     } catch (...) {                                                             \
       return NULL;                                                              \
