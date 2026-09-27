@@ -1,7 +1,7 @@
 # pyright: standard
 """Repeated per-launch timings for argument annotations and README comparisons.
 
-Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep | --last-key | --tuned] [--iters N] [--batches N]
+Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep | --last-key | --tuned | --dynamic] [--iters N] [--batches N]
 
 The `--readme` rows report host time per launch for a trivial kernel:
 
@@ -48,6 +48,15 @@ def noop(x, y, o, n, a, BLOCK: tl.constexpr):
         tl.load(x + off, mask=mask) + tl.load(y + off, mask=mask) * a,
         mask=mask,
     )
+
+
+@triton.jit
+def act_noop(x, o, n, ACT: tl.constexpr):
+    off = tl.arange(0, 128)
+    v = tl.load(x + off, mask=off < n)
+    if ACT == "relu":
+        v = tl.maximum(v, 0.0)
+    tl.store(o + off, v, mask=off < n)
 
 
 def bench(fn, args, iters, batches, sync):
@@ -325,6 +334,32 @@ def bench_tuned(iters, batches):
         print(f"{name:>10}: {bench(fn, args, iters, batches, sync):7.1f} ns/launch")
 
 
+def bench_dynamic(iters, batches):
+    """Warmed lazy launchers: plain, with two dynamic options, with a str constexpr."""
+    x = torch.zeros(4096, device="cuda")
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    args = (x, x, x, 4096, 1.0, 128)
+    rows = (
+        ("lazy plain", make_launcher(noop), (device, stream, (1,), *args)),
+        (
+            "2 dynamic options",
+            make_launcher(noop, dynamic_options=("num_warps", "knobs.runtime.debug")),
+            (device, stream, (1,), 4, False, *args),
+        ),
+        (
+            "str constexpr",
+            make_launcher(act_noop),
+            (device, stream, (1,), x, x, 4096, "relu"),
+        ),
+    )
+    print(f"mode=dynamic; {iters} calls × {batches} batches; median ns/call")
+    print(f"{'path':>19} {'ns/call':>10}")
+    for label, fn, call in rows:
+        ns = bench(fn, call, iters, batches, torch.cuda.synchronize)
+        print(f"{label:>19} {ns:10.1f}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -347,13 +382,18 @@ if __name__ == "__main__":
         action="store_true",
         help="compare a warmed autotuned launcher with the same kernel baked",
     )
+    modes.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="warmed lazy launchers: plain, 2 dynamic options, str constexpr",
+    )
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
     options = parser.parse_args()
     if options.iters < 1 or options.batches < 1:
         parser.error("--iters and --batches must be positive")
-    if (options.readme or options.tuned) and options.no_gpu:
-        parser.error("--readme and --tuned need the GPU; drop --no-gpu")
+    if (options.readme or options.tuned or options.dynamic) and options.no_gpu:
+        parser.error("--readme, --tuned and --dynamic need the GPU; drop --no-gpu")
     if options.readme:
         bench_readme(options.iters, options.batches)
     elif options.sweep:
@@ -362,5 +402,7 @@ if __name__ == "__main__":
         bench_last_key(options.iters, options.batches)
     elif options.tuned:
         bench_tuned(options.iters, options.batches)
+    elif options.dynamic:
+        bench_dynamic(options.iters, options.batches)
     else:
         main(options.iters, options.batches, options.no_gpu)

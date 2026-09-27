@@ -12,9 +12,14 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   that launches uses a dead context. Triton guards this by pid. Fix with a
   `pthread_atfork` child handler that repoints the cache at an empty sentinel.
 - **`knobs.runtime.debug` / `knobs.compilation.instrumentation_mode`** are in triton's
-  cache key but neither in intj's module digest nor its spec key: flipping one after
-  `make_launcher` keeps launching the old binary. Same for `use_buffer_ops`, which
-  is only stale-but-valid since the `S` bit is unconditionally keyed.
+  cache key; intj reads them at a launcher's first call. Flipping one later keeps
+  launching the old binary unless it is declared in `dynamic_options`. Same for
+  `use_buffer_ops`, which is only stale-but-valid since the `S` bit is
+  unconditionally keyed.
+- **Free-threaded lazy-launcher publication on non-TSO hosts.** CPython reads
+  `ml_meth` with a plain load; the build publishes `state` before a release store
+  of `ml_meth`, which x86-64 orders. Recheck (or have the entry fall back to an
+  acquire reload of `state`) when ARM64 is supported.
 - **Run the NVIDIA path on an NVIDIA GPU.** It is compile-checked only.
 - **`noexcept` at the CPython boundary in C++ builds.** STATIC_COMPILE tensor
   access and non-intj cache backends compile the extension as C++. An
@@ -34,8 +39,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 - Callable grids (`dynamic_grid`). The expensive part is `ConstexprFunction.__call__`
   (~963 ns/call), not the mapping; a `grid=<spec>` baked to literal C is ~4 ns.
-- Per-launch options (`dynamic_options`) — needs a second entry point, not a reserved
-  always-`None` slot on the hot path.
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
 - Tuple / namedtuple arguments: `ARG_TUPLE` recursion in the decoder and the key.
@@ -53,12 +56,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   keywords with no cost for positional calls (`kwnames` `NULL`) -- needs a
   name-to-slot map. E.g. Triton's `test_prune_configs` passes `N=N` and
   expects it in the pruner's kwargs.
-- **Per-call variants.** Compile options, baked constexprs (`str` / `tl.dtype`
-  / JIT-function constexprs) and grid mode/rank are fixed when `make_launcher`
-  builds a launcher, so a call site whose Triton config changes per call
-  (e.g. aiter's `**_get_config(M, N, K)` with `num_warps`) needs one launcher
-  per variant or `intj.compat.launch`; key these into the launcher (spec-key
-  or a variant table) to serve them from one handle.
 - **Cache-invalidating knobs are not keyed.** Triton's cache key includes
   `get_cache_invalidating_env_vars()` (e.g. AMD buffer-ops / pingpong knobs);
   intj's module and spec keys capture only `debug`, instrumentation mode and

@@ -6,6 +6,7 @@ Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import dis
@@ -14,6 +15,7 @@ import inspect
 import json
 import os
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -4216,7 +4218,9 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
     monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
     for _ in range(3):
         with pytest.raises(
-            UnsupportedKernel, match="python -m intj.kernel_cache tsl.*no network"
+            UnsupportedKernel,
+            match=rf"`{re.escape(pathlib.Path(sys.executable).name)} -m "
+            r"intj\.kernel_cache tsl`.*no network",
         ):
             make_launcher(scale, kernel_cache=KernelCache.TSL)
     assert attempts == [KernelCache.TSL]  # remembered, not re-attempted
@@ -5188,3 +5192,115 @@ def test_unknown_dynamic_option_is_refused_on_the_first_call():
     launch = make_launcher(act_store, dynamic_options=("num_warpz",))
     with pytest.raises(UnsupportedKernel, match="unknown compile option"):
         launch(*_gpu_controls(), 4, torch.zeros(1, device="cuda"), 1.0, "pos")
+
+
+@triton.jit
+def dyn_axpy(
+    o, x, n, ACT: tl.constexpr, DT: tl.constexpr, FN: tl.constexpr, BLOCK: tl.constexpr
+):
+    offs = tl.arange(0, BLOCK)
+    v = FN(tl.load(x + offs, mask=offs < n)).to(DT)
+    if ACT == "neg":
+        v = -v
+    tl.store(o + offs, v, mask=offs < n)
+
+
+_ON_HIP = (
+    getattr(triton.runtime.driver.active.get_current_target(), "backend", None) == "hip"
+)
+# debug feeds a compile option; disable_line_info feeds none and keys only
+# through the knob values; use_buffer_ops feeds HIP's pointer specialization
+_DYNAMIC = (
+    "num_warps",
+    "knobs.runtime.debug",
+    "knobs.compilation.disable_line_info",
+) + (("knobs.amd.use_buffer_ops",) if _ON_HIP else ())
+
+
+@contextlib.contextmanager
+def _live_knob_values(values):
+    """Set the live knobs a call passes (a declared knob only keys), then restore."""
+    from triton import knobs
+
+    before = {}
+    try:
+        for path, value in values.items():
+            _, group, name = path.split(".")
+            before.setdefault((group, name), getattr(getattr(knobs, group), name))
+            setattr(getattr(knobs, group), name, value)
+        yield
+    finally:
+        for (group, name), value in before.items():
+            setattr(getattr(knobs, group), name, value)
+
+
+def check_dynamic_invariant():
+    """Same key => same annotated ASTSource, same canonical options, same knobs."""
+    import itertools
+
+    from triton.compiler import make_backend
+
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import (
+        _canonical_options,
+        _compiler_input,
+        _current_target,
+        _knob_options,
+        _live_knobs,
+        _render_params,
+        _split_dynamic,
+    )
+
+    launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
+    module, device = module_of(launch), torch.cuda.current_device()
+    params, _, _ = _render_params(
+        _resolve_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED
+    )
+    target = _current_target()
+    backend, knobs_now = make_backend(target), _live_knobs()
+    x = torch.randn(64, device="cuda")
+    o = torch.empty_like(x)
+    seen = {}
+    per_value = [(2, 4)] + [(False, True)] * (len(_DYNAMIC) - 1)
+    for dyn in itertools.product(*per_value):
+        options, dyn_knobs = _split_dynamic(_DYNAMIC, dyn)
+        knob_values = {**knobs_now, **dyn_knobs}
+        with _live_knob_values(dyn_knobs):
+            canonical = _canonical_options(
+                target, _knob_options(dyn_axpy, options, knob_values)
+            ).hash()
+            for act in ("neg", "".join(["n", "e", "g"]), "pos"):
+                for dt in (tl.float32, tl.float16):
+                    for fn in (_twice, _thrice, triton.jit(_twice.fn)):
+                        public = (o, x, 64, act, dt, fn, 64)
+                        key, _ = module.spec_key(launch, device, *dyn, *public)
+                        truth = (
+                            _compiler_input(dyn_axpy, params, public, backend),
+                            canonical,
+                            tuple(sorted(knob_values.items())),
+                        )
+                        assert seen.setdefault(key, truth) == truth, (
+                            "intj key collides for dynamic values"
+                        )
+
+
+def test_dynamic_values_are_never_coarser_than_triton():
+    check_dynamic_invariant()
+
+
+@pytest.mark.parametrize("dropped", _DYNAMIC)
+def test_dynamic_invariant_catches_a_dropped_value(monkeypatch, dropped):
+    original = launcher._dynamic_key_fields
+    monkeypatch.setattr(
+        launcher,
+        "_dynamic_key_fields",
+        lambda name: () if name == dropped else original(name),
+    )
+    with pytest.raises(AssertionError, match="collides"):
+        check_dynamic_invariant()
+
+
+def test_dynamic_invariant_catches_a_dropped_object_id(monkeypatch):
+    monkeypatch.setattr(launcher._Interner, "__call__", lambda self, value: 0)
+    with pytest.raises(AssertionError, match="collides"):
+        check_dynamic_invariant()

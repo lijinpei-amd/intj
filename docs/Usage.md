@@ -147,6 +147,13 @@ compile then runs under the live knobs. A hit only compares keys, so
 passing an old value after the knob changed launches the record compiled
 under that value.
 
+Do not change a declared knob while a miss for its launcher is running: the
+check and the compile read the knob at different times, so a change in
+between compiles under the new value and records it under the old key. The
+check runs per launcher, before the module's compile cache: a sibling
+launcher's first call with an old value raises even when that cache already
+holds the kernel compiled under it.
+
 Refused at `make_launcher` with `UnsupportedKernel`: an unknown knob path, a
 repeated name, a name also given in `options=` (for knobs, the option the knob
 feeds, e.g. `debug`), a kernel parameter name, `device`/`stream`/`device_type`/

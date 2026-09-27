@@ -723,13 +723,19 @@ def test_lowered_tensor_heuristic_matches_python(h):
     _check_lowered(h, [(x, y, 1, 2) for x, y in pairs])
 
 
-def _reference(kernel, args_by_name):
-    """What Triton itself decides for these arguments: its tuning keys, the
-    heuristic outputs and the final call, from a private chain whose innermost
-    layer records instead of launching."""
+def _reference(kernel, args_by_name, dynamic=None):
+    """What Triton itself decides for these arguments and per-call options and
+    knobs: its tuning keys, the heuristic outputs and the final call, from a
+    private chain whose innermost layer records instead of launching.  The
+    caller has set the live knobs to `dynamic`'s: a declared knob only keys."""
     import copy
 
     from triton.runtime.autotuner import Autotuner
+
+    from intj.launcher import _split_dynamic
+
+    dynamic = dynamic or {}
+    run_options, run_knobs = _split_dynamic(tuple(dynamic), tuple(dynamic.values()))
 
     layers, inner = [], kernel
     while not hasattr(inner, "params"):
@@ -750,7 +756,7 @@ def _reference(kernel, args_by_name):
     for layer in layers:
         if type(layer) is Autotuner:
             layer.cache = {}
-    layers[0].run(grid=(1,), warmup=False, **args_by_name)
+    layers[0].run(grid=(1,), warmup=False, **args_by_name, **run_options)
     for layer in layers:
         if type(layer) is Autotuner:
             tuning_keys.append(tuple(layer.cache))
@@ -764,23 +770,37 @@ def _reference(kernel, args_by_name):
         repr(triton_specialization(inner, params, options)),
         tuple(tuning_keys),
         heuristics,
+        tuple(sorted(run_knobs.items())),
     )
 
 
-def check_tuned_invariant(make_kernel, cases):
-    kernel = make_kernel()
-    launch = make_launcher(kernel)
+def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
+    from triton import knobs
+
+    from intj.launcher import _split_dynamic
+
+    launch = make_launcher(make_kernel(), dynamic_options=dynamic)
     module = module_of(launch)
     device, stream = controls()
-    seen = {}
-    for case in cases:
-        launch(device, stream, 1, *case.values())
-        chain, found = module.key_chain(launch, device, *case.values())
-        assert found
-        truth = _reference(make_kernel(), case)
-        assert seen.setdefault(chain, truth) == truth, (
-            "intj key chain collides across Triton decisions"
-        )
+    seen, before = {}, {}
+    try:
+        for dyn in dyn_values:
+            # a declared knob only keys: set the live value the call passes
+            for path, value in _split_dynamic(dynamic, dyn)[1].items():
+                _, group, name = path.split(".")
+                before.setdefault((group, name), getattr(getattr(knobs, group), name))
+                setattr(getattr(knobs, group), name, value)
+            for case in cases:
+                launch(device, stream, 1, *dyn, *case.values())
+                chain, found = module.key_chain(launch, device, *dyn, *case.values())
+                assert found
+                truth = _reference(make_kernel(), case, dict(zip(dynamic, dyn)))
+                assert seen.setdefault(chain, truth) == truth, (
+                    "intj key chain collides across Triton decisions"
+                )
+    finally:
+        for (group, name), value in before.items():
+            setattr(getattr(knobs, group), name, value)
 
 
 def _invariant_kernel():
@@ -883,6 +903,99 @@ _needs_hip = pytest.mark.skipif(
     != "hip",
     reason="waves_per_eu is a HIP option",
 )
+
+
+@triton.jit
+def aligned_act(
+    x, out, N, stride, ACT: tl.constexpr, BLOCK: tl.constexpr, ALIGNED: tl.constexpr
+):
+    v = tl.load(x) + BLOCK + ALIGNED + (N + stride) * 0
+    if ACT == "neg":
+        v = -v
+    tl.store(out, v)
+
+
+# waves_per_eu is a compile option, debug a knob feeding one,
+# disable_line_info a knob feeding none (keyed only through the knob values),
+# use_buffer_ops a knob feeding HIP's pointer specialization
+_TUNED_DYNAMIC = (
+    "waves_per_eu",
+    "knobs.runtime.debug",
+    "knobs.compilation.disable_line_info",
+    "knobs.amd.use_buffer_ops",
+)
+# a base and one flip per value: dropping any one value from the key collides
+# its flip with the base, which Triton tells apart
+_TUNED_DYN_VALUES = [
+    (1, False, False, False),
+    (2, False, False, False),
+    (1, True, False, False),
+    (1, False, True, False),
+    (1, False, False, True),
+]
+
+
+def _dynamic_invariant_kernel():
+    def bench(call, quantiles):  # first config wins, deterministically
+        return [1.0, 1.0, 1.0]
+
+    return triton.autotune(
+        configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
+        key=["N"],
+        do_bench=bench,
+    )(
+        triton.heuristics({"ALIGNED": lambda a: a["stride"] % a["BLOCK"] == 0})(
+            aligned_act
+        )
+    )
+
+
+def _dynamic_invariant_cases():
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    return [
+        {"x": x, "out": out, "N": n, "stride": 32, "ACT": act}
+        for n in (16, 17)
+        for act in ("neg", "".join(["n", "e", "g"]), "pos")
+    ]
+
+
+def _check_dynamic_tuned_invariant():
+    check_tuned_invariant(
+        _dynamic_invariant_kernel,
+        _dynamic_invariant_cases(),
+        _TUNED_DYNAMIC,
+        _TUNED_DYN_VALUES,
+    )
+
+
+@_needs_hip
+def test_tuned_dynamic_values_are_never_coarser_than_triton():
+    _check_dynamic_tuned_invariant()
+
+
+@_needs_hip
+@pytest.mark.parametrize("dropped", _TUNED_DYNAMIC)
+def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
+    from intj import launcher as launcher_mod
+
+    original = launcher_mod._dynamic_key_fields
+    monkeypatch.setattr(
+        launcher_mod,
+        "_dynamic_key_fields",
+        lambda name: () if name == dropped else original(name),
+    )
+    with pytest.raises(AssertionError, match="collides"):
+        _check_dynamic_tuned_invariant()
+
+
+@_needs_hip
+def test_tuned_invariant_catches_a_dropped_object_id(monkeypatch):
+    from intj import launcher as launcher_mod
+
+    monkeypatch.setattr(launcher_mod._Interner, "__call__", lambda self, value: 0)
+    with pytest.raises(AssertionError, match="collides"):
+        _check_dynamic_tuned_invariant()
 
 
 @_needs_hip

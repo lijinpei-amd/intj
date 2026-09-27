@@ -734,11 +734,8 @@ static_assert(sizeof(intj_bound_tail) ==
 static inline int intj_object_id_slow(PyObject *intern, intj_rwlock *lock,
                                       intj_memo *memo, PyObject *o,
                                       const char *pname, uint64_t *id) {
-  if (!intern) {
-    PyErr_Format(PyExc_RuntimeError,
-                 "intj: no intern table for '%s'; this is an intj bug", pname);
-    return -1;
-  }
+  /* never NULL: init_bound sets it before publishing the launcher, and only
+   * tp_clear drops it, after the entry and spec_key stop reaching it */
   PyObject *r = PyObject_CallFunctionObjArgs(intern, o, NULL);
   if (!r)
     return -1;

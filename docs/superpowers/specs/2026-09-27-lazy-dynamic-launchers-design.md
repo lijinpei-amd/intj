@@ -293,6 +293,10 @@ The compile callback receives the dynamic values.
   as `knobs.compilation.disable_line_info`, must not reuse another value's
   kernel. A hit only compares keys, so an old value keeps hitting the record
   compiled under it after the knob changes.
+  A declared knob must not change while a miss for its launcher is running:
+  the check and the compile read it at different times. The check runs per
+  launcher, before the module's compile cache, so a sibling launcher's first
+  call with an old value raises even when that cache holds the kernel.
 - **Object constexprs:** these reach the compiler as the Python objects from
   the call.
 - **Tuned launchers:** dynamic values sit in the level-0 key, and the shim
