@@ -120,7 +120,8 @@ static-compile tensor slots. `NBOUND` is known without a GPU.
   - device ordinal and handle
   - the cache storage, including its memo
   - the fixed-kernel pointer
-  - the dynamic-value slot memos
+  - (the per-slot dynamic-value memos, sized by the number of dynamic slots,
+    live in the trailing arrays right after the header)
 
   Cold fields come after them: the build lock, the builder, GC hooks,
   `tuned_cb`, `grid_py`, `grid_hidden`, and the module pointer.
