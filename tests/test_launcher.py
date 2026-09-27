@@ -5061,9 +5061,9 @@ def test_dynamic_num_warps_keys_separate_records():
         "x",
         "ACT",
     )
-    with pytest.raises(
-        AssertionError
-    ):  # parse_options: not a power of two, raised on this miss
+    # Triton's own `assert` in parse_options (not a power of two), raised on
+    # this miss; like Triton's, it vanishes under `python -O`
+    with pytest.raises(AssertionError):
         launch(*_gpu_controls(), 3, o, 1.0, "pos")
 
 
@@ -5105,6 +5105,78 @@ def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
     first = build()
     monkeypatch.setattr(knobs.runtime, "debug", not knobs.runtime.debug)
     assert build() is first
+
+
+def test_declared_knob_without_an_option_compiles_per_value():
+    """knobs.compilation.disable_line_info feeds neither a compile option nor
+    the specialization: only the knob values in the compile identity keep
+    its two values apart."""
+    from triton import knobs
+
+    before = knobs.compilation.disable_line_info
+    launch = make_launcher(
+        act_store,
+        dynamic_options=("knobs.compilation.disable_line_info",),
+        return_compiled=True,
+    )
+    o = torch.zeros(1, device="cuda")
+    lines = launch(*_gpu_controls(), False, o, 1.0, "pos")
+    bare = launch(*_gpu_controls(), True, o, 1.0, "pos")
+    assert knobs.compilation.disable_line_info == before
+    assert launch(*_gpu_controls(), True, o, 1.0, "pos") is bare
+    asm = "amdgcn" if "amdgcn" in lines.asm else "ptx"
+    assert ".loc" in lines.asm[asm] and ".loc" not in bare.asm[asm]
+
+
+def test_concurrent_declared_knob_compiles_each_see_their_own_value(monkeypatch):
+    """Two threads' knob scopes never interleave: each compile runs under its
+    own call's value, and the knob is restored once both are done."""
+    import threading
+
+    import intj.launcher as launcher
+    from triton import knobs
+
+    before = knobs.runtime.debug
+    real = launcher._checked_compile
+    barrier = threading.Barrier(2, timeout=1.0)
+    seen = {}
+
+    def spy(jit_func, compiler_input, target, options):
+        try:  # without serialization, the other scope enters meanwhile
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        seen[options.debug] = knobs.runtime.debug
+        return real(jit_func, compiler_input, target, options)
+
+    monkeypatch.setattr(launcher, "_checked_compile", spy)
+    launch = make_launcher(
+        act_store,
+        dynamic_options=("knobs.runtime.debug",),
+        options={"num_stages": 1},  # a module of its own: both calls compile
+    )
+    o = torch.zeros(1, device="cuda")
+    device, stream = (
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+    errors = []
+
+    def call(value):
+        try:
+            torch.cuda.set_device(device)
+            launch(device, stream, 1, value, o, 1.0, "pos")
+        except Exception as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    threads = [threading.Thread(target=call, args=(v,)) for v in (True, False)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert seen == {True: True, False: False}
+    assert knobs.runtime.debug == before
 
 
 @pytest.mark.skipif(

@@ -1022,14 +1022,27 @@ def _split_dynamic(
     )
 
 
+#: One declared-knob scope at a time, process-wide.  Triton's `scope()`
+#: restores the snapshot it took on entry, so two interleaved scopes would
+#: leave a knob changed for good, and one thread's values would reach the
+#: other's compile.  Reentrant: a compile can miss again on its own thread.
+#: Lock order: this, then a module's compile lock; a tuned launcher's lock,
+#: then this.  Taken only for a non-empty `values`.
+_KNOB_LOCK = threading.RLock()
+
+
 @contextlib.contextmanager
 def _knob_scope(values: Mapping[str, object]) -> Generator[None, None, None]:
     """Set declared knobs to one call's values for one compile, then restore
-    them, through triton's own per-group `scope()`.  The knobs are process
-    globals: a compile on another thread meanwhile sees these values."""
+    them, through triton's own per-group `scope()`.  Scopes are serialized
+    by `_KNOB_LOCK`, but the knobs are process globals: a compile of an
+    undeclared launcher on another thread meanwhile sees these values."""
+    if not values:
+        yield
+        return
     from triton import knobs
 
-    with contextlib.ExitStack() as stack:
+    with _KNOB_LOCK, contextlib.ExitStack() as stack:
         for group in sorted({path.split(".")[1] for path in values}):
             stack.enter_context(getattr(knobs, group).scope())
         for path, value in values.items():
