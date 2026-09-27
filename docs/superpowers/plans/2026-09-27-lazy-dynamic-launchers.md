@@ -7,7 +7,7 @@
 **Architecture:**
 - Every launcher becomes a real `PyCFunction` whose `self` is a fixed-layout bound object allocated by a small generic C extension, `_intj_lazy`. Its `PyMethodDef` lives inside that object and starts on a build shim.
 - The first call renders, compiles and loads the module as today, fills the bound object in place through the module's `init_bound`, and swaps `ml_meth` to the rendered entry. CPython reads `m_ml->ml_meth` on every call, so references taken before the build reach the entry too.
-- Dynamic values sit in the level-0 key: scalars as a kind byte plus 8 value bytes, and objects as an id from a per-module intern table, memoized per argument slot by pointer.
+- Dynamic values sit in the level-0 key: scalars as a kind byte plus 8 value bytes, and objects as an id from the launcher's own intern table, memoized per argument slot by pointer. Every launcher owns its level-0 cache; the module keeps a compile cache so sibling launchers compile a key once.
 
 **Tech Stack:** CPython 3.8–3.14 (plus 3.13t/3.14t) C API, Jinja2-rendered C/C++ extension, Triton ≥3.7 (`triton.knobs`, `parse_options`, `Autotuner`), pthread rwlock on free-threaded builds.
 
@@ -47,8 +47,8 @@ A throwaway probe built a `METH_FASTCALL` `PyCFunction` over a `PyMethodDef` emb
 
 ### Deliberate deviations from the spec (each one is a correctness or cost fix)
 
-1. **Intern ids are per module, not per launcher.** Launchers of one `ModuleKey` share the module's kernel cache and compile callback. Per-launcher ids would let id 0 mean `"gelu"` in one launcher and `"relu"` in another, which launches the wrong binary. Ids still never persist and never enter `ModuleKey`.
-2. **Free-threaded memo reads take the module rwlock's read side.** A `(object, id)` pair cannot be read atomically without a lock: a writer between the two loads pairs an old object with a new id. GIL builds compile the lock out, so the spec's "one pointer compare, no lock" holds there.
+1. **Every launcher owns its level-0 kernel cache and its intern table** (spec amended, "Uniform shape"). The module-level `st->cache` that plain launchers shared is no longer on any launch path: it stays only behind the module's debug `entry`. This removes the only structure shared across launchers. Every launcher behaves like a tuned or `bind_device` one, so per-launcher ids are safe. To avoid compiling a key twice, the module's compile callback keeps a compile cache keyed on `(CompilerInput, canonical options hash, declared knob values, device)`. A sibling launcher's first miss builds only its C record. Memory grows per launcher: a 16-slot map (about 0.5–0.8 KB) and a small dict. Every launcher's cache, memos and table writes stay under the module's `st->lock`, as bound caches are today.
+2. **Free-threaded memo reads take the read side of the module rwlock, the lock that guards the launcher's cache and table.** A `(object, id)` pair cannot be read atomically without a lock: a writer between the two loads pairs an old object with a new id. GIL builds compile the lock out, so the spec's "one pointer compare, no lock" holds there.
 3. **The hot header carries `state` (the module's `intj_state *`).** The warmed entry reads it on every call. The `module` object pointer stays cold, as the spec lists.
 4. **C-side bind checks move to the first call.** Pointer overflow, `data_ptr()` failures, STATIC_COMPILE tensor capture and `hipDeviceGet` all need the built module. Python-side bind checks stay at `.bind()`. The device-ordinal range check moves into Python, so it stays at `.bind_device()`.
 5. **Unknown `dynamic_options` compile-option names raise on the first call.** The option set belongs to the target's backend. Knob paths, overlaps, and tuned-name clashes are refused at `make_launcher`.
@@ -162,6 +162,8 @@ for row in sorted({r for r, _ in per}):
     print(f"| {row} | {b:.1f} | {n:.1f} | {n - b:+.1f} |")
 ```
 
+**Per-launcher caches.** A second launcher of one `ModuleKey` pays one miss on its first call of each key. That miss builds its C record from the module's compile cache and runs no Triton compile (`test_sibling_launchers_compile_once`). Warmed rows are unaffected. The benchmarks build each launcher once and warm it, so the gate rows stay comparable to the baseline.
+
 **Record.** Write `benchmarks/journals/$(date +%F)_lazy-task<N>_0_<sha>.md` (baseline: `..._lazy-baseline_0_<sha>.md`) in the format of `benchmarks/AGENTS.md` "Result journals". Include the commands, raw outputs, a baseline-vs-task table of medians with the delta per row, the A/B table where the task runs one, and the environment. Commit it with the task.
 
 ---
@@ -172,18 +174,18 @@ for row in sorted({r for r, _ in per}):
 2. **A launcher is never called, and its builder closure sits in a reference cycle** (a module-level handle that is dropped, or an object holding its own launcher). Expect GC to collect it before and after the build. Pinned in Task 2 (`test_unbuilt_and_built_launchers_are_collected`).
 3. **An object constexpr of an unsupported kind** (a `list`, a `str` subclass, a tensor). Expect a `TypeError` that names the parameter, with the launcher still usable afterwards. Pinned in Task 3 (`test_unsupported_object_constexpr_names_the_parameter`).
 4. **A compile fails while a declared knob is set.** Expect the knob restored, no record, and a next call that retries. Pinned in Task 4 (`test_declared_knob_is_set_for_the_compile_and_restored`).
-5. **Two launchers of one module intern different strings first.** Expect each value to launch its own binary through either handle, because ids are per module. Pinned in Task 3 (`test_object_ids_are_shared_by_launchers_of_one_module`).
+5. **Two launchers of one module intern different strings first**, so the same id means different values in each. Expect every value to launch its own binary through either handle, and each variant to compile once across both, through the module's compile cache. Pinned in Task 3 (`test_sibling_launchers_intern_independently`).
 
 ## File Map
 
 | file | responsibility | tasks |
 |---|---|---|
-| `intj/runtime/intj_lazy.h` (new) | `intj_bound_header`: the fixed header, hot fields first, `offsetof` asserts | 1 |
+| `intj/runtime/intj_lazy.h` (new) | `intj_bound_header`: the fixed header (hot fields first, `offsetof` asserts; the launcher's own cache storage and intern table) | 1 |
 | `intj/runtime/intj_lazy.c` (new) | `_intj_lazy`: launcher type, build shim, `new_launcher`, GC | 2 |
 | `intj/lazy.py` (new) | compile, cache and load `_intj_lazy` without triton | 2 |
 | `intj/runtime/intj_runtime.h` | header typedef, trailing arrays (`intj_bound_tail`), object ids and memos | 1, 3 |
-| `intj/runtime/entry.c.jinja` | tail accessors; `init_bound` replaces `make_bound`; hooks; object and dynamic decode; dynamic argument layout | 1–4 |
-| `intj/launcher.py` | lazy `LauncherFactory`, `module_of`, knob options at the first call, `_Interner`, `DynamicSlot`, `dynamic_options` | 2–4 |
+| `intj/runtime/entry.c.jinja` | tail accessors; `init_bound` replaces `make_bound`; every launcher on its own cache; hooks; object and dynamic decode; untuned `key_chain`; dynamic argument layout | 1–4 |
+| `intj/launcher.py` | lazy `LauncherFactory`, `module_of`, knob options at the first call, the module compile cache, per-launcher `_Interner`, `DynamicSlot`, `dynamic_options` | 2–4 |
 | `intj/tuning.py` | `knob_values`/`dynamic` in the tuned miss path | 2, 4 |
 | `intj/grid.py` | `compile_grid(..., offset=)` for dynamic arguments | 4 |
 | `tests/test_runtime.py` | stub, swap, retry, concurrency, GC and memo tests on the Python matrix | 2, 3 |
@@ -234,7 +236,7 @@ About 3 hours. There is no behaviour change. Every bound object gets one fixed h
 
 **Interfaces:**
 - Produces, C, `intj_lazy.h`:
-  - `typedef struct intj_bound_header {...} intj_bound_header;` with fields `state, device_ordinal, device_handle, cache_ready, cache[3], fixed_kernel` (hot, in that order), then `def, doc, builder, module, tuned_cb, grid_py, grid_hidden, build_lock, build_thread, traverse, clear` (cold)
+  - `typedef struct intj_bound_header {...} intj_bound_header;` with fields `state, device_ordinal, device_handle, cache_ready, cache[3], fixed_kernel` (hot, in that order), then `def, doc, builder, module, intern, tuned_cb, grid_py, grid_hidden, build_lock, build_thread, traverse, clear` (cold)
   - `typedef PyObject *(*intj_fast_fn)(PyObject *, PyObject *const *, Py_ssize_t);`
 - Produces, C, `intj_runtime.h`:
   - `typedef intj_bound_header intj_bound_launcher;`
@@ -310,6 +312,7 @@ typedef struct intj_bound_header {
   PyObject *doc;           /* bytes behind def.ml_doc */
   PyObject *builder;       /* until built: callable(header) -> entry address */
   PyObject *module;
+  PyObject *intern;        /* callable(value) -> id or None: this launcher's intern table */
   PyObject *tuned_cb;
   PyObject *grid_py;
   PyObject *grid_hidden;
@@ -541,6 +544,7 @@ About 1.5 days. This is the largest task: the stub, the swap, `init_bound`, the 
   - `_loaded_module(..., baked_values, knob_values=None)`
   - `_make_compile_callback(..., *, return_compiled=False, knob_values: Mapping[str, object])`
 - Produces, `intj/tuning.py`: `make_tuned_callback(plan, resolved, options, grid, render, return_compiled, knob_values)`
+- Produces, ownership: every launcher with a key (`nwords > 0`) uses `INTJ_BOUND_CACHE_OF(bound)`, and a keyless fixed-device launcher uses `fixed_kernel`. `st->cache` serves only the module's debug `entry`. `_make_compile_callback` keeps the module's compile cache.
 
 - [ ] **Step 1: Write the failing runtime tests (triton-free, run on the whole matrix)**
 
@@ -1064,6 +1068,38 @@ static PyObject *header_size(PyObject *self, PyObject *unused) {
 8. `intj_exec`: delete the `bound_type` creation (1921–1927). `intj_traverse`: delete `Py_VISIT(st->bound_type);`. `intj_clear`: delete `Py_CLEAR(st->bound_type);`.
 9. `intj_methods`: replace the `make_bound` row with `{"init_bound", (PyCFunction)(void (*)(void))init_bound, METH_FASTCALL, NULL},` and add `{"header_size", header_size, METH_NOARGS, NULL},`.
 
+- [ ] **Step 5b: Every launcher owns its level-0 cache; the module keeps a compile cache**
+
+In `entry.c.jinja`, the bound cache was selected by `(fixed_device and nwords) or tuned`. Select it by `nwords` alone. `nwords` is 0 only for a keyless fixed-device launcher, which keeps `fixed_kernel`.
+- `intj_bound_entry`'s cache argument: `{{ 'INTJ_BOUND_CACHE_OF(bound)' if nwords else 'NULL' }}`.
+- `init_bound`: `{% if (fixed_device and nwords) or tuned %}` around `intj_cache_init` → `{% if nwords %}`.
+- `intj_bound_clear`: `{% if nwords %}` (free the cache) / `{% elif fixed_device %}` (free `fixed_kernel`).
+- `intj_bound_traverse`: `{% if (return_compiled or (tuned and grid_py_mode)) and nwords %}`.
+- `intj_state.cache` and its init/traverse/free stay (`{% if not fixed_device %}`), but only the module-level debug `entry` reaches them. Say so in the struct comment.
+- The lock is unchanged: every launcher's cache stays guarded by the module's `st->lock`, as bound caches are today. Add `/* ponytail: one rwlock per module, so sibling launchers' misses serialize on free-threaded builds; move a rwlock into the header's cold part if that shows */` beside `intj_rwlock lock;`.
+
+In `launcher.py`, add `import weakref` and `MutableMapping` to the `collections.abc` import. In `_make_compile_callback`, replace the `kernels` list with the module's compile cache:
+
+```python
+    # The module's compile cache: a sibling launcher's miss reuses the kernel
+    # and only builds its own C record.  With return_compiled the records own
+    # their CompiledKernel, so the cache must not keep it alive past them.
+    compiled: MutableMapping[tuple[object, ...], CompiledKernel] = (
+        weakref.WeakValueDictionary() if return_compiled else {}
+    )
+```
+
+Then replace `kernel = _checked_compile(jit_func, compiler_input, target, canonical_options)` with the lookup below, and delete `kernels.append(kernel)`:
+
+```python
+        cache_key = (compiler_input, canonical_options.hash(), current)
+        kernel = compiled.get(cache_key)
+        if kernel is None:
+            kernel = compiled[cache_key] = _checked_compile(
+                jit_func, compiler_input, target, canonical_options
+            )
+```
+
 - [ ] **Step 6: Run the runtime tests**
 
 Run: `PYTHONPATH=$PWD VIRTUAL_ENV=$V uv run --active --no-sync python -m pytest tests/test_runtime.py -q`
@@ -1386,6 +1422,30 @@ Expected: pass on all nine builds. On 3.13t and 3.14t this covers the concurrenc
 Append to `tests/test_launcher.py` (`from intj.launcher import module_of` at the top):
 
 ```python
+def test_sibling_launchers_compile_once(monkeypatch):
+    """Each launcher owns its cache; the module's compile cache shares kernels."""
+    import intj.launcher as launcher
+
+    monkeypatch.setattr(launcher, "_LOADED", {})  # a fresh module: an empty compile cache
+    real, compiles = launcher._checked_compile, []
+
+    def counted(*args, **kwargs):
+        compiles.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_checked_compile", counted)
+    first, second = make_launcher(scale), make_launcher(scale)
+    assert first.__self__ is not second.__self__
+    x = torch.ones(64, device="cuda")
+    o = torch.zeros_like(x)
+    device, stream = torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream
+    first(device, stream, 1, x, o, 64, 2.0, 64)
+    second(device, stream, 1, x, o, 64, 3.0, 64)  # its own miss: a record, no compile
+    torch.cuda.synchronize()
+    assert o[0].item() == 3.0
+    assert module_of(first) is module_of(second) and len(compiles) == 1
+
+
 def test_decoration_needs_no_gpu(monkeypatch):
     """make_launcher, the decorator form and bind_device never query a target."""
     import intj.launcher as launcher
@@ -1504,6 +1564,8 @@ Then fix the tests whose premise moved:
   - the fpsan test asserts on `launcher._knob_options(_kernel, options, kwargs["knob_values"])["fpsan_homomorphic_casts"] is True`.
 - `test_modules_stay_out_of_the_import_system`: switch to `module_of(...)` and add `assert "_intj_lazy" not in sys.modules`.
 
+- Tests that install a counting compile callback and launch through two sibling handles (test_launcher ~340–380 `compile_once_per_handle` / `compile_each_constant`, test_grid ~151 and ~341) now see one callback call per launcher per key, because each launcher owns its cache. Update the expected counts. Do not reintroduce sharing.
+
 Check the migration: `grep -n "__self__" tests/*.py benchmarks/*.py` lists only the rule-4 sites and `module_of` internals.
 
 - [ ] **Step 11: Run the full suite and pyright**
@@ -1582,7 +1644,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 ### Task 3: Object constexprs keyed by value
 
-About 4 hours. Untyped, unbaked `tl.constexpr` parameters accept `str`, `tl.dtype` and JIT functions. The key carries a per-module id, memoized per slot.
+About 4 hours. Untyped, unbaked `tl.constexpr` parameters accept `str`, `tl.dtype` and JIT functions. The key carries a per-launcher id, memoized per slot.
 
 **Files:**
 - Modify: `intj/runtime/intj_runtime.h`: codes 596–602, `intj_value_kind` 610–617, new `intj_object_id`/`intj_decode_value` after `intj_decode_constexpr` (655), `intj_infer_type`/`intj_constexpr_type` 814–849
@@ -1596,31 +1658,42 @@ About 4 hours. Untyped, unbaked `tl.constexpr` parameters accept `str`, `tl.dtyp
 - Produces, C: `INTJ_VALUE_OBJECT`, `INTJ_B_CX_OBJECT` (154)
   - `int intj_object_id(PyObject *intern, intj_rwlock *lock, intj_memo *memo, PyObject *o, const char *pname, uint64_t *id)`
   - `int intj_decode_value(PyObject *o, const char *pname, PyObject *intern, intj_rwlock *lock, intj_memo *memo, intj_decoded *out)`
-- Produces, rendered module: `set_interner(callable)`; `intj_state.intern`
-- Produces, Python: `Param.memo: int | None`; `_object_capable(annotation) -> bool`; `_Interner.__call__(value) -> int | None`
+- Produces, rendered module: `init_bound(header, interner, [tuned_cb], [grid_py, hidden], [device], *bound)`; the header's `intern`; `key_chain(launcher, device, *public) -> ((key,), found)` for untuned modules as well. `spec_key` and the debug `entry` have no launcher, so they refuse object values.
+- Produces, Python: `Param.memo: int | None`; `_object_capable(annotation) -> bool`; `_Interner.__call__(value) -> int | None`, one per launcher
 
 - [ ] **Step 1: Write the failing tests**
 
 In `tests/test_runtime.py`:
-- add `_IDS: dict = {}` at module level;
-- in the `built` fixture, after `set_torch_version`, add `module.set_interner(lambda v: _IDS.setdefault(v, len(_IDS)) if type(v) is str else None)`;
+- add a per-launcher test interner, and make every existing `module.init_bound(header)` in this file `module.init_bound(header, _interner())`:
+
+```python
+def _interner():
+    ids = {}
+    return lambda v: ids.setdefault(v, len(ids)) if type(v) is str else None
+```
+
 - change `_TAIL` to `launcher._tail_bytes(sum(p.memo is not None for p in _PARAMS), 0)`;
 - append:
 
 ```python
-def test_str_constexpr_keys_by_value(built):
+def test_str_constexpr_keys_by_value(built, stub_module):
     module, _, _ = built
+    launch = stub_module.new_launcher(_TAIL, b"", lambda header: module.init_bound(header, _interner()))
+    launch(*_args())
     x = torch.zeros(4)
-    a = module.spec_key(x, 5, -7, 1.5, True, "act")
-    b = module.spec_key(x, 5, -7, 1.5, True, "".join(["a", "c", "t"]))
-    c = module.spec_key(x, 5, -7, 1.5, True, "other")
-    assert a == b and a != c
-    assert module.spec_key(x, 5, -7, 1.5, True, 0) != a  # an int never shares an object's code
+
+    def key(value):
+        return module.key_chain(launch, 0, x, 5, -7, 1.5, True, value)[0]
+
+    assert key("act") == key("".join(["a", "c", "t"])) != key("other")
+    assert key(0) != key("act")  # an int never shares an object's code
+    with pytest.raises(TypeError, match="launcher"):
+        module.spec_key(x, 5, -7, 1.5, True, "act")  # no launcher, no intern table
 
 
 def test_memo_holds_its_object_until_replaced(built, stub_module):
     module, _, _ = built
-    launch = stub_module.new_launcher(_TAIL, b"", lambda header: module.init_bound(header))
+    launch = stub_module.new_launcher(_TAIL, b"", lambda header: module.init_bound(header, _interner()))
     first, second = "".join(["o", "n", "e"]), "".join(["t", "w", "o"])
     launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, first)
     held = sys.getrefcount(first)
@@ -1700,16 +1773,30 @@ def test_dtype_and_jit_constexprs():
     assert o.item() == 9.0
 
 
-def test_object_ids_are_shared_by_launchers_of_one_module():
-    first = make_launcher(act_store, return_compiled=True)
-    second = make_launcher(act_store, return_compiled=True)
-    assert module_of(first) is module_of(second)
+def test_sibling_launchers_intern_independently(monkeypatch):
+    """Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
+    and the module's compile cache compiles each variant once."""
+    import intj.launcher as launcher
+
+    monkeypatch.setattr(launcher, "_LOADED", {})
+    real, compiles = launcher._checked_compile, []
+
+    def counted(*args, **kwargs):
+        compiles.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_checked_compile", counted)
+    first, second = make_launcher(act_store), make_launcher(act_store)
     o = torch.zeros(1, device="cuda")
-    neg = second(*_gpu_controls(), o, 2.0, "neg")  # interned by the second handle
-    first(*_gpu_controls(), o, 2.0, "pos")
-    assert first(*_gpu_controls(), o, 2.0, "neg") is neg
-    torch.cuda.synchronize()
-    assert o.item() == -2.0
+    second(*_gpu_controls(), o, 2.0, "neg")  # id 0 = "neg" in second
+    first(*_gpu_controls(), o, 2.0, "pos")  # id 0 = "pos" in first
+    for launch, act, want in (
+        (first, "neg", -2.0), (second, "pos", 2.0), (first, "pos", 2.0), (second, "neg", -2.0)
+    ):
+        launch(*_gpu_controls(), o, 2.0, act)
+        torch.cuda.synchronize()
+        assert o.item() == want, (act, want)
+    assert module_of(first) is module_of(second) and len(compiles) == 2  # one per variant
 
 
 def test_unsupported_object_constexpr_names_the_parameter():
@@ -1730,8 +1817,8 @@ def test_unsupported_object_constexpr_names_the_parameter():
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `... pytest tests/test_runtime.py tests/test_launcher.py -q -k "constexpr or memo or object_ids"`
-Expected: FAIL. `set_interner` is missing, `Param` has no `memo`, and a `str` constexpr raises `TypeError: … pass a scalar int, float, bool or None`.
+Run: `... pytest tests/test_runtime.py tests/test_launcher.py -q -k "constexpr or memo or intern"`
+Expected: FAIL. `init_bound` takes no interner, `Param` has no `memo`, and a `str` constexpr raises `TypeError: … pass a scalar int, float, bool or None`.
 
 - [ ] **Step 3: Runtime helpers in `intj_runtime.h`**
 
@@ -1751,7 +1838,9 @@ Expected: FAIL. `set_interner` is missing, `Param` has no `memo`, and a `str` co
 static inline int intj_object_id_slow(PyObject *intern, intj_rwlock *lock, intj_memo *memo,
                                PyObject *o, const char *pname, uint64_t *id) {
   if (!intern) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: the module's interner is not set");
+    PyErr_Format(PyExc_TypeError,
+                 "intj: object value for '%s' needs a launcher's intern table; "
+                 "use key_chain(launcher, ...) rather than spec_key or entry", pname);
     return -1;
   }
   PyObject *r = PyObject_CallFunctionObjArgs(intern, o, NULL);
@@ -1816,13 +1905,14 @@ static INTJ_ALWAYS_INLINE int intj_decode_value(PyObject *o, const char *pname,
 - [ ] **Step 4: Template**
 
 1. After `#define INTJ_NBOUND …`, add `#define INTJ_NMEMO {{ params | rejectattr('memo', 'none') | list | length }}`.
-2. In `intj_state`, add `PyObject *intern; /* callable(value) -> id or None; set once, before the module is reachable */`.
+2. Every object decode reads the launcher's table, `bound ? bound->intern : NULL`, never module state.
 3. In `decode_auto_constexpr`, replace the final `else { PyErr_Format(...); return -1; }` with the code below. In the auto path every constexpr is untyped and public, so it always has a memo.
 
 ```jinja
     } else {
       code = INTJ_B_CX_OBJECT;
-      if (intj_object_id(st->intern, &st->lock, bound ? &INTJ_TAIL(bound)->memo[{{ p.memo }}] : NULL,
+      if (intj_object_id(bound ? bound->intern : NULL, &st->lock,
+                         bound ? &INTJ_TAIL(bound)->memo[{{ p.memo }}] : NULL,
                          o, intj_param_names[{{ p.index }}], &bits) != 0)
         return -1;
     }
@@ -1832,7 +1922,8 @@ static INTJ_ALWAYS_INLINE int intj_decode_value(PyObject *o, const char *pname,
 
 ```jinja
 {% elif a.kind == 'constexpr' and p.memo is not none %}
-  if (intj_decode_value(args[{{ p.call_index }}], intj_param_names[{{ i }}], st->intern, &st->lock,
+  if (intj_decode_value(args[{{ p.call_index }}], intj_param_names[{{ i }}],
+                        bound ? bound->intern : NULL, &st->lock,
                         bound ? &INTJ_TAIL(bound)->memo[{{ p.memo }}] : NULL, &{{ d }}) != 0)
     return -1;
 {% elif a.kind == 'constexpr' %}
@@ -1841,19 +1932,47 @@ static INTJ_ALWAYS_INLINE int intj_decode_value(PyObject *o, const char *pname,
 ```
 
 5. In `intj_bound_traverse`, visit the memos: `for (int k = 0; k < INTJ_NMEMO; k++) Py_VISIT(tail->memo[k].obj);`. In `intj_bound_clear`, clear them: `for (int k = 0; k < INTJ_NMEMO; k++) Py_CLEAR(tail->memo[k].obj);`.
-6. Add the method below and register it in `intj_methods` as `{"set_interner", set_interner, METH_O, NULL},`. In `intj_traverse` add `Py_VISIT(st->intern);`, and in `intj_clear` add `Py_CLEAR(st->intern);`.
+5b. Visit and clear the table in the hooks as well: `Py_VISIT(bound->intern);` and `Py_CLEAR(bound->intern);`.
+6. `init_bound` takes the launcher's interner as its second argument. Make the count check `2 + {{ … }} + INTJ_NBOUND` in both places. After the header check:
+   - add `if (!PyCallable_Check(args[1])) { PyErr_SetString(PyExc_TypeError, "intj: init_bound needs the launcher's interner"); return NULL; }`;
+   - change `args += 1;` to `PyObject *interner = args[1]; args += 2;`;
+   - as the second statement inside `try {` (after `bound->module = …`), add `bound->intern = Py_NewRef(interner);`.
+   The `fail:` path's `intj_bound_clear` drops it again.
+7. Render `key_chain` for untuned modules too, so a launcher's own ids can be inspected; `spec_key` has none. Beside the tuned version, inside `{% if not tuned %}`, add the function below and register `key_chain` in `intj_methods` unconditionally:
 
 ```c
-/* Called once, under the launcher's load lock, before the module is reachable. */
-static PyObject *set_interner(PyObject *self, PyObject *fn) {
+/* Debug: this launcher's key for these arguments, and whether its cache holds
+ * it.  key_chain(launcher, device, *public_args) -> ((bytes,), found) */
+static PyObject *key_chain(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
-  if (st->intern) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: interner already set");
+  int64_t device = 0;
+  if (nargs != 2 + INTJ_NPARAMS || !PyCFunction_Check(args[0]) ||
+      !PyLong_CheckExact(args[1]) || intj_as_i64(args[1], &device) != 0 ||
+      device < 0 || device > 255) {
+    PyErr_SetString(PyExc_TypeError, "intj: key_chain(launcher, device, *public_args)");
     return NULL;
   }
-  Py_INCREF(fn);
-  st->intern = fn;
-  Py_RETURN_NONE;
+  PyObject *owner = PyCFunction_GET_SELF(args[0]);
+  if (!owner || Py_TYPE(owner)->tp_basicsize != (Py_ssize_t)sizeof(intj_bound_header) ||
+      ((intj_bound_launcher *)owner)->module != self) {
+    PyErr_SetString(PyExc_TypeError, "intj: key_chain needs a built launcher of this module");
+    return NULL;
+  }
+  intj_bound_launcher *bound = (intj_bound_launcher *)owner;
+  uint64_t key[INTJ_NWORDS];
+  uint64_t vals[INTJ_NSLOTS];
+  int np = 0;
+  if (intj_pack(st, args + 2, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound) != 0)
+    return NULL;
+  INTJ_RDLOCK(&st->lock);
+{% if nwords %}
+  int found = bound->cache_ready && intj_cache_lookup(INTJ_BOUND_CACHE_OF(bound), key) != NULL;
+{% else %}
+  int found = bound->fixed_kernel != NULL;
+{% endif %}
+  INTJ_RWUNLOCK(&st->lock);
+  PyObject *k0 = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
+  return k0 ? Py_BuildValue("((N)O)", k0, found ? Py_True : Py_False) : NULL;
 }
 ```
 
@@ -1875,12 +1994,12 @@ def _object_capable(annotation: CanonicalAnnotation) -> bool:
 
 
 class _Interner:
-    """One module's object values -> small ids, by canonical value.
+    """One launcher's object values -> small ids, by canonical value.
 
-    Per module, not per launcher: every launcher of a module shares its kernel
-    cache and compile callback, so an id must mean one value for all of them.
-    Ids live for the process and never enter a `ModuleKey`.  A JIT function's
-    `cache_key` is read once, when its object is first seen, as triton does."""
+    Per launcher, like its kernel cache: an id means one value within one
+    launcher and nothing outside it.  Ids live for the process and never enter
+    a `ModuleKey`.  A JIT function's `cache_key` is read once, when its object
+    is first seen, as triton does."""
 
     def __init__(self) -> None:
         self._ids: dict[tuple[object, ...], int] = {}
@@ -1918,7 +2037,19 @@ In `_render_key`'s params loop, assign memo slots in call order:
 ```
 
 - In `LauncherFactory._bind`, pass `_tail_bytes(sum(p.memo is not None for p in params), len(bound_values))`.
-- In `_loaded_module`, right after `set_compile_callback(...)`, add `module.set_interner(_Interner())`.
+- In `LauncherFactory._build`, pass a fresh table: `return module.init_bound(header, _Interner(), *prefix, *args)`.
+- In `_make_compile_callback`, the `keyblob -> CompilerInput` bug check compares keys across launchers, and object ids are per launcher. Run it only for calls with no object value:
+
+```python
+        objects = any(
+            p.memo is not None and type(args[p.call_index]) not in (int, float, bool, type(None))
+            for p in params
+        )
+        if not objects:
+            # <the existing keyblob / no_key_input check, unchanged>
+```
+
+  Calls that do carry objects are covered by the invariant tests (Task 5).
 
 - [ ] **Step 6: Run the tests**
 
@@ -1989,7 +2120,7 @@ About 1 day.
 - Docs: `docs/Usage.md`
 
 **Interfaces:**
-- Consumes: `intj_decode_value`, `set_interner`, memos (Task 3); `_knob_options`, `_live_knobs`, `_KNOB_OPTIONS` (Task 2)
+- Consumes: `intj_decode_value`, `init_bound(header, interner, ...)`, the untuned `key_chain`, memos (Task 3); the module compile cache (Task 2); `_knob_options`, `_live_knobs`, `_KNOB_OPTIONS` (Task 2)
 - Produces, Python:
   - `DynamicSlot(name: str, value_offset: int | None, kind_offset: int | None, memo: int)`
   - `RenderContext.dynamic: tuple[DynamicSlot, ...] = ()`, `LauncherFactory.dynamic: tuple[str, ...] = ()`
@@ -1998,7 +2129,7 @@ About 1 day.
   - `_knob_scope(values: Mapping[str, object]) -> ContextManager[None]`
   - `_render_key(...) -> (params, device_offset, nwords, computed_fields, dynamic_slots)`
   - `compile_grid(fn, params, baked, deps=None, offset=0)`
-- Produces, call layout: `launch(device, stream, *grid controls, *dynamic values in declared order, *public args)`. The compile and tuned callbacks receive `(..., *dynamic values, *public args)`. `spec_key(*dynamic, *public)`, `key_chain(launcher, device, *dynamic, *public)`.
+- Produces, call layout: `launch(device, stream, *grid controls, *dynamic values in declared order, *public args)`. The compile and tuned callbacks receive `(..., *dynamic values, *public args)`. `spec_key(*dynamic, *public)` takes scalars only, and `key_chain(launcher, device, *dynamic, *public)` accepts objects too.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2271,6 +2402,9 @@ In `make_launcher`:
 ```python
     seen: dict[bytes, tuple[object, ...]] = {}
     no_key: tuple[object, ...] | None = None
+    compiled: MutableMapping[tuple[object, ...], CompiledKernel] = (  # from Task 2
+        weakref.WeakValueDictionary() if return_compiled else {}
+    )
 
     def compile_callback(
         keyblob: bytes, nparams: int, device: int, *args: Any
@@ -2287,18 +2421,26 @@ In `make_launcher`:
         )
         compiler_input = _compiler_input(jit_func, params, args, backend, baked_values=baked_values)
         identity = (compiler_input, canonical.hash(), tuple(sorted(dyn_knobs.items())))
-        if keyblob:
-            previous = seen.setdefault(keyblob, identity)
-        else:
-            if no_key is None:
-                no_key = identity
-            previous = no_key
-        if previous != identity:
-            raise RuntimeError(
-                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
-            )
-        with _knob_scope(dyn_knobs):
-            kernel = _checked_compile(jit_func, compiler_input, target, canonical)
+        scalars = (int, float, bool, type(None))
+        objects = any(type(v) not in scalars for v in values) or any(
+            p.memo is not None and type(args[p.call_index]) not in scalars for p in params
+        )
+        if not objects:  # object ids are per launcher; the key means nothing across them
+            if keyblob:
+                previous = seen.setdefault(keyblob, identity)
+            else:
+                if no_key is None:
+                    no_key = identity
+                previous = no_key
+            if previous != identity:
+                raise RuntimeError(
+                    "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
+                )
+        cache_key = (*identity, current)
+        kernel = compiled.get(cache_key)
+        if kernel is None:
+            with _knob_scope(dyn_knobs):
+                kernel = compiled[cache_key] = _checked_compile(jit_func, compiler_input, target, canonical)
         # <from `md = kernel.metadata` on: unchanged>
 ```
 
@@ -2334,7 +2476,7 @@ Autotune passes `dyn_options` through to the shim as extra kwargs. There they me
 {% for slot in dynamic %}
   {
     intj_decoded dv;
-    if (intj_decode_value(dyn[{{ loop.index0 }}], "{{ slot.name }}", st->intern, &st->lock,
+    if (intj_decode_value(dyn[{{ loop.index0 }}], "{{ slot.name }}", bound ? bound->intern : NULL, &st->lock,
                           bound ? &INTJ_TAIL(bound)->memo[{{ slot.memo }}] : NULL, &dv) != 0)
       return -1;
 {% if slot.value_offset is not none %}
@@ -2369,7 +2511,7 @@ Autotune passes `dyn_options` through to the shim as extra kwargs. There they me
 6. `intj_tuned_fill`:
    - size `cb_args[5 + INTJ_NDYN + INTJ_NPARAMS]`, fill `cb_args[5 + i] = args[{{ grid_count }} + i]` for `i < INTJ_NDYN + INTJ_NPARAMS`, and use that count in the vectorcall;
    - the level functions read `args + {{ grid_count }} + INTJ_NDYN`.
-7. `spec_key`: `nargs != INTJ_NDYN + INTJ_NPARAMS` (in the message too) and `intj_pack(st, args, args + INTJ_NDYN, …)`.
+7. `spec_key`: `nargs != INTJ_NDYN + INTJ_NPARAMS` (in the message too) and `intj_pack(st, args, args + INTJ_NDYN, …)`. The untuned `key_chain` (Task 3) changes the same way: `nargs != 2 + INTJ_NDYN + INTJ_NPARAMS` and `intj_pack(st, args + 2, args + 2 + INTJ_NDYN, …)`.
 8. `key_chain`:
    - `nargs != 2 + INTJ_NDYN + INTJ_NPARAMS`;
    - `intj_pack(st, args + 2, args + 2 + INTJ_NDYN, …)`;
@@ -2456,7 +2598,7 @@ About half a day.
 - Modify: `benchmarks/bench_launch.py` (`--dynamic`), `benchmarks/AGENTS.md`, `TODO.md`
 
 **Interfaces:**
-- Consumes: `spec_key(*dynamic, *public)`, `key_chain(launcher, device, *dynamic, *public)`, `_dynamic_key_fields`, `_Interner`, `_knob_options`, `_live_knobs`, `_knob_scope`, `_split_dynamic`, `module_of`
+- Consumes: `key_chain(launcher, device, *dynamic, *public)` (untuned and tuned), `_dynamic_key_fields`, `_Interner`, `_knob_options`, `_live_knobs`, `_knob_scope`, `_split_dynamic`, `module_of`
 
 - [ ] **Step 1: Untuned invariant with mutation checks**
 
@@ -2485,7 +2627,8 @@ def check_dynamic_invariant():
         _render_params,
     )
 
-    module = module_of(make_launcher(dyn_axpy, dynamic_options=_DYNAMIC))
+    launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
+    module, device = module_of(launch), torch.cuda.current_device()
     params, _, _ = _render_params(_resolve_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED)
     target = _current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
@@ -2498,7 +2641,7 @@ def check_dynamic_invariant():
                 for dt in (tl.float32, tl.float16):
                     for fn in (_twice, _thrice, triton.jit(_twice.fn)):
                         public = (o, x, 64, act, dt, fn, 64)
-                        key, _ = module.spec_key(warps, debug, *public)
+                        (key,), _ = module.key_chain(launch, device, warps, debug, *public)
                         options = _knob_options(
                             dyn_axpy, {"num_warps": warps}, {**knobs_now, "knobs.runtime.debug": debug}
                         )

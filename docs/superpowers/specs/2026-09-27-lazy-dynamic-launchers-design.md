@@ -181,8 +181,21 @@ Launchers without bindings return the module's `entry` today, with
 `self = module`. They become bound-style lazy launchers too. `.bind()` and
 `.bind_device()` return lazy launchers.
 
-The kernel cache, locking, key layout, and tuned paths are unchanged, apart
-from where the bound object comes from.
+Every launcher owns its level-0 kernel cache and its intern table, the way
+tuned and `bind_device` launchers already own their cache. The module-level
+cache that plain launchers shared goes away from launch paths; it stays only
+behind the module's own debug `entry`. This removes the only structure shared
+across launchers, so every launcher behaves like a tuned or `bind_device` one,
+and an intern id never has to mean the same value in two launchers.
+
+To avoid compiling twice, the module's compile callback keeps a compile cache
+keyed on the compiler input, canonical options, declared knob values, and
+device. A sibling launcher of the same `ModuleKey` misses once and builds only
+its C record, reusing the `CompiledKernel`. Memory grows per launcher: one map
+(16 slots to start) and one intern table each.
+
+Locking, key layout, and tuned paths are otherwise unchanged. The module's
+rwlock still guards every launcher's cache, memos, and intern-table writes.
 
 ## Keying dynamic values
 
@@ -209,7 +222,8 @@ and the key carries the id.
   object it saw, plus that object's id. Holding the reference means the
   object's address cannot be reused while it is memoized. When the same
   object arrives again, one pointer compare returns the id, with no Python
-  code and no lock. This covers literals, interned strings, dtype singletons,
+  code and no lock (a free-threaded build takes the read side of the module
+  rwlock that guards this launcher's cache). This covers literals, interned strings, dtype singletons,
   and repeated JIT objects.
 - **New object:**
   - Python computes the canonical tuple outside any lock. For a JIT function
@@ -222,7 +236,8 @@ and the key carries the id.
     outside the lock.
 - **Equality:** equal content gets the same id whichever object carries it,
   which matches Triton's constexpr semantics.
-- **Scope:** ids are per launcher and per process. They are never persisted
+- **Scope:** ids are per launcher and per process, because each launcher also
+  owns its kernel cache (see Uniform shape). They are never persisted
   and never enter the module key.
 - **Limitation:** a JIT function's `cache_key` is read once and cached. Edits
   to a callee's source or globals after first use are not seen. Triton has the
@@ -274,6 +289,8 @@ knobs stays a TODO.
   - After warm-up, `dis` with adaptive specialization shows
     `CALL_BUILTIN_FAST` at the call site.
   - `offsetof` asserts pin the hot fields to the first cache line.
+- **Per-launcher caches:** two launchers of one `ModuleKey` compile a key
+  once; the second's first call only builds its C record.
 - **Concurrency:** N threads make the first call together on 3.13t and 3.14t
   (both installed via uv). There is exactly one build, and every call returns
   correctly.
@@ -288,6 +305,8 @@ knobs stays a TODO.
   - `tl.dtype` works.
   - A JIT function works, and the same `cache_key` shares a record.
   - A freed-and-reused address cannot alias another value.
+  - Two launchers of one module that intern different strings first each
+    launch the right binary, and each variant compiles once.
 - **Invariant:**
   - The untuned and tuned invariant tests vary each dynamic option, knob, and
     object constexpr.
