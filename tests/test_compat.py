@@ -236,7 +236,9 @@ def test_tensor_wrapper_pointer_annotation_uses_triton_global_default():
     )
 
 
-def test_callable_grid_bridge_reuses_kernel_cache(monkeypatch):
+@pytest.fixture
+def host_bridge(monkeypatch):
+    """compat on the host: no_gpu launchers, a fake driver, fresh caches."""
     import intj.compat as compat
     import intj.launcher as launcher_module
 
@@ -264,14 +266,12 @@ def test_callable_grid_bridge_reuses_kernel_cache(monkeypatch):
         ),
     )
     monkeypatch.setattr(launcher_module, "_LOADED", {})
+    compat._cached_grid_py.cache_clear()
+    yield compat
+    compat._cached_grid_py.cache_clear()
 
-    dimensions = [0]
 
-    def grid(meta):
-        return (dimensions[0],)
-
-    compat.launch(unused_pointer, grid, 7)
-    (module,) = launcher_module._LOADED.values()
+def _count_misses(module):
     misses = []
 
     def compile_once(key, nparams, device, *args):
@@ -279,10 +279,46 @@ def test_callable_grid_bridge_reuses_kernel_cache(monkeypatch):
         return 0, 1, 0, nparams
 
     override_compile(module, compile_once)
+    return misses
+
+
+def test_callable_grid_bridge_reuses_kernel_cache(host_bridge):
+    import intj.launcher as launcher_module
+
+    dimensions = [0]
+
+    def grid(meta):
+        return (dimensions[0],)
+
+    host_bridge.launch(unused_pointer, grid, 7)
+    (module,) = launcher_module._LOADED.values()
+    misses = _count_misses(module)
     dimensions[0] = 1
-    compat.launch(unused_pointer, grid, 7)
-    compat.launch(unused_pointer, grid, 7)
+    host_bridge.launch(unused_pointer, grid, 7)
+    host_bridge.launch(unused_pointer, grid, 7)
     assert len(misses) == 1
+
+
+def test_per_call_grid_lambda_hits_and_is_not_retained(host_bridge):
+    """A grid lambda made per call is neither a new launcher each call nor kept."""
+    import gc
+    import weakref
+
+    import intj.launcher as launcher_module
+
+    host_bridge.launch(unused_pointer, lambda meta: (0,), 7)
+    (module,) = launcher_module._LOADED.values()
+    misses = _count_misses(module)
+    refs = []
+    for _ in range(3):
+        captured = torch.empty(4)
+        refs.append(weakref.ref(captured))
+        host_bridge.launch(unused_pointer, lambda meta: (captured.numel() // 4,), 7)
+        del captured
+    gc.collect()
+    assert len(misses) == 1
+    assert host_bridge._cached_grid_py.cache_info().currsize == 1
+    assert all(ref() is None for ref in refs)
 
 
 def test_fpsan_knob_change_reselects_compat_launcher(monkeypatch):

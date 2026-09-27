@@ -85,15 +85,21 @@ def _cached(
     )
 
 
-#: the TensorWrappers of the `launch` running on this thread, for its grid
-_WRAPPERS = threading.local()
+#: the grid and TensorWrappers of the `launch` running on this thread
+_CALL = threading.local()
+
+
+def _calling_grid(meta: dict[str, object]) -> object:
+    """Every cached callable-grid launcher's grid_py: the calling launch's own
+    grid, with its own wrappers, so the launcher keys on neither and holds
+    neither (a per-call lambda neither misses every call nor pins its captures)."""
+    return _CALL.grid({**meta, **_CALL.wrapped})
 
 
 @lru_cache(maxsize=256)
 def _cached_grid_py(
     kernel: Any,
     source_key: str,
-    grid: Any,
     options: tuple[tuple[str, Any], ...],
     baked: tuple[tuple[str, Any], ...],
     wrapped_types: tuple[tuple[str, Any], ...],
@@ -106,28 +112,19 @@ def _cached_grid_py(
     """A callable-grid launcher, reused across calls like `_cached`'s: each
     launcher owns its kernel cache, so a fresh one per call would miss every time."""
     del source_key, target, debug, instrumentation, fpsan_casts
-    return _make_grid_py(kernel, grid, options, baked, wrapped_types, return_compiled)
+    return _make_grid_py(kernel, options, baked, wrapped_types, return_compiled)
 
 
 def _make_grid_py(
     kernel: Any,
-    grid: Any,
     options: tuple[tuple[str, Any], ...],
     baked: tuple[tuple[str, Any], ...],
     wrapped_types: tuple[tuple[str, Any], ...],
     return_compiled: bool,
 ) -> Any:
-    grid_py = grid
-    if wrapped_types:
-
-        def wrapped_grid(meta: dict[str, object]) -> object:
-            # the calling launch's own wrappers: the launcher outlives them
-            return grid({**meta, **_WRAPPERS.current})
-
-        grid_py = wrapped_grid
     return make_launcher(
         kernel,
-        grid_py=grid_py,
+        grid_py=_calling_grid,
         options=dict(options),
         extra_annotation=_annotations(baked, wrapped_types),
         return_compiled=return_compiled,
@@ -211,7 +208,6 @@ def launch(
         key = (
             kernel,
             kernel.cache_key,
-            grid,
             options,
             baked,
             wrapped_types,
@@ -223,18 +219,17 @@ def launch(
             hash(key)
         except TypeError:
             native = _make_grid_py(
-                kernel, grid, options, baked, wrapped_types, return_compiled
+                kernel, options, baked, wrapped_types, return_compiled
             )
         else:
             native = _cached_grid_py(*key)
-        if not wrapped:
-            return native(device, stream, *values)
-        previous = getattr(_WRAPPERS, "current", None)
-        _WRAPPERS.current = wrapped  # the grid may launch again: restore after
+        # the grid may launch again: restore after, and drop this call's refs
+        previous = getattr(_CALL, "grid", None), getattr(_CALL, "wrapped", None)
+        _CALL.grid, _CALL.wrapped = grid, wrapped
         try:
             return native(device, stream, *values)
         finally:
-            _WRAPPERS.current = previous
+            _CALL.grid, _CALL.wrapped = previous
     if type(grid) is int:
         dimensions = (grid,)
     elif type(grid) in (tuple, list):

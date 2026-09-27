@@ -31,8 +31,11 @@ static int intj_lazy_build(intj_bound_header *h) {
   if (!PyThread_acquire_lock(h->build_lock, NOWAIT_LOCK)) {
     /* detached while waiting: the builder runs Python, and a free-threaded
      * stop-the-world must not wait on us */
-    Py_BEGIN_ALLOW_THREADS PyThread_acquire_lock(h->build_lock, WAIT_LOCK);
+    // clang-format off
+    Py_BEGIN_ALLOW_THREADS
+    PyThread_acquire_lock(h->build_lock, WAIT_LOCK);
     Py_END_ALLOW_THREADS
+    // clang-format on
   }
   int rc = 0;
   PyObject *done = NULL;

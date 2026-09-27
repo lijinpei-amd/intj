@@ -110,8 +110,10 @@ every call, including from specialized call sites (3.11
 `PRECALL_NO_KW_BUILTIN_FAST`, 3.12 `CALL_NO_KW_BUILTIN_FAST`, 3.13+
 `CALL_BUILTIN_FAST`; 3.13t does not specialize). They also rely on
 `meth_dealloc` not reading `m_ml` after dropping `m_self`.
-`test_first_call_builds_and_swaps_for_old_references` pins both on the matrix.
-Recheck it first when adding a Python version.
+`test_first_call_builds_and_swaps_for_old_references` pins the swap on the
+matrix; the dealloc order was checked by a throwaway probe (3.8 to 3.14t,
+scribbling over the def in `self`'s dealloc), not by a test. Recheck both
+first when adding a Python version.
 
 ## Free-threaded modules
 

@@ -168,6 +168,38 @@ def test_reentrant_cache_miss_returns_winning_record(monkeypatch):
     assert x.item() == 5
 
 
+def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
+    """Without return_compiled the module's compile cache is the kernel's only
+    owner.  A nested miss records its kernel first; the outer compile must not
+    replace it in that cache, or the record's function handle is freed."""
+    import intj.launcher as launcher_module
+    import triton.compiler
+
+    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    real_compile = triton.compiler.compile
+    compiled = []  # weak: the test must not keep a kernel alive itself
+
+    def compile_with_reentry(*args, **kwargs):
+        kernel = real_compile(*args, **kwargs)
+        compiled.append(weakref.ref(kernel))
+        if len(compiled) == 1:
+            launch(device, stream, (1,), x, 5)  # the nested miss records first
+        return kernel
+
+    monkeypatch.setattr(triton.compiler, "compile", compile_with_reentry)
+    launch = make_launcher(reentrant_store)
+    launch(device, stream, (1,), x, 5)
+    gc.collect()
+    assert len(compiled) == 2
+    assert compiled[1]() is not None, "the recorded (nested) kernel was freed"
+    launch(device, stream, (1,), x, 7)  # a hit on the nested record
+    torch.cuda.synchronize()
+    assert x.item() == 7
+
+
 @pytest.mark.parametrize("cache", list(KernelCache), ids=lambda cache: cache.value)
 def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
     import intj.launcher as launcher_module
