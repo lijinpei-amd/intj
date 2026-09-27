@@ -17,6 +17,11 @@ before timing when the benchmark writes data.
   `--dynamic` times warmed lazy launchers: plain, with two `dynamic_options`,
   and with an `int` or a `str` constexpr, each as a full launch and as a
   host-only `spec_key` (decode + key).
+- `bench_mix.py`: host-only launches with 4, 16 or 32 arguments, 0-100 %
+  of them `tl.constexpr` (int, str or `tl.dtype` values), int, tensor or
+  mixed other arguments, repeated or alternating keys. It probes the API
+  and prints `n/a` for rows a commit cannot run, so it runs unmodified on
+  every commit with `no_gpu` (`f87f970` on); see the mix-history journal.
 - `bench_ffi_compare.py`: cached INTJ versus preconverted TVM FFI no-ops and GPU
   kernel launches; `--sweep` measures 0, 3, 5, 8, 16, 32, and 64 arguments.
   Requires `apache-tvm-ffi` and a ROCm or CUDA GPU.
