@@ -5138,11 +5138,14 @@ def test_concurrent_declared_knob_compiles_each_see_their_own_value(monkeypatch)
 
     before = knobs.runtime.debug
     real = launcher._checked_compile
-    barrier = threading.Barrier(2, timeout=1.0)
+    # With the knob lock only one thread reaches the spy at a time, so the
+    # barrier times out; without it both meet and the second scope's value
+    # is what both compiles see.
+    barrier = threading.Barrier(2, timeout=0.2)
     seen = {}
 
     def spy(jit_func, compiler_input, target, options):
-        try:  # without serialization, the other scope enters meanwhile
+        try:
             barrier.wait()
         except threading.BrokenBarrierError:
             pass

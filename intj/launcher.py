@@ -1026,8 +1026,12 @@ def _split_dynamic(
 #: restores the snapshot it took on entry, so two interleaved scopes would
 #: leave a knob changed for good, and one thread's values would reach the
 #: other's compile.  Reentrant: a compile can miss again on its own thread.
-#: Lock order: this, then a module's compile lock; a tuned launcher's lock,
-#: then this.  Taken only for a non-empty `values`.
+#: Lock order, always: this, then a tuned launcher's lock, then a module's
+#: compile lock.  An untuned miss takes it only for declared knobs; every
+#: tuned miss takes it first, knobs or not, because tuning runs user hooks
+#: (pre_hook, prune, perf_model) that may launch another tuned launcher.
+#: Cost: tuned misses serialize process-wide, and a declared-knob untuned
+#: compile waits while any tuning runs.
 _KNOB_LOCK = threading.RLock()
 
 

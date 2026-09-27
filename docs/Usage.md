@@ -138,7 +138,10 @@ On a miss, options merge into `options=` and go through `parse_options` per
 kernel (an invalid value such as `num_warps=3` raises on that call); knobs are
 set to the call's values with Triton's `knobs` scope for the duration of the
 compile, then restored. The knobs are process globals, so a compile running on
-another thread meanwhile sees the declared values too. With `triton.autotune`,
+another thread meanwhile sees the declared values too. Declared-knob compiles
+and every autotune/heuristics miss share one process-wide lock (so tuning hooks
+that launch other launchers cannot deadlock): tuned misses run one at a time,
+and a declared-knob compile waits while any tuning runs. With `triton.autotune`,
 the values reach every config.
 
 Refused at `make_launcher` with `UnsupportedKernel`: an unknown knob path, a

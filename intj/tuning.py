@@ -301,6 +301,7 @@ def make_tuned_callback(
     from .launcher import (
         Param,
         _canonical_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        _KNOB_LOCK,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _current_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
@@ -367,7 +368,8 @@ def make_tuned_callback(
         *args: Any,
     ) -> tuple[Any, ...]:
         del keyblob
-        with lock:
+        # the knob lock first, always: see _KNOB_LOCK for the order
+        with _KNOB_LOCK, lock:
             if running[0]:
                 raise UnsupportedKernel(
                     "intj: a tuned launcher was re-entered while tuning"

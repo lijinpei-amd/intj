@@ -929,3 +929,63 @@ def test_tuned_dynamic_knob_without_an_option_compiles_per_value():
     assert launch(*controls(), True, x, out, 256) is bare
     asm = "amdgcn" if "amdgcn" in lines.asm else "ptx"
     assert ".loc" in lines.asm[asm] and ".loc" not in bare.asm[asm]
+
+
+def test_tuning_hook_launching_another_tuned_launcher_does_not_deadlock():
+    """Thread 1 tunes T1, whose pre_hook launches T2; thread 2 misses T2 with a
+    declared knob meanwhile.  Every tuned miss takes the knob lock before its
+    launcher lock, so neither thread holds one lock while waiting on the other."""
+    import time
+
+    knob = "knobs.compilation.disable_line_info"
+    x = torch.ones(256, device="cuda", dtype=torch.int32)
+    out, other = torch.zeros_like(x), torch.zeros_like(x)
+    device = torch.cuda.current_device()
+    hooked = threading.Event()
+    t2 = make_launcher(
+        triton.autotune(configs=configs()[:1], key=["n"])(tagged),
+        grid_cpp=grid,
+        dynamic_options=(knob,),
+    )
+
+    def pre_hook(nargs):
+        if not hooked.is_set():
+            hooked.set()
+            time.sleep(0.3)  # thread 2 takes T2's lock first, without the fix
+            t2(*controls(), False, x, other, 256)
+
+    t1 = make_launcher(
+        triton.autotune(
+            configs=[triton.Config({"TAG": 1, "BLOCK": 32}, pre_hook=pre_hook)],
+            key=["n"],
+        )(tagged),
+        grid_cpp=grid,
+        dynamic_options=(knob,),
+    )
+    errors = []
+
+    def run(fn):
+        try:
+            torch.cuda.set_device(device)
+            fn()
+        except Exception as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    def second():
+        hooked.wait(60)
+        t2(*controls(), True, x, other, 256)
+
+    threads = [
+        threading.Thread(
+            target=run, args=(lambda: t1(*controls(), False, x, out, 256),), daemon=True
+        ),
+        threading.Thread(target=run, args=(second,), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(120)
+    assert not any(t.is_alive() for t in threads), "deadlocked"
+    assert errors == []
+    torch.cuda.synchronize()
+    assert int(out[0].item()) == 2 and int(other[0].item()) == 2
