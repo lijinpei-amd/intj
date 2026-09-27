@@ -123,8 +123,10 @@ static-compile tensor slots. `NBOUND` is known without a GPU.
   - (the per-slot dynamic-value memos, sized by the number of dynamic slots,
     live in the trailing arrays right after the header)
 
-  Cold fields come after them: the build lock, the builder, GC hooks,
-  `tuned_cb`, `grid_py`, `grid_hidden`, and the module pointer.
+  Cold fields come after them: the build lock, the builder, GC hooks, the
+  launcher's miss callback (`compile_cb`, the tuned callback when tuned), its
+  intern table, its read/write lock, `grid_py`, `grid_hidden`, and the module
+  pointer.
   `offsetof` static asserts pin this order.
 - **Layout check:** the rendered module `static_assert`s the same header. At
   load it checks the header size the stub reports and raises `ImportError` on
@@ -148,7 +150,8 @@ The shim:
 2. calls the builder, which renders and loads the module (or reuses one
    already loaded for the same `ModuleKey`) and calls the rendered module's
    `init_bound(self, ...)`. That call fills the header in place (module
-   reference, device handle, cache init, `tuned_cb`, `grid_py`, GC hooks) and
+   reference, device handle, cache init, miss callback, intern table,
+   `grid_py`, GC hooks) and
    returns the rendered entry function pointer;
 3. stores the entry with one release store to `def->ml_meth`;
 4. drops the builder;
@@ -173,7 +176,10 @@ taken before the build:
 
 The stub type's traverse and clear visit the builder and the module reference,
 then call the rendered module's hooks once they are installed. The hooks reach
-cache records, compiled objects, `tuned_cb`, and grid objects.
+cache records, compiled objects, the miss callback, the intern table, slot
+memos, and grid objects. The stub creates the launcher's rwlock with the
+header and destroys it in dealloc, never in clear, so a retried build never
+re-initializes a live lock.
 
 ### Uniform shape
 
@@ -181,21 +187,36 @@ Launchers without bindings return the module's `entry` today, with
 `self = module`. They become bound-style lazy launchers too. `.bind()` and
 `.bind_device()` return lazy launchers.
 
-Every launcher owns its level-0 kernel cache and its intern table, the way
-tuned and `bind_device` launchers already own their cache. The module-level
-cache that plain launchers shared goes away from launch paths; it stays only
-behind the module's own debug `entry`. This removes the only structure shared
-across launchers, so every launcher behaves like a tuned or `bind_device` one,
-and an intern id never has to mean the same value in two launchers.
+All mutable state lives in the launcher (the bound object):
 
-To avoid compiling twice, the module's compile callback keeps a compile cache
-keyed on the compiler input, canonical options, declared knob values, and
-device. A sibling launcher of the same `ModuleKey` misses once and builds only
-its C record, reusing the `CompiledKernel`. Memory grows per launcher: one map
-(16 slots to start) and one intern table each.
+- its level-0 kernel cache and that cache's memo;
+- its intern table and per-slot memos;
+- its own read/write lock, which guards the cache, memos, and intern writes;
+- its key self-check (the map behind "one spec key maps to two compiler
+  inputs"), which therefore runs on every call, object values included;
+- its miss callback: the tuned callback, or a per-launcher wrapper around the
+  module's compile function.
 
-Locking, key layout, and tuned paths are otherwise unchanged. The module's
-rwlock still guards every launcher's cache, memos, and intern-table writes.
+Module state is read-only after load: torch types, the ABI layout and dtype
+table, and driver symbols, written once under the load lock before the module
+is reachable. The module also carries the Python compile function. That
+function keeps a per-module compile cache behind its own Python lock, keyed on
+the compiler input, canonical options, declared knob values, and device. A
+sibling launcher of the same `ModuleKey` misses once and builds only its C
+record, reusing the `CompiledKernel`.
+
+The module's debug `entry`, its shared cache, its compile-callback slot, and
+its rwlock go away: every `make_launcher` result is a lazy bound launcher, and
+no module lock remains. `module.spec_key(launcher, device, *args)` takes the
+launcher, decodes with its intern table, and is the level-0 half of
+`key_chain`.
+
+Why: this removes every structure shared across launchers, so every launcher
+behaves like a tuned or `bind_device` one, and an intern id never has to mean
+the same value in two launchers. The cost is memory per launcher: one map
+(16 slots to start), one intern table, and one lock.
+
+Key layout and tuned paths are otherwise unchanged.
 
 ## Keying dynamic values
 
@@ -222,8 +243,8 @@ and the key carries the id.
   object it saw, plus that object's id. Holding the reference means the
   object's address cannot be reused while it is memoized. When the same
   object arrives again, one pointer compare returns the id, with no Python
-  code and no lock (a free-threaded build takes the read side of the module
-  rwlock that guards this launcher's cache). This covers literals, interned strings, dtype singletons,
+  code and no lock (a free-threaded build takes the read side of the
+  launcher's own rwlock). This covers literals, interned strings, dtype singletons,
   and repeated JIT objects.
 - **New object:**
   - Python computes the canonical tuple outside any lock. For a JIT function
@@ -231,7 +252,7 @@ and the key carries the id.
   - It then probes a plain dict of canonical tuple → id:
     - `str` content hashes use CPython's cached hash, so this is cheap.
     - Equality is by value.
-  - A new tuple takes the next id under the write lock.
+  - A new tuple takes the next id under the launcher's write lock.
   - The memo moves to the new object, and the old reference is released
     outside the lock.
 - **Equality:** equal content gets the same id whichever object carries it,
@@ -289,8 +310,9 @@ knobs stays a TODO.
   - After warm-up, `dis` with adaptive specialization shows
     `CALL_BUILTIN_FAST` at the call site.
   - `offsetof` asserts pin the hot fields to the first cache line.
-- **Per-launcher caches:** two launchers of one `ModuleKey` compile a key
-  once; the second's first call only builds its C record.
+- **Per-launcher state:** two launchers of one `ModuleKey` compile a key
+  once; the second's first call only builds its C record. The key self-check
+  raises for a key that maps to two compiler inputs, object values included.
 - **Concurrency:** N threads make the first call together on 3.13t and 3.14t
   (both installed via uv). There is exactly one build, and every call returns
   correctly.
