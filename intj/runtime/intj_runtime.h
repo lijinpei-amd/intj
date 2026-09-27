@@ -600,7 +600,8 @@ typedef int32_t (*intj_error_string_out_t)(int32_t, const char **);
 #define INTJ_B_I16 148u
 #define INTJ_B_U16 150u
 #define INTJ_B_U32 152u
-/* 154..255 unused. Integer codes reserve their low bit for alignment.
+#define INTJ_B_CX_OBJECT 154u /* id of a str / tl.dtype / JIT function */
+/* 155..255 unused. Integer codes reserve their low bit for alignment.
  * The constexpr codes are disjoint from the rest even though
  * a byte position is always known at render time to be one or the other: it
  * costs nothing out of the spare codes, and it turns a wrong render-time offset
@@ -614,7 +615,8 @@ typedef enum {
   INTJ_VALUE_I64,
   INTJ_VALUE_U64,
   INTJ_VALUE_FP64,
-  INTJ_VALUE_NONE
+  INTJ_VALUE_NONE,
+  INTJ_VALUE_OBJECT /* bits: the launcher's id; constexprs only */
 } intj_value_kind;
 
 typedef struct {
@@ -722,6 +724,76 @@ static_assert(sizeof(intj_bound_tail) ==
               "intj: bound tail layout");
 #define INTJ_TAIL(b)                                                           \
   ((intj_bound_tail *)((char *)(b) + sizeof(intj_bound_header)))
+
+/* An object value's id: one pointer compare when this slot saw the same object
+ * last, else the launcher's intern table (Python, cold).  The memo holds a
+ * strong reference, so a memoized object's address cannot come back as another
+ * value.  Free-threaded, the (obj, id) pair is read under the launcher lock's
+ * read side: a writer replaces both, and two plain loads could pair them
+ * wrongly.  With the GIL the lock compiles away. */
+static inline int intj_object_id_slow(PyObject *intern, intj_rwlock *lock,
+                                      intj_memo *memo, PyObject *o,
+                                      const char *pname, uint64_t *id) {
+  if (!intern) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "intj: no intern table for '%s'; this is an intj bug", pname);
+    return -1;
+  }
+  PyObject *r = PyObject_CallFunctionObjArgs(intern, o, NULL);
+  if (!r)
+    return -1;
+  if (r == Py_None) {
+    Py_DECREF(r);
+    PyErr_Format(PyExc_TypeError,
+                 "intj: unsupported argument '%s' of type %s; pass a scalar "
+                 "int, float, bool or None, a str, a tl.dtype or a "
+                 "@triton.jit function",
+                 pname, Py_TYPE(o)->tp_name);
+    return -1;
+  }
+  uint64_t value = PyLong_AsUnsignedLongLong(r);
+  Py_DECREF(r);
+  if (value == (uint64_t)-1 && PyErr_Occurred())
+    return -1;
+  Py_INCREF(o);
+  INTJ_WRLOCK(lock);
+  PyObject *old = memo->obj;
+  memo->obj = o;
+  memo->id = value;
+  INTJ_RWUNLOCK(lock);
+  Py_XDECREF(old); /* outside the lock: a finalizer can run Python */
+  *id = value;
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int intj_object_id(PyObject *intern,
+                                             intj_rwlock *lock, intj_memo *memo,
+                                             PyObject *o, const char *pname,
+                                             uint64_t *id) {
+  INTJ_RDLOCK(lock);
+  int hit = memo->obj == o;
+  uint64_t value = memo->id;
+  INTJ_RWUNLOCK(lock);
+  if (INTJ_LIKELY(hit)) {
+    *id = value;
+    return 0;
+  }
+  return intj_object_id_slow(intern, lock, memo, o, pname, id);
+}
+
+/* A constexpr value: scalars as intj_decode_constexpr, anything else as an
+ * object id from the launcher's table, memoized in its slot. */
+static INTJ_ALWAYS_INLINE int
+intj_decode_value(PyObject *o, const char *pname, PyObject *intern,
+                  intj_rwlock *lock, intj_memo *memo, intj_decoded *out) {
+  PyTypeObject *type = Py_TYPE(o);
+  if (type == &PyLong_Type || type == &PyFloat_Type || type == &PyBool_Type ||
+      o == Py_None)
+    return intj_decode_constexpr(o, pname, out);
+  memset(out, 0, sizeof(*out));
+  out->kind = INTJ_VALUE_OBJECT;
+  return intj_object_id(intern, lock, memo, o, pname, &out->bits);
+}
 
 /* The header's cache storage, typed.  Never accessed any other way.  The
  * rendered module asserts that intj_cache fits, after defining it. */
@@ -832,6 +904,7 @@ static INTJ_ALWAYS_INLINE uint32_t intj_infer_type(const intj_decoded *value) {
   case INTJ_VALUE_FP64:
     return INTJ_B_FP32;
   case INTJ_VALUE_NONE:
+  case INTJ_VALUE_OBJECT: /* arguments never decode objects */
     return INTJ_B_NONE;
   }
   return INTJ_B_NONE;
@@ -848,6 +921,8 @@ intj_constexpr_type(const intj_decoded *value) {
     return INTJ_B_CX_UINT;
   case INTJ_VALUE_FP64:
     return INTJ_B_CX_FLOAT;
+  case INTJ_VALUE_OBJECT:
+    return INTJ_B_CX_OBJECT;
   default:
     return INTJ_B_CX_NONE;
   }

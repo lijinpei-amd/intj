@@ -90,6 +90,7 @@ class Param:
     index: int
     call_index: int | None
     annotation: CanonicalAnnotation
+    memo: int | None = None  # this slot's intj_memo, if it takes objects
 
 
 @dataclasses.dataclass(frozen=True)
@@ -319,7 +320,8 @@ class LauncherFactory:
         def build(header: object) -> int:
             return self._build(header, state, args, hidden)
 
-        return _stub().new_launcher(_tail_bytes(0, len(bound_values)), doc, build)
+        nmemo = sum(p.memo is not None for p in params)
+        return _stub().new_launcher(_tail_bytes(nmemo, len(bound_values)), doc, build)
 
     def _build(
         self,
@@ -380,7 +382,7 @@ class LauncherFactory:
                 knob_values,
             )
         grid_py = () if self.grid_py is None else (self.grid_py, hidden)
-        return module.init_bound(header, callback, *grid_py, *args)
+        return module.init_bound(header, callback, _Interner(), *grid_py, *args)
 
 
 def _validate_grid_kwargs(
@@ -1517,6 +1519,7 @@ def _render_key(
     layout = _layout_fields(fields, device_binding)
     params: list[Param] = []
     call_index = 0
+    memo = 0
     for p in resolved:
         annotation = dataclasses.replace(
             p.annotation,
@@ -1532,8 +1535,11 @@ def _render_key(
             and annotation.bind_value is None
             and not annotation.tuned
         )
+        slot = None
+        if public and _object_capable(annotation):
+            slot, memo = memo, memo + 1
         params.append(
-            Param(p.name, p.index, call_index if public else None, annotation)
+            Param(p.name, p.index, call_index if public else None, annotation, slot)
         )
         if public:
             call_index += 1
@@ -1553,6 +1559,42 @@ def _render_params(
     """Place canonical key fields and number the arguments in the public call."""
     params, device_offset, nwords, _ = _render_key(resolved, device_binding)
     return params, device_offset, nwords
+
+
+def _object_capable(annotation: CanonicalAnnotation) -> bool:
+    """A public constexpr keyed by descriptor + 8-byte payload takes objects:
+    str, tl.dtype and JIT functions key as INTJ_B_CX_OBJECT plus an id."""
+    return (
+        annotation.kind == "constexpr"
+        and annotation.types is None
+        and not annotation.power_of_two_or_zero
+    )
+
+
+class _Interner:
+    """One launcher's object values -> small ids, by canonical value.
+
+    Per launcher, like its kernel cache: an id means one value within one
+    launcher and nothing outside it.  Ids live for the process and never enter
+    a `ModuleKey`.  A JIT function's `cache_key` is read once, when its object
+    is first seen, as triton does.  New ids are taken under this table's own
+    lock rather than the launcher's C write lock: same effect, and the C side
+    never holds a lock while calling Python."""
+
+    def __init__(self) -> None:
+        self._ids: dict[tuple[object, ...], int] = {}
+        self._lock = threading.Lock()
+
+    def __call__(self, value: object) -> int | None:
+        try:
+            canonical = _canonical_value(value)
+        except ValueError:
+            return None  # C raises the TypeError, naming the parameter
+        found = self._ids.get(canonical)
+        if found is None:
+            with self._lock:  # two new values must not both take len(_ids)
+                found = self._ids.setdefault(canonical, len(self._ids))
+        return found
 
 
 def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:

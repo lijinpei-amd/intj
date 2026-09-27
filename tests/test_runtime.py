@@ -441,7 +441,7 @@ module.set_torch_version({torch_version()!r}, {layout.as_args() if layout else N
 spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
 lazy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lazy)
-launch = lazy.new_launcher({_TAIL!r}, b"", lambda header: module.init_bound(header, print))
+launch = lazy.new_launcher({_TAIL!r}, b"", lambda header: module.init_bound(header, print, print))
 assert not sys._is_gil_enabled()
 grid = [0, 1000, 1000]
 stop = threading.Event()
@@ -543,7 +543,12 @@ def stub_module(tmp_path_factory):
 
 
 _CALL = (0, 0, 1)  # device, stream, grid
-_TAIL = launcher._tail_bytes(0, 0)
+_TAIL = launcher._tail_bytes(sum(p.memo is not None for p in _PARAMS), 0)
+
+
+def _interner():
+    ids = {}
+    return lambda v: ids.setdefault(v, len(ids)) if type(v) is str else None
 
 
 @pytest.fixture(scope="module")
@@ -553,7 +558,9 @@ def launch(built, stub_module):
     fn = stub_module.new_launcher(
         _TAIL,
         b"",
-        lambda header: module.init_bound(header, launcher._launcher_compile(module)),
+        lambda header: module.init_bound(
+            header, launcher._launcher_compile(module), _interner()
+        ),
     )
     fn(*_args())
     return fn
@@ -575,7 +582,9 @@ def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
 
     def build(header):
         builds.append(1)
-        return module.init_bound(header, launcher._launcher_compile(module))
+        return module.init_bound(
+            header, launcher._launcher_compile(module), _interner()
+        )
 
     launch = stub_module.new_launcher(_TAIL, b"launch(a, /)\n--\n\n", build)
     before = launch  # a reference taken before the build
@@ -616,7 +625,9 @@ def test_failed_build_raises_and_the_next_call_retries(built, stub_module):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("first build fails")
-        return module.init_bound(header, launcher._launcher_compile(module))
+        return module.init_bound(
+            header, launcher._launcher_compile(module), _interner()
+        )
 
     launch = stub_module.new_launcher(_TAIL, b"", build)
     with pytest.raises(RuntimeError, match="first build fails"):
@@ -631,7 +642,9 @@ def test_concurrent_first_calls_build_once(built, stub_module):
     def build(header):
         builds.append(1)
         time.sleep(0.05)  # hold the build lock while the others arrive
-        return module.init_bound(header, launcher._launcher_compile(module))
+        return module.init_bound(
+            header, launcher._launcher_compile(module), _interner()
+        )
 
     launch = stub_module.new_launcher(_TAIL, b"", build)
     barrier, results, errors = threading.Barrier(8), [], []
@@ -660,7 +673,9 @@ def test_call_during_build_is_refused(built, stub_module):
             launch(*_args())
         except RuntimeError as error:
             seen.append(str(error))
-        return module.init_bound(header, launcher._launcher_compile(module))
+        return module.init_bound(
+            header, launcher._launcher_compile(module), _interner()
+        )
 
     launch = stub_module.new_launcher(_TAIL, b"", build)
     assert launch(*_args()) is None
@@ -677,7 +692,9 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module):
         owner = Owner()
 
         def build(header, owner=owner):  # the builder holds its owner: a cycle
-            return module.init_bound(header, launcher._launcher_compile(module))
+            return module.init_bound(
+                header, launcher._launcher_compile(module), _interner()
+            )
 
         owner.launch = stub_module.new_launcher(_TAIL, b"", build)
         if call_first:
@@ -686,3 +703,38 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module):
         del owner, build
         gc.collect()
         assert ref() is None, f"leaked (called first: {call_first})"
+
+
+def test_str_constexpr_keys_by_value(built, stub_module):
+    module, _, _ = built
+    launch = stub_module.new_launcher(
+        _TAIL,
+        b"",
+        lambda h: module.init_bound(h, launcher._launcher_compile(module), _interner()),
+    )
+    launch(*_args())
+    x = torch.zeros(4)
+
+    def key(value):
+        return module.spec_key(launch, 0, x, 5, -7, 1.5, True, value)[0]
+
+    assert key("act") == key("".join(["a", "c", "t"])) != key("other")
+    assert key(0) != key("act")  # an int never shares an object's code
+
+
+def test_memo_holds_its_object_until_replaced(built, stub_module):
+    module, _, _ = built
+    launch = stub_module.new_launcher(
+        _TAIL,
+        b"",
+        lambda h: module.init_bound(h, launcher._launcher_compile(module), _interner()),
+    )
+    first, second = "".join(["o", "n", "e"]), "".join(["t", "w", "o"])
+    launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, first)
+    held = sys.getrefcount(first)
+    launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, second)
+    assert sys.getrefcount(first) == held - 1  # the memo moved and let go
+    launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, first)
+    assert sys.getrefcount(first) == held
+    with pytest.raises(TypeError, match="unsupported argument 'BLOCK' of type list"):
+        launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, [1])

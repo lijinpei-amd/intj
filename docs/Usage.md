@@ -392,7 +392,17 @@ at factory creation and trusts the range promise.
 | `float` | `fp32` | — |
 | `bool` | `u1` | — |
 | `None` | `constexpr` | — |
-| `tl.constexpr` parameter | `constexpr` | the value itself (`int`, `float`, `bool`, `None`) |
+| `tl.constexpr` parameter | `constexpr` | the value itself (`int`, `float`, `bool`, `None`); a `str`, `tl.dtype` or `@triton.jit` function keys by value (see below) |
+
+An untyped, unbaked `tl.constexpr` also takes a `str`, a `tl.dtype`, or a
+`@triton.jit` function, keyed by value, as Triton does: two equal strings share
+one kernel, and two JIT functions with the same source share one kernel. Each value gets a
+small id from a table owned by the launcher (never persisted, never in the
+module digest); each argument slot remembers its last object, so passing the
+same object again costs one pointer compare. A JIT function's `cache_key` is
+read when the function is first seen, so later edits to a callee are not seen
+-- Triton has the same limitation. Baking the value with `extra_annotation`
+still works and removes it from the call.
 
 `do_not_specialize` and `do_not_specialize_on_alignment` are honoured. The `S` bit is
 AMD-only; there it is always part of the key, even when `knobs.amd.use_buffer_ops` is
@@ -414,7 +424,8 @@ hits it:
 - `dynamic_grid=True` and per-launch options (`dynamic_options`). Use `grid_cpp`
   or `grid_py` for a callable grid.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
-- Tuple, `tl.constexpr` object, `TensorDescriptor`, JIT-function and string arguments.
+- Tuple, `tl.constexpr` object and `TensorDescriptor` arguments, and `str` /
+  `tl.dtype` / JIT-function values for anything but an untyped `tl.constexpr`.
 - Tensor subclasses other than `torch.nn.Parameter` — the fast path gates on exact
   type, because a subclass can redefine what `data_ptr()` means.
 

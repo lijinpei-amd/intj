@@ -60,6 +60,7 @@
 {% endif %}
 #define INTJ_CPYTHON_STATIC_COMPILE_HEADER "{{ cpython_static_compile_header }}"
 #define INTJ_NBOUND {{ bound_params | length }}
+#define INTJ_NMEMO {{ params | rejectattr('memo', 'none') | list | length }}
 #define INTJ_NWORDS {{ [nwords, 1] | max }}
 #define INTJ_HAS_KEY {{ 1 if nwords else 0 }}
 #define INTJ_KEY_BYTES {{ nwords * 8 }}
@@ -296,11 +297,11 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
     } else if (o == Py_None) {
       code = INTJ_B_CX_NONE;
     } else {
-      PyErr_Format(PyExc_TypeError,
-                   "intj: unsupported argument '%s' of type %s; pass a "
-                   "scalar int, float, bool or None",
-                   intj_param_names[{{ p.index }}], Py_TYPE(o)->tp_name);
-      return -1;
+      /* every auto-path constexpr is untyped and public, so it has a memo */
+      code = INTJ_B_CX_OBJECT;
+      if (intj_object_id(bound->intern, &bound->lock, &INTJ_TAIL(bound)->memo[{{ p.memo }}],
+                         o, intj_param_names[{{ p.index }}], &bits) != 0)
+        return -1;
     }
 {{ key_accumulate(payload[0], 'bits') }}
 {{ auto_key_accumulate(descriptor[0], 'code') }}
@@ -361,6 +362,10 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *args,
                                bound, {{ bound_params.index(p) }},
                                {{ 1 if a.pointer_range_32 == 'assume' and verify_annotation else 0 }},
                                intj_param_names[{{ i }}], &{{ d }}) != 0)
+    return -1;
+{% elif a.kind == 'constexpr' and p.memo is not none %}
+  if (intj_decode_value(args[{{ p.call_index }}], intj_param_names[{{ i }}], bound->intern,
+                        &bound->lock, &INTJ_TAIL(bound)->memo[{{ p.memo }}], &{{ d }}) != 0)
     return -1;
 {% elif a.kind == 'constexpr' %}
   if (intj_decode_constexpr(args[{{ p.call_index }}], intj_param_names[{{ i }}], &{{ d }}) != 0)
@@ -1316,6 +1321,9 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
   Py_VISIT(bound->grid_py);
   Py_VISIT(bound->grid_hidden);
   Py_VISIT(bound->compile_cb);
+  Py_VISIT(bound->intern);
+  for (int k = 0; k < INTJ_NMEMO; k++)
+    Py_VISIT(tail->memo[k].obj);
   for (int i = 0; i < INTJ_NBOUND; i++)
     Py_VISIT(tail->owners[i]);
 {% if (return_compiled or (tuned and grid_py_mode)) and nwords %}
@@ -1342,6 +1350,9 @@ static int intj_bound_clear(PyObject *self) {
   Py_CLEAR(bound->grid_py);
   Py_CLEAR(bound->grid_hidden);
   Py_CLEAR(bound->compile_cb);
+  Py_CLEAR(bound->intern);
+  for (int k = 0; k < INTJ_NMEMO; k++)
+    Py_CLEAR(tail->memo[k].obj);
   for (int i = 0; i < INTJ_NBOUND; i++) {
     Py_CLEAR(tail->owners[i]);
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
@@ -1365,16 +1376,17 @@ static int intj_bound_clear(PyObject *self) {
   return 0;
 }
 
-/* init_bound(header, callback, [grid_py, fixed values], [device], *bound)
+/* init_bound(header, callback, interner, [grid_py, fixed values], [device], *bound)
  * -> the entry's address.  Fills an unbuilt `_intj_lazy` header in place.  On
  * failure the header is left unbuilt, so the launcher's next call retries.
  * `callback` is this launcher's miss callback: the tuned callback, or a
- * per-launcher wrapper of the module's compile function. */
+ * per-launcher wrapper of the module's compile function.  `interner` is the
+ * launcher's own intern table: object value -> id, or None if unsupported. */
 static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
-  if (nargs != 2 + {{ bound_arg_offset + grid_py_offset }} + INTJ_NBOUND) {
+  if (nargs != 3 + {{ bound_arg_offset + grid_py_offset }} + INTJ_NBOUND) {
     PyErr_Format(PyExc_TypeError, "intj: init_bound takes %d arguments, got %zd",
-                 2 + {{ bound_arg_offset + grid_py_offset }} + INTJ_NBOUND, nargs);
+                 3 + {{ bound_arg_offset + grid_py_offset }} + INTJ_NBOUND, nargs);
     return NULL;
   }
   PyTypeObject *type = Py_TYPE(args[0]);
@@ -1390,7 +1402,12 @@ static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     PyErr_SetString(PyExc_TypeError, "intj: init_bound needs the launcher's miss callback");
     return NULL;
   }
-  args += 2;
+  PyObject *interner = args[2];
+  if (!PyCallable_Check(interner)) {
+    PyErr_SetString(PyExc_TypeError, "intj: init_bound needs the launcher's interner");
+    return NULL;
+  }
+  args += 3;
   if (!st->abi.ready) {
     PyErr_SetString(PyExc_RuntimeError, "intj: set_torch_version has not been called");
     return NULL;
@@ -1417,6 +1434,7 @@ static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
 #endif
     bound->module = Py_NewRef(self);
     bound->compile_cb = Py_NewRef(callback);
+    bound->intern = Py_NewRef(interner);
 {% if grid_py_mode %}
     bound->grid_py = Py_NewRef(args[0]);
     bound->grid_hidden = Py_NewRef(args[1]);

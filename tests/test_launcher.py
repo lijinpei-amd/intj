@@ -186,12 +186,12 @@ def _launcher_module(launcher):
 
 def _launcher_over(module):
     """A built, binding-free launcher of `module`, for its `spec_key`."""
-    from intj.launcher import _launcher_compile, _stub, _tail_bytes
+    from intj.launcher import _Interner, _launcher_compile, _stub, _tail_bytes
 
     launch = _stub().new_launcher(
         _tail_bytes(0, 0),
         b"",
-        lambda h: module.init_bound(h, _launcher_compile(module)),
+        lambda h: module.init_bound(h, _launcher_compile(module), _Interner()),
     )
     module_of(launch)
     return launch
@@ -3128,6 +3128,156 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device):
             "intj key collides for annotated ASTSource inputs"
         )
         assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
+
+
+@triton.jit
+def act_store(o, x, ACT: tl.constexpr):
+    if ACT == "neg":
+        tl.store(o, -x)
+    else:
+        tl.store(o, x)
+
+
+@triton.jit
+def cast_store(o, x, DT: tl.constexpr):
+    tl.store(o, x.to(DT).to(tl.float32))
+
+
+@triton.jit
+def _twice(v):
+    return v * 2
+
+
+@triton.jit
+def _thrice(v):
+    return v * 3
+
+
+@triton.jit
+def apply_store(o, x, FN: tl.constexpr):
+    tl.store(o, FN(x))
+
+
+def _gpu_controls():
+    return torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream, 1
+
+
+def test_object_constexpr_key_is_never_coarser_than_triton():
+    """The invariant for interned values: equal ids only for equal canonical
+    values, whichever object carries them."""
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+    from triton.compiler import make_backend
+
+    launch = make_launcher(act_store)
+    module = module_of(launch)
+    params, _, _ = _render_params(
+        _resolve_annotations(act_store, None), DeviceBinding.NOT_FIXED
+    )
+    backend = make_backend(_current_target())
+    o = torch.zeros(1, device="cuda")
+    values = [
+        "neg",
+        "".join(["n", "e", "g"]),
+        "pos",
+        "",
+        0,
+        1,
+        None,
+        True,
+        1.0,
+        tl.int32,
+        tl.float32,
+        tl.dtype("int32"),
+        _twice,
+        _thrice,
+        triton.jit(_twice.fn),
+    ]
+    seen, keys = {}, set()
+    for value in values:
+        key, _ = module.spec_key(launch, 0, o, 2.0, value)
+        source = _compiler_input(act_store, params, (o, 2.0, value), backend)
+        assert seen.setdefault(key, source) == source, value
+        keys.add(key)
+    assert len(keys) == len(values) - 3  # "neg", tl.int32 and _twice each twice
+
+
+def test_str_constexpr_keys_by_value():
+    launch = make_launcher(act_store, return_compiled=True)
+    o = torch.zeros(1, device="cuda")
+    neg = launch(*_gpu_controls(), o, 2.0, "neg")
+    torch.cuda.synchronize()
+    assert o.item() == -2.0
+    other = "".join(["n", "e", "g"])  # equal value, another object
+    assert launch(*_gpu_controls(), o, 2.0, other) is neg
+    pos = launch(*_gpu_controls(), o, 2.0, "pos")
+    torch.cuda.synchronize()
+    assert o.item() == 2.0 and pos is not neg
+
+
+def test_dtype_and_jit_constexprs():
+    o = torch.zeros(1, device="cuda")
+    cast = make_launcher(cast_store, return_compiled=True)
+    as_int = cast(*_gpu_controls(), o, 2.7, tl.int32)
+    torch.cuda.synchronize()
+    assert o.item() == 2.0
+    assert cast(*_gpu_controls(), o, 2.7, tl.float32) is not as_int
+    torch.cuda.synchronize()
+    assert abs(o.item() - 2.7) < 1e-6
+    apply = make_launcher(apply_store, return_compiled=True)
+    twice = apply(*_gpu_controls(), o, 3.0, _twice)
+    torch.cuda.synchronize()
+    assert o.item() == 6.0
+    again = triton.jit(_twice.fn)  # another JITFunction, same cache_key
+    assert again is not _twice and apply(*_gpu_controls(), o, 3.0, again) is twice
+    apply(*_gpu_controls(), o, 3.0, _thrice)
+    torch.cuda.synchronize()
+    assert o.item() == 9.0
+
+
+def test_sibling_launchers_intern_independently(monkeypatch):
+    """Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
+    and the module's compile cache compiles each variant once."""
+    monkeypatch.setattr(launcher, "_LOADED", {})
+    real, compiles = launcher._checked_compile, []
+
+    def counted(*args, **kwargs):
+        compiles.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_checked_compile", counted)
+    first, second = make_launcher(act_store), make_launcher(act_store)
+    o = torch.zeros(1, device="cuda")
+    second(*_gpu_controls(), o, 2.0, "neg")  # id 0 = "neg" in second
+    first(*_gpu_controls(), o, 2.0, "pos")  # id 0 = "pos" in first
+    for launch, act, want in (
+        (first, "neg", -2.0),
+        (second, "pos", 2.0),
+        (first, "pos", 2.0),
+        (second, "neg", -2.0),
+    ):
+        launch(*_gpu_controls(), o, 2.0, act)
+        torch.cuda.synchronize()
+        assert o.item() == want, (act, want)
+    assert (
+        module_of(first) is module_of(second) and len(compiles) == 2
+    )  # one per variant
+
+
+def test_unsupported_object_constexpr_names_the_parameter():
+    launch = make_launcher(act_store)
+    o = torch.zeros(1, device="cuda")
+
+    class Name(str):
+        pass
+
+    with pytest.raises(TypeError, match="unsupported argument 'ACT' of type list"):
+        launch(*_gpu_controls(), o, 2.0, ["neg"])
+    with pytest.raises(TypeError, match="'ACT' of type Name"):
+        launch(*_gpu_controls(), o, 2.0, Name("neg"))
+    launch(*_gpu_controls(), o, 2.0, "neg")  # still usable
+    torch.cuda.synchronize()
+    assert o.item() == -2.0
 
 
 @triton.jit
