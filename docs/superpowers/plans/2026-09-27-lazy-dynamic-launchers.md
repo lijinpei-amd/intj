@@ -65,7 +65,7 @@ A throwaway probe built a `METH_FASTCALL` `PyCFunction` over a `PyMethodDef` emb
 
 Every task ends by rerunning the launcher benchmarks against a baseline taken at this plan's starting commit (Task 0). A task does not commit with an unexplained regression.
 
-**Suite.** All four scripts in `benchmarks/`, in every mode, plus the C++ kernel-cache benchmark that `benchmarks/AGENTS.md` lists. That is 10 cases, 3 rounds each. Every case runs in its own process, one at a time, pinned to core 0. The driver is `/tmp/intj-bench/run_all.sh <label>`. It writes `/tmp/intj-bench/<label>/round<r>_<case>.txt` with the commit, command, raw output, elapsed time and exit status:
+**Suite.** All four scripts in `benchmarks/`, in every mode, plus the C++ kernel-cache benchmark that `benchmarks/AGENTS.md` lists. That is 12 cases, 3 rounds each (`launch_tuned` and `launch_dynamic` were added in Task 5; `lazy-baseline` predates them, so `bench_compare.py` reports them as MISSING against it). Every case runs in its own process, one at a time, pinned to core 0. The driver is `/tmp/intj-bench/run_all.sh <label>`. It writes `/tmp/intj-bench/<label>/round<r>_<case>.txt` with the commit, command, raw output, elapsed time and exit status:
 
 | case | command (after `PYTHONPATH=$PWD INTJ_BENCHMARK_ROOT=/tmp/gbench taskset -c 0 /tmp/gb2/bin/python`) |
 |---|---|
@@ -79,6 +79,8 @@ Every task ends by rerunning the launcher benchmarks against a baseline taken at
 | ffi_paths | `benchmarks/bench_intj_ffi_paths.py --mode all --iters 1000 --batches 9` |
 | hip_module | `benchmarks/bench_hip_module_launch.py --iters 1000 --batches 9` |
 | kernel_cache | `-m pytest tests/test_kernel_cache.py -s -q` (google/benchmark in `/tmp/gbench`) |
+| launch_tuned | `benchmarks/bench_launch.py --tuned --iters 20000 --batches 9` |
+| launch_dynamic | `benchmarks/bench_launch.py --dynamic --iters 20000 --batches 9` |
 
 If `/tmp` was cleaned, recreate the driver from this copy (unchanged from the autotune plan):
 
@@ -100,6 +102,8 @@ cases=(
   "ffi_paths|benchmarks/bench_intj_ffi_paths.py --mode all --iters 1000 --batches 9"
   "hip_module|benchmarks/bench_hip_module_launch.py --iters 1000 --batches 9"
   "kernel_cache|-m pytest tests/test_kernel_cache.py -s -q"
+  "launch_tuned|benchmarks/bench_launch.py --tuned --iters 20000 --batches 9"
+  "launch_dynamic|benchmarks/bench_launch.py --dynamic --iters 20000 --batches 9"
 )
 for r in 0 1 2; do
   for c in "${cases[@]}"; do

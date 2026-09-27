@@ -59,12 +59,24 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - **Cache-invalidating knobs are not keyed.** Triton's cache key includes
   `get_cache_invalidating_env_vars()` (e.g. AMD buffer-ops / pingpong knobs);
   intj's module and spec keys capture only `debug`, instrumentation mode and
-  fpsan casts, so flipping another such knob after a launcher exists keeps
-  launching the binary compiled under the old value -- a coarser key than
-  Triton's. Freeze them into the module identity at build.
+  fpsan casts, read at a launcher's first call, so flipping another such knob
+  after that keeps launching the binary compiled under the old value -- a
+  coarser key than Triton's. Workaround today: declare the knob in
+  `dynamic_options`, which keys it per call. Fix: freeze the rest into the
+  module identity at the first call.
 
 ## Performance
 
+- **32-argument launches lost ~7-10 ns to code placement.** `last_key 32` and
+  `sweep 32 int` moved from 99-106 ns to 106-113 ns during the lazy-launcher
+  work with identical `intj_call` instructions: cold code grew ahead of it.
+  Aligning `intj_call`/`intj_bound_entry` to 64 bytes wins that back but costs
+  common shapes ~1.5 ns (journal `2026-09-28_lazy-task5_0_8d95e66.md`); the
+  upgrade path is a hot/cold section split (`__attribute__((hot/cold))` or
+  `.text.hot`) so cold code cannot move the hit path.
+- **Two-entry memo per object slot.** A slot remembers one object; a call site
+  alternating two `str`/dtype/JIT objects in one slot pays an interner call
+  per launch. Add a second entry if `--dynamic` or a real site shows it.
 - **ROCm zero-user-argument launches.** Triton still declares two implicit
   scratch-pointer arguments (16-byte kernarg segment) when neither scratch
   buffer is needed. On gfx942, `hipModuleLaunchKernel` took ~1.55 us with no

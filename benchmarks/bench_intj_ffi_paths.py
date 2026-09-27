@@ -17,8 +17,8 @@ from collections.abc import Callable
 import torch
 import triton
 import triton.language as tl
-from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
-from tvm_ffi.utils.unpack_dataclass import unpack_dataclass_to_tuple
+from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-ffi, benchmarks only
+from tvm_ffi.utils.unpack_dataclass import unpack_dataclass_to_tuple  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-ffi, benchmarks only
 
 from intj import make_launcher
 from intj.launcher import module_of, override_compile

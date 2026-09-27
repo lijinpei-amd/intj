@@ -10,6 +10,7 @@ import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, triton_specialization
+from knob_helpers import live_knob_values, needs_hip
 
 
 @triton.jit
@@ -775,21 +776,15 @@ def _reference(kernel, args_by_name, dynamic=None):
 
 
 def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
-    from triton import knobs
-
     from intj.launcher import _split_dynamic
 
     launch = make_launcher(make_kernel(), dynamic_options=dynamic)
     module = module_of(launch)
     device, stream = controls()
-    seen, before = {}, {}
-    try:
-        for dyn in dyn_values:
-            # a declared knob only keys: set the live value the call passes
-            for path, value in _split_dynamic(dynamic, dyn)[1].items():
-                _, group, name = path.split(".")
-                before.setdefault((group, name), getattr(getattr(knobs, group), name))
-                setattr(getattr(knobs, group), name, value)
+    seen = {}
+    for dyn in dyn_values:
+        # a declared knob only keys: set the live value the call passes
+        with live_knob_values(_split_dynamic(dynamic, dyn)[1]):
             for case in cases:
                 launch(device, stream, 1, *dyn, *case.values())
                 chain, found = module.key_chain(launch, device, *dyn, *case.values())
@@ -798,9 +793,6 @@ def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
                 assert seen.setdefault(chain, truth) == truth, (
                     "intj key chain collides across Triton decisions"
                 )
-    finally:
-        for (group, name), value in before.items():
-            setattr(getattr(knobs, group), name, value)
 
 
 def _invariant_kernel():
@@ -898,13 +890,6 @@ def test_dynamic_option_clashing_with_a_config_is_refused():
         make_launcher(kernel, grid_cpp=grid, dynamic_options=("num_warps",))
 
 
-_needs_hip = pytest.mark.skipif(
-    getattr(triton.runtime.driver.active.get_current_target(), "backend", None)
-    != "hip",
-    reason="waves_per_eu is a HIP option",
-)
-
-
 @triton.jit
 def aligned_act(
     x, out, N, stride, ACT: tl.constexpr, BLOCK: tl.constexpr, ALIGNED: tl.constexpr
@@ -969,12 +954,12 @@ def _check_dynamic_tuned_invariant():
     )
 
 
-@_needs_hip
+@needs_hip
 def test_tuned_dynamic_values_are_never_coarser_than_triton():
     _check_dynamic_tuned_invariant()
 
 
-@_needs_hip
+@needs_hip
 @pytest.mark.parametrize("dropped", _TUNED_DYNAMIC)
 def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
     from intj import launcher as launcher_mod
@@ -989,7 +974,7 @@ def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
         _check_dynamic_tuned_invariant()
 
 
-@_needs_hip
+@needs_hip
 def test_tuned_invariant_catches_a_dropped_object_id(monkeypatch):
     from intj import launcher as launcher_mod
 
@@ -998,7 +983,7 @@ def test_tuned_invariant_catches_a_dropped_object_id(monkeypatch):
         _check_dynamic_tuned_invariant()
 
 
-@_needs_hip
+@needs_hip
 def test_tuned_dynamic_option_reaches_every_config():
     kernel = triton.autotune(
         configs=configs(),

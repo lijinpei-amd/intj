@@ -705,7 +705,10 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
 
 typedef intj_bound_header intj_bound_launcher;
 
-/* An object-valued slot's last object and its interned id. */
+/* An object-valued slot's last object and its interned id.
+ * ponytail: one entry per slot, so a site alternating two objects in one slot
+ * calls the interner on every launch; add a second entry if real sites (or
+ * bench_launch.py --dynamic) show that pattern. */
 typedef struct {
   PyObject *obj;
   uint64_t id;

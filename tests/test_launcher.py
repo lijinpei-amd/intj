@@ -6,7 +6,6 @@ Run with `pytest tests` on a machine with an AMD GPU, torch and triton.
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import dataclasses
 import dis
@@ -58,6 +57,7 @@ from intj.launcher import (
     override_compile,
     triton_specialization,
 )
+from knob_helpers import ON_HIP, live_knob_values, needs_hip
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
 from intj.python_intf import cpython_abi
 from intj.torch_intf.abi_detect import probe_layout
@@ -5144,11 +5144,7 @@ def test_declared_knob_without_an_option_compiles_per_value(monkeypatch):
     assert ".loc" in lines.asm[asm] and ".loc" not in bare.asm[asm]
 
 
-@pytest.mark.skipif(
-    getattr(triton.runtime.driver.active.get_current_target(), "backend", None)
-    != "hip",
-    reason="knobs.amd.use_buffer_ops is a HIP knob",
-)
+@needs_hip  # knobs.amd.use_buffer_ops is a HIP knob
 def test_declared_knob_reaches_the_specialization(monkeypatch):
     """HIP's pointer specialization reads knobs.amd.use_buffer_ops: with the
     live knob matching the passed value, the compiler input follows it."""
@@ -5205,33 +5201,11 @@ def dyn_axpy(
     tl.store(o + offs, v, mask=offs < n)
 
 
-_ON_HIP = (
-    getattr(triton.runtime.driver.active.get_current_target(), "backend", None) == "hip"
-)
-# debug feeds a compile option; disable_line_info feeds none and keys only
-# through the knob values; use_buffer_ops feeds HIP's pointer specialization
 _DYNAMIC = (
     "num_warps",
     "knobs.runtime.debug",
     "knobs.compilation.disable_line_info",
-) + (("knobs.amd.use_buffer_ops",) if _ON_HIP else ())
-
-
-@contextlib.contextmanager
-def _live_knob_values(values):
-    """Set the live knobs a call passes (a declared knob only keys), then restore."""
-    from triton import knobs
-
-    before = {}
-    try:
-        for path, value in values.items():
-            _, group, name = path.split(".")
-            before.setdefault((group, name), getattr(getattr(knobs, group), name))
-            setattr(getattr(knobs, group), name, value)
-        yield
-    finally:
-        for (group, name), value in before.items():
-            setattr(getattr(knobs, group), name, value)
+) + (("knobs.amd.use_buffer_ops",) if ON_HIP else ())
 
 
 def check_dynamic_invariant():
@@ -5265,7 +5239,7 @@ def check_dynamic_invariant():
     for dyn in itertools.product(*per_value):
         options, dyn_knobs = _split_dynamic(_DYNAMIC, dyn)
         knob_values = {**knobs_now, **dyn_knobs}
-        with _live_knob_values(dyn_knobs):
+        with live_knob_values(dyn_knobs):
             canonical = _canonical_options(
                 target, _knob_options(dyn_axpy, options, knob_values)
             ).hash()

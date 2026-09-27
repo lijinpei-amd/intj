@@ -18,8 +18,8 @@ import tempfile
 import torch
 import triton
 import triton.language as tl
-import tvm_ffi
-import tvm_ffi.cpp
+import tvm_ffi  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-ffi, benchmarks only
+import tvm_ffi.cpp  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-ffi, benchmarks only
 
 from intj import Argument, NEVER, TorchAccessMode, make_launcher
 from intj.launcher import module_of

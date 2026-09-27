@@ -335,29 +335,36 @@ def bench_tuned(iters, batches):
 
 
 def bench_dynamic(iters, batches):
-    """Warmed lazy launchers: plain, with two dynamic options, with a str constexpr."""
+    """Warmed lazy launchers: plain, with two dynamic options, with a str
+    constexpr (and an int one to compare it with).  `launch` includes the ~3 us
+    driver call; `spec_key` is the host decode + key alone, at ns resolution."""
     x = torch.zeros(4096, device="cuda")
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream
     args = (x, x, x, 4096, 1.0, 128)
+    act = make_launcher(act_noop)
     rows = (
-        ("lazy plain", make_launcher(noop), (device, stream, (1,), *args)),
+        ("lazy plain", make_launcher(noop), (), args),
         (
             "2 dynamic options",
             make_launcher(noop, dynamic_options=("num_warps", "knobs.runtime.debug")),
-            (device, stream, (1,), 4, False, *args),
+            (4, False),
+            args,
         ),
-        (
-            "str constexpr",
-            make_launcher(act_noop),
-            (device, stream, (1,), x, x, 4096, "relu"),
-        ),
+        ("int constexpr", act, (), (x, x, 4096, 0)),
+        ("str constexpr", act, (), (x, x, 4096, "relu")),
     )
+    sync = torch.cuda.synchronize
     print(f"mode=dynamic; {iters} calls × {batches} batches; median ns/call")
-    print(f"{'path':>19} {'ns/call':>10}")
-    for label, fn, call in rows:
-        ns = bench(fn, call, iters, batches, torch.cuda.synchronize)
-        print(f"{label:>19} {ns:10.1f}")
+    print(f"{'path':>19} {'launch':>10} {'spec_key':>10}")
+    for label, fn, dyn, public in rows:
+        launch_ns = bench(
+            fn, (device, stream, (1,), *dyn, *public), iters, batches, sync
+        )
+        key_ns = bench(
+            module_of(fn).spec_key, (fn, device, *dyn, *public), iters, batches, sync
+        )
+        print(f"{label:>19} {launch_ns:10.1f} {key_ns:10.1f}")
 
 
 if __name__ == "__main__":
