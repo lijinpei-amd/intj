@@ -45,12 +45,27 @@
 static void release(intj_kernel *) {}
 INTJ_DEFINE_CACHE(intj_kernel)
 INTJ_DEFINE_MAP(bench_child, 2, intj_kernel, 4)
+/* key words, a hash only above two words, the record: 32/40/72 bytes */
+#ifdef INTJ_CACHE_INTJ
+static_assert(sizeof(intj_cache_slot) ==
+                  8 * (INTJ_NWORDS + (INTJ_NWORDS > 2)) + sizeof(intj_kernel),
+              "slot layout");
+#endif
+static_assert(sizeof(bench_child_slot) == 40, "slot layout");
 
 #ifndef INTJ_CACHE_NAME
 #define INTJ_CACHE_NAME "unknown"
 #endif
 
 namespace {
+
+/* A record the map counts as live: block_dim is its occupancy mark. */
+intj_kernel kernel(int i) {
+  intj_kernel k{};
+  k.function = (void *)(uintptr_t)(i + 1);
+  k.block_dim = 1;
+  return k;
+}
 
 std::vector<std::vector<uint64_t>> make_keys(int n) {
   std::mt19937_64 rng(20260923);
@@ -76,7 +91,7 @@ void hit(benchmark::State &state) {
     return;
   }
   for (int i = 0; i < n; i++) {
-    intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
+    intj_kernel k = kernel(i);
     if (!intj_cache_put(&cache, keys[i].data(), &k)) {
       state.SkipWithError("intj_cache_put failed");
       intj_cache_free(&cache, release);
@@ -112,7 +127,7 @@ void miss(benchmark::State &state) {
     return;
   }
   for (int i = 0; i < n; i++) {
-    intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
+    intj_kernel k = kernel(i);
     intj_cache_put(&cache, keys[i].data(), &k);
   }
 
@@ -152,7 +167,7 @@ void hit_child(benchmark::State &state) {
   }
   uint64_t keys[2][2] = {{0, 1}, {1, 1}};
   for (int i = 0; i < 2; i++) {
-    intj_kernel k = {(void *)(uintptr_t)(i + 1), 1, 0, 0};
+    intj_kernel k = kernel(i);
     bench_child_put(&map, keys[i], &k);
   }
   int i = 0;

@@ -156,6 +156,16 @@ def keyed_store(x, K: tl.constexpr):
     tl.store(x, K)
 
 
+def test_block_dim_zero_is_refused():
+    """block_dim 0 marks an empty slot in intj's map; storing one would hide it."""
+    launch = make_launcher(
+        keyed_store, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
+    )
+    launch.__self__.set_compile_callback(lambda key, nparams, *_: (0, 0, 0, nparams))
+    with pytest.raises(ValueError, match="block_dim 0"):
+        launch(0, 0, 1, 0, 1)
+
+
 @pytest.mark.parametrize("cache", list(KernelCache))
 def test_records_survive_rehash(cache):
     """Records live in the slots now, so every growth moves them."""

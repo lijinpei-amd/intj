@@ -103,6 +103,7 @@ typedef struct {
   PyObject *meta; /* tuned parameter values, for grid_py */
 {% endif %}
 } intj_final;
+static inline int intj_final_live(const intj_final *f) { return intj_kernel_live(&f->k); }
 
 /* Outside any lock: dropping a CompiledKernel may run a finalizer. */
 static void intj_final_release(intj_final *f) {
@@ -123,6 +124,7 @@ typedef struct {
   intj_map_{{ n }} child;
 } intj_rec_{{ n - 1 }};
 typedef intj_rec_{{ n - 1 }} *intj_rec_{{ n - 1 }}_ref;
+static inline int intj_rec_{{ n - 1 }}_ref_live(const intj_rec_{{ n - 1 }}_ref *p) { return *p != NULL; }
 static void intj_rec_{{ n - 1 }}_release(intj_rec_{{ n - 1 }} **p) {
   intj_rec_{{ n - 1 }} *r = *p;
   intj_map_{{ n }}_free(&r->child, {{ rec_release(n) }});
@@ -130,6 +132,13 @@ static void intj_rec_{{ n - 1 }}_release(intj_rec_{{ n - 1 }} **p) {
 }
 {% endfor %}
 INTJ_DEFINE_CACHE({{ rec_type(0) }})
+{% if not tuned %}
+#ifdef INTJ_CACHE_INTJ
+/* the key, the hash above two words, and the record with no padding */
+static_assert(sizeof(intj_cache_slot) == 8 * (INTJ_NWORDS + (INTJ_NWORDS > 2)) + sizeof(intj_kernel),
+              "kernel-cache slot layout");
+#endif
+{% endif %}
 #define INTJ_V0_RELEASE {{ rec_release(0) }}
 
 #include "intj_runtime.h"
@@ -695,6 +704,11 @@ static int intj_fill(intj_state *st, intj_cache *cache, intj_bound_launcher *bou
     Py_DECREF(res);
     return -1;
   }
+  if (INTJ_UNLIKELY(block_dim == 0)) { /* marks an empty map slot */
+    Py_DECREF(res);
+    PyErr_SetString(PyExc_ValueError, "intj: compile callback returned block_dim 0");
+    return -1;
+  }
   intj_final fresh;
   memset(&fresh, 0, sizeof(fresh));
   fresh.k.function = (void *)(uintptr_t)function;
@@ -845,6 +859,11 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_cache *cache,
   if (!PyArg_ParseTuple(res, "KIIIOOOO", &function, &block_dim, &shared, &nparams,
                         &compiled, &deps, &computed, &meta)) {
     Py_DECREF(res);
+    return NULL;
+  }
+  if (INTJ_UNLIKELY(block_dim == 0)) { /* marks an empty map slot */
+    Py_DECREF(res);
+    PyErr_SetString(PyExc_ValueError, "intj: tuned callback returned block_dim 0");
     return NULL;
   }
   intj_final fresh;

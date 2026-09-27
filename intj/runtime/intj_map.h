@@ -9,6 +9,7 @@
 #pragma once
 
 #include <Python.h>
+#include <assert.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -80,22 +81,36 @@ static inline uint64_t intj_hash(const uint64_t *w) {
 }
 #endif
 
+/* 24 bytes, 32 with `compiled`.  block_dim and nparams would fit 16 bits and
+ * make it 16/24, but that measured slower on 1-64-key hits (2026-09-27). */
 typedef struct {
   void *function;     /* hipFunction_t / CUfunction */
-  uint32_t block_dim; /* warp_size * num_warps */
+  uint32_t block_dim; /* warp_size * num_warps; 0 only in an empty slot */
   uint32_t shared;    /* dynamic LDS bytes */
   uint32_t nparams;   /* kernel params, scratch slots excluded */
 #ifdef INTJ_RETURN_COMPILED
   PyObject *compiled; /* owns the CompiledKernel behind function */
 #endif
 } intj_kernel;
+#ifdef INTJ_RETURN_COMPILED
+static_assert(sizeof(intj_kernel) == 32, "intj_kernel layout");
+#else
+static_assert(sizeof(intj_kernel) == 24, "intj_kernel layout");
+#endif
+static inline int intj_kernel_live(const intj_kernel *k) {
+  return k->block_dim != 0;
+}
 
-/* `full` marks occupancy because no value field is free to act as a sentinel.
- * A slot stores its key and, above one word, its hash.  At one word the hash is
- * a bijection of the key, so it is left out -- a zero-length array, which gcc
- * and clang accept in C and C++ -- and recomputed by a rehash.  Keeping the key
- * rather than the hash lets the memo compare without hashing, which measured
- * ~1.3 ns on the launch path; keeping both costs a probe ~2 ns on a miss.
+/* A slot is its key, its hash above two words, and the value.  Occupancy is
+ * the value's own: every V defines `V##_live`, false for the all-zero value a
+ * fresh slot holds -- a kernel's block_dim, a record pointer.  A put of a value
+ * that is not live would leave a hole in a probe chain, so the compile callback
+ * rejects block_dim 0.  At one and two words the hash is a multiply or two
+ * away, so a slot leaves it out (a zero-length array, which gcc and clang
+ * accept in C and C++) and a rehash recomputes it; a probe compares the key.
+ * That keeps the one-word intj_final slot at 32 bytes.  Keeping the key rather
+ * than the hash lets the memo compare without hashing, which measured ~1.3 ns
+ * on the launch path.
  *
  * `last` is the one-entry memo: the slot of the last hit.  Readers under the
  * read lock store it (INTJ_MEMO_STORE, atomic when free-threaded); a slot cannot
@@ -108,15 +123,14 @@ typedef struct {
  * sanitizer build of `tests/bench_kernel_cache.cpp` reports a wrong kernel. */
 #define INTJ_DEFINE_MAP(P, NW, V, CAP)                                         \
   typedef struct {                                                             \
-    uint64_t full;                                                             \
-    uint64_t hash[(NW) > 1];                                                   \
+    uint64_t hash[(NW) > 2];                                                   \
     uint64_t key[NW];                                                          \
     V val;                                                                     \
   } P##_slot;                                                                  \
   static INTJ_ALWAYS_INLINE uint64_t P##_slot_hash(const P##_slot *s) {        \
     uint64_t h = 0;                                                            \
     memcpy(&h, s->hash, sizeof(s->hash));                                      \
-    return (NW) > 1 ? h : intj_hash_n(s->key, 1);                              \
+    return (NW) > 2 ? h : intj_hash_n(s->key, (NW));                           \
   }                                                                            \
   typedef struct {                                                             \
     P##_slot *slots;                                                           \
@@ -136,9 +150,9 @@ typedef struct {
     uint32_t i = (uint32_t)h & m->mask;                                        \
     for (;;) {                                                                 \
       P##_slot *s = &m->slots[i];                                              \
-      if (INTJ_UNLIKELY(!s->full))                                             \
+      if (INTJ_UNLIKELY(!V##_live(&s->val)))                                   \
         return NULL;                                                           \
-      if (INTJ_LIKELY(((NW) == 1 || P##_slot_hash(s) == h) &&                  \
+      if (INTJ_LIKELY(((NW) <= 2 || P##_slot_hash(s) == h) &&                  \
                       memcmp(s->key, k, sizeof(s->key)) == 0))                 \
         return s;                                                              \
       i = (i + 1) & m->mask;                                                   \
@@ -167,10 +181,10 @@ typedef struct {
       if (!grown)                                                              \
         return NULL;                                                           \
       for (uint32_t i = 0; i <= m->mask; i++) {                                \
-        if (!m->slots[i].full)                                                 \
+        if (!V##_live(&m->slots[i].val))                                       \
           continue;                                                            \
         uint32_t j = (uint32_t)P##_slot_hash(&m->slots[i]) & (cap - 1);        \
-        while (grown[j].full)                                                  \
+        while (V##_live(&grown[j].val))                                        \
           j = (j + 1) & (cap - 1);                                             \
         grown[j] = m->slots[i];                                                \
       }                                                                        \
@@ -180,11 +194,10 @@ typedef struct {
     }                                                                          \
     uint64_t h = intj_hash_n(k, (NW));                                         \
     uint32_t i = (uint32_t)h & m->mask;                                        \
-    while (m->slots[i].full)                                                   \
+    while (V##_live(&m->slots[i].val))                                         \
       i = (i + 1) & m->mask;                                                   \
     P##_slot *s = &m->slots[i];                                                \
     memcpy(s->hash, &h, sizeof(s->hash));                                      \
-    s->full = 1;                                                               \
     memcpy(s->key, k, sizeof(s->key));                                         \
     s->val = *val;                                                             \
     m->used++;                                                                 \
@@ -195,7 +208,7 @@ typedef struct {
     if (!m->slots)                                                             \
       return 0;                                                                \
     for (uint32_t i = 0; i <= m->mask; i++)                                    \
-      if (m->slots[i].full) {                                                  \
+      if (V##_live(&m->slots[i].val)) {                                        \
         int r = fn(&m->slots[i].val, ctx);                                     \
         if (r)                                                                 \
           return r;                                                            \
@@ -212,7 +225,7 @@ typedef struct {
     if (!slots)                                                                \
       return;                                                                  \
     for (uint32_t i = 0; i <= mask; i++)                                       \
-      if (slots[i].full)                                                       \
+      if (V##_live(&slots[i].val))                                             \
         release(&slots[i].val);                                                \
     PyMem_RawFree(slots);                                                      \
   }
