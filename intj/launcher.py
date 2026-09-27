@@ -947,7 +947,8 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
     cxx_cache = context.kernel_cache != KernelCache.INTJ.value
     # No -falign-loops=64 (tests/test_kernel_cache.py uses it): measured
     # 2026-09-27, it leaves the launch path's instruction count unchanged -- the
-    # hit path runs no loop -- and moves rows +-1 ns either way by layout alone.
+    # memo-hit path runs no loop -- and moves rows +-1 ns either way by layout
+    # alone.
     flags: dict[str, Any] = {
         "include_dirs": [str(_RUNTIME), str(_PYTHON_INTF), *context.cache_include_dirs],
         "ccflags": [

@@ -318,6 +318,36 @@ def test_config_value_read_by_c_must_be_int_or_bool(block):
         make_launcher(kernel, grid_cpp=grid)
 
 
+def test_tuned_callback_block_dim_zero_is_refused(monkeypatch):
+    """block_dim 0 marks an empty map slot (test_kernel_cache.py covers the
+    compile callback); the tuned callback rejects it too, at
+    entry.c.jinja:864. Triton never actually returns block_dim 0, so the
+    tuned callback is wrapped to force it."""
+    import intj.tuning as tuning_mod
+
+    original = tuning_mod.make_tuned_callback
+
+    def zeroed(*args, **kwargs):
+        cb = original(*args, **kwargs)
+
+        def wrapped(*a, **k):
+            function, _block_dim, shared, nparams, *rest = cb(*a, **k)
+            return (function, 0, shared, nparams, *rest)
+
+        return wrapped
+
+    monkeypatch.setattr(tuning_mod, "make_tuned_callback", zeroed)
+
+    x = torch.zeros(64, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    bench = Bench(out, {None: {1: 2.0, 2: 1.0}})
+    kernel = triton.autotune(configs=configs(), key=[], do_bench=bench)(tagged)
+    launch = make_launcher(kernel, grid_cpp=grid)
+    device, stream = controls()
+    with pytest.raises(ValueError, match="block_dim 0"):
+        launch(device, stream, x, out, 64)
+
+
 def test_default_restore_and_reset_hooks_stay_private():
     @triton.jit
     def bump(x, acc, TAG: tl.constexpr):
@@ -387,6 +417,67 @@ def test_two_level_chain():
     module = launch.__self__.__self__
     keys, found = module.key_chain(launch, device, x, out, 8, 256)
     assert found and len(keys) == 2
+
+
+@triton.jit
+def strided_tag(out, N, stride, BLOCK: tl.constexpr, REM: tl.constexpr):
+    tl.store(out, REM + N * 0)
+
+
+def test_child_map_grows_past_four_slots(monkeypatch):
+    """A level-1 (child) map starts at CAP 4 and only grows on its 3rd put
+    (intj_map.h's INTJ_DEFINE_MAP). A heuristic with <=2 distinct values, as
+    every other tuned test uses, never exercises that grow/rehash loop. Give
+    REM 5 distinct values so the child map must grow once, then check every
+    value still reads back through both a fresh launch and key_chain."""
+    import intj.launcher as launcher_mod
+
+    compiles = []
+    original = launcher_mod._checked_compile
+
+    def counted(*args, **kwargs):
+        compiles.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(launcher_mod, "_checked_compile", counted)
+
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    def bench(call, quantiles):  # first config (BLOCK=32) wins, deterministically
+        return [1.0, 1.0, 1.0]
+
+    kernel = triton.autotune(
+        configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
+        key=["N"],
+        do_bench=bench,
+    )(triton.heuristics({"REM": lambda a: a["stride"] % a["BLOCK"]})(strided_tag))
+    launch = make_launcher(kernel)
+    device, stream = controls()
+    module = launch.__self__.__self__
+    cases = [(32, 0), (33, 1), (34, 2), (35, 3), (36, 4)]  # remainders mod BLOCK=32
+    # Insert all 5 first: the 3rd distinct REM triggers the child map's only
+    # grow, which must rehash the 2 entries already there. Checking a value
+    # right after inserting it (and never again) would miss corruption of
+    # those two -- a later launch's miss would just silently repair the
+    # record (recompute + reinsert), and re-check as if nothing broke.
+    for stride, _rem in cases:
+        launch(device, stream, 1, out, 8, stride)
+        torch.cuda.synchronize()
+    assert len(compiles) == 5, "each distinct REM compiles/records exactly once"
+    # Right after growth, and before any launch gets a chance to repair a
+    # dropped record, key_chain is a pure map lookup (no compile callback) --
+    # it must find every one of the 5 keys, including the 2 inserted before
+    # the grow moved them.
+    for stride, rem in cases:
+        keys, found = module.key_chain(launch, device, out, 8, stride)
+        assert found, f"stride {stride} (REM={rem}) missing after the child map grew"
+    # Still correct through fresh launches, and no record needed recompiling.
+    for stride, rem in cases:
+        for _ in range(2):
+            launch(device, stream, 1, out, 8, stride)
+            torch.cuda.synchronize()
+            assert int(out.item()) == rem
+    assert len(compiles) == 5, "revisiting after growth must not recompile"
 
 
 @triton.jit

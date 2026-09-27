@@ -48,7 +48,10 @@ so a record pointer is valid only while the module's read lock is held; `lookup`
 checks a one-entry memo before hashing or probing, and a put clears it. A
 backend owns the records it is given (`intj_cache_free` hands each to a release
 function) and must not let an exception escape -- the C++ maps throw where intj
-returns NULL. Map-only
+returns NULL. Every value stored by `INTJ_DEFINE_MAP` must read as occupied
+(a non-null pointer, or `block_dim >= 1`); a zeroed slot is what "empty" means,
+so a value type or insert path that can store all-zero-but-live breaks every
+map. Map-only
 numbers live in `tests/bench_kernel_cache.cpp`; add a backend there when you add
 one. `benchmarks/bench_launch.py --last-key` measures the full host launch path.
 
