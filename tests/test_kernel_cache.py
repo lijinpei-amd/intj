@@ -68,6 +68,9 @@ def _build(
     command = [
         os.environ.get("CXX", "g++"),
         "-O3",
+        # rows are 1-3 ns: without it an unrelated edit moves a miss row by
+        # up to 1 ns through loop placement alone (2026-09-27 regression report)
+        "-falign-loops=64",
         "-DNDEBUG",
         "-std=c++20",
         f"-DINTJ_NWORDS={nwords}",
