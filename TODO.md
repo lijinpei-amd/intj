@@ -47,6 +47,10 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
 - Parameter defaults: the launcher requires every argument positionally.
+- **Gluon layout objects as constexpr arguments.** gfx1250 GEMM/MoE/batched-GEMM
+  kernels pass SHARED/WMMA layouts via `**layouts`; intj can't decode them.
+  Rewrite the kernels to build layouts in-kernel from constexpr ints, or add
+  value-keyed layout constexprs.
 - **`Autotuner.cache` is not mirrored.** intj copies back `best_config`,
   `bench_time` and `configs_timings` after tuning, but not `cache` itself, so
   code inspecting `len(kernel.cache)` sees 0 even after a tuned launch; either
