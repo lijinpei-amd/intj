@@ -41,7 +41,12 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   (~963 ns/call), not the mapping; a `grid=<spec>` baked to literal C is ~4 ns.
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
-- Tuple / namedtuple arguments: `ARG_TUPLE` recursion in the decoder and the key.
+- **Tuple / namedtuple arguments and tuple constexprs.** `ARG_TUPLE` recursion in the decoder and
+  the key; aiter `attn_res` (`res`) and ~41 Triton-test entries pass tuples.
+- **`torch.compile` integration.** Kernels wrapped with `torch.library.wrap_triton` or launched
+  inside `torch.compile` graphs still go through Triton (aiter rotary, Triton's constexpr-mutation
+  test); intj launchers are opaque to dynamo -- register them as custom ops or teach
+  `wrap_triton` to dispatch to an intj launcher.
 - Kernels reading globals: `assume_constant_globals=True` trusts them; still
   refused by default. Revalidating in C (`PyObject_RichCompareBool` per entry)
   would cover the default too.
@@ -51,7 +56,8 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - **Gluon layout objects as constexpr arguments.** gfx1250 GEMM/MoE/batched-GEMM
   kernels pass SHARED/WMMA layouts via `**layouts`; intj can't decode them.
   Rewrite the kernels to build layouts in-kernel from constexpr ints, or add
-  value-keyed layout constexprs.
+  value-keyed layout constexprs. The Triton tree has ~75 such entries
+  (`unsupported_layout_constexpr`) plus 6 with tuples.
 - **`Autotuner.cache` is not mirrored.** intj copies back `best_config`,
   `bench_time` and `configs_timings` after tuning, but not `cache` itself, so
   code inspecting `len(kernel.cache)` sees 0 even after a tuned launch; either
