@@ -1116,3 +1116,28 @@ def test_tuned_dynamic_waves_per_eu_object_constexprs_return_compiled():
     del launch, module, neg_one, pos_two, neg_one_again
     gc.collect()
     assert module_ref() is None and launch_ref() is None
+
+
+@triton.jit
+def warps_tag(out, n, num_warps: tl.constexpr):
+    tl.store(out + tl.arange(0, 64), tl.full([64], num_warps, tl.int32) + n * 0)
+
+
+@pytest.mark.parametrize("layer", ["autotune", "heuristics"])
+def test_tuned_constexpr_option_parameter_feeds_the_option(layer):
+    """A config's (or heuristic's) `num_warps` reaches Triton's run as a
+    keyword, so it is both the parameter and the compile option."""
+    if layer == "autotune":
+        kernel = triton.autotune(configs=[triton.Config({}, num_warps=8)], key=["n"])(
+            warps_tag
+        )
+    else:
+        kernel = triton.heuristics({"num_warps": lambda a: 8})(warps_tag)
+    launch = make_launcher(kernel, return_compiled=True)
+    out = torch.zeros(64, device="cuda", dtype=torch.int32)
+    compiled = launch(*controls(), 1, out, 1)
+    assert compiled.metadata.num_warps == 8
+    torch.cuda.synchronize()
+    assert (out == 8).all()
+    with pytest.raises(UnsupportedKernel, match="set by the autotune configs"):
+        make_launcher(kernel, dynamic_options=("num_warps",))

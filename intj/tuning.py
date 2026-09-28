@@ -306,6 +306,7 @@ def make_tuned_callback(
         _current_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _current_target,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _split_dynamic,  # pyright: ignore[reportPrivateUsage]  # launcher internals
     )
@@ -320,13 +321,15 @@ def make_tuned_callback(
     compiled: dict[tuple[Any, str, tuple[tuple[str, object], ...], int], Any] = {}
     # this miss's declared knob values; misses are serialized by `lock`
     call_knobs: list[dict[str, object]] = [{}]
+    # passed, baked or tuned alike: Triton's layers pass a tuned one by keyword
+    fed = _parameter_options(backend, params)
 
     def compile_kernel(values: dict[str, Any], config_options: dict[str, Any]) -> Any:
         canonical = _canonical_options(
             target,
             _knob_options(
                 jit_func,
-                {**options, **config_options},
+                {**options, **config_options, **{n: values[n] for n in fed}},
                 {**knob_values, **call_knobs[0]},
             ),
         )
