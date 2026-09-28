@@ -19,7 +19,6 @@ general; this file tracks what blocks migration.
 | **Class-valued globals** | A kernel that reads a global holding a class is refused, with the misleading hint "pass it as an argument". `assume_constant_globals` accepts only values it can canonicalize. Layout classes such as `AMDWMMALayout` are the typical case. | triton: 27 |
 | ~~**Dynamic option with the same name as a constexpr parameter**~~ | **Closed** in `8df1e41` (plain launchers, `compat.launch`) and `0be1991` (autotune/heuristics). A `tl.constexpr` parameter named like a compile option (`num_warps`, `num_stages`, `waves_per_eu`, ...) now also sets that option on every call, passed, baked or tuned; `dynamic_options` naming it is a no-op, and `options=` naming it is refused. Unlike Triton, a positional value sets the option too (see `docs/Usage.md`). | none |
 | **No way back from a launcher to its kernel** | A launcher is a `PyCFunction` and exposes no `JITFunction`. Callers that need it keep a separate named launcher. Uses include AOT compile by name, reference launches through Triton in tests, heuristics checks, calling the kernel as a device function, and reading its `debug` attribute (FlashKDA). A candidate fix is an `intj.jit_of(launcher)` read from the lazy-state object. | aiter: ~13 named launchers + FlashKDA |
-| **Parameter defaults** | Kernel parameter defaults are not applied, so every argument must be passed positionally. | triton: a few |
 | **`tl.constexpr` grid dimension** | A `tl.constexpr` value used as a grid dimension is rejected. | triton: a few |
 | **`compat.launch` has no `assume_constant_globals`** | Neither `compat.launch` nor `launch_or_interpret` can pass the option, so kernels behind the bridge that read globals stay refused. | triton: bridge sites that read globals |
 | **Tuple arguments and tuple constexprs** | `ARG_TUPLE` is not decoded or keyed (see `TODO.md`). aiter's Gluon kernels were rewritten to take scalars instead. | triton: ~41 entries; aiter: `attn_res` (`res`) |
@@ -31,6 +30,7 @@ general; this file tracks what blocks migration.
 
 | Gap | Sites |
 |---|---|
+| Parameter defaults: a launcher never applies a `def k(..., X=4)` default; callers pass it explicitly (see `docs/Usage.md`) | triton: 0 alone (6 also hit other gaps) |
 | Kernels that need profile or global scratch memory, or a scratch allocator | triton: ~129 |
 | `num_ctas > 1` (CGA / multicast) | triton: 82; aiter: 3 |
 | Host tensor descriptors and descriptor arguments | triton: ~71 |

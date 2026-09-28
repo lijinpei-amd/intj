@@ -52,7 +52,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   would cover the default too.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
-- Parameter defaults: the launcher requires every argument positionally.
 - **Gluon layout objects as constexpr arguments.** gfx1250 GEMM/MoE/batched-GEMM
   kernels pass SHARED/WMMA layouts via `**layouts`; intj can't decode them.
   Rewrite the kernels to build layouts in-kernel from constexpr ints, or add

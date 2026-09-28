@@ -254,9 +254,13 @@ binary on the current device, so intj refuses a mismatch instead of launching a
 function in the wrong context. Kernels compiled for different devices live under
 different keys, so one launcher serves all of them.
 
-Keyword arguments are not accepted, defaults are not filled in, and the launcher does
-not read the current device or stream for you — that is where the launch overhead of
-`JITFunction` goes.
+Keyword arguments are not accepted, and the launcher does not read the current
+device or stream for you — that is where the launch overhead of `JITFunction` goes.
+
+Parameter defaults are not supported, by design: a launcher never applies a
+`def k(..., X: tl.constexpr = 4)` default. Pass every parameter positionally,
+defaulted ones included, or bake it with `extra_annotation`. Omitting one raises
+`TypeError: intj: <kernel> takes exactly N arguments (...), got N-1`.
 
 ## Autotune and heuristics
 
