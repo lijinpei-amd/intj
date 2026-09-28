@@ -738,14 +738,14 @@ typedef struct {
   PyObject *dtype_type; /* the interner's `dtype_type`; NULL: none */
 } intj_objtab;
 
-/* The trailing arrays: the object table, memos, then one entry per bound
- * parameter. */
+/* The trailing arrays: memos, one entry per bound parameter, then the object
+ * table. */
 typedef struct {
-  intj_objtab objtab;
   intj_memo memo[INTJ_MEMO_SLOTS];
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
   void *tensors[INTJ_BOUND_SLOTS]; /* at::Tensor * in STATIC_COMPILE */
+  intj_objtab objtab;              /* cold: last, so the hot offsets hold */
 } intj_bound_tail;
 /* launcher._tail_bytes computes the same size for _intj_lazy's allocation. */
 static_assert(sizeof(intj_bound_tail) ==
@@ -819,13 +819,20 @@ static inline int intj_objtab_add(intj_objtab *t, uint64_t tag, Py_hash_t hash,
   return 1;
 }
 
-static inline int intj_objtab_visit(intj_objtab *t, visitproc visit,
-                                    void *arg) {
-  Py_VISIT(t->dtype_type);
-  for (size_t i = 0; t->e && i <= t->mask; i++)
+/* The table's references, visited as the kernel cache's are: collected under
+ * the read lock (a concurrent insert can grow and free the entry array), then
+ * visited after the unlock. */
+static inline int intj_objtab_traverse(intj_bound_launcher *bound,
+                                       intj_objtab *t, visitproc visit,
+                                       void *arg) {
+  intj_snapshot s = {NULL, 0, 0};
+  INTJ_RDLOCK(&bound->lock);
+  int failed = intj_snapshot_add(&s, t->dtype_type);
+  for (size_t i = 0; !failed && t->e && i <= t->mask; i++)
     if (t->e[i].tag != INTJ_OBJ_EMPTY)
-      Py_VISIT(t->e[i].ref);
-  return 0;
+      failed = intj_snapshot_add(&s, t->e[i].ref);
+  INTJ_RWUNLOCK(&bound->lock);
+  return intj_snapshot_visit(&s, failed, visit, arg);
 }
 
 static inline void intj_objtab_clear(intj_objtab *t) {

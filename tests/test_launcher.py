@@ -3446,9 +3446,11 @@ def test_equal_strs_share_an_id_in_c(monkeypatch):
     module = module_of(launch)
     o = torch.zeros(1, device="cuda")
     wide = "\u043d\u0435\u0433"  # a 2-byte-kind str
-    keys = {v: module.spec_key(launch, 0, o, 2.0, v)[0] for v in ("neg", "pos", wide)}
+    wider = "\U0001f600x"  # a 4-byte-kind str
+    known = ("neg", "pos", wide, wider)
+    keys = {v: module.spec_key(launch, 0, o, 2.0, v)[0] for v in known}
     del calls[:]
-    for value in ("neg", "pos", wide):
+    for value in known:
         again = "".join(list(value))  # equal content, another object
         assert again is not value
         assert module.spec_key(launch, 0, o, 2.0, again)[0] == keys[value]
@@ -3457,6 +3459,27 @@ def test_equal_strs_share_an_id_in_c(monkeypatch):
         key = module.spec_key(launch, 0, o, 2.0, other)[0]
         assert key not in keys.values()
     assert len(calls) == 2
+
+
+def test_equal_hash_different_content_is_another_str(monkeypatch):
+    """Content, not the cached hash, decides a str hit: a str whose cached
+    hash is forged to equal "neg"'s is still another value."""
+    calls = _count_interner(monkeypatch)
+    launch = make_launcher(act_store)
+    module = module_of(launch)
+    o = torch.zeros(1, device="cuda")
+    neg = module.spec_key(launch, 0, o, 2.0, "neg")[0]
+    forged = "".join(["g", "e", "n"])
+    hash(forged)  # fill the cache, then overwrite it
+    # PyASCIIObject: PyObject_HEAD, Py_ssize_t length, Py_hash_t hash (3.8-3.14,
+    # free-threaded too: object.__basicsize__ covers the larger head)
+    ctypes.c_ssize_t.from_address(id(forged) + object.__basicsize__ + 8).value = hash(
+        "neg"
+    )
+    assert hash(forged) == hash("neg")
+    del calls[:]
+    assert module.spec_key(launch, 0, o, 2.0, forged)[0] != neg
+    assert calls == ["gen"]
 
 
 def test_fresh_dtype_objects_hit_by_name(monkeypatch):

@@ -1348,7 +1348,7 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_VISIT(tail->memo[k].obj);
   {
-    int err = intj_objtab_visit(&tail->objtab, visit, arg);
+    int err = intj_objtab_traverse(bound, &tail->objtab, visit, arg);
     if (err)
       return err;
   }
