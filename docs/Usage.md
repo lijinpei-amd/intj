@@ -108,6 +108,16 @@ option overrides the JIT function's debug default;
 Triton's runtime debug flag can still enable it. Instrumentation mode comes from
 Triton's compilation knob. These effective options also determine module identity.
 
+A `tl.constexpr` parameter named like a compile option (`num_warps: tl.constexpr`,
+also `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`, `kpack`, ...) is that
+option too: each call's value, passed or baked through `extra_annotation`, sets
+both the parameter and the option on a miss, and an autotune config or heuristic
+that assigns it sets both as well. The parameter's own exact key already tells
+every value apart, so this adds no key field. Triton sets the option only when the
+caller passes the value by keyword (`k[grid](x, num_warps=8)`), not positionally;
+intj always does, which is how such parameters are used. The same name in
+`options=` is refused with `UnsupportedKernel`: the parameter decides it per call.
+
 Most things intj cannot handle raise `intj.launcher.UnsupportedKernel` here. The
 rest — `num_ctas > 1`, a cooperative launch, a kernel needing scratch memory — can
 only be seen once triton has compiled, so they raise on the first launch that misses
@@ -176,9 +186,14 @@ holds the kernel compiled under it.
 
 Refused at `make_launcher` with `UnsupportedKernel`: an unknown knob path, a
 repeated name, a name also given in `options=` (for knobs, the option the knob
-feeds, e.g. `debug`), a kernel parameter name, `device`/`stream`/`device_type`/
+feeds, e.g. `debug`), `device`/`stream`/`device_type`/
 `warp_size`, a name an autotune config sets, and `no_gpu=True`. An unknown
 compile-option name raises on the first call, where the target is known.
+
+A runtime kernel parameter name is refused too. A `tl.constexpr` parameter name
+is accepted and changes nothing: that parameter already sets the option on every
+call (see `options` above), and it gets no extra positional argument. It must
+still be a compile option; `dynamic_options=("BLOCK",)` raises on the first call.
 
 Knobs you do not declare are read once, at the first call, and fixed for that
 launcher (`debug`, `instrumentation_mode`, fpsan casts feed its options). Other
@@ -325,7 +340,9 @@ launch(kernel, (triton.cdiv(n, BLOCK),), out, n=n, BLOCK=BLOCK,
 
 The bridge binds Python arguments and reads the current device and stream on
 every call. Construct a `make_launcher` handle once for hot loops. Unsupported
-kernels and options still raise instead of falling back to Triton;
+kernels and options still raise instead of falling back to Triton.
+As in Triton, a keyword naming both a `tl.constexpr` parameter and a compile
+option (`num_warps=8` for a `num_warps: tl.constexpr` kernel) sets both;
 `@triton.autotune` and `@triton.heuristics` wrappers are refused here (use
 `make_launcher`, see [Autotune and heuristics](#autotune-and-heuristics)).
 Pass `return_compiled=True` when the caller needs the cached Triton
