@@ -378,6 +378,12 @@ tensor (dtype, 16-byte alignment, pointer range); its decode just skips the
 scalar cases. It combines with an explicit pointer type, and conflicts with a
 constexpr, a scalar or `None` type, a baked value or a binding.
 
+`torch.Tensor | None`, `Optional[torch.Tensor]` and `Union[torch.Tensor, None]`
+(likewise for `tl.tensor`; inline, postponed, or in `extra_annotation`) also
+accept `None`, keyed as Triton keys an unannotated `None` (a constexpr, so the
+kernel can test `is not None`); anything else raises `TypeError`. A plain
+`torch.Tensor` annotation still rejects `None`.
+
 `AUTO` retains the applicable Triton specialization: integer equality to 1,
 16-byte alignment for integers and pointers, and AMD's <2 GiB pointer-storage
 range. `NEVER` omits those facts. `Assume(EqualTo(1), Aligned(16),

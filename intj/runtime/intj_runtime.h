@@ -730,11 +730,13 @@ static INTJ_ALWAYS_INLINE int intj_finish_tensor(const intj_torch_abi *abi,
   return 0;
 }
 
-/* A parameter annotated `torch.Tensor` / `tl.tensor` takes only a tensor. */
-static inline void intj_not_a_tensor(PyObject *o, const char *pname) {
+/* A parameter annotated `torch.Tensor` / `tl.tensor` takes only a tensor;
+ * one annotated `... | None` also takes None. */
+static inline void intj_not_a_tensor(PyObject *o, const char *pname,
+                                     int none_ok) {
   PyErr_Format(PyExc_TypeError,
-               "intj: argument '%s' is annotated as a tensor; got %s", pname,
-               Py_TYPE(o)->tp_name);
+               "intj: argument '%s' is annotated as a %s; got %s", pname,
+               none_ok ? "tensor or None" : "tensor", Py_TYPE(o)->tp_name);
 }
 
 /* `o` is an exact torch.Tensor or nn.Parameter. */
@@ -755,10 +757,15 @@ intj_decode_tensor_checked(const intj_torch_abi *abi, PyObject *o,
 static INTJ_ALWAYS_INLINE int
 intj_decode_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
                    PyTypeObject *param_type, PyObject *o, int want_size,
-                   const char *pname, intj_decoded *out) {
+                   int none_ok, const char *pname, intj_decoded *out) {
   PyTypeObject *type = Py_TYPE(o);
   if (INTJ_UNLIKELY(type != tensor_type && type != param_type)) {
-    intj_not_a_tensor(o, pname);
+    if (none_ok && o == Py_None) {
+      memset(out, 0, sizeof(*out));
+      out->kind = INTJ_VALUE_NONE;
+      return 0;
+    }
+    intj_not_a_tensor(o, pname, none_ok);
     return -1;
   }
   return intj_decode_tensor_checked(abi, o, want_size, pname, out);

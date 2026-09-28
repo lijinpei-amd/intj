@@ -211,6 +211,9 @@ class CanonicalAnnotation:
     #: annotated `torch.Tensor` / `tl.tensor`: only a tensor is accepted, keyed
     #: as an unannotated tensor (Triton ignores these annotations)
     tensor_only: bool = False
+    #: annotated `torch.Tensor | None` (or `tl.tensor`): a tensor or None, each
+    #: keyed as unannotated; implies `tensor_only`
+    none_ok: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,16 +245,47 @@ def _canonical_value(value: object) -> tuple[object, ...]:
     raise ValueError("intj: baked values must be scalar int, float, bool, or None")
 
 
-def _tensor_annotation(value: object) -> bool:
-    """`torch.Tensor` or `tl.tensor`, as an object or a postponed string."""
+_TENSOR_NAMES = ("torch.Tensor", "tl.tensor")
+_OPTIONAL_TENSOR_NAMES = frozenset(
+    form.format(t)
+    for t in _TENSOR_NAMES
+    for form in (
+        "Optional[{}]",
+        "Union[{},None]",
+        "Union[None,{}]",
+        "{}|None",
+        "None|{}",
+    )
+)
+
+
+def _tensor_annotation(value: object) -> str | None:
+    """ "tensor" for `torch.Tensor` / `tl.tensor`, "optional" for either `| None`
+    (`Optional[...]`, `Union[..., None]`), as an object or a postponed string."""
     import sys
+    import types
+    import typing
 
     import triton.language as tl
 
     if type(value) is str:
-        return value.strip() in ("torch.Tensor", "tl.tensor")
+        text = "".join(value.split()).replace("typing.", "")
+        if text in _TENSOR_NAMES:
+            return "tensor"
+        return "optional" if text in _OPTIONAL_TENSOR_NAMES else None
     torch = sys.modules.get("torch")
-    return value is tl.tensor or (torch is not None and value is torch.Tensor)
+    classes = (tl.tensor,) if torch is None else (tl.tensor, torch.Tensor)
+    if any(value is cls for cls in classes):
+        return "tensor"
+    # `X | None` is a types.UnionType from Python 3.10 on
+    unions = (typing.Union, getattr(types, "UnionType", typing.Union))
+    if typing.get_origin(value) in unions:
+        args = typing.get_args(value)
+        if len(args) == 2 and type(None) in args:
+            other = args[0] if args[1] is type(None) else args[1]
+            if any(other is cls for cls in classes):
+                return "optional"
+    return None
 
 
 def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
@@ -479,11 +513,12 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
         # The type Triton's binder stamps on the argument: `int`, `bool`, `float`,
         # `tl.int64`, `"tl.int64"`, pointer types, ... -- whatever it recognizes.
         triton_type = cast(str, param.annotation_type)
-        tensor_only = False
+        tensor_kinds: set[str] = set()
         if triton_type:
             inline = Argument(type=tl.str_to_ty(triton_type, None))
-        elif _tensor_annotation(raw):
-            inline, tensor_only = None, True
+        elif (tensor_kind := _tensor_annotation(raw)) is not None:
+            inline = None
+            tensor_kinds.add(tensor_kind)
         else:
             # Preserve Triton's legacy constexpr strings, including postponed annotations.
             inline = _annotation_source(
@@ -491,10 +526,16 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
                 name,
             )
         other = None
-        if name in extra and _tensor_annotation(extra[name]):
-            tensor_only = True
+        if name in extra and (tensor_kind := _tensor_annotation(extra[name])):
+            tensor_kinds.add(tensor_kind)
         elif name in extra:
             other = _annotation_source(extra[name], name)
+        if len(tensor_kinds) > 1:
+            raise ValueError(
+                f"intj: parameter {name!r} has conflicting tensor annotations"
+            )
+        tensor_only = bool(tensor_kinds)
+        none_ok = tensor_kinds == {"optional"}
         if inline is not None and other is not None and type(inline) is not type(other):
             raise ValueError(f"intj: parameter {name!r} has conflicting kind")
         kind = "constexpr" if type(inline or other) is Constexpr else "argument"
@@ -714,6 +755,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             tag,
             triton_typed=bool(triton_type) and kind == "argument",
             tensor_only=tensor_only,
+            none_ok=none_ok,
         )
         resolved.append(ResolvedParam(name, index, annotation, baked))
     return tuple(resolved)

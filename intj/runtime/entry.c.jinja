@@ -235,8 +235,12 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
                         {{ spec_pointer_range }} && storage_nbytes <= 2147483647LL);
       vals[np++] = (uint64_t)(uintptr_t)pointer;
 {% if p.annotation.tensor_only %}
+{% if p.annotation.none_ok %}
+    } else if (o == Py_None) {
+      code = INTJ_B_NONE;
+{% endif %}
     } else {
-      intj_not_a_tensor(o, intj_param_names[{{ p.index }}]);
+      intj_not_a_tensor(o, intj_param_names[{{ p.index }}], {{ 1 if p.annotation.none_ok else 0 }});
       return -1;
     }
 {% else %}
@@ -384,7 +388,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
   if (intj_decode_tensor(&st->abi, st->tensor_type, st->param_type,
                          args[{{ p.call_index }}],
                          {{ 1 if (a.pointer_range_32 == 'auto' and spec_pointer_range) or (a.pointer_range_32 == 'assume' and verify_annotation) else 0 }},
-                         intj_param_names[{{ i }}], &{{ d }}) != 0)
+                         {{ 1 if a.none_ok else 0 }}, intj_param_names[{{ i }}], &{{ d }}) != 0)
     return -1;
 {% elif typed in ('fp32', 'fp64') %}
   if (intj_decode_typed_float(args[{{ p.call_index }}], &{{ d }}) != 0)

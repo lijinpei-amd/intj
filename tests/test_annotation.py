@@ -3,6 +3,7 @@
 import dataclasses
 import importlib.util
 import json
+import typing
 from typing import Any, cast
 
 import pytest
@@ -237,6 +238,53 @@ def test_tensor_annotations_resolve_as_unannotated_but_tensor_only(tmp_path, fut
         0
     ].annotation
     assert pointer.tensor_only and pointer.types == ("*fp32",)
+
+
+@pytest.mark.parametrize(
+    "future",
+    ["", "from __future__ import annotations\n"],
+    ids=["evaluated", "postponed"],
+)
+def test_optional_tensor_annotations_resolve_as_unannotated_but_none_ok(
+    tmp_path, future
+):
+    """`T | None`, `Optional[T]` and `Union[T, None]` for either tensor class:
+    unannotated plus `tensor_only` and `none_ok`."""
+    from intj.annotation import _resolve_annotations
+
+    forms = (
+        "torch.Tensor | None",
+        "None | tl.tensor",
+        "Optional[torch.Tensor]",
+        "typing.Optional[tl.tensor]",
+        "typing.Union[torch.Tensor, None]",
+        "Union[None, tl.tensor]",
+    )
+    params = ", ".join(f"p{i}: {form}" for i, form in enumerate(forms))
+    kernel = kernel_from_source(
+        tmp_path,
+        future + "import typing\nfrom typing import Optional, Union\n"
+        "import torch\nimport triton\nimport triton.language as tl\n\n"
+        f"@triton.jit\ndef kernel({params}, t: torch.Tensor, z):\n    pass\n",
+    )
+    *optional, t, z = (p.annotation for p in _resolve_annotations(kernel, None))
+    for a in optional:
+        assert a.tensor_only and a.none_ok
+        assert dataclasses.replace(a, tensor_only=False, none_ok=False) == z
+    assert t.tensor_only and not t.none_ok
+    import torch
+
+    (extra_z,) = [
+        p.annotation
+        for p in _resolve_annotations(kernel, {"z": typing.Optional[torch.Tensor]})
+        if p.name == "z"
+    ]
+    assert extra_z.tensor_only and extra_z.none_ok
+    with pytest.raises(ValueError, match="conflicting tensor annotations"):
+        _resolve_annotations(kernel, {"t": "torch.Tensor | None"})
+    # a union with anything else is still unsupported
+    with pytest.raises(ValueError, match="unsupported annotation"):
+        _resolve_annotations(kernel, {"z": typing.Union[torch.Tensor, int]})
 
 
 @pytest.mark.parametrize(

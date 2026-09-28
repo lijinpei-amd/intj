@@ -176,6 +176,30 @@ def axpy_tensor(
 
 
 @triton.jit
+def axpy_optional(
+    x: torch.Tensor,
+    y: torch.Tensor | None,
+    o: tl.tensor | None,  # pyright: ignore[reportInvalidTypeForm]  # triton's tensor class
+    n,
+    a,
+    flag,
+    bias,
+    BLOCK: tl.constexpr,
+):
+    """`axpy` with `y` and `o` optional tensors, which Triton ignores too."""
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = off < n
+    v = tl.load(x + off, mask=mask) * a
+    if y is not None:
+        if flag:
+            v += tl.load(y + off, mask=mask)
+    if bias is not None:
+        v += bias
+    if o is not None:
+        tl.store(o + off, v, mask=mask)
+
+
+@triton.jit
 def scale(x, o, n, s, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = off < n
@@ -3109,7 +3133,16 @@ def test_int_boundaries_match_triton(axpy_launcher):
 @pytest.mark.parametrize(
     "bind_device", [False, True], ids=["dynamic_device", "bind_device"]
 )
-@pytest.mark.parametrize("kernel", ["plain", "tensor_annotated", "tensor_generic"])
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        "plain",
+        "tensor_annotated",
+        "tensor_generic",
+        "optional_annotated",
+        "optional_generic",
+    ],
+)
 def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kernel):
     """The load-bearing invariant: same intj key => same triton specialization.
 
@@ -3117,12 +3150,15 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
     tt.divisibility=16 binary on an unaligned pointer. `tensor_annotated` is
     `axpy` with `torch.Tensor` / `tl.tensor` pointers (tensor-only decode, auto
     path); `tensor_generic` adds an explicit `n` type to force the generic path.
-    Both must compile exactly what the unannotated `axpy` does, as in Triton.
+    `optional_*` annotate `y` and `o` `... | None` and also pass None there.
+    All must compile exactly what the unannotated `axpy` does, as in Triton.
     """
-    jit = axpy if kernel == "plain" else axpy_tensor
+    jit = {"plain": axpy, "tensor": axpy_tensor, "optional": axpy_optional}[
+        kernel.split("_")[0]
+    ]
     extra = (
         {"n": Argument(type=(tl.int32, tl.int64, tl.uint64))}
-        if kernel == "tensor_generic"
+        if kernel.endswith("_generic")
         else None
     )
     if bind_device:
@@ -3171,6 +3207,9 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
             for bias in (None, 0.0, 1.0):
                 for block in (64, 128):
                     cases.append((base, base, base, 4096, a, flag, bias, block))
+    if jit is axpy_optional:
+        for y, o in ((None, base), (base, None), (None, None), (base[1:], None)):
+            cases.append((base, y, o, 4096, 1.5, True, None, 128))
 
     seen = {}
     for args in cases:
@@ -4699,6 +4738,29 @@ def test_tensor_annotated_param_takes_only_a_tensor(path):
     for bad in (None, 0, 1, 16, 2.5, True, x.cpu().numpy()):
         with pytest.raises(TypeError, match="'y' is annotated as a tensor"):
             launch(0, 0, 1, x, bad, o, 64, 2.0, True, None, 64)
+
+
+@pytest.mark.parametrize("path", ["auto", "generic"])
+def test_optional_tensor_param_takes_a_tensor_or_none(path):
+    """`y: torch.Tensor | None` / `o: tl.tensor | None` take a tensor or None,
+    each launched as Triton would; anything else is a TypeError."""
+    extra = {"n": Argument(type=tl.int32)} if path == "generic" else None
+    launch = make_launcher(axpy_optional, extra_annotation=extra)
+    x = torch.randn(64, device="cuda")
+    y = torch.nn.Parameter(torch.randn(64, device="cuda"))
+    o = torch.empty(64, device="cuda")
+    launch(0, 0, 1, x, y, o, 64, 2.0, True, None, 64)
+    torch.testing.assert_close(o, 2.0 * x + y.detach())
+    launch(0, 0, 1, x, None, o, 64, 3.0, True, None, 64)
+    torch.testing.assert_close(o, 3.0 * x)
+    launch(0, 0, 1, x, y, None, 64, 3.0, True, None, 64)
+    for bad in (0, 1, 16, 2.5, True, x.cpu().numpy()):
+        with pytest.raises(TypeError, match="'y' is annotated as a tensor or None"):
+            launch(0, 0, 1, x, bad, o, 64, 2.0, True, None, 64)
+        with pytest.raises(TypeError, match="'o' is annotated as a tensor or None"):
+            launch(0, 0, 1, x, y, bad, 64, 2.0, True, None, 64)
+    with pytest.raises(TypeError, match="'x' is annotated as a tensor; got NoneType"):
+        launch(0, 0, 1, None, y, o, 64, 2.0, True, None, 64)
 
 
 CONSTEXPR_GLOBAL = tl.constexpr(3)
