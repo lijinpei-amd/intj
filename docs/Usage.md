@@ -40,10 +40,13 @@ directly. If the build raises, that call raises and the next call retries.
 Concurrent first calls build once.
 
 Decorating a module-level kernel is therefore safe at import on a machine
-without a GPU. A few checks need the target and surface on the first call: an
-unknown `options=` name, an invalid compile option in an autotune config, and
-the C-side checks on bound values (an out-of-range pointer, a failing
-`hipDeviceGet`). Triton's `debug`, `instrumentation_mode` and
+without a GPU, and under `TRITON_INTERPRET=1` -- that refusal, like the others
+below, surfaces on the first call rather than at `make_launcher`, so it costs
+nothing once the launcher is built (the swapped-in entry never reads the knob
+again). A few other checks need the target and surface on the first call
+too: an unknown `options=` name, an invalid compile option in an autotune
+config, and the C-side checks on bound values (an out-of-range pointer, a
+failing `hipDeviceGet`). Triton's `debug`, `instrumentation_mode` and
 `fpsan_homomorphic_casts` knobs are read then too, and fixed for the launcher.
 Every launcher is a builtin function whose `__self__` is an
 `_intj_lazy.Launcher`, whatever it binds; `intj.launcher.module_of(launcher)`
@@ -475,7 +478,12 @@ hits it:
   launch symbol, error-string convention, whether it specializes pointers on a 2 GiB
   range) and calling `register()`. **CUDA is compile-checked but runtime-untested** --
   there is no NVIDIA GPU on the development machine.
-- `TRITON_INTERPRET=1`.
+- `TRITON_INTERPRET=1` -- refused on the first call, never at `make_launcher`,
+  so a module-level `@make_launcher` still imports under the interpreter (a
+  `@triton.jit` kernel decorated while it is on is an `InterpretedFunction`,
+  which intj cannot analyze either; decorating one also defers to the first
+  call). The refusal costs nothing after that call: it is not in the swapped-in
+  entry, so turning the knob on later does not stop an already-built launcher.
 - `dynamic_grid=True`. Use `grid_cpp` or `grid_py` for a callable grid.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
 - Tuple, `tl.constexpr` object and `TensorDescriptor` arguments, and `str` /

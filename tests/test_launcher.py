@@ -4517,6 +4517,73 @@ def test_refuses_kernel_reading_globals():
         make_launcher(uses_global)
 
 
+def test_decorating_under_triton_interpret_succeeds_and_defers_the_refusal():
+    """`@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
+    not a JITFunction, so a module-level `@make_launcher` must not raise at
+    decoration -- only its first call may (intj issue 1)."""
+    from triton import knobs
+    from triton.runtime.interpreter import InterpretedFunction
+    from triton.runtime.jit import JITFunction
+
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = True
+
+        @triton.jit
+        def interp_scale(x, o, n, s, BLOCK: tl.constexpr):
+            off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            mask = off < n
+            tl.store(o + off, tl.load(x + off, mask=mask) * s, mask=mask)
+
+        assert isinstance(interp_scale, InterpretedFunction)
+        assert not isinstance(interp_scale, JITFunction)
+
+        deferred = make_launcher(interp_scale)  # must not raise
+        with pytest.raises(UnsupportedKernel, match="TRITON_INTERPRET=1"):
+            module_of(deferred)
+
+
+def test_fresh_launcher_builds_and_launches_normally_once_interpret_is_off():
+    """After the interpreter-mode launcher above refuses, a kernel decorated
+    with interpret off builds and launches through the usual path."""
+    from triton import knobs
+
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = True
+
+        @triton.jit
+        def interp_scale2(x, o, n, s, BLOCK: tl.constexpr):
+            off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            mask = off < n
+            tl.store(o + off, tl.load(x + off, mask=mask) * s, mask=mask)
+
+        deferred = make_launcher(interp_scale2)
+        with pytest.raises(UnsupportedKernel, match="TRITON_INTERPRET=1"):
+            module_of(deferred)
+
+    launch_fn = make_launcher(scale)
+    x = torch.arange(8, device="cuda", dtype=torch.float32)
+    o = torch.empty_like(x)
+    launch(launch_fn, (1,), x, o, 8, 2.0, 8)
+    torch.testing.assert_close(o, x * 2.0)
+
+
+def test_launcher_built_with_interpret_off_keeps_launching_if_turned_on_later(
+    scale_launcher,
+):
+    """The interpreter refusal lives only in `_build` (the first call): once
+    the module is swapped in, a later call never reads the knob again, so
+    turning interpret on afterwards does not stop it launching."""
+    from triton import knobs
+
+    module_of(scale_launcher)  # ensure it is already built, interpret off
+    x = torch.arange(8, device="cuda", dtype=torch.float32)
+    o = torch.empty_like(x)
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = True
+        launch(scale_launcher, (1,), x, o, 8, 2.0, 8)
+    torch.testing.assert_close(o, x * 2.0)
+
+
 def test_accepts_kernel_with_lazy_launch_metadata():
     module_of(make_launcher(uses_launch_metadata, no_gpu=True))
 

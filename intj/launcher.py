@@ -351,7 +351,19 @@ class LauncherFactory:
         hidden: tuple[object, ...],
     ) -> int:
         """The first call: query the target, render, compile, load, fill `header`.
-        Returns the rendered entry's address for `_intj_lazy` to swap in."""
+        Returns the rendered entry's address for `_intj_lazy` to swap in.
+
+        `TRITON_INTERPRET=1` is refused here, not at `make_launcher`, so a
+        module-level decorator does not make its module unimportable under the
+        interpreter: decoration never runs a kernel, only the first call does.
+        Once this call succeeds the swapped-in entry never reads the knob
+        again, so a launcher built with the interpreter off keeps launching if
+        it is turned on later.
+        """
+        from triton import knobs
+
+        if knobs.runtime.interpret:
+            raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
         # a declared knob is per call: leaving its live value out keeps it out
         # of the ModuleKey, so it cannot build a module per value
         knob_values = (
@@ -445,6 +457,37 @@ def _validate_grid_kwargs(
         )
     if return_compiled and no_gpu:
         raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
+
+
+def _interpreter_deferred(bind_device_requested: bool) -> Any:
+    """Stand-in for a launcher over an `InterpretedFunction`.  GPU-free, like a
+    real `_bind`: the refusal itself only fires on the first call, so it costs
+    nothing beyond that (there is no second call -- this build never succeeds)."""
+
+    def build(header: object) -> int:
+        raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
+
+    def make() -> Any:
+        return _stub().new_launcher(_tail_bytes(0, 0), b"(*args, **kwargs)\x00", build)
+
+    if not bind_device_requested:
+        return make()
+
+    class _DeferredFactory:
+        def bind(self, /, **values: object) -> Any:
+            raise TypeError("intj: use bind_device(device_ordinal, **values)")
+
+        def bind_device(self, /, *args: object, **values: object) -> Any:
+            if len(args) != 1:
+                raise TypeError(
+                    "intj: bind_device requires exactly one positional device ordinal"
+                )
+            ordinal = args[0]
+            if type(ordinal) is not int or not 0 <= ordinal <= 2**31 - 1:
+                raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
+            return make()
+
+    return _DeferredFactory()
 
 
 @overload
@@ -600,10 +643,21 @@ def make_launcher(
             "intj: no_gpu=True supports only default compile options"
         )
     from triton.runtime.autotuner import Autotuner, Heuristics
+    from triton.runtime.interpreter import InterpretedFunction
 
     chain = kernel
     while type(kernel) in (Autotuner, Heuristics):
         kernel = kernel.fn
+    if isinstance(kernel, InterpretedFunction):
+        # `@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
+        # not a JITFunction: it has none of the attributes the analysis below
+        # needs (`.params`, `.cache_key`, ...), so there is nothing to decorate.
+        # Decoration still must not raise -- a module-level `@make_launcher`
+        # would make its module unimportable under the interpreter -- so this
+        # stands in for the real launcher and defers the actual refusal to the
+        # first call, exactly like `_build`'s live `knobs.runtime.interpret`
+        # check does for a kernel that decoded to a real JITFunction.
+        return _interpreter_deferred(bind_device)
     kernel = _check_kernel(kernel, options)
     resolved = _resolve_annotations(kernel, extra_annotation)
     tuned: _Tuned | None = None
@@ -1490,11 +1544,8 @@ _FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
 
 
 def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunction:
-    from triton import knobs
     from triton.runtime.jit import JITFunction
 
-    if knobs.runtime.interpret:
-        raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
     if not isinstance(jit_func, JITFunction):
         raise UnsupportedKernel(
             "intj: expected a @triton.jit function, optionally wrapped in "
