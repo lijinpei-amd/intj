@@ -206,6 +206,62 @@ def test_make_launcher_accepts_legacy_constexpr_annotations(tmp_path, future):
     assert callable(intj.make_launcher(kernel))
 
 
+@pytest.mark.parametrize(
+    "future",
+    ["", "from __future__ import annotations\n"],
+    ids=["evaluated", "postponed"],
+)
+def test_tensor_annotations_resolve_as_unannotated_but_tensor_only(tmp_path, future):
+    """Triton ignores `torch.Tensor` / `tl.tensor` (its `annotation_type` is
+    empty), so the canonical form is the unannotated one plus `tensor_only`."""
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_from_source(
+        tmp_path,
+        future + "import torch\nimport triton\nimport triton.language as tl\n\n"
+        "@triton.jit\ndef kernel(x: torch.Tensor, y: tl.tensor, z):\n    pass\n",
+    )
+    x, y, z = (p.annotation for p in _resolve_annotations(kernel, None))
+    assert x.tensor_only and y.tensor_only and not z.tensor_only
+    assert dataclasses.replace(x, tensor_only=False) == z
+    assert dataclasses.replace(y, tensor_only=False) == z
+    import torch
+
+    (extra_z,) = [
+        p.annotation
+        for p in _resolve_annotations(kernel, {"z": torch.Tensor})
+        if p.name == "z"
+    ]
+    assert extra_z.tensor_only
+    pointer = _resolve_annotations(kernel, {"x": tl.pointer_type(tl.float32)})[
+        0
+    ].annotation
+    assert pointer.tensor_only and pointer.types == ("*fp32",)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        intj.Constexpr(),
+        tl.int32,
+        None,
+        intj.Argument(value=3),
+        intj.Argument(bind_value=intj.BindValue.TENSOR),
+    ],
+    ids=["constexpr", "scalar", "none", "baked", "bound"],
+)
+def test_tensor_annotation_rejects_non_tensor_declarations(tmp_path, extra):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_from_source(
+        tmp_path,
+        "import torch\nimport triton\n\n"
+        "@triton.jit\ndef kernel(x: torch.Tensor):\n    pass\n",
+    )
+    with pytest.raises(ValueError, match="(annotated as a tensor|conflicting kind)"):
+        _resolve_annotations(kernel, {"x": extra})
+
+
 def test_assumptions_merge_independently_and_types_sort(tmp_path):
     from intj.annotation import _resolve_annotations
 

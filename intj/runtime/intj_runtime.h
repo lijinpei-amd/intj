@@ -376,7 +376,7 @@ static inline int intj_read_tensor(const intj_torch_abi *abi, PyObject *o,
     return -1;
   /* struct THPDtype { PyObject_HEAD at::ScalarType scalar_type; char name[65];
    * } ScalarType is `enum class : int8_t`, so this is the first byte of
-   * payload. Only reached after intj_decode_argument's exact-type test, so `o` really is
+   * payload. Only reached after an exact-type test, so `o` really is
    * a tensor and `d` really is a THPDtype.
    */
   *dt = (int32_t)*(const int8_t *)((char *)d + sizeof(PyObject));
@@ -730,13 +730,18 @@ static INTJ_ALWAYS_INLINE int intj_finish_tensor(const intj_torch_abi *abi,
   return 0;
 }
 
+/* A parameter annotated `torch.Tensor` / `tl.tensor` takes only a tensor. */
+static inline void intj_not_a_tensor(PyObject *o, const char *pname) {
+  PyErr_Format(PyExc_TypeError,
+               "intj: argument '%s' is annotated as a tensor; got %s", pname,
+               Py_TYPE(o)->tp_name);
+}
+
+/* `o` is an exact torch.Tensor or nn.Parameter. */
 static INTJ_ALWAYS_INLINE int
-intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                     PyTypeObject *param_type, PyObject *o, int want_size,
-                     const char *pname, intj_decoded *out) {
-  PyTypeObject *type = Py_TYPE(o);
-  if (type != tensor_type && type != param_type)
-    return intj_decode_constexpr(o, pname, out);
+intj_decode_tensor_checked(const intj_torch_abi *abi, PyObject *o,
+                           int want_size, const char *pname,
+                           intj_decoded *out) {
   memset(out, 0, sizeof(*out));
   int32_t dtype = -1;
   if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype, want_size,
@@ -745,6 +750,28 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
     return -1;
   }
   return intj_finish_tensor(abi, dtype, pname, out);
+}
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                   PyTypeObject *param_type, PyObject *o, int want_size,
+                   const char *pname, intj_decoded *out) {
+  PyTypeObject *type = Py_TYPE(o);
+  if (INTJ_UNLIKELY(type != tensor_type && type != param_type)) {
+    intj_not_a_tensor(o, pname);
+    return -1;
+  }
+  return intj_decode_tensor_checked(abi, o, want_size, pname, out);
+}
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
+                     PyTypeObject *param_type, PyObject *o, int want_size,
+                     const char *pname, intj_decoded *out) {
+  PyTypeObject *type = Py_TYPE(o);
+  if (type != tensor_type && type != param_type)
+    return intj_decode_constexpr(o, pname, out);
+  return intj_decode_tensor_checked(abi, o, want_size, pname, out);
 }
 
 #ifndef INTJ_NBOUND

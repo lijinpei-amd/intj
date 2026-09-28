@@ -154,6 +154,28 @@ def axpy(x, y, o, n, a, flag, bias, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def axpy_tensor(
+    x: torch.Tensor,
+    y: tl.tensor,  # pyright: ignore[reportInvalidTypeForm]  # triton's tensor class
+    o: torch.Tensor,
+    n,
+    a,
+    flag,
+    bias,
+    BLOCK: tl.constexpr,
+):
+    """`axpy` with its pointers annotated as tensors, which Triton ignores."""
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = off < n
+    v = tl.load(x + off, mask=mask) * a
+    if flag:
+        v += tl.load(y + off, mask=mask)
+    if bias is not None:
+        v += bias
+    tl.store(o + off, v, mask=mask)
+
+
+@triton.jit
 def scale(x, o, n, s, BLOCK: tl.constexpr):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = off < n
@@ -3087,25 +3109,42 @@ def test_int_boundaries_match_triton(axpy_launcher):
 @pytest.mark.parametrize(
     "bind_device", [False, True], ids=["dynamic_device", "bind_device"]
 )
-def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device):
+@pytest.mark.parametrize("kernel", ["plain", "tensor_annotated", "tensor_generic"])
+def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kernel):
     """The load-bearing invariant: same intj key => same triton specialization.
 
     A coarser key is the failure mode that does not crash -- it launches, say, a
-    tt.divisibility=16 binary on an unaligned pointer.
+    tt.divisibility=16 binary on an unaligned pointer. `tensor_annotated` is
+    `axpy` with `torch.Tensor` / `tl.tensor` pointers (tensor-only decode, auto
+    path); `tensor_generic` adds an explicit `n` type to force the generic path.
+    Both must compile exactly what the unannotated `axpy` does, as in Triton.
     """
-    launch = (
-        make_launcher(axpy, bind_device=True).bind_device(torch.cuda.current_device())
-        if bind_device
-        else axpy_launcher
+    jit = axpy if kernel == "plain" else axpy_tensor
+    extra = (
+        {"n": Argument(type=(tl.int32, tl.int64, tl.uint64))}
+        if kernel == "tensor_generic"
+        else None
     )
+    if bind_device:
+        launch = make_launcher(jit, bind_device=True, extra_annotation=extra)
+        launch = launch.bind_device(torch.cuda.current_device())
+    else:
+        launch = (
+            axpy_launcher
+            if kernel == "plain"
+            else make_launcher(jit, extra_annotation=extra)
+        )
     module = module_of(launch)
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input, _current_target, _render_params
     from triton.compiler import make_backend
 
     params, _, _ = _render_params(
-        _resolve_annotations(axpy, None),
+        _resolve_annotations(jit, extra),
         DeviceBinding.FIXED if bind_device else DeviceBinding.NOT_FIXED,
+    )
+    plain_params, _, _ = _render_params(
+        _resolve_annotations(axpy, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(_current_target())
     base = torch.randn(4096, device="cuda")
@@ -3136,11 +3175,13 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device):
     seen = {}
     for args in cases:
         key, nparams = module.spec_key(launch, 0, *args)
-        source = _compiler_input(axpy, params, args, backend)
+        source = _compiler_input(jit, params, args, backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
         )
         assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
+        # Triton treats tensor annotations as absent: same compiler input
+        assert source == _compiler_input(axpy, plain_params, args, backend)
 
 
 @triton.jit
@@ -4640,6 +4681,24 @@ def test_launcher_requires_triton_extra(monkeypatch, version):
 def test_refuses_kernel_reading_globals():
     with pytest.raises(UnsupportedKernel, match="global variable"):
         make_launcher(uses_global)
+
+
+@pytest.mark.parametrize("path", ["auto", "generic"])
+def test_tensor_annotated_param_takes_only_a_tensor(path):
+    """`x: torch.Tensor` / `y: tl.tensor` decode through the tensor-only path:
+    a tensor or `nn.Parameter` launches like an unannotated one; anything else,
+    `None` included, is a TypeError (Triton would take `None` as a constexpr).
+    """
+    extra = {"n": Argument(type=tl.int32)} if path == "generic" else None
+    launch = make_launcher(axpy_tensor, extra_annotation=extra)
+    x = torch.randn(64, device="cuda")
+    y = torch.nn.Parameter(torch.randn(64, device="cuda"))
+    o = torch.empty(64, device="cuda")
+    launch(0, 0, 1, x, y, o, 64, 2.0, True, None, 64)
+    torch.testing.assert_close(o, 2.0 * x + y.detach())
+    for bad in (None, 0, 1, 16, 2.5, True, x.cpu().numpy()):
+        with pytest.raises(TypeError, match="'y' is annotated as a tensor"):
+            launch(0, 0, 1, x, bad, o, 64, 2.0, True, None, 64)
 
 
 CONSTEXPR_GLOBAL = tl.constexpr(3)

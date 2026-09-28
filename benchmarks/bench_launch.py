@@ -266,6 +266,12 @@ def main(iters=20000, batches=7, no_gpu=False):
         return elapsed
 
     auto_ns = row("auto map")
+    # `torch.Tensor` pointers decode tensor-only; same key as unannotated
+    tensors: dict[str, object] = {name: torch.Tensor for name in ("x", "y", "o")}
+    row("tensor annotated", tensors)
+    typed_n: dict[str, object] = {"n": Argument(type=tl.int32)}  # the generic path
+    row("generic", typed_n)
+    row("generic tensor ann", {**typed_n, **tensors})
     row("reduced key", reduced)
     row("verify off", fixed)
     row("verify on", fixed, verify=True)

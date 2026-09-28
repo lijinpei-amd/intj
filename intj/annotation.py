@@ -208,6 +208,9 @@ class CanonicalAnnotation:
     #: the type comes from a Triton annotation (`x: float`): values convert
     #: the way Triton's launcher extracts them
     triton_typed: bool = False
+    #: annotated `torch.Tensor` / `tl.tensor`: only a tensor is accepted, keyed
+    #: as an unannotated tensor (Triton ignores these annotations)
+    tensor_only: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,6 +240,18 @@ def _canonical_value(value: object) -> tuple[object, ...]:
     if type(value) is float:
         return ("float64", struct.pack(">d", value).hex())
     raise ValueError("intj: baked values must be scalar int, float, bool, or None")
+
+
+def _tensor_annotation(value: object) -> bool:
+    """`torch.Tensor` or `tl.tensor`, as an object or a postponed string."""
+    import sys
+
+    import triton.language as tl
+
+    if type(value) is str:
+        return value.strip() in ("torch.Tensor", "tl.tensor")
+    torch = sys.modules.get("torch")
+    return value is tl.tensor or (torch is not None and value is torch.Tensor)
 
 
 def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
@@ -464,15 +479,22 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
         # The type Triton's binder stamps on the argument: `int`, `bool`, `float`,
         # `tl.int64`, `"tl.int64"`, pointer types, ... -- whatever it recognizes.
         triton_type = cast(str, param.annotation_type)
+        tensor_only = False
         if triton_type:
             inline = Argument(type=tl.str_to_ty(triton_type, None))
+        elif _tensor_annotation(raw):
+            inline, tensor_only = None, True
         else:
             # Preserve Triton's legacy constexpr strings, including postponed annotations.
             inline = _annotation_source(
                 tl.constexpr if isinstance(raw, str) and param.is_constexpr else raw,
                 name,
             )
-        other = _annotation_source(extra[name], name) if name in extra else None
+        other = None
+        if name in extra and _tensor_annotation(extra[name]):
+            tensor_only = True
+        elif name in extra:
+            other = _annotation_source(extra[name], name)
         if inline is not None and other is not None and type(inline) is not type(other):
             raise ValueError(f"intj: parameter {name!r} has conflicting kind")
         kind = "constexpr" if type(inline or other) is Constexpr else "argument"
@@ -529,6 +551,17 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
                 modes = ("never",) + modes[1:]
             power = False
         types = _canonical_types(raw_type, kind)
+        if tensor_only and (
+            kind != "argument"
+            or baked is not UNSET
+            or bind_value is not None
+            or types is not None
+            and any(ty is None or not ty.startswith("*") for ty in types)
+        ):
+            raise ValueError(
+                f"intj: parameter {name!r} is annotated as a tensor; it cannot also "
+                "be a constexpr, a non-pointer type, baked or bound"
+            )
         if (
             power
             and types is not None
@@ -680,6 +713,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             bind_value.value if isinstance(bind_value, BindValue) else None,
             tag,
             triton_typed=bool(triton_type) and kind == "argument",
+            tensor_only=tensor_only,
         )
         resolved.append(ResolvedParam(name, index, annotation, baked))
     return tuple(resolved)
