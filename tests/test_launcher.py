@@ -10,6 +10,7 @@ import ctypes
 import dataclasses
 import dis
 import gc
+import importlib.util
 import inspect
 import itertools
 import json
@@ -4639,6 +4640,140 @@ def test_launcher_requires_triton_extra(monkeypatch, version):
 def test_refuses_kernel_reading_globals():
     with pytest.raises(UnsupportedKernel, match="global variable"):
         make_launcher(uses_global)
+
+
+CONSTEXPR_GLOBAL = tl.constexpr(3)
+
+
+@triton.jit
+def reads_constexpr_global(x, o, n, BLOCK: tl.constexpr):
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = off < n
+    tl.store(o + off, tl.load(x + off, mask=mask) * CONSTEXPR_GLOBAL, mask=mask)
+
+
+def test_constant_globals_are_a_caller_promise():
+    """Refused by default; `assume_constant_globals=True` launches with the
+    value triton saw when it hashed the kernel, in both call forms."""
+    with pytest.raises(UnsupportedKernel, match="assume_constant_globals"):
+        make_launcher(reads_constexpr_global)
+    x = torch.randn(64, device="cuda")
+    for launch in (
+        make_launcher(reads_constexpr_global, assume_constant_globals=True),
+        make_launcher(assume_constant_globals=True)(reads_constexpr_global),
+    ):
+        o = torch.empty(64, device="cuda")
+        launch(0, 0, 1, x, o, 64, 64)
+        torch.testing.assert_close(o, 3 * x)
+
+
+def test_constant_globals_are_not_rechecked_on_a_hit(monkeypatch):
+    """No per-launch read: changing the global after the build is not seen.
+    Unsupported and undetected (docs/Usage.md); Triton raises instead."""
+    launch = make_launcher(reads_constexpr_global, assume_constant_globals=True)
+    x = torch.randn(64, device="cuda")
+    o = torch.empty(64, device="cuda")
+    launch(0, 0, 1, x, o, 64, 64)
+    monkeypatch.setitem(
+        reads_constexpr_global.__globals__, "CONSTEXPR_GLOBAL", tl.constexpr(5)
+    )
+    o.zero_()
+    launch(0, 0, 1, x, o, 64, 64)
+    torch.testing.assert_close(o, 3 * x)
+
+
+_TILES_KERNEL = """
+import triton
+import triton.language as tl
+
+TILES = {tiles}
+
+
+@triton.constexpr_function
+def ntiles():
+    return len(TILES)
+
+
+@triton.jit
+def kernel(o):
+    tl.store(o, ntiles())
+"""
+
+_CONSTEXPR_KERNEL = """
+import triton
+import triton.language as tl
+
+TILES = tl.constexpr(len({tiles}))
+
+
+@triton.jit
+def kernel(o):
+    tl.store(o, TILES)
+"""
+
+
+def _module_kernel(path, source):
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
+    return module.kernel
+
+
+@pytest.mark.parametrize("kind", ["plain", "constexpr"])
+def test_different_global_values_never_share_a_module(tmp_path, kind):
+    """Two kernels differing only in a global's value get two modules.
+
+    Triton's `cache_key` hashes a `tl.constexpr` global's value but not a plain
+    one's (a tuple read by a `constexpr_function`, like aiter's
+    `_SUPPORTED_TILES`), so for `plain` only the values in the `ModuleKey`
+    keep the second launcher off the first's module.  The binaries are
+    Triton's business: its own compile cache keys on `cache_key` too, so for
+    `plain` it hands both the first kernel compiled, exactly as `kernel[grid]`
+    does -- only `constexpr` can check the outputs.
+    """
+    template = _TILES_KERNEL if kind == "plain" else _CONSTEXPR_KERNEL
+    kernels = []
+    for i, tiles in enumerate((((1, 2),), ((1, 2), (3, 4)))):
+        # one module name, so nothing but the global tells the two apart
+        (tmp_path / str(i)).mkdir()
+        path = tmp_path / str(i) / f"globals_{kind}.py"
+        kernels.append(_module_kernel(path, template.format(tiles=tiles)))
+    assert (kernels[0].cache_key == kernels[1].cache_key) == (kind == "plain")
+    launches = [make_launcher(k, assume_constant_globals=True) for k in kernels]
+    out = []
+    for launch in launches:
+        o = torch.zeros(1, device="cuda", dtype=torch.int32)
+        launch(0, 0, 1, o)
+        out.append(o.item())
+    assert module_of(launches[0]) is not module_of(launches[1])
+    if kind == "constexpr":
+        assert out == [1, 2]
+
+
+def test_global_values_canonicalize_or_refuse(tmp_path):
+    from triton._C.libtriton import ir
+
+    from intj.launcher import _canonical_global
+
+    assert _canonical_global(tl.constexpr(ir.PROPAGATE_NAN.ALL)) == (
+        "constexpr",
+        ("enum", "triton._C.libtriton.ir", "PROPAGATE_NAN", "ALL"),
+    )
+    assert _canonical_global(((1, 2), tl.constexpr(True))) == (
+        "tuple",
+        ("tuple", ("int", "1"), ("int", "2")),
+        ("constexpr", ("bool", True)),
+    )
+    json.dumps(
+        _module_key(global_values=(("G", "m", _canonical_global((1,))),)).digest()
+    )
+    opaque = _module_kernel(
+        tmp_path / "opaque_global.py", _TILES_KERNEL.format(tiles="object()")
+    )
+    with pytest.raises(UnsupportedKernel, match="cannot be part of a module key"):
+        make_launcher(opaque, assume_constant_globals=True)
 
 
 def test_decorating_under_triton_interpret_succeeds_and_defers_the_refusal():

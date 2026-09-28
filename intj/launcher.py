@@ -227,6 +227,11 @@ class ModuleKey:
     ]  # changes to compiler flags invalidate cached .so files
     ext_suffix: str | None
     intj_version: tuple[int, int]
+    #: `assume_constant_globals=True`: the globals the kernel reads, by value.
+    #: triton's `cache_key` hashes only the `tl.constexpr` ones; a plain global
+    #: (a tuple read by a `constexpr_function`) would otherwise let two
+    #: different values share a module -- and its compile callback's kernel.
+    global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
 
     def digest(self) -> str:
         # sort_keys so the digest does not depend on field order
@@ -251,6 +256,7 @@ class LauncherFactory:
     tuned: _Tuned | None = None
     grid_fn: object | None = None
     dynamic: tuple[str, ...] = ()
+    global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
 
     def bind(self, /, **values: object) -> Callable[..., Any]:
         if self.bind_device_requested:
@@ -392,6 +398,7 @@ class LauncherFactory:
             tuning=self.tuned.render if self.tuned else None,
             knob_values=knob_values,
             dynamic=self.dynamic,
+            global_values=self.global_values,
         )
         if self.tuned is None:
             callback: Callable[..., Any] = _launcher_compile(module)
@@ -507,6 +514,7 @@ def make_launcher(
     grid_cpp: object | None = None,
     grid_py: Callable[[dict[str, object]], object] | None = None,
     return_compiled: bool = False,
+    assume_constant_globals: bool = False,
 ) -> Any: ...
 
 
@@ -526,6 +534,7 @@ def make_launcher(
     grid_cpp: object | None = None,
     grid_py: Callable[[dict[str, object]], object] | None = None,
     return_compiled: bool = False,
+    assume_constant_globals: bool = False,
 ) -> Callable[[Any], Any]: ...
 
 
@@ -550,6 +559,7 @@ def make_launcher(
     grid_cpp: object | None = None,
     grid_py: Callable[[dict[str, object]], object] | None = None,
     return_compiled: bool = False,
+    assume_constant_globals: bool = False,
 ) -> Any:
     """Build a fast launcher for `jit_func`.
 
@@ -600,6 +610,10 @@ def make_launcher(
     otherwise these are caller promises.
     `return_compiled=True` returns the cached Triton CompiledKernel after a
     successful launch, including on a zero-volume grid, and requires GPU mode.
+    `assume_constant_globals=True` accepts a kernel that reads global
+    variables: their values when triton first hashed the kernel become part of
+    the module identity, and are never checked again. Changing one afterwards
+    is unsupported and not detected.
     """
     if args:
         raise TypeError(
@@ -632,6 +646,7 @@ def make_launcher(
             grid_cpp=grid_cpp,
             grid_py=grid_py,
             return_compiled=return_compiled,
+            assume_constant_globals=assume_constant_globals,
         )
     kernel: JitFunction = jit_func
     triton_hint = "intj: Triton >=3.7 is required; install `intj[launcher]`"
@@ -665,7 +680,8 @@ def make_launcher(
         # first call, exactly like `_build`'s live `knobs.runtime.interpret`
         # check does for a kernel that decoded to a real JITFunction.
         return _interpreter_deferred(bind_device)
-    kernel = _check_kernel(kernel, options)
+    kernel = _check_kernel(kernel, options, bool(assume_constant_globals))
+    global_values = _global_values(kernel) if assume_constant_globals else ()
     resolved = _resolve_annotations(kernel, extra_annotation)
     tuned: _Tuned | None = None
     if chain is not kernel:
@@ -746,6 +762,7 @@ def make_launcher(
         tuned,
         grid_cpp,
         dynamic=dynamic,
+        global_values=global_values,
     )
     return factory if needs_binding else factory.bind()
 
@@ -766,6 +783,7 @@ def _materialize_module(
     tuning: TuningRender | None = None,
     knob_values: Mapping[str, object] | None = None,
     dynamic: tuple[str, ...] = (),
+    global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = (),
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -869,6 +887,7 @@ def _materialize_module(
         build_flags=tuple(build["ccflags"]),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
+        global_values=global_values,
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
@@ -1550,7 +1569,11 @@ def _refuse_unknown_options(parsed: Any, names: Iterable[str]) -> None:
 _FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
 
 
-def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunction:
+def _check_kernel(
+    jit_func: JitFunction,
+    options: Mapping[str, Any],
+    assume_constant_globals: bool = False,
+) -> JitFunction:
     from triton.runtime.jit import JITFunction
 
     if not isinstance(jit_func, JITFunction):
@@ -1561,16 +1584,55 @@ def _check_kernel(jit_func: JitFunction, options: Mapping[str, Any]) -> JitFunct
     if jit_func.pre_run_hooks:
         raise UnsupportedKernel("intj: kernels with pre-run hooks are not supported")
     jit_func.cache_key  # populates used_global_vals
-    if jit_func.used_global_vals:
+    if jit_func.used_global_vals and not assume_constant_globals:
         names = sorted({name for name, _ in jit_func.used_global_vals})
         raise UnsupportedKernel(
             f"intj: kernel reads global variable(s) {names}, which intj cannot revalidate; "
-            "pass them as arguments instead"
+            "pass them as arguments instead, or promise they never change with "
+            "assume_constant_globals=True"
         )
     for key in _FORBIDDEN_OPTIONS:
         if key in options:
             raise UnsupportedKernel(f"intj: option {key!r} is not allowed")
     return jit_func
+
+
+def _canonical_global(value: object) -> tuple[object, ...]:
+    import triton.language as tl
+
+    if isinstance(value, tl.constexpr):
+        return ("constexpr", _canonical_global(value.value))
+    if type(value) is tuple:
+        return ("tuple", *(_canonical_global(item) for item in value))
+    # a Python or pybind11 enum member (Gluon's `PropagateNan.ALL`), by name
+    kind = type(value)
+    members = getattr(kind, "__members__", None)
+    name = getattr(value, "name", None)
+    if (
+        isinstance(members, Mapping)
+        and type(name) is str
+        and cast(Mapping[str, object], members).get(name) is value
+    ):
+        return ("enum", kind.__module__, kind.__qualname__, name)
+    return _canonical_value(value)
+
+
+def _global_values(
+    jit_func: JitFunction,
+) -> tuple[tuple[str, str, tuple[object, ...]], ...]:
+    """The globals `jit_func` reads, as triton snapshotted them when it first
+    computed `cache_key`, canonicalized for the `ModuleKey`."""
+    values: list[tuple[str, str, tuple[object, ...]]] = []
+    for (name, _), (value, scope) in jit_func.used_global_vals.items():
+        try:
+            canonical = _canonical_global(value)
+        except ValueError:
+            raise UnsupportedKernel(
+                f"intj: global variable {name!r} = {value!r} cannot be part of a "
+                "module key; pass it as an argument instead"
+            ) from None
+        values.append((name, str(scope.get("__name__", "")), canonical))
+    return tuple(sorted(values, key=lambda item: (item[0], item[1])))
 
 
 @dataclasses.dataclass(frozen=True)

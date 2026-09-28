@@ -20,6 +20,7 @@ launcher = make_launcher(
     grid_cpp=None,         # keyword-only: annotated def compiled into the extension
     grid_py=None,          # keyword-only: Python callback evaluated on each launch
     return_compiled=False, # keyword-only: return the cached Triton CompiledKernel
+    assume_constant_globals=False, # keyword-only: accept kernels reading globals
 )
 ```
 
@@ -75,6 +76,22 @@ bound handle. `no_gpu=True` renders and times host decoding and cache lookup
 without querying a GPU target or driver, compiling a kernel, or launching one.
 It accepts only default compile options. The `torch_access_mode` and `kernel_cache`
 choices are described below.
+
+`assume_constant_globals=True` accepts a kernel that reads global variables
+(`X = tl.constexpr(...)`, or a plain value a `constexpr_function` reads),
+which is refused by default. It is a caller promise: **those globals never
+change after the kernel is first hashed** (at `make_launcher`, the first time
+Triton computes its `cache_key`). Their values then become part of the
+module's identity, so two values never share a module, and a launch never
+reads them again -- no hit-path cost. Changing one afterwards is unsupported
+and **not detected**: the launcher keeps launching what it built, and a later
+cache miss compiles with the new value under the old identity. Triton raises
+instead, on every launch. Values must be `tl.constexpr` wrappers, `int`,
+`float`, `bool`, `str`, `None`, `tl.dtype`, enum members (Gluon's
+`PropagateNan.ALL`) or tuples of these; anything else raises
+`UnsupportedKernel`. A plain global is not in Triton's own compile-cache key,
+so Triton hands two kernels that differ only in one the same binary; intj
+keeps them in separate modules but compiles through that cache like Triton.
 
 `options` must be valid triton compile options (`num_warps`, `num_stages`,
 `waves_per_eu`, ...) and are fixed for the lifetime of the launcher. `device`,
@@ -511,7 +528,8 @@ accessors. `RUNTIME_SHIM` and `STATIC_COMPILE` share it because `RUNTIME_SHIM`
 cannot see the policy bit. Neither kind of tensor is a usable triton kernel
 argument in the first place.
 - Kernels that read global variables (triton revalidates those on every launch;
-  intj cannot, so it refuses instead of silently launching a stale kernel).
+  intj does not, so it refuses instead of silently launching a stale kernel),
+  unless `assume_constant_globals=True` promises they never change.
 - Kernels with pre-run hooks, `num_ctas > 1`, cooperative launches, or non-zero
   global/profile scratch.
 

@@ -42,8 +42,9 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
 - Tuple / namedtuple arguments: `ARG_TUPLE` recursion in the decoder and the key.
-- Kernels reading globals: revalidate in C (`PyObject_RichCompareBool` per entry)
-  instead of refusing.
+- Kernels reading globals: `assume_constant_globals=True` trusts them; still
+  refused by default. Revalidating in C (`PyObject_RichCompareBool` per entry)
+  would cover the default too.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
 - Parameter defaults: the launcher requires every argument positionally.
