@@ -529,8 +529,13 @@ def make_launcher(
 ) -> Callable[[Any], Any]: ...
 
 
+#: make_launcher's "no kernel given" default: a positional None is an error, not
+#: the decorator-factory form (an optional kernel whose import failed).
+_NO_KERNEL: Any = object()
+
+
 def make_launcher(
-    jit_func: JitFunction | None = None,
+    jit_func: JitFunction = _NO_KERNEL,
     *args: object,
     dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
@@ -610,6 +615,8 @@ def make_launcher(
         no_gpu,
     )
     if jit_func is None:
+        raise TypeError("intj: make_launcher got None instead of a kernel")
+    if jit_func is _NO_KERNEL:
         return functools.partial(
             make_launcher,
             dynamic_grid=dynamic_grid,

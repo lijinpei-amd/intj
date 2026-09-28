@@ -2554,6 +2554,15 @@ def test_bare_decorator_matches_the_call_form():
     torch.testing.assert_close(o, x * 2.0)
 
 
+def test_none_kernel_is_rejected_not_a_decorator_factory():
+    """An optional kernel whose import failed must not become the factory form."""
+    with pytest.raises(TypeError, match="None instead of a kernel"):
+        make_launcher(None)
+    with pytest.raises(TypeError, match="None instead of a kernel"):
+        make_launcher(None, options={"num_warps": 4})
+    assert callable(make_launcher(options={"num_warps": 4}))
+
+
 def test_positional_arguments_beyond_the_kernel_are_rejected():
     with pytest.raises(TypeError, match="no positional arguments"):
         make_launcher(scale, False)  # pyright: ignore[reportCallIssue]
