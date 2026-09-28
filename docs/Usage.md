@@ -88,8 +88,17 @@ and **not detected**: the launcher keeps launching what it built, and a later
 cache miss compiles with the new value under the old identity. Triton raises
 instead, on every launch. Values must be `tl.constexpr` wrappers, `int`,
 `float`, `bool`, `str`, `None`, `tl.dtype`, enum members (Gluon's
-`PropagateNan.ALL`) or tuples of these; anything else raises
-`UnsupportedKernel`. A plain global is not in Triton's own compile-cache key,
+`PropagateNan.ALL`), classes, or tuples of these; anything else raises
+`UnsupportedKernel` naming the global and its type.
+
+A class global (a `NamedTuple` the kernel constructs, a Gluon layout class such as
+`AMDWMMALayout`) is keyed by `module.qualname`, like a called `@triton.jit`
+function; the kernel's source is already in the key. Replacing the class under the
+same name is not detected, so `make_launcher` emits one `intj.ClassGlobalWarning`
+(a `RuntimeWarning`) per launcher it builds, naming the classes; launches never warn.
+Silence it with
+`warnings.filterwarnings("ignore", category=intj.ClassGlobalWarning)` or
+`-W ignore::intj.ClassGlobalWarning`. A plain global is not in Triton's own compile-cache key,
 so Triton hands two kernels that differ only in one the same binary; intj
 keeps them in separate modules but compiles through that cache like Triton.
 

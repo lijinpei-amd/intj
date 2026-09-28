@@ -4918,8 +4918,94 @@ def test_global_values_canonicalize_or_refuse(tmp_path):
     opaque = _module_kernel(
         tmp_path / "opaque_global.py", _TILES_KERNEL.format(tiles="object()")
     )
-    with pytest.raises(UnsupportedKernel, match="cannot be part of a module key"):
+    with pytest.raises(UnsupportedKernel, match="'TILES' holds a object") as info:
         make_launcher(opaque, assume_constant_globals=True)
+    assert "as an argument" not in str(info.value)
+
+
+_CLASS_KERNEL = """
+from typing import NamedTuple
+
+import triton
+import triton.language as tl
+
+
+class {cls}(NamedTuple):
+    foo: tl.constexpr
+
+
+T = {cls}
+
+
+@triton.jit
+def kernel(o):
+    tl.store(o, T(3).foo)
+"""
+
+
+def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
+    """A class global (the NamedTuple repro) is keyed by its qualified name:
+    refused by default, launched under `assume_constant_globals=True` with one
+    ClassGlobalWarning per `make_launcher` and none on a launch."""
+    from intj import ClassGlobalWarning
+
+    kernel = _module_kernel(tmp_path / "class_global.py", _CLASS_KERNEL.format(cls="A"))
+    with pytest.raises(UnsupportedKernel, match="assume_constant_globals"):
+        make_launcher(kernel)
+    with pytest.warns(ClassGlobalWarning, match=r"\['class_global\.A'\]") as record:
+        launch = make_launcher(kernel, assume_constant_globals=True)
+    assert len(record) == 1
+    assert record[0].filename == __file__  # stacklevel points at the caller
+    o = torch.zeros(1, device="cuda", dtype=torch.int32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        launch(0, 0, 1, o)  # the miss
+        launch(0, 0, 1, o)  # a hit
+    assert o.item() == 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warnings.filterwarnings("ignore", category=ClassGlobalWarning)
+        make_launcher(kernel, assume_constant_globals=True)  # filterable
+
+
+def test_different_class_globals_never_share_a_module(tmp_path):
+    """Same module name, same kernel source (so the same cache_key): only the
+    class's qualified name in the ModuleKey tells the two apart."""
+    kernels = []
+    for cls in ("A", "B"):
+        (tmp_path / cls).mkdir()
+        path = tmp_path / cls / "class_global.py"
+        kernels.append(_module_kernel(path, _CLASS_KERNEL.format(cls=cls)))
+    assert kernels[0].cache_key == kernels[1].cache_key
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", intj.ClassGlobalWarning)
+        launches = [make_launcher(k, assume_constant_globals=True) for k in kernels]
+    assert module_of(launches[0]) is not module_of(launches[1])
+
+
+_BlockedLayout = gl.BlockedLayout  # a class global, like Triton's layout imports
+
+
+@gluon.jit
+def gluon_class_global(o, BLOCK: gl.constexpr, WARP: gl.constexpr):
+    off = gl.arange(
+        0,
+        BLOCK,
+        layout=_BlockedLayout([1], [WARP], [4], [0]),  # pyright: ignore[reportArgumentType]  # JIT constexpr is an int
+    )
+    gl.store(o + off, off)
+
+
+def test_gluon_layout_class_global_launches():
+    """A Gluon kernel building its layout from a global layout class."""
+    target = triton.runtime.driver.active.get_current_target()
+    assert target is not None
+    warp = target.warp_size
+    with pytest.warns(intj.ClassGlobalWarning, match="BlockedLayout"):
+        launch = make_launcher(gluon_class_global, assume_constant_globals=True)
+    o = torch.full((256,), -1, device="cuda", dtype=torch.int32)
+    launch(0, 0, 1, o, 256, warp)
+    torch.testing.assert_close(o, torch.arange(256, device="cuda", dtype=torch.int32))
 
 
 def test_decorating_under_triton_interpret_succeeds_and_defers_the_refusal():

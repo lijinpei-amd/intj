@@ -21,6 +21,7 @@ import weakref
 from collections.abc import (
     Callable,
     Iterable,
+    Iterator,
     Mapping,
     MutableMapping,
     Sequence,
@@ -81,6 +82,14 @@ def _runtime_headers() -> bytes:
 
 class UnsupportedKernel(NotImplementedError):
     """Raised for kernels or options outside intj's (deliberately small) scope."""
+
+
+class ClassGlobalWarning(RuntimeWarning):
+    """`make_launcher(..., assume_constant_globals=True)` keyed a class global
+    by its qualified name, so replacing that class later goes undetected.
+
+    Silence with `warnings.filterwarnings("ignore", category=ClassGlobalWarning)`.
+    """
 
 
 def _cache_version() -> tuple[int, int]:
@@ -779,6 +788,17 @@ def make_launcher(
         global_values=global_values,
         declared_parameters=tuple(n for n in declared if n in kernel.arg_names),
     )
+    classes = sorted(
+        {".".join(c[1:]) for _, _, v in global_values for c in _class_globals(v)}
+    )
+    if classes:
+        warnings.warn(
+            f"intj: {kernel.fn.__qualname__} reads class global(s) {classes}; intj "
+            "keys a class by its qualified name and will not detect if it is "
+            "replaced (assume_constant_globals=True)",
+            ClassGlobalWarning,
+            stacklevel=2,
+        )
     return factory if needs_binding else factory.bind()
 
 
@@ -1658,7 +1678,21 @@ def _canonical_global(value: object) -> tuple[object, ...]:
             and (member is value or member == value)
         ):
             return ("enum", kind.__module__, kind.__qualname__, name)
+    if isinstance(value, type):
+        # like a JIT callee, by qualified name: the kernel's cache_key already
+        # holds the source using it, and replacing the class is the caller's
+        # promise not to (ClassGlobalWarning says so)
+        return ("class", value.__module__, value.__qualname__)
     return _canonical_value(value)
+
+
+def _class_globals(canonical: tuple[object, ...]) -> Iterator[tuple[str, str, str]]:
+    """The `("class", module, qualname)` entries in a `_canonical_global` result."""
+    if canonical[0] == "class":
+        yield cast(tuple[str, str, str], canonical)
+    elif canonical[0] in ("constexpr", "tuple"):
+        for item in canonical[1:]:
+            yield from _class_globals(cast(tuple[object, ...], item))
 
 
 def _global_values(
@@ -1672,8 +1706,10 @@ def _global_values(
             canonical = _canonical_global(value)
         except ValueError:
             raise UnsupportedKernel(
-                f"intj: global variable {name!r} = {value!r} cannot be part of a "
-                "module key; pass it as an argument instead"
+                f"intj: global variable {name!r} holds a {type(value).__qualname__} "
+                f"({value!r}), which intj cannot canonicalize into a module key "
+                "(supported: tl.constexpr, int, float, bool, str, None, tl.dtype, "
+                "enum members, classes, and tuples of these)"
             ) from None
         values.append((name, str(scope.get("__name__", "")), canonical))
     return tuple(sorted(values, key=lambda item: (item[0], item[1])))

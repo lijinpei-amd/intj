@@ -18,7 +18,7 @@ from .annotation import (
     Specialization,
 )
 from .kernel_cache import KernelCache
-from .launcher import make_launcher
+from .launcher import ClassGlobalWarning, make_launcher
 from .torch_intf.torch_abi import TorchAccessMode
 
 if TYPE_CHECKING:
@@ -37,6 +37,7 @@ __all__ = [
     "KernelCache",
     "TorchAccessMode",
     "make_launcher",
+    "ClassGlobalWarning",
     "Annotation",
     "Argument",
     "Constexpr",
