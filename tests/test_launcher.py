@@ -3174,7 +3174,11 @@ def test_python_annotated_params_compile_like_triton():
     o = torch.zeros(1, device="cuda")
     seen = {}
     for n, w, f, b, m in itertools.product(
-        (1, 16, 17, 0), (1, 32, 3), (1.0, 2.5), (True, False), (1, 16, 7)
+        (1, 16, 17, 0, True, False),
+        (1, 32, 3),
+        (1.0, 2.5, 3),
+        (True, False),
+        (1, 16, 7),
     ):
         args = (o, n, w, f, b, m)
         spec = triton_specialization(python_annotated, args)
@@ -3191,6 +3195,65 @@ def test_python_annotated_params_compile_like_triton():
         }, args
         key, _ = module.spec_key(launch, 0, *args)
         assert seen.setdefault(key, source) == source, args
+
+
+@triton.jit
+def typed_f32(o, x: float):
+    tl.store(o, x.to(tl.float64))  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@triton.jit
+def typed_f64(o, x: tl.float64):  # pyright: ignore[reportInvalidTypeForm]
+    tl.store(o, x)
+
+
+@triton.jit
+def typed_i32(o, x: int):
+    tl.store(o, x.to(tl.float64))  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@triton.jit
+def typed_u64(o, x: tl.uint64):  # pyright: ignore[reportInvalidTypeForm]
+    tl.store(o, x.to(tl.float64))
+
+
+@triton.jit
+def typed_i1(o, x: tl.int1):  # pyright: ignore[reportInvalidTypeForm]
+    tl.store(o, tl.where(x, 1.0, 2.0).to(tl.float64))
+
+
+@triton.jit
+def untyped_store(o, x):
+    tl.store(o, x.to(tl.float64))
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [typed_f32, typed_f64, typed_i32, typed_u64, typed_i1, untyped_store],
+    ids=lambda k: k.__name__,
+)
+def test_annotated_scalar_values_convert_like_triton(kernel):
+    """A Triton-annotated scalar takes Triton's launcher conversion: `3` into a
+    `float` is 3.0, `2.5` into an `int` is a TypeError, out-of-range ints raise
+    OverflowError -- never a reinterpretation of the Python value's bits."""
+    launcher = make_launcher(kernel)
+    values = [3, True, False, 2.5, 2.0, -1, 2**31, 2**40, 2**63, 2**64 - 1, 2**70]
+    values += [1e300, float("nan"), None]
+
+    def result(call, value):
+        o = torch.full((1,), -777.0, device="cuda", dtype=torch.float64)
+        try:
+            call(o, value)
+        except (TypeError, OverflowError) as e:
+            return type(e).__name__
+        return o.item()
+
+    for value in values:
+        if kernel is untyped_store and value is None:
+            continue  # `None.to` does not compile, in either
+        expected = result(lambda o, v: kernel[(1,)](o, v), value)
+        actual = result(lambda o, v: launch(launcher, (1,), o, v), value)
+        assert repr(actual) == repr(expected), (kernel.__name__, value)
 
 
 @triton.jit

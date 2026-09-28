@@ -344,7 +344,10 @@ shorthands work in `extra_annotation`. Any inline type annotation Triton
 recognizes (`int`, `bool`, `float`, `tl.int64`, postponed `"tl.int64"`, ...)
 becomes `Argument(type=<Triton's type>)`, and, as in Triton, its equal-to-1
 fact is `NEVER` under `AUTO`: an annotated integer equal to 1 stays a runtime
-argument. The two sources merge field by field:
+argument. Its values convert as Triton's launcher converts them (`3` into a
+`float` is `3.0`; `2.5` into an `int` raises `TypeError`; an int outside
+64 bits raises `OverflowError`; narrower integers truncate), and
+`verify_annotation` adds no type or range check on top. The two sources merge field by field:
 unspecified fields come from the other source, equal fields agree, and
 conflicting explicit fields raise at `make_launcher`. Triton's
 `do_not_specialize` and `do_not_specialize_on_alignment` are merged into the

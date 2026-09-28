@@ -205,6 +205,9 @@ class CanonicalAnnotation:
     tuned: bool = False
     #: a caller var an autotune layer keys on: keyed by its exact value
     exact_key: bool = False
+    #: the type comes from a Triton annotation (`x: float`): values convert
+    #: the way Triton's launcher extracts them
+    triton_typed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -676,6 +679,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             power,
             bind_value.value if isinstance(bind_value, BindValue) else None,
             tag,
+            triton_typed=bool(triton_type) and kind == "argument",
         )
         resolved.append(ResolvedParam(name, index, annotation, baked))
     return tuple(resolved)

@@ -659,6 +659,57 @@ intj_decode_constexpr(PyObject *o, const char *pname, intj_decoded *out) {
   return 0;
 }
 
+/* A parameter with a Triton type annotation (`x: float`, `n: int`,
+ * `n: tl.uint64`, ...) is converted the way Triton's launcher extracts it --
+ * PyFloat_AsDouble, PyLong_AsLongLong, PyLong_AsUnsignedLongLong -- not
+ * classified by its Python kind: `3` into a float is 3.0, `2.5` into an int
+ * is a TypeError. Exact ints and floats take the fast path; everything else,
+ * including every value those calls reject, goes through CPython for
+ * Triton's own result or error. A bool stays INTJ_VALUE_BOOL so the key can
+ * skip divisibility, which Triton does not derive from a bool. */
+static INTJ_ALWAYS_INLINE int intj_decode_typed_float(PyObject *o,
+                                                      intj_decoded *out) {
+  memset(out, 0, sizeof(*out));
+  double value =
+      PyFloat_CheckExact(o) ? INTJ_FLOAT_VALUE(o) : PyFloat_AsDouble(o);
+  if (INTJ_UNLIKELY(value == -1.0 && PyErr_Occurred()))
+    return -1;
+  out->kind = INTJ_VALUE_FP64;
+  memcpy(&out->bits, &value, sizeof(value));
+  return 0;
+}
+
+static INTJ_ALWAYS_INLINE int
+intj_decode_typed_int(PyObject *o, int is_unsigned, intj_decoded *out) {
+  memset(out, 0, sizeof(*out));
+  if (o == Py_True || o == Py_False) {
+    out->kind = INTJ_VALUE_BOOL;
+    out->bits = (uint64_t)(o == Py_True);
+    return 0;
+  }
+  out->kind = is_unsigned ? INTJ_VALUE_U64 : INTJ_VALUE_I64;
+  if (INTJ_LIKELY(PyLong_CheckExact(o))) {
+    int kind = intj_as_int(o, &out->bits);
+    if (INTJ_LIKELY(is_unsigned
+                        ? kind == INTJ_INT_U64 ||
+                              (kind == INTJ_INT_I64 && (int64_t)out->bits >= 0)
+                        : kind == INTJ_INT_I64))
+      return 0;
+  }
+  if (is_unsigned) {
+    unsigned long long value = PyLong_AsUnsignedLongLong(o);
+    if (value == (unsigned long long)-1 && PyErr_Occurred())
+      return -1;
+    out->bits = (uint64_t)value;
+  } else {
+    long long value = PyLong_AsLongLong(o);
+    if (value == -1 && PyErr_Occurred())
+      return -1;
+    out->bits = (uint64_t)value;
+  }
+  return 0;
+}
+
 static INTJ_ALWAYS_INLINE int intj_finish_tensor(const intj_torch_abi *abi,
                                                  int32_t dtype,
                                                  const char *pname,
