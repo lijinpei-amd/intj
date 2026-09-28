@@ -340,7 +340,11 @@ coerces the Python value.
 Annotations may appear inline on the JIT function or in `extra_annotation`
 under the parameter name. Inline `tl.constexpr` means `Constexpr()`; an inline
 Triton dtype or `None` is shorthand for `Argument(type=...)`. The same
-shorthands work in `extra_annotation`. The two sources merge field by field:
+shorthands work in `extra_annotation`. Any inline type annotation Triton
+recognizes (`int`, `bool`, `float`, `tl.int64`, postponed `"tl.int64"`, ...)
+becomes `Argument(type=<Triton's type>)`, and, as in Triton, its equal-to-1
+fact is `NEVER` under `AUTO`: an annotated integer equal to 1 stays a runtime
+argument. The two sources merge field by field:
 unspecified fields come from the other source, equal fields agree, and
 conflicting explicit fields raise at `make_launcher`. Triton's
 `do_not_specialize` and `do_not_specialize_on_alignment` are merged into the

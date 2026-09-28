@@ -11,6 +11,7 @@ import dataclasses
 import dis
 import gc
 import inspect
+import itertools
 import json
 import os
 import pathlib
@@ -3130,6 +3131,57 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device):
             "intj key collides for annotated ASTSource inputs"
         )
         assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
+
+
+@triton.jit
+def python_annotated(
+    o,
+    n: int,
+    w: tl.int64,  # pyright: ignore[reportInvalidTypeForm]  # a triton dtype
+    f: float,
+    b: bool,
+    m,
+):
+    tl.store(o, (n + w + m).to(tl.float32) + f + b.to(tl.float32))  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_python_annotated_params_compile_like_triton():
+    """Type-annotated parameters get triton's `(annotation,) + specialize[1:]`.
+
+    An `int` or `tl.int64` parameter equal to 1 stays a runtime integer (only
+    divisibility survives), `float`/`bool` are never specialized, and the
+    unannotated `m` still folds 1 -- intj must hand the compiler exactly that.
+    """
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+    from triton.compiler import make_backend
+
+    launch = make_launcher(python_annotated)
+    module = module_of(launch)
+    params, _, _ = _render_params(
+        _resolve_annotations(python_annotated, None), DeviceBinding.NOT_FIXED
+    )
+    backend = make_backend(_current_target())
+    o = torch.zeros(1, device="cuda")
+    seen = {}
+    for n, w, f, b, m in itertools.product(
+        (1, 16, 17, 0), (1, 32, 3), (1.0, 2.5), (True, False), (1, 16, 7)
+    ):
+        args = (o, n, w, f, b, m)
+        spec = triton_specialization(python_annotated, args)
+        expected_attrs = tuple(
+            ((i,), tuple(tuple(attr) for attr in backend.parse_attr(desc)))
+            for i, (_, desc) in enumerate(spec)
+            if isinstance(desc, str) and backend.parse_attr(desc)
+        )
+        source = _compiler_input(python_annotated, params, args, backend)
+        assert [ty for _, ty in source.signature] == [ty for ty, _ in spec], args
+        assert source.attrs == expected_attrs, args
+        assert dict(source.values) == {
+            (i,): args[i] for i, (ty, _) in enumerate(spec) if ty == "constexpr"
+        }, args
+        key, _ = module.spec_key(launch, 0, *args)
+        assert seen.setdefault(key, source) == source, args
 
 
 @triton.jit

@@ -458,10 +458,17 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
     for index, param in enumerate(jit_func.params):
         name = param.name
         raw = param._param.annotation
-        # Preserve Triton's legacy constexpr strings, including postponed annotations.
-        inline = _annotation_source(
-            tl.constexpr if isinstance(raw, str) and param.is_constexpr else raw, name
-        )
+        # The type Triton's binder stamps on the argument: `int`, `bool`, `float`,
+        # `tl.int64`, `"tl.int64"`, pointer types, ... -- whatever it recognizes.
+        triton_type = cast(str, param.annotation_type)
+        if triton_type:
+            inline = Argument(type=tl.str_to_ty(triton_type, None))
+        else:
+            # Preserve Triton's legacy constexpr strings, including postponed annotations.
+            inline = _annotation_source(
+                tl.constexpr if isinstance(raw, str) and param.is_constexpr else raw,
+                name,
+            )
         other = _annotation_source(extra[name], name) if name in extra else None
         if inline is not None and other is not None and type(inline) is not type(other):
             raise ValueError(f"intj: parameter {name!r} has conflicting kind")
@@ -512,6 +519,11 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
                     modes[2],
                 )
             modes = tuple("auto" if mode is UNSET else mode for mode in modes)
+            if triton_type and modes[0] == "auto":
+                # Triton's binder replaces the specialized type of a type-annotated
+                # parameter with the annotation: `("i32",) + specialize_impl(...)[1:]`
+                # keeps divisibility but never folds 1 into a constexpr.
+                modes = ("never",) + modes[1:]
             power = False
         types = _canonical_types(raw_type, kind)
         if (
