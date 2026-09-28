@@ -257,6 +257,9 @@ class LauncherFactory:
     grid_fn: object | None = None
     dynamic: tuple[str, ...] = ()
     global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
+    #: `dynamic_options` naming a tl.constexpr parameter: no slot, and only
+    #: checked to be a compile option once the target is known
+    declared_parameters: tuple[str, ...] = ()
 
     def bind(self, /, **values: object) -> Callable[..., Any]:
         if self.bind_device_requested:
@@ -399,6 +402,7 @@ class LauncherFactory:
             knob_values=knob_values,
             dynamic=self.dynamic,
             global_values=self.global_values,
+            declared_parameters=self.declared_parameters,
         )
         if self.tuned is None:
             callback: Callable[..., Any] = _launcher_compile(module)
@@ -706,8 +710,18 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
-    dynamic = tuple(dynamic_options)
-    _check_dynamic(dynamic, options, kernel, tuned)
+    declared = tuple(dynamic_options)
+    _check_dynamic(declared, options, kernel, tuned)
+    # a tl.constexpr parameter feeds its option on every call already: no slot
+    dynamic = tuple(n for n in declared if n not in kernel.arg_names)
+    constexprs = {p.name for p in kernel.params if p.is_constexpr}
+    clash = sorted(n for n in options if n in constexprs)
+    if clash:
+        raise UnsupportedKernel(
+            f"intj: options {clash} name tl.constexpr parameter(s), whose value is "
+            "that compile option on every call; pass it as the argument, or bake "
+            "it with extra_annotation"
+        )
     deps: Mapping[str, int] | None = None
     if tuned is not None:
         render = _tuning_render(tuned.plan, resolved, grid_cpp, grid_py)
@@ -763,6 +777,7 @@ def make_launcher(
         grid_cpp,
         dynamic=dynamic,
         global_values=global_values,
+        declared_parameters=tuple(n for n in declared if n in kernel.arg_names),
     )
     return factory if needs_binding else factory.bind()
 
@@ -784,6 +799,7 @@ def _materialize_module(
     knob_values: Mapping[str, object] | None = None,
     dynamic: tuple[str, ...] = (),
     global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = (),
+    declared_parameters: tuple[str, ...] = (),
 ) -> types.ModuleType:
     if no_gpu:
         target = None
@@ -803,7 +819,9 @@ def _materialize_module(
         )
         # the names only: each value is canonicalized on its own miss
         _refuse_unknown_options(
-            canonical_options, [n for n in dynamic if not n.startswith("knobs.")]
+            canonical_options,
+            [n for n in dynamic if not n.startswith("knobs.")]
+            + list(declared_parameters),
         )
     params, device_offset, nwords, computed_fields, slots = _render_key(
         resolved,
@@ -1086,9 +1104,11 @@ def _check_dynamic(
                 f"{_KNOB_OVERWRITES[name]!r}; declare that knob path instead"
             )
         elif name in kernel.arg_names:
-            raise UnsupportedKernel(
-                f"intj: dynamic option {name!r} is a kernel parameter"
-            )
+            if not kernel.params[kernel.arg_names.index(name)].is_constexpr:
+                raise UnsupportedKernel(
+                    f"intj: dynamic option {name!r} is a runtime kernel parameter; "
+                    "only a tl.constexpr parameter can also be a compile option"
+                )
     derived = dict(_KNOB_OPTIONS)
     both = sorted(n for n in dynamic if n in options or derived.get(n) in options)
     if both:
@@ -1101,6 +1121,24 @@ def _check_dynamic(
         raise UnsupportedKernel(
             f"intj: dynamic_options {owned} are set by the autotune configs"
         )
+
+
+def _parameter_options(
+    backend: Any, params: Iterable[ResolvedParam | Param]
+) -> tuple[str, ...]:
+    """The tl.constexpr parameters named like one of `backend`'s compile
+    options (`num_warps`, `num_stages`, `waves_per_eu`, ...), which every
+    call's value also sets, as Triton's `k[grid](..., num_warps=8)` does.
+    Not a key field: the parameter's own exact key already tells every value
+    apart.  Options a launch fixes itself stay parameters only."""
+    fields = {f.name for f in dataclasses.fields(backend.parse_options({}))}
+    return tuple(
+        p.name
+        for p in params
+        if p.annotation.kind == "constexpr"
+        and p.name in fields
+        and p.name not in _FORBIDDEN_OPTIONS
+    )
 
 
 def _split_dynamic(
@@ -2187,10 +2225,20 @@ def _make_compile_callback(
 
     target = _current_target()
     backend = make_backend(target)
-    # without dynamic values every record has the same options
+    fed = {p.name: p for p in params if p.name in _parameter_options(backend, params)}
+    options = {
+        **options,
+        **{
+            n: (baked_values or {})[p.index]
+            for n, p in fed.items()
+            if p.call_index is None
+        },
+    }
+    per_call = {n: p.call_index for n, p in fed.items() if p.call_index is not None}
+    # without per-call values every record has the same options
     fixed_options = (
         None
-        if dynamic
+        if dynamic or per_call
         else _canonical_options(target, _knob_options(jit_func, options, knob_values))
     )
     # The module's compile cache: a sibling launcher's miss reuses the kernel
@@ -2218,6 +2266,7 @@ def _make_compile_callback(
             )
         values, args = args[: len(dynamic)], args[len(dynamic) :]
         dyn_options, dyn_knobs = _split_dynamic(dynamic, values)
+        dyn_options.update({n: args[i] for n, i in per_call.items()})
         _check_live_knobs(dyn_knobs)
         canonical = (
             fixed_options

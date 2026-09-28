@@ -2,6 +2,7 @@
 """Triton-style calls routed through the native launcher."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -396,3 +397,20 @@ def test_launch_rejects_unpinned_cpu_tensor_before_gpu_driver_lookup():
 def test_launch_refuses_decorated_kernel(wrap):
     with pytest.raises(UnsupportedKernel, match="expected a @triton.jit function"):
         launch(wrap(unused_pointer), (1,), torch.empty(1, device="cuda"))
+
+
+@triton.jit
+def warps_tag(out, num_warps: tl.constexpr):
+    tl.store(out + tl.arange(0, 64), tl.full([64], num_warps, tl.int32))
+
+
+def test_keyword_naming_a_parameter_and_an_option_sets_both():
+    """Triton parses options from every keyword: `num_warps=8` is the
+    parameter and the compile option."""
+    out = torch.zeros(64, device="cuda", dtype=torch.int32)
+    compiled = launch(warps_tag, (1,), out, num_warps=8, return_compiled=True)
+    assert compiled.metadata.num_warps == 8
+    triton_kernel: Any = warps_tag[(1,)](out, num_warps=8)  # pyright: ignore[reportArgumentType]  # Triton binds the int to the constexpr
+    assert triton_kernel.metadata.num_warps == 8
+    torch.cuda.synchronize()
+    assert (out == 8).all()

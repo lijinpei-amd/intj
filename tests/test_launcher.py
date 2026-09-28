@@ -6008,3 +6008,118 @@ def test_dynamic_invariant_catches_a_dropped_object_id(monkeypatch):
     monkeypatch.setattr(launcher._Interner, "__call__", lambda self, value: 0)
     with pytest.raises(AssertionError, match="collides"):
         check_dynamic_invariant()
+
+
+@triton.jit
+def warps_store(o, num_warps: tl.constexpr, SCALE: tl.constexpr):
+    tl.store(o + tl.arange(0, 64), tl.full([64], num_warps * SCALE, tl.int32))
+
+
+@pytest.mark.parametrize("declared", [(), ("num_warps",)], ids=["plain", "declared"])
+def test_constexpr_option_parameter_feeds_the_option(declared):
+    """A `num_warps: tl.constexpr` parameter is also the compile option, as
+    Triton's `k[grid](o, num_warps=8)` makes it: one record per value, each
+    compiled with that many warps.  Declaring it in dynamic_options adds nothing."""
+    launch = make_launcher(warps_store, dynamic_options=declared, return_compiled=True)
+    assert tuple(inspect.signature(launch).parameters)[3:] == (
+        "o",
+        "num_warps",
+        "SCALE",
+    )
+    o = torch.zeros(64, device="cuda", dtype=torch.int32)
+    records = {}
+    for warps in (2, 4, 8):
+        records[warps] = launch(*_gpu_controls(), o, warps, 1)
+        assert records[warps].metadata.num_warps == warps
+        torch.cuda.synchronize()
+        assert (o == warps).all()
+    assert len({id(r) for r in records.values()}) == 3
+    assert launch(*_gpu_controls(), o, 2, 1) is records[2]
+
+
+def test_baked_constexpr_option_parameter_feeds_its_value():
+    launch = make_launcher(
+        warps_store,
+        extra_annotation={"num_warps": Constexpr(value=8)},
+        return_compiled=True,
+    )
+    o = torch.zeros(64, device="cuda", dtype=torch.int32)
+    assert launch(*_gpu_controls(), o, 3).metadata.num_warps == 8
+    torch.cuda.synchronize()
+    assert (o == 24).all()
+
+
+def test_static_option_naming_a_constexpr_parameter_is_refused():
+    with pytest.raises(UnsupportedKernel, match=r"options \['num_warps'\] name"):
+        make_launcher(warps_store, options={"num_warps": 8})
+
+
+def test_dynamic_constexpr_parameter_that_is_no_option_is_refused():
+    launch = make_launcher(warps_store, dynamic_options=("SCALE",))
+    o = torch.zeros(64, device="cuda", dtype=torch.int32)
+    with pytest.raises(
+        UnsupportedKernel, match=r"unknown compile option\(s\) \['SCALE'\]"
+    ):
+        launch(*_gpu_controls(), o, 4, 1)
+
+
+@triton.jit
+def option_axpy(
+    o, x, n, num_warps: tl.constexpr, num_stages: tl.constexpr, BLOCK: tl.constexpr
+):
+    offs = tl.arange(0, BLOCK)
+    tl.store(o + offs, tl.load(x + offs, mask=offs < n) * num_stages, mask=offs < n)
+
+
+def check_option_parameter_invariant():
+    """Same key => same annotated ASTSource and same canonical options, the
+    options being what Triton's keyword call makes of the parameters; and the
+    launcher really compiles with them."""
+    from triton.compiler import make_backend
+
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import (
+        _canonical_options,
+        _compiler_input,
+        _current_target,
+        _knob_options,
+        _live_knobs,
+        _render_params,
+    )
+
+    launch = make_launcher(option_axpy, return_compiled=True)
+    module, device = module_of(launch), torch.cuda.current_device()
+    params, _, _ = _render_params(
+        _resolve_annotations(option_axpy, None), DeviceBinding.NOT_FIXED
+    )
+    target = _current_target()
+    backend, knobs_now = make_backend(target), _live_knobs()
+    x = torch.randn(64, device="cuda")
+    o = torch.empty_like(x)
+    seen = {}
+    for warps, stages, block in itertools.product((2, 4), (1, 2), (64, 128)):
+        public = (o, x, 64, warps, stages, block)
+        options = {"num_warps": warps, "num_stages": stages}
+        key, _ = module.spec_key(launch, device, *public)
+        truth = (
+            _compiler_input(option_axpy, params, public, backend),
+            _canonical_options(
+                target, _knob_options(option_axpy, options, knobs_now)
+            ).hash(),
+        )
+        assert seen.setdefault(key, truth) == truth, "intj key collides"
+        md = launch(*_gpu_controls(), *public).metadata
+        assert (md.num_warps, md.num_stages) == (warps, stages), "option not fed"
+
+
+def test_option_parameters_are_never_coarser_than_triton():
+    check_option_parameter_invariant()
+
+
+def test_option_parameter_invariant_catches_an_unfed_option(monkeypatch):
+    # the key is unchanged, so a fresh module table keeps the loaded module's
+    # compile function (built unmutated) out of the way
+    monkeypatch.setattr(launcher, "_LOADED", {})
+    monkeypatch.setattr(launcher, "_parameter_options", lambda backend, params: ())
+    with pytest.raises(AssertionError, match="option not fed"):
+        check_option_parameter_invariant()
