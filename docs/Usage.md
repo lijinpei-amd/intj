@@ -446,7 +446,15 @@ one kernel, and two JIT functions with the same source share one kernel. Each va
 small id from a table owned by the launcher (never persisted, never in the
 module digest); each argument slot remembers its last object, so passing the
 same object again costs one pointer compare (free-threaded builds also take
-the launcher's read lock for it). A JIT function's `cache_key` is
+the launcher's read lock for it). Behind that, the launcher keeps a table in
+C of every value it has already seen: a `str` by content, a `tl.dtype` by its
+`name` (so a `tl.dtype("fp16")` built per call finds the entry, and the
+`str` `"fp16"` stays a different value), a JIT function by identity.
+Alternating between known values therefore stays in C; only a new value calls
+into Python. The table has no cap, and each distinct JIT function object
+adds an entry held for the launcher's lifetime: building a
+`triton.jit(...)` object per call grows it without bound (Triton keeps its
+own registry of every such object too). A JIT function's `cache_key` is
 read when the function is first seen, so later edits to a callee are not seen
 -- Triton has the same limitation. Baking the value with `extra_annotation`
 still works and removes it from the call.

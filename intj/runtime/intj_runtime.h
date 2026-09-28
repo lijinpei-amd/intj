@@ -307,6 +307,7 @@ static PyObject *intj_str_dtype;
 static PyObject *intj_str_data_ptr;
 static PyObject *intj_str_untyped_storage;
 static PyObject *intj_str_nbytes;
+static PyObject *intj_str_name; /* tl.dtype's, for the object table */
 
 #if defined(INTJ_TORCH_ACCESS_RUNTIME_SHIM)
 
@@ -531,8 +532,9 @@ static inline int intj_intern_names(void) {
   intj_str_data_ptr = PyUnicode_InternFromString("data_ptr");
   intj_str_untyped_storage = PyUnicode_InternFromString("untyped_storage");
   intj_str_nbytes = PyUnicode_InternFromString("nbytes");
+  intj_str_name = PyUnicode_InternFromString("name");
   return (intj_str_dtype && intj_str_data_ptr && intj_str_untyped_storage &&
-          intj_str_nbytes)
+          intj_str_nbytes && intj_str_name)
              ? 0
              : -1;
 }
@@ -705,17 +707,41 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
 
 typedef intj_bound_header intj_bound_launcher;
 
-/* An object-valued slot's last object and its interned id.
- * ponytail: one entry per slot, so a site alternating two objects in one slot
- * calls the interner on every launch; add a second entry if real sites (or
- * bench_launch.py --dynamic) show that pattern. */
+/* An object-valued slot's last object and its interned id. */
 typedef struct {
   PyObject *obj;
   uint64_t id;
 } intj_memo;
 
-/* The trailing arrays: memos first, then one entry per bound parameter. */
+/* The launcher's second tier, behind the memos: values the interner has
+ * already answered, in an open-addressing table.  An exact str is keyed by
+ * content (cached hash, then kind, length and bytes); a tl.dtype by its
+ * `name`'s content, read when that object is first seen, under a tag of its
+ * own; every non-str the interner answered also by identity, so a known
+ * dtype object skips reading `name`.  Every key is held by a strong
+ * reference, so an address cannot come back as another value.  Ids still
+ * come only from the Python interner.
+ * ponytail: no cap.  Anything keyed by identity only (a JIT function) adds an
+ * entry per distinct object, so a site building a JIT function per call grows
+ * the table for the launcher's life, as it grows triton's own registry. */
+enum { INTJ_OBJ_EMPTY, INTJ_OBJ_SAME, INTJ_OBJ_STR, INTJ_OBJ_DTYPE };
 typedef struct {
+  PyObject *ref; /* SAME: the object; STR / DTYPE: the str keyed by content */
+  Py_hash_t hash;
+  uint64_t id;
+  uint64_t tag;
+} intj_objent;
+typedef struct {
+  intj_objent *e; /* NULL until the first insert */
+  size_t mask;    /* capacity - 1, a power of two */
+  size_t n;
+  PyObject *dtype_type; /* the interner's `dtype_type`; NULL: none */
+} intj_objtab;
+
+/* The trailing arrays: the object table, memos, then one entry per bound
+ * parameter. */
+typedef struct {
+  intj_objtab objtab;
   intj_memo memo[INTJ_MEMO_SLOTS];
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
@@ -723,76 +749,242 @@ typedef struct {
 } intj_bound_tail;
 /* launcher._tail_bytes computes the same size for _intj_lazy's allocation. */
 static_assert(sizeof(intj_bound_tail) ==
-                  16 * INTJ_MEMO_SLOTS + 24 * INTJ_BOUND_SLOTS,
+                  32 + 16 * INTJ_MEMO_SLOTS + 24 * INTJ_BOUND_SLOTS,
               "intj: bound tail layout");
 #define INTJ_TAIL(b)                                                           \
   ((intj_bound_tail *)((char *)(b) + sizeof(intj_bound_header)))
 
-/* An object value's id: one pointer compare when this slot saw the same object
- * last, else the launcher's intern table (Python, cold).  The memo holds a
- * strong reference, so a memoized object's address cannot come back as another
- * value.  Free-threaded, the (obj, id) pair is read under the launcher lock's
- * read side: a writer replaces both, and two plain loads could pair them
- * wrongly.  With the GIL the lock compiles away. */
-static inline int intj_object_id_slow(PyObject *intern, intj_rwlock *lock,
-                                      intj_memo *memo, PyObject *o,
-                                      const char *pname, uint64_t *id) {
-  /* never NULL: init_bound sets it before publishing the launcher, and only
-   * tp_clear drops it, after the entry and spec_key stop reaching it */
-  PyObject *r = PyObject_CallFunctionObjArgs(intern, o, NULL);
-  if (!r)
-    return -1;
-  if (r == Py_None) {
-    Py_DECREF(r);
-    PyErr_Format(PyExc_TypeError,
-                 "intj: unsupported argument '%s' of type %s; pass a scalar "
-                 "int, float, bool or None, a str, a tl.dtype or a "
-                 "@triton.jit function",
-                 pname, Py_TYPE(o)->tp_name);
-    return -1;
+static inline Py_hash_t intj_pointer_hash(PyObject *o) {
+  return (Py_hash_t)((uintptr_t)o >> 4);
+}
+
+/* Equal exact strs; the caller has compared hashes. */
+static inline int intj_str_equal(PyObject *a, PyObject *b) {
+  Py_ssize_t n = PyUnicode_GET_LENGTH(a);
+  int kind = (int)PyUnicode_KIND(a);
+  return n == PyUnicode_GET_LENGTH(b) && kind == (int)PyUnicode_KIND(b) &&
+         memcmp(PyUnicode_DATA(a), PyUnicode_DATA(b), (size_t)n * kind) == 0;
+}
+
+/* The entry for (tag, key), or NULL.  Under the read lock. */
+static inline intj_objent *intj_objtab_find(const intj_objtab *t, uint64_t tag,
+                                            Py_hash_t hash, PyObject *key) {
+  if (!t->e)
+    return NULL;
+  for (size_t i = (size_t)hash & t->mask;; i = (i + 1) & t->mask) {
+    intj_objent *e = &t->e[i];
+    if (e->tag == INTJ_OBJ_EMPTY)
+      return NULL;
+    if (e->tag == tag && e->hash == hash &&
+        (e->ref == key ||
+         (tag != INTJ_OBJ_SAME && intj_str_equal(e->ref, key))))
+      return e;
   }
-  uint64_t value = PyLong_AsUnsignedLongLong(r);
-  Py_DECREF(r);
-  if (value == (uint64_t)-1 && PyErr_Occurred())
-    return -1;
-  Py_INCREF(o);
-  INTJ_WRLOCK(lock);
-  PyObject *old = memo->obj;
-  memo->obj = o;
-  memo->id = value;
-  INTJ_RWUNLOCK(lock);
-  Py_XDECREF(old); /* outside the lock: a finalizer can run Python */
-  *id = value;
+}
+
+/* Record (tag, key) -> id, taking the reference `key`; 0 when not taken (the
+ * key is already there, or growing failed: still correct, the interner keeps
+ * answering).  Under the write lock; allocates, runs no Python.  Load stays
+ * at most one half, so a probe always ends on an empty slot. */
+static inline int intj_objtab_add(intj_objtab *t, uint64_t tag, Py_hash_t hash,
+                                  PyObject *key, uint64_t id) {
+  if (intj_objtab_find(t, tag, hash, key))
+    return 0;
+  size_t cap = t->e ? t->mask + 1 : 0;
+  if (2 * (t->n + 1) > cap) {
+    size_t grown = cap ? 2 * cap : 8;
+    intj_objent *e = (intj_objent *)calloc(grown, sizeof(intj_objent));
+    if (!e)
+      return 0;
+    for (size_t j = 0; j < cap; j++) {
+      if (t->e[j].tag == INTJ_OBJ_EMPTY)
+        continue;
+      size_t i = (size_t)t->e[j].hash & (grown - 1);
+      while (e[i].tag != INTJ_OBJ_EMPTY)
+        i = (i + 1) & (grown - 1);
+      e[i] = t->e[j];
+    }
+    free(t->e);
+    t->e = e;
+    t->mask = grown - 1;
+  }
+  size_t i = (size_t)hash & t->mask;
+  while (t->e[i].tag != INTJ_OBJ_EMPTY)
+    i = (i + 1) & t->mask;
+  t->e[i].ref = key;
+  t->e[i].hash = hash;
+  t->e[i].id = id;
+  t->e[i].tag = tag;
+  t->n++;
+  return 1;
+}
+
+static inline int intj_objtab_visit(intj_objtab *t, visitproc visit,
+                                    void *arg) {
+  Py_VISIT(t->dtype_type);
+  for (size_t i = 0; t->e && i <= t->mask; i++)
+    if (t->e[i].tag != INTJ_OBJ_EMPTY)
+      Py_VISIT(t->e[i].ref);
   return 0;
 }
 
-static INTJ_ALWAYS_INLINE int intj_object_id(PyObject *intern,
-                                             intj_rwlock *lock, intj_memo *memo,
-                                             PyObject *o, const char *pname,
-                                             uint64_t *id) {
-  INTJ_RDLOCK(lock);
+static inline void intj_objtab_clear(intj_objtab *t) {
+  intj_objent *e = t->e;
+  size_t cap = e ? t->mask + 1 : 0;
+  t->e = NULL;
+  t->mask = t->n = 0;
+  Py_CLEAR(t->dtype_type);
+  for (size_t i = 0; i < cap; i++)
+    if (e[i].tag != INTJ_OBJ_EMPTY)
+      Py_DECREF(e[i].ref);
+  free(e);
+}
+
+/* Point `memo` at `o` (id `value`); when `same`, record `o` by identity; when
+ * `key` (an owned reference) is set, record it under `tag` by content.
+ * References are taken before the write lock and dropped after it: a
+ * finalizer can run Python. */
+static inline void intj_object_remember(intj_bound_launcher *bound,
+                                        intj_memo *memo, PyObject *o,
+                                        uint64_t value, int same, uint64_t tag,
+                                        Py_hash_t hash, PyObject *key) {
+  intj_objtab *t = &INTJ_TAIL(bound)->objtab;
+  Py_INCREF(o);
+  if (same)
+    Py_INCREF(o);
+  INTJ_WRLOCK(&bound->lock);
+  PyObject *old = memo->obj;
+  memo->obj = o;
+  memo->id = value;
+  if (same && intj_objtab_add(t, INTJ_OBJ_SAME, intj_pointer_hash(o), o, value))
+    same = 0;
+  if (key && intj_objtab_add(t, tag, hash, key, value))
+    key = NULL;
+  INTJ_RWUNLOCK(&bound->lock);
+  if (same)
+    Py_DECREF(o);
+  Py_XDECREF(key);
+  Py_XDECREF(old);
+}
+
+/* A hit in the object table, or 0.  Free-threaded, under the read lock. */
+static inline int intj_objtab_lookup(intj_bound_launcher *bound, uint64_t tag,
+                                     Py_hash_t hash, PyObject *key,
+                                     uint64_t *value) {
+  INTJ_RDLOCK(&bound->lock);
+  intj_objent *e = intj_objtab_find(&INTJ_TAIL(bound)->objtab, tag, hash, key);
+  if (e)
+    *value = e->id;
+  INTJ_RWUNLOCK(&bound->lock);
+  return e != NULL;
+}
+
+/* An object value's id: one pointer compare when this slot saw the same object
+ * last, else the launcher's object table, else its intern table (Python,
+ * cold).  The memo and the table hold strong references, so a remembered
+ * object's address cannot come back as another value.  Free-threaded, both
+ * are read under the launcher lock's read side: a writer replaces an (obj, id)
+ * pair, and two plain loads could pair them wrongly.  With the GIL the lock
+ * compiles away. */
+static inline int intj_object_id_slow(intj_bound_launcher *bound,
+                                      intj_memo *memo, PyObject *o,
+                                      const char *pname, uint64_t *id) {
+  intj_objtab *t = &INTJ_TAIL(bound)->objtab;
+  uint64_t value = 0;
+  uint64_t tag = INTJ_OBJ_SAME; /* the content key's tag; SAME: none */
+  PyObject *key = NULL;         /* owned: the str keyed by content */
+  Py_hash_t hash = 0;
+  if (PyUnicode_CheckExact(o)) {
+    tag = INTJ_OBJ_STR;
+    key = Py_NewRef(o);
+  } else {
+    if (intj_objtab_lookup(bound, INTJ_OBJ_SAME, intj_pointer_hash(o), o,
+                           &value))
+      goto hit;
+    /* dtype_type: set by init_bound, dropped only by tp_clear */
+    if (t->dtype_type && PyObject_TypeCheck(o, (PyTypeObject *)t->dtype_type)) {
+      key = PyObject_GetAttr(o, intj_str_name);
+      if (!key)
+        return -1;
+      if (PyUnicode_CheckExact(key))
+        tag = INTJ_OBJ_DTYPE;
+      else
+        Py_CLEAR(key); /* the interner decides */
+    }
+  }
+  if (key) {
+#if PY_VERSION_HEX < 0x030C0000
+    if (PyUnicode_READY(key) < 0)
+      goto fail;
+#endif
+    hash = PyObject_Hash(key); /* cached in the str after the first call */
+    if (hash == -1)
+      goto fail;
+    if (intj_objtab_lookup(bound, tag, hash, key, &value)) {
+      Py_DECREF(key);
+      goto hit;
+    }
+  }
+  {
+    /* never NULL: init_bound sets it before publishing the launcher, and only
+     * tp_clear drops it, after the entry and spec_key stop reaching it */
+    PyObject *r = PyObject_CallFunctionObjArgs(bound->intern, o, NULL);
+    if (!r)
+      goto fail;
+    if (r == Py_None) {
+      Py_DECREF(r);
+      PyErr_Format(PyExc_TypeError,
+                   "intj: unsupported argument '%s' of type %s; pass a scalar "
+                   "int, float, bool or None, a str, a tl.dtype or a "
+                   "@triton.jit function",
+                   pname, Py_TYPE(o)->tp_name);
+      goto fail;
+    }
+    value = PyLong_AsUnsignedLongLong(r);
+    Py_DECREF(r);
+    if (value == (uint64_t)-1 && PyErr_Occurred())
+      goto fail;
+  }
+  intj_object_remember(bound, memo, o, value, tag != INTJ_OBJ_STR, tag, hash,
+                       key);
+  *id = value;
+  return 0;
+hit:
+  intj_object_remember(bound, memo, o, value, 0, 0, 0, NULL);
+  *id = value;
+  return 0;
+fail:
+  Py_XDECREF(key);
+  return -1;
+}
+
+static INTJ_ALWAYS_INLINE int intj_object_id(intj_bound_launcher *bound,
+                                             intj_memo *memo, PyObject *o,
+                                             const char *pname, uint64_t *id) {
+  INTJ_RDLOCK(&bound->lock);
   int hit = memo->obj == o;
   uint64_t value = memo->id;
-  INTJ_RWUNLOCK(lock);
+  INTJ_RWUNLOCK(&bound->lock);
   if (INTJ_LIKELY(hit)) {
     *id = value;
     return 0;
   }
-  return intj_object_id_slow(intern, lock, memo, o, pname, id);
+  return intj_object_id_slow(bound, memo, o, pname, id);
 }
 
 /* A constexpr value: scalars as intj_decode_constexpr, anything else as an
- * object id from the launcher's table, memoized in its slot. */
-static INTJ_ALWAYS_INLINE int
-intj_decode_value(PyObject *o, const char *pname, PyObject *intern,
-                  intj_rwlock *lock, intj_memo *memo, intj_decoded *out) {
+ * object id from the launcher's tables, memoized in its slot. */
+static INTJ_ALWAYS_INLINE int intj_decode_value(PyObject *o, const char *pname,
+                                                intj_bound_launcher *bound,
+                                                intj_memo *memo,
+                                                intj_decoded *out) {
   PyTypeObject *type = Py_TYPE(o);
   if (type == &PyLong_Type || type == &PyFloat_Type || type == &PyBool_Type ||
       o == Py_None)
     return intj_decode_constexpr(o, pname, out);
   memset(out, 0, sizeof(*out));
   out->kind = INTJ_VALUE_OBJECT;
-  return intj_object_id(intern, lock, memo, o, pname, &out->bits);
+  return intj_object_id(bound, memo, o, pname, &out->bits);
 }
 
 /* The header's cache storage, typed.  Never accessed any other way.  The

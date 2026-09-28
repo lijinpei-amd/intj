@@ -301,8 +301,8 @@ INTJ_B_PTR({{ 'st->abi.dtype_index[' ~ matches[0][1] ~ ']' if matches else '0' }
     } else {
       /* every auto-path constexpr is untyped and public, so it has a memo */
       code = INTJ_B_CX_OBJECT;
-      if (intj_object_id(bound->intern, &bound->lock, &INTJ_TAIL(bound)->memo[{{ p.memo }}],
-                         o, intj_param_names[{{ p.index }}], &bits) != 0)
+      if (intj_object_id(bound, &INTJ_TAIL(bound)->memo[{{ p.memo }}], o,
+                         intj_param_names[{{ p.index }}], &bits) != 0)
         return -1;
     }
 {{ key_accumulate(payload[0], 'bits') }}
@@ -366,8 +366,8 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
                                intj_param_names[{{ i }}], &{{ d }}) != 0)
     return -1;
 {% elif a.kind == 'constexpr' and p.memo is not none %}
-  if (intj_decode_value(args[{{ p.call_index }}], intj_param_names[{{ i }}], bound->intern,
-                        &bound->lock, &INTJ_TAIL(bound)->memo[{{ p.memo }}], &{{ d }}) != 0)
+  if (intj_decode_value(args[{{ p.call_index }}], intj_param_names[{{ i }}], bound,
+                        &INTJ_TAIL(bound)->memo[{{ p.memo }}], &{{ d }}) != 0)
     return -1;
 {% elif a.kind == 'constexpr' %}
   if (intj_decode_constexpr(args[{{ p.call_index }}], intj_param_names[{{ i }}], &{{ d }}) != 0)
@@ -505,7 +505,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% for slot in dynamic %}
   {
     intj_decoded dv;
-    if (intj_decode_value(dyn[{{ loop.index0 }}], "{{ slot.name }}", bound->intern, &bound->lock,
+    if (intj_decode_value(dyn[{{ loop.index0 }}], "{{ slot.name }}", bound,
                           &INTJ_TAIL(bound)->memo[{{ slot.memo }}], &dv) != 0)
       return -1;
 {% if slot.value_offset is not none %}
@@ -1347,6 +1347,11 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
   Py_VISIT(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_VISIT(tail->memo[k].obj);
+  {
+    int err = intj_objtab_visit(&tail->objtab, visit, arg);
+    if (err)
+      return err;
+  }
   for (int i = 0; i < INTJ_NBOUND; i++)
     Py_VISIT(tail->owners[i]);
 {% if (return_compiled or (tuned and grid_py_mode)) and nwords %}
@@ -1376,6 +1381,7 @@ static int intj_bound_clear(PyObject *self) {
   Py_CLEAR(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_CLEAR(tail->memo[k].obj);
+  intj_objtab_clear(&tail->objtab);
   for (int i = 0; i < INTJ_NBOUND; i++) {
     Py_CLEAR(tail->owners[i]);
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
@@ -1458,6 +1464,18 @@ static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     bound->module = Py_NewRef(self);
     bound->compile_cb = Py_NewRef(callback);
     bound->intern = Py_NewRef(interner);
+    {
+      /* optional: the type the object table keys by `name` (tl.dtype) */
+      PyObject *dtype_type = PyObject_GetAttrString(interner, "dtype_type");
+      if (dtype_type && PyType_Check(dtype_type))
+        INTJ_TAIL(bound)->objtab.dtype_type = dtype_type;
+      else if (dtype_type)
+        Py_DECREF(dtype_type);
+      else if (PyErr_ExceptionMatches(PyExc_AttributeError))
+        PyErr_Clear();
+      else
+        goto fail;
+    }
 {% if grid_py_mode %}
     bound->grid_py = Py_NewRef(args[0]);
     bound->grid_hidden = Py_NewRef(args[1]);

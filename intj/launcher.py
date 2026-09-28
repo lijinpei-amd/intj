@@ -866,9 +866,10 @@ def _stub() -> types.ModuleType:
 
 
 def _tail_bytes(nmemo: int, nbound: int) -> int:
-    """sizeof(intj_bound_tail) in intj_runtime.h: 16 per memo and 24 per bound
-    slot, each at least one.  The rendered module static_asserts the same."""
-    return 16 * max(nmemo, 1) + 24 * max(nbound, 1)
+    """sizeof(intj_bound_tail) in intj_runtime.h: 32 for the object table, 16
+    per memo and 24 per bound slot, each at least one.  The rendered module
+    static_asserts the same."""
+    return 32 + 16 * max(nmemo, 1) + 24 * max(nbound, 1)
 
 
 def module_of(launcher: Callable[..., Any]) -> types.ModuleType:
@@ -1775,11 +1776,18 @@ class _Interner:
     a `ModuleKey`.  A JIT function's `cache_key` is read once, when its object
     is first seen, as triton does.  New ids are taken under this table's own
     lock rather than the launcher's C write lock: same effect, and the C side
-    never holds a lock while calling Python."""
+    never holds a lock while calling Python.
+
+    C asks this table only on a miss in its own object table, which keys
+    what it has already answered: a str by content, an instance of
+    `dtype_type` by its `name`, anything else by identity."""
 
     def __init__(self) -> None:
+        import triton.language as tl
+
         self._ids: dict[tuple[object, ...], int] = {}
         self._lock = threading.Lock()
+        self.dtype_type: type = tl.dtype  # read once by init_bound
 
     def __call__(self, value: object) -> int | None:
         try:

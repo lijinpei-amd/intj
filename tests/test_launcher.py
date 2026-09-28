@@ -3400,6 +3400,114 @@ def test_unsupported_object_constexpr_names_the_parameter():
     assert o.item() == -2.0
 
 
+def _count_interner(monkeypatch):
+    """Count calls into the Python interner, still answering them."""
+    calls = []
+    real = launcher._Interner.__call__
+
+    def counted(self, value):
+        calls.append(value)
+        return real(self, value)
+
+    monkeypatch.setattr(launcher._Interner, "__call__", counted)
+    return calls
+
+
+def test_alternating_objects_skip_the_interner(monkeypatch):
+    """A slot switching between known objects is answered by the C object
+    table: after warmup, no interner call, and each value keeps its key."""
+    calls = _count_interner(monkeypatch)
+    act, cast = make_launcher(act_store), make_launcher(cast_store)
+    act_module, cast_module = module_of(act), module_of(cast)
+    o = torch.zeros(1, device="cuda")
+    neg, pos = (act_module.spec_key(act, 0, o, 2.0, v)[0] for v in ("neg", "pos"))
+    i32, f32 = (
+        cast_module.spec_key(cast, 0, o, 2.0, v)[0] for v in (tl.int32, tl.float32)
+    )
+    assert neg != pos and i32 != f32 and len(calls) == 4
+    del calls[:]
+    for _ in range(5):
+        assert act_module.spec_key(act, 0, o, 2.0, "neg")[0] == neg
+        assert act_module.spec_key(act, 0, o, 2.0, "pos")[0] == pos
+        assert cast_module.spec_key(cast, 0, o, 2.0, tl.int32)[0] == i32
+        assert cast_module.spec_key(cast, 0, o, 2.0, tl.float32)[0] == f32
+    assert calls == []
+    for act_value, want in (("neg", -2.0), ("pos", 2.0), ("neg", -2.0)):
+        act(*_gpu_controls(), o, 2.0, act_value)
+        torch.cuda.synchronize()
+        assert o.item() == want
+
+
+def test_equal_strs_share_an_id_in_c(monkeypatch):
+    """Another str object with equal content hits the table by content; one
+    of equal length, kind and different bytes does not."""
+    calls = _count_interner(monkeypatch)
+    launch = make_launcher(act_store)
+    module = module_of(launch)
+    o = torch.zeros(1, device="cuda")
+    wide = "\u043d\u0435\u0433"  # a 2-byte-kind str
+    keys = {v: module.spec_key(launch, 0, o, 2.0, v)[0] for v in ("neg", "pos", wide)}
+    del calls[:]
+    for value in ("neg", "pos", wide):
+        again = "".join(list(value))  # equal content, another object
+        assert again is not value
+        assert module.spec_key(launch, 0, o, 2.0, again)[0] == keys[value]
+    assert calls == []
+    for other in ("gen", "\u0433\u0435\u043d"):  # same length and kind as a known str
+        key = module.spec_key(launch, 0, o, 2.0, other)[0]
+        assert key not in keys.values()
+    assert len(calls) == 2
+
+
+def test_fresh_dtype_objects_hit_by_name(monkeypatch):
+    """A tl.dtype built per call hits the entry for its name: no interner
+    call, and the table keeps none of those objects.  A str spelling the
+    same name is another value."""
+    calls = _count_interner(monkeypatch)
+    launch = make_launcher(act_store)
+    module = module_of(launch)
+    o = torch.zeros(1, device="cuda")
+    fp16 = module.spec_key(launch, 0, o, 2.0, tl.float16)[0]
+    fp32 = module.spec_key(launch, 0, o, 2.0, tl.float32)[0]
+    del calls[:]
+    refs = []
+    for _ in range(5):
+        for name, key in (("fp16", fp16), ("fp32", fp32)):
+            fresh = tl.dtype(name)
+            assert fresh is not tl.float16 and fresh is not tl.float32
+            assert module.spec_key(launch, 0, o, 2.0, fresh)[0] == key
+            refs.append(weakref.ref(fresh))
+            del fresh
+    assert calls == []
+    gc.collect()
+    assert sum(r() is not None for r in refs) == 1  # the memo's, nothing else
+    assert module.spec_key(launch, 0, o, 2.0, "fp16")[0] not in (fp16, fp32)
+    assert calls == ["fp16"]
+
+
+def test_object_table_references_die_with_the_launcher(monkeypatch):
+    """An object the table holds (and the memo no longer does) is released
+    when the launcher is collected.  A fresh tl.dtype, not a JIT function:
+    triton keeps every JITFunction in a registry of its own."""
+    monkeypatch.setattr(launcher, "_LOADED", {})
+    launch = make_launcher(cast_store)
+    module = module_of(launch)
+    o = torch.zeros(1, device="cuda")
+    dt = tl.dtype("int32")
+    assert dt is not tl.int32
+    key = module.spec_key(launch, 0, o, 2.0, dt)[0]
+    module.spec_key(launch, 0, o, 2.0, tl.float32)  # the memo moves on
+    dt_ref, launch_ref = weakref.ref(dt), weakref.ref(launch)
+    del dt
+    gc.collect()
+    assert dt_ref() is not None  # the table holds it
+    assert module.spec_key(launch, 0, o, 2.0, tl.int32)[0] == key
+    launcher._LOADED.clear()
+    del launch, module
+    gc.collect()
+    assert launch_ref() is None and dt_ref() is None
+
+
 @triton.jit
 def annotated_store(o, x):
     tl.store(o, x)

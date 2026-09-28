@@ -249,6 +249,22 @@ and the key carries the id.
   code and no lock (a free-threaded build takes the read side of the
   launcher's own rwlock). This covers literals, interned strings, dtype singletons,
   and repeated JIT objects.
+- **Object table:** on a memo miss, C probes the launcher's hash table of
+  values the interner has already answered, each key held by a strong
+  reference, before calling Python:
+  - an exact `str` by content: its cached hash, then kind, length and bytes,
+    so an equal string from another object hits;
+  - a `tl.dtype` (the interner's `dtype_type`) by identity, then by its
+    `name` string's content under a tag of its own, so a fresh
+    `tl.dtype("fp16")` hits the entry of the first fp16 and a `str` `"fp16"`
+    never does. `name` is read when an object is first seen;
+  - anything else (JIT functions) by identity.
+
+  A hit moves the memo to the object and calls no Python. The table is read
+  under the launcher's read lock; GC traverses and clears its references.
+  There is no cap: per-call dtype objects and equal strings add nothing, but
+  each distinct JIT function object adds an identity entry for the
+  launcher's life. Ids still come only from the interner.
 - **New object:**
   - Python computes the canonical tuple outside any lock. For a JIT function
     this reads `cache_key`.
@@ -256,8 +272,9 @@ and the key carries the id.
     - `str` content hashes use CPython's cached hash, so this is cheap.
     - Equality is by value.
   - A new tuple takes the next id under the launcher's write lock.
-  - The memo moves to the new object, and the old reference is released
-    outside the lock.
+  - The memo moves to the new object and the table records it (both
+    references taken before the write lock); the old memo reference is
+    released outside the lock.
 - **Equality:** equal content gets the same id whichever object carries it,
   which matches Triton's constexpr semantics.
 - **Scope:** ids are per launcher and per process, because each launcher also
