@@ -1608,12 +1608,18 @@ def _canonical_global(value: object) -> tuple[object, ...]:
     kind = type(value)
     members = getattr(kind, "__members__", None)
     name = getattr(value, "name", None)
-    if (
-        isinstance(members, Mapping)
-        and type(name) is str
-        and cast(Mapping[str, object], members).get(name) is value
-    ):
-        return ("enum", kind.__module__, kind.__qualname__, name)
+    if isinstance(members, Mapping) and type(name) is str:
+        member = cast(Mapping[str, object], members).get(name)
+        # `is` covers Python's enum.Enum (members are singletons); `==` also
+        # accepts a pybind11 enum member that Triton recorded as a deepcopy,
+        # which is `==` but not `is` its live member (deepcopy makes a new
+        # object; a pybind11 enum has no `__deepcopy__` to keep it a singleton).
+        if (
+            member is not None
+            and type(member) is kind
+            and (member is value or member == value)
+        ):
+            return ("enum", kind.__module__, kind.__qualname__, name)
     return _canonical_value(value)
 
 

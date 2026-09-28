@@ -4825,6 +4825,31 @@ def test_global_values_canonicalize_or_refuse(tmp_path):
         ("tuple", ("int", "1"), ("int", "2")),
         ("constexpr", ("bool", True)),
     )
+    # Triton's `used_global_vals` holds a `deepcopy` of the global (jit.py's
+    # `record_reference`), and a pybind11 enum member does not deepcopy to
+    # itself, unlike a Python `enum.Enum` member. Canonicalization must not
+    # rely on identity with the live member.
+    import copy
+    import enum
+
+    deepcopied = copy.deepcopy(ir.PROPAGATE_NAN.ALL)
+    assert deepcopied is not ir.PROPAGATE_NAN.ALL
+    assert _canonical_global(tl.constexpr(deepcopied)) == (
+        "constexpr",
+        ("enum", "triton._C.libtriton.ir", "PROPAGATE_NAN", "ALL"),
+    )
+
+    class _PyEnum(enum.Enum):
+        ALL = 1
+
+    py_deepcopied = copy.deepcopy(_PyEnum.ALL)
+    assert py_deepcopied is _PyEnum.ALL  # Python enums are singletons
+    assert _canonical_global(py_deepcopied) == (
+        "enum",
+        __name__,
+        "test_global_values_canonicalize_or_refuse.<locals>._PyEnum",
+        "ALL",
+    )
     json.dumps(
         _module_key(global_values=(("G", "m", _canonical_global((1,))),)).digest()
     )
