@@ -609,7 +609,7 @@ _NO_KERNEL: Any = object()
 
 def make_launcher(
     jit_func: JitFunction = _NO_KERNEL,
-    *args: object,
+    *,
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, object] | None = None,
     options: Mapping[str, Any] | None = None,
@@ -699,18 +699,13 @@ def make_launcher(
     Raises:
         UnsupportedKernel: The kernel or an option is outside intj's scope,
             or the kernel cache's library cannot be provisioned.
-        TypeError: A bad positional argument, a None kernel, or a malformed
-            keyword argument.
+        TypeError: A None kernel or a malformed keyword argument.
         ValueError: A malformed grid option.
 
     Warns:
         ClassGlobalWarning: `assume_constant_globals=True` keyed a class
             global by its qualified name.
     """
-    if args:
-        raise TypeError(
-            "intj: make_launcher takes no positional arguments besides the kernel"
-        )
     _validate_grid_kwargs(
         dynamic_options,
         grid_arg,

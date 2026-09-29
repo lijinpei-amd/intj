@@ -2614,7 +2614,7 @@ def test_none_kernel_is_rejected_not_a_decorator_factory():
 
 
 def test_positional_arguments_beyond_the_kernel_are_rejected():
-    with pytest.raises(TypeError, match="no positional arguments"):
+    with pytest.raises(TypeError, match="positional argument"):
         make_launcher(scale, False)  # pyright: ignore[reportCallIssue]
 
 
