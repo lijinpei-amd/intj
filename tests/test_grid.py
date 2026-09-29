@@ -91,11 +91,7 @@ def test_grid_arg_zero_skips_launch_and_argument_decode():
 
 
 def test_grid_modes_validate_options_and_keep_separate_modules():
-    assert callable(
-        make_launcher(
-            write_programs, dynamic_grid=False, dynamic_options=(), no_gpu=True
-        )
-    )
+    assert callable(make_launcher(write_programs, dynamic_options=(), no_gpu=True))
     for value in (0, 4, True, 1.0, "2"):
         with pytest.raises(ValueError, match="grid_arg must be 1, 2, or 3"):
             make_launcher(write_programs, grid_arg=value, no_gpu=True)  # pyright: ignore[reportArgumentType]

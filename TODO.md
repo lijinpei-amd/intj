@@ -37,8 +37,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Coverage (all currently refused loudly)
 
-- Callable grids (`dynamic_grid`). The expensive part is `ConstexprFunction.__call__`
-  (~963 ns/call), not the mapping; a `grid=<spec>` baked to literal C is ~4 ns.
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
 - **Tuple / namedtuple arguments and tuple constexprs.** `ARG_TUPLE` recursion in the decoder and

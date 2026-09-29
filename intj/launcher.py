@@ -446,7 +446,6 @@ class LauncherFactory:
 
 
 def _validate_grid_kwargs(
-    dynamic_grid: bool,
     dynamic_options: Sequence[str],
     grid_arg: int | None,
     grid_cpp: object | None,
@@ -457,10 +456,6 @@ def _validate_grid_kwargs(
     """The cheap checks on `make_launcher`'s grid/compile kwargs: no imports, no
     GPU, no build. Run eagerly both in the factory form (at decoration time,
     before the kernel exists) and in the direct-call form."""
-    if dynamic_grid:
-        raise UnsupportedKernel(
-            "intj: dynamic_grid is not implemented; pass an int or tuple grid"
-        )
     if grid_arg is not None and (
         type(grid_arg) is not int or grid_arg not in (1, 2, 3)
     ):
@@ -514,7 +509,6 @@ def _interpreter_deferred(bind_device_requested: bool) -> Any:
 def make_launcher(
     jit_func: JitFunction,
     *,
-    dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, object] | None = None,
     options: Mapping[str, Any] | None = None,
@@ -534,7 +528,6 @@ def make_launcher(
 @overload
 def make_launcher(
     *,
-    dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, object] | None = None,
     options: Mapping[str, Any] | None = None,
@@ -559,7 +552,6 @@ _NO_KERNEL: Any = object()
 def make_launcher(
     jit_func: JitFunction = _NO_KERNEL,
     *args: object,
-    dynamic_grid: bool = False,
     dynamic_options: Sequence[str] = (),
     extra_annotation: Mapping[str, object] | None = None,
     options: Mapping[str, Any] | None = None,
@@ -617,8 +609,7 @@ def make_launcher(
     hash map behind the kernel cache; see `KernelCache`. `no_gpu=True` decodes
     and caches on the host without compiling or launching a GPU kernel.
     `dynamic_options` names compile options and `knobs.<group>.<name>` paths
-    passed per call, right after the grid controls, and keyed; `dynamic_grid`
-    is reserved.
+    passed per call, right after the grid controls, and keyed.
     `verify_annotation=True` checks declared types, ranges and assumed facts;
     otherwise these are caller promises.
     `return_compiled=True` returns the cached Triton CompiledKernel after a
@@ -633,7 +624,6 @@ def make_launcher(
             "intj: make_launcher takes no positional arguments besides the kernel"
         )
     _validate_grid_kwargs(
-        dynamic_grid,
         dynamic_options,
         grid_arg,
         grid_cpp,
@@ -646,7 +636,6 @@ def make_launcher(
     if jit_func is _NO_KERNEL:
         return functools.partial(
             make_launcher,
-            dynamic_grid=dynamic_grid,
             dynamic_options=dynamic_options,
             extra_annotation=extra_annotation,
             options=options,

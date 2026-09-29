@@ -7,7 +7,6 @@ from intj import KernelCache, TorchAccessMode, make_launcher
 
 launcher = make_launcher(
     jit_func,              # a @triton.jit function
-    dynamic_grid=False,    # reserved, must be False
     dynamic_options=(),    # compile options / knobs.<group>.<name> passed per call
     extra_annotation=None, # parameter name -> annotation or shorthand
     options=None,          # triton compile options, e.g. {"num_warps": 8}
@@ -552,7 +551,6 @@ hits it:
   which intj cannot analyze either; decorating one also defers to the first
   call). The refusal costs nothing after that call: it is not in the swapped-in
   entry, so turning the knob on later does not stop an already-built launcher.
-- `dynamic_grid=True`. Use `grid_cpp` or `grid_py` for a callable grid.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
 - Tuple, `tl.constexpr` object and `TensorDescriptor` arguments, and `str` /
   `tl.dtype` / JIT-function values for anything but an untyped `tl.constexpr`.
