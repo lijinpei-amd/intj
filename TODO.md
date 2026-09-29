@@ -50,6 +50,12 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - Kernels reading globals: `assume_constant_globals=True` trusts them; still
   refused by default. Revalidating in C (`PyObject_RichCompareBool` per entry)
   would cover the default too.
+- **Delayed argument evaluation.** `make_launcher` arguments (`options`,
+  `extra_annotation` values, ...) are evaluated at declaration, so one that
+  needs the GPU (aiter `mla_decode_ref`'s `kpack` from `get_arch()`) forces a
+  `functools.cache` factory instead of a decorator. Accept a callable resolved
+  once at the first call, which already builds lazily; e.g.
+  `options=lambda: {"kpack": ...}`.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
 - **Gluon layout objects as constexpr arguments.** gfx1250 GEMM/MoE/batched-GEMM
