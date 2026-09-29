@@ -72,9 +72,9 @@ void typed_nop_mixed(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::Tenso
 void launch_empty(tvm::ffi::TensorView x, tvm::ffi::TensorView y, tvm::ffi::TensorView z) {
   GpuStream stream = static_cast<GpuStream>(
       TVMFFIEnvGetStream(x.device().device_type, x.device().device_id));
-  EmptyKernel<<<1, 1, 0, stream>>>(static_cast<const float*>(x.data_ptr()),
-                                    static_cast<const float*>(y.data_ptr()),
-                                    static_cast<float*>(z.data_ptr()));
+  EmptyKernel<<<1, kMixedThreads, 0, stream>>>(static_cast<const float*>(x.data_ptr()),
+                                                static_cast<const float*>(y.data_ptr()),
+                                                static_cast<float*>(z.data_ptr()));
 }
 
 void launch_mixed(tvm::ffi::TensorView x, tvm::ffi::TensorView y, tvm::ffi::TensorView z,
