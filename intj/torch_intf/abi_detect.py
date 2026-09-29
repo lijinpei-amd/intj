@@ -1,4 +1,4 @@
-"""Detect the torch ABI at runtime, from the torch that is running.
+"""Detects the torch ABI at runtime, from the torch that is running.
 
 Every offset is found by matching field values against what torch's own python
 accessors report, so an entry generated this way is verified by construction.
@@ -34,7 +34,7 @@ _STORAGEIMPL_WINDOW = 72
 
 
 def _probes() -> list[Any]:
-    """Tensors whose disagreement pins every offset to one candidate.
+    """Returns tensors whose disagreement pins every offset to one candidate.
 
     The set is load-bearing, not decoration:
 
@@ -74,7 +74,10 @@ def _malloc_usable_size() -> Any:
 
 
 def _heap_window(address: int, size: int) -> bytes:
-    """Up to `size` bytes of the `new`-allocated object at `address`, never past it."""
+    """Returns up to `size` bytes of the `new`-allocated object at `address`.
+
+    Never reads past the object's own allocation.
+    """
     return _window(address, min(size, _malloc_usable_size()(address)))
 
 
@@ -83,7 +86,7 @@ def _window(address: int, size: int) -> bytes:
 
 
 def _find_u64(blob: bytes, want: int, align: int = 8) -> set[int]:
-    """Offsets in `blob` holding `want` as a little-endian 8-byte value."""
+    """Returns the offsets in `blob` holding `want` as a little-endian 8-byte value."""
     target = want.to_bytes(8, "little", signed=want < 0)
     return {i for i in range(0, len(blob) - 7, align) if blob[i : i + 8] == target}
 
@@ -93,7 +96,7 @@ def _find_u8(blob: bytes, want: int) -> set[int]:
 
 
 def probe_layout(header_size: int) -> TensorABI | None:
-    """Discover the offsets from the running torch, or return None.
+    """Returns the offsets discovered from the running torch, or None.
 
     Not used when launching: `_LAYOUTS` is consulted instead, so a torch intj has
     not been verified against is refused rather than read at guessed offsets.
@@ -105,6 +108,9 @@ def probe_layout(header_size: int) -> TensorABI | None:
     does not come down to exactly one candidate yields None -- the caller then
     refuses the RUNTIME_SHIM mode rather than reading a guessed offset, which
     is the one failure here that cannot raise.
+
+    Args:
+        header_size: `sizeof(PyObject)` for this interpreter; see `pyobject_size`.
     """
     if header_size <= 0:
         return None
@@ -163,7 +169,7 @@ def probe_layout(header_size: int) -> TensorABI | None:
 
 
 def _selfcheck(layout: TensorABI, header_size: int) -> bool:
-    """Reproduce torch's own `data_ptr()` through the discovered offsets.
+    """Returns whether `layout` reproduces torch's own `data_ptr()` on every case.
 
     The probe pins each offset independently; this checks the arithmetic that
     combines them, including the zero-element rule that `data_ptr()` applies and
@@ -184,7 +190,7 @@ def _selfcheck(layout: TensorABI, header_size: int) -> bool:
 
 
 def _read(layout: TensorABI, t: Any, header_size: int) -> tuple[int, int, int]:
-    """What the C reader in RUNTIME_SHIM mode would compute, in Python."""
+    """Returns what the RUNTIME_SHIM C reader would compute for `t`, in Python."""
     impl = ctypes.c_size_t.from_address(id(t) + header_size + layout.cdata).value
     simpl = ctypes.c_size_t.from_address(impl + layout.storage).value
     numel = ctypes.c_int64.from_address(impl + layout.numel).value
@@ -204,7 +210,7 @@ def _expected(t: Any) -> tuple[int, int, int]:
 
 
 def _main() -> None:
-    """Print the entry for the running torch, to paste into `torch_abi.toml`."""
+    """Prints the entry for the running torch, to paste into `torch_abi.toml`."""
     import torch
 
     header_size = pyobject_size()

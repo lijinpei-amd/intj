@@ -47,8 +47,11 @@ def test_grid_arg_passes_each_requested_dimension(dimensions, shape):
 
 
 def test_decorator_factory_form_matches_call_form_with_grid_arg():
-    """`@make_launcher(grid_arg=1)` on a stacked def builds the same launcher as
-    `make_launcher(kernel, grid_arg=1)`."""
+    """The decorator-factory form builds the same launcher as the call form.
+
+    `@make_launcher(grid_arg=1)` on a stacked def builds the same launcher as
+    `make_launcher(kernel, grid_arg=1)`.
+    """
 
     @make_launcher(grid_arg=1)
     @triton.jit

@@ -169,9 +169,12 @@ def test_reentrant_cache_miss_returns_winning_record(monkeypatch):
 
 
 def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
-    """Without return_compiled the module's compile cache is the kernel's only
-    owner.  A nested miss records its kernel first; the outer compile must not
-    replace it in that cache, or the record's function handle is freed."""
+    """A reentrant miss keeps the kernel its nested miss recorded alive.
+
+    Without return_compiled the module's compile cache is the kernel's only owner.
+    A nested miss records its kernel first; the outer compile must not replace it
+    in that cache, or the record's function handle is freed.
+    """
     import intj.launcher as launcher_module
     import triton.compiler
 
@@ -236,6 +239,13 @@ def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
 
 @pytest.fixture(scope="module")
 def traversal_helpers(tmp_path_factory):
+    """Builds and loads a C library that drives an object's `tp_traverse` directly.
+
+    `traverse_count(owner, trigger, callback)` counts visited objects of
+    `trigger`'s type and calls `callback` once when `trigger` is visited;
+    `traverse_fail(owner, trigger)` fails the traversal with 77 at the first such
+    object.
+    """
     path = tmp_path_factory.mktemp("visit")
     source = path / "visit.c"
     library = path / "visit.so"

@@ -1,4 +1,4 @@
-"""Build and load `_intj_lazy`, the generic stub every launcher starts as.
+"""Builds and loads `_intj_lazy`, the generic stub every launcher starts as.
 
 Kernel-free, so it needs only the host C compiler and no GPU: `make_launcher`
 allocates launchers from it at decoration time (see runtime/intj_lazy.c).
@@ -27,7 +27,7 @@ _HEADER = _RUNTIME / "intj_lazy.h"
 
 
 def python_include() -> str:
-    """This interpreter's `Python.h` directory; Debian's posix_local scheme included."""
+    """Returns this interpreter's `Python.h` directory, Debian's posix_local too."""
     get_scheme = getattr(sysconfig, "get_default_scheme", None)  # 3.10+
     scheme = get_scheme() if get_scheme is not None else None
     if scheme == "posix_local":
@@ -47,7 +47,13 @@ def _digest(cc: str) -> str:
 
 
 def load_stub(root: Path, cc: str) -> types.ModuleType:
-    """`_intj_lazy`, compiled into `root/<digest>/` on first use."""
+    """Returns `_intj_lazy`, compiled with `cc` into `root/<digest>/` on first use.
+
+    The module is loaded by hand, never imported.
+
+    Raises:
+        UnsupportedKernel: The host compiler failed to build the stub.
+    """
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
     so = root / _digest(cc) / f"_intj_lazy{suffix}"
     if not so.exists():

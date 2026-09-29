@@ -1,4 +1,4 @@
-"""Detect the torch ABI by compiling against torch's own headers.
+"""Detects the torch ABI by compiling against torch's own headers.
 
 The C++ half of the check `abi_detect` makes at runtime: here the compiler, not
 a search over field values, places each field.  The two share no code, so a
@@ -121,12 +121,18 @@ extern "C" const char *intj_detect() {
 
 
 def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
-    """(facts, offsets, dtype code -> element size), unchecked.
+    """Returns the layout torch's headers declare, unchecked.
 
-    `facts` are what the layout rests on rather than the layout itself:
-    `sizeof(PyObject)`, where and what `THPVariable::cdata` is, whether the
-    STATIC_COMPILE mode's `intj_THPVariable` matches it, and the sizes of
-    TensorImpl and StorageImpl.
+    Returns:
+        `(facts, offsets, sizes)`: `offsets` are absolute and `sizes` maps each
+        dtype code to its element size. `facts` are what the layout rests on
+        rather than the layout itself: `sizeof(PyObject)`, where and what
+        `THPVariable::cdata` is, whether the STATIC_COMPILE mode's
+        `intj_THPVariable` matches it, and the sizes of TensorImpl and
+        StorageImpl.
+
+    Raises:
+        subprocess.CalledProcessError: The probe does not build.
     """
     import torch
     from torch.utils import cpp_extension
@@ -174,14 +180,18 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
 
 
 def detect() -> tuple[dict[str, int], dict[int, int]]:
-    """(offsets, dtype code -> element size), with cdata relative to PyObject_HEAD.
+    """Returns the checked offsets and the element size of each dtype code.
 
-    `measure()` keeps the raw absolute offsets declared by torch's headers.
+    `cdata` is relative to the end of `PyObject_HEAD`; `measure()` keeps the
+    raw absolute offsets declared by torch's headers.
 
-    Raises if the toolchain is missing, the program does not build, or the
-    STATIC_COMPILE mode's `intj_THPVariable` (runtime/intj_thpvariable.h) no
-    longer matches torch's `THPVariable` -- the one layout that mode declares rather than
-    includes.
+    Raises:
+        OSError: The C++ compiler is missing.
+        subprocess.CalledProcessError: The probe does not build.
+        RuntimeError: The STATIC_COMPILE mode's `intj_THPVariable`
+            (runtime/intj_thpvariable.h) no longer matches torch's `THPVariable`
+            -- the one layout that mode declares rather than includes -- or the
+            cdata slot precedes `PyObject_HEAD`.
     """
     head, offsets, sizes = measure()
     if not head["intj_thpvariable"]:

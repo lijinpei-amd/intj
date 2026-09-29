@@ -109,6 +109,8 @@ def stub(tmp_path_factory):
 
 
 class Stub:
+    """A view of the stub driver's counters and last recorded launch."""
+
     def __init__(self, lib):
         self.lib = lib
 
@@ -116,7 +118,7 @@ class Stub:
         return ctypes.c_long.in_dll(self.lib, "intj_stub_calls").value
 
     def last(self, nparams: int):
-        """(grid, block_dim, stream, params) of the last launch."""
+        """Returns `(grid, block_dim, stream, params)` of the last launch."""
         launch = list((ctypes.c_uint64 * 5).in_dll(self.lib, "intj_stub_launch"))
         params = list((ctypes.c_uint64 * 16).in_dll(self.lib, "intj_stub_params"))
         return tuple(launch[:3]), launch[3], launch[4], params[:nparams]
@@ -124,7 +126,12 @@ class Stub:
 
 @pytest.fixture(scope="module", params=_MODES, ids=lambda m: m.value)
 def built(request, stub, tmp_path_factory):
-    """(module, stub, compile callback calls) for one access mode."""
+    """Builds the entry module for one access mode against the stub driver.
+
+    Returns:
+        The loaded module, a `Stub` over the driver, and the list of values the
+        compile callback was called with.
+    """
     lib, lib_path = stub
     mode = request.param
     context = RenderContext(
@@ -495,8 +502,11 @@ def test_unreadable_tensor_names_the_argument(built, launch):
 
 
 def test_concurrent_launches(built, launch):
-    """Cold fills and hits from many threads at once.  With the GIL this is
-    interleaving only; on a free-threaded build it is the cache lock's test."""
+    """Cold fills and hits from many threads at once all reach the launch.
+
+    With the GIL this is interleaving only; on a free-threaded build it is the
+    cache lock's test.
+    """
     module, stub, _ = built
     x = torch.zeros(4)
     nthreads, iters = 8, 400
@@ -538,8 +548,11 @@ def test_verified_python_versions_share_one_header():
 
 
 def test_load_stub_reports_a_missing_compiler_as_unsupported(tmp_path_factory):
-    """Final review minor 3: a decoration-time build must never raise a bare
-    subprocess error -- refusals are loud, per AGENTS.md."""
+    """A missing host compiler raises `UnsupportedKernel`, not a subprocess error.
+
+    Final review minor 3: a decoration-time build must never raise a bare
+    subprocess error -- refusals are loud, per AGENTS.md.
+    """
     root = tmp_path_factory.mktemp("lazy_missing_cc")
     with pytest.raises(launcher.UnsupportedKernel, match="host compiler") as excinfo:
         lazy.load_stub(root, "intj-test-nonexistent-cc")

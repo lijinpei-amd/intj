@@ -1,4 +1,4 @@
-"""Check a CPython layer header against the interpreter that is running.
+"""Checks a CPython layer header against the interpreter that is running.
 
 The compiler checks where a field is, not what it holds.  This compiles the
 header `cpython_abi` selects (or one named on the command line) against this
@@ -55,6 +55,11 @@ _FLOATS = (0.0, -0.0, 1.5, -2.25, 1e300, float("inf"))
 
 
 def _build(header: str, out: pathlib.Path) -> ctypes.PyDLL:
+    """Compiles the check source with `header` into `out` and loads it.
+
+    Raises:
+        subprocess.CalledProcessError: The C compiler (`$CC`, else `cc`) failed.
+    """
     src = out.with_suffix(".c")
     src.write_text(_SOURCE)
     subprocess.run(
@@ -84,7 +89,14 @@ def _build(header: str, out: pathlib.Path) -> ctypes.PyDLL:
 
 
 def check(header: str | None = None) -> list[str]:
-    """Every disagreement between `header` and this interpreter; empty when it holds."""
+    """Returns every disagreement between `header` and this interpreter.
+
+    Args:
+        header: The header to check; defaults to the one `header_for` selects.
+
+    Returns:
+        One message per mismatch; empty when the header holds.
+    """
     header = header or header_for()
     if header is None:
         return [f"no header is recorded for python {sys.version.split()[0]}; name one"]

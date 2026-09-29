@@ -1,9 +1,14 @@
 # pyright: standard
-"""Port TVM FFI's CUDA CUBIN overhead example to ROCm HSACO.
+r"""Port TVM FFI's CUDA CUBIN overhead example to ROCm HSACO.
 
-Compile one Triton empty kernel, load its HSACO through TVM FFI and HIP,
-then time that same kernel through TVM FFI, Triton, and INTJ. Run from the
-INTJ repository root with PYTHONPATH=$PWD; requires a ROCm GPU and tvm-ffi.
+Usage, from the INTJ repository root:
+
+    PYTHONPATH=$PWD python benchmarks/bench_hip_module_launch.py \
+        [--iters N] [--batches N]
+
+Compiles one Triton empty kernel, loads its HSACO through TVM FFI and HIP, then
+times that same kernel through TVM FFI, Triton, and INTJ (host enqueue time, no
+timed sync). Requires a ROCm GPU and tvm-ffi.
 """
 
 import argparse
@@ -73,6 +78,14 @@ void launch_empty(tvm::ffi::TensorView a, tvm::ffi::TensorView b,
 
 
 def main(iters: int, batches: int) -> None:
+    """Times one HSACO through TVM FFI, Triton, and INTJ and prints the medians.
+
+    INTJ gets Triton's compiled function through `override_compile`, so its
+    compile callback must run exactly once. Batches alternate the case order.
+
+    Raises:
+        RuntimeError: No ROCm GPU is available.
+    """
     if not torch.cuda.is_available() or torch.version.hip is None:
         raise RuntimeError("a ROCm GPU is required")
     device = torch.cuda.current_device()

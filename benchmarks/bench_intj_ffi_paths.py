@@ -1,9 +1,15 @@
 # pyright: standard
-"""INTJ counterparts for TVM FFI's callback, kwargs, and dataclass scripts.
+r"""INTJ counterparts for TVM FFI's callback, kwargs, and dataclass scripts.
 
-Run from the INTJ root with PYTHONPATH=. python benchmarks/bench_intj_ffi_paths.py
-[--iters N] [--batches N]. Callback results measure *cold cache misses*;
-all other rows measure warm host-only calls. No GPU kernel is launched.
+Usage, from the INTJ root:
+
+    PYTHONPATH=. python benchmarks/bench_intj_ffi_paths.py \
+        [--iters N] [--batches N] \
+        [--mode {callback,kwargs,dataclass,all}]
+
+Callback results measure *cold cache misses*; all other rows measure warm
+host-only calls. No GPU kernel is launched, but callback mode needs a GPU
+tensor. Requires apache-tvm-ffi.
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ def callback_kernel(x, y, z, variant: tl.constexpr):
 
 @dataclasses.dataclass
 class Config:
+    """Three kernel arguments packed in a dataclass."""
+
     x: int
     y: int
     z: int
@@ -48,6 +56,8 @@ class Config:
 
 @dataclasses.dataclass
 class Pair:
+    """Two kernel arguments packed in a dataclass."""
+
     x: int
     y: int
 
@@ -71,6 +81,11 @@ def report(name: str, samples: list[float]) -> None:
 
 
 def callback(iters: int, batches: int) -> None:
+    """Times cold compile-callback misses, hot hits, and a 3-tensor host-only no-op.
+
+    Every timed miss uses a new `variant`, so each call runs the fake compile
+    callback and inserts a cache entry; the callback count is checked afterwards.
+    """
     tensors = tuple(torch.zeros(1, device="cuda") for _ in range(3))
     launch = make_launcher(callback_kernel, bind_device=True, no_gpu=True).bind_device(
         0
@@ -107,6 +122,11 @@ def callback(iters: int, batches: int) -> None:
 
 
 def kwargs(iters: int, batches: int) -> None:
+    """Times keyword and default arguments through Python adapters around INTJ.
+
+    Compares direct positional calls with a hand-written adapter and TVM FFI's
+    `make_kwargs_wrapper`, then checks that INTJ itself rejects keywords.
+    """
     launch = make_launcher(three, no_gpu=True)
     launch(0, 0, 1, 1, 2, 3)
 
@@ -134,6 +154,12 @@ def kwargs(iters: int, batches: int) -> None:
 
 
 def dataclass(iters: int, batches: int) -> None:
+    """Times dataclass unpacking before INTJ calls.
+
+    Compares attribute access, a prebuilt tuple, TVM FFI's
+    `unpack_dataclass_to_tuple`, and `dataclasses.astuple`, then checks that INTJ
+    itself rejects a dataclass argument.
+    """
     launch = make_launcher(two, no_gpu=True)
     pair = Pair(1, 2)
     cfg = Config(1, 2, 3)
@@ -170,6 +196,7 @@ def dataclass(iters: int, batches: int) -> None:
 
 
 def main() -> None:
+    """Parses the command line and runs the selected modes."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--batches", type=int, default=9)

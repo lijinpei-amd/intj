@@ -42,7 +42,7 @@ _NWORDS = (1, 2, 5)
 
 
 def _benchmark_toolchain():
-    """(include dir, [libraries]) for google/benchmark, or None."""
+    """Returns `(include dir, [libraries])` for google/benchmark, or None if absent."""
     root = os.environ.get("INTJ_BENCHMARK_ROOT")
     if root:
         include = pathlib.Path(root) / "include"
@@ -64,6 +64,11 @@ def _build(
     libraries: list[str],
     out: pathlib.Path,
 ):
+    """Compiles the C++ benchmark for `cache` at key length `nwords` into `out`.
+
+    Returns:
+        The finished compiler process, with its output captured as text.
+    """
     toolchain = toolchain_for(cache)
     assert toolchain is not None
     command = [

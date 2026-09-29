@@ -14,8 +14,12 @@ needs_hip = pytest.mark.skipif(not ON_HIP, reason="needs a HIP target")
 
 @contextlib.contextmanager
 def live_knob_values(values):
-    """Set the live Triton knobs a call passes (a declared knob only keys, so
-    the live value must match), then restore every knob touched."""
+    """Sets the given live Triton knobs for the duration of the block.
+
+    A declared knob only keys the launch, so the live value must match what the
+    call passes. Every knob touched is restored on exit. `values` maps dotted
+    paths such as `"knobs.compilation.disable_line_info"` to values.
+    """
     from triton import knobs
 
     before = {}

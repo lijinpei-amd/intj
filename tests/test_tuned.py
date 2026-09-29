@@ -81,8 +81,11 @@ def test_tunes_on_miss_and_launches_natively_on_hit():
 
 
 def test_autotune_miss_does_not_retain_call_tensors():
-    """A miss's argument tensors must die when the caller drops them, not linger
-    until the launcher's next miss (the private tuner chain outlives the call)."""
+    """An autotune miss does not keep its argument tensors alive.
+
+    A miss's argument tensors must die when the caller drops them, not linger
+    until the launcher's next miss (the private tuner chain outlives the call).
+    """
     import gc
     import weakref
 
@@ -145,9 +148,12 @@ def test_float_autotune_key_is_exact():
 
 
 def test_decorator_factory_stacks_on_autotune_and_heuristics_with_grid_cpp():
-    """`@make_launcher(grid_cpp=grid)` on an autotune+heuristics stack builds the
+    """The decorator-factory form stacks on autotune and heuristics.
+
+    `@make_launcher(grid_cpp=grid)` on an autotune+heuristics stack builds the
     same launcher as calling `make_launcher(kernel, grid_cpp=grid)` on the
-    already-wrapped chain."""
+    already-wrapped chain.
+    """
 
     def grid(n: int, BLOCK: int):
         return (triton.cdiv(n, BLOCK),)
@@ -399,10 +405,13 @@ def test_config_value_read_by_c_must_be_int_or_bool(block):
 
 
 def test_tuned_callback_block_dim_zero_is_refused(monkeypatch):
-    """block_dim 0 marks an empty map slot (test_kernel_cache.py covers the
-    compile callback); the tuned callback rejects it too, at
-    entry.c.jinja:864. Triton never actually returns block_dim 0, so the
-    tuned callback is wrapped to force it."""
+    """A tuned callback returning block_dim 0 is refused.
+
+    block_dim 0 marks an empty map slot (test_kernel_cache.py covers the compile
+    callback); the tuned callback rejects it too, at entry.c.jinja:864. Triton
+    never actually returns block_dim 0, so the tuned callback is wrapped to force
+    it.
+    """
     import intj.tuning as tuning_mod
 
     original = tuning_mod.make_tuned_callback
@@ -468,6 +477,8 @@ def test_two_level_chain():
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
 
     class ByBlock(Bench):
+        """A `Bench` that scores by the BLOCK the config wrote, preferring 64."""
+
         def __call__(self, kernel_call, quantiles):
             self.out.zero_()
             kernel_call()
@@ -505,11 +516,14 @@ def strided_tag(out, N, stride, BLOCK: tl.constexpr, REM: tl.constexpr):
 
 
 def test_child_map_grows_past_four_slots(monkeypatch):
-    """A level-1 (child) map starts at CAP 4 and only grows on its 3rd put
+    """A level-1 (child) map keeps every record when it grows past four slots.
+
+    A level-1 (child) map starts at CAP 4 and only grows on its 3rd put
     (intj_map.h's INTJ_DEFINE_MAP). A heuristic with <=2 distinct values, as
-    every other tuned test uses, never exercises that grow/rehash loop. Give
-    REM 5 distinct values so the child map must grow once, then check every
-    value still reads back through both a fresh launch and key_chain."""
+    every other tuned test uses, never exercises that grow/rehash loop. Give REM
+    5 distinct values so the child map must grow once, then check every value
+    still reads back through both a fresh launch and key_chain.
+    """
     import intj.launcher as launcher_mod
 
     compiles = []
@@ -584,9 +598,12 @@ def even_src(dst, src, n, EVEN_src: tl.constexpr):
 
 
 def test_triton_heuristic_data_ptr_key():
-    """Mirrors triton's test_decorator.py::test_triton_heuristic: a heuristic
-    reading src.data_ptr() must be accepted by make_launcher and key on
-    pointer parity, one record per parity."""
+    """A heuristic reading `src.data_ptr()` keys on pointer parity.
+
+    Mirrors triton's test_decorator.py::test_triton_heuristic: a heuristic
+    reading src.data_ptr() must be accepted by make_launcher and key on pointer
+    parity, one record per parity.
+    """
     kernel = triton.heuristics({"EVEN_src": lambda a: a["src"].data_ptr() % 2 == 0})(
         even_src
     )
@@ -683,6 +700,11 @@ LOWERED_SCALAR = [
 
 
 def _check_lowered(h, cases):
+    """Checks that heuristic `h`, as lowered by intj, picks what Python `h` picks.
+
+    Each case is an `(x, y, n, m)` argument tuple. The compiled kernel's `K` must
+    match `h`'s Python result in value and type, and so must the stored output.
+    """
     launch = make_launcher(triton.heuristics({"K": h})(lowered), return_compiled=True)
     out = torch.zeros(1, device="cuda", dtype=torch.int32)
     device, stream = controls()
@@ -727,10 +749,12 @@ def test_lowered_tensor_heuristic_matches_python(h):
 
 
 def _reference(kernel, args_by_name, dynamic=None):
-    """What Triton itself decides for these arguments and per-call options and
-    knobs: its tuning keys, the heuristic outputs and the final call, from a
-    private chain whose innermost layer records instead of launching.  The
-    caller has set the live knobs to `dynamic`'s: a declared knob only keys."""
+    """Returns what Triton itself decides for these arguments, options and knobs.
+
+    That is its tuning keys, the heuristic outputs and the final call, from a
+    private chain whose innermost layer records instead of launching. The caller
+    has set the live knobs to `dynamic`'s: a declared knob only keys.
+    """
     import copy
 
     from triton.runtime.autotuner import Autotuner
@@ -747,6 +771,8 @@ def _reference(kernel, args_by_name, dynamic=None):
     final = {}
 
     class Record:
+        """An innermost layer that records the final call instead of launching."""
+
         fn = inner
 
         def run(self, *args, grid, warmup, **kwargs):
@@ -778,6 +804,15 @@ def _reference(kernel, args_by_name, dynamic=None):
 
 
 def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
+    """Asserts that no intj key chain covers two different Triton decisions.
+
+    Launches the kernel from `make_kernel` on every case, under every tuple of
+    `dyn_values` for the dynamic options `dynamic`, and compares each key chain
+    against `_reference`.
+
+    Raises:
+        AssertionError: If one key chain maps to two Triton decisions.
+    """
     from intj.launcher import _split_dynamic
 
     launch = make_launcher(make_kernel(), dynamic_options=dynamic)
@@ -798,6 +833,8 @@ def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
 
 
 def _invariant_kernel():
+    """Returns `aligned_tag` under a heuristic and a deterministic autotuner."""
+
     def bench(call, quantiles):  # first config wins, deterministically
         return [1.0, 1.0, 1.0]
 
@@ -923,6 +960,8 @@ _TUNED_DYN_VALUES = [
 
 
 def _dynamic_invariant_kernel():
+    """Returns `aligned_act` under a heuristic and a deterministic autotuner."""
+
     def bench(call, quantiles):  # first config wins, deterministically
         return [1.0, 1.0, 1.0]
 
@@ -1004,9 +1043,12 @@ def test_tuned_dynamic_option_reaches_every_config():
 
 
 def test_tuned_dynamic_knob_without_an_option_compiles_per_value(monkeypatch):
-    """knobs.compilation.disable_line_info feeds neither a compile option nor
-    the specialization: only the knob values in the tuned compile cache key
-    keep its two values apart."""
+    """A dynamic knob feeding no compile option still compiles once per value.
+
+    knobs.compilation.disable_line_info feeds neither a compile option nor the
+    specialization: only the knob values in the tuned compile cache key keep its
+    two values apart.
+    """
     from triton import knobs
 
     kernel = triton.autotune(
@@ -1074,9 +1116,12 @@ def act_apply(o, x, ACT: tl.constexpr, FN: tl.constexpr):
 
 
 def test_tuned_dynamic_waves_per_eu_object_constexprs_return_compiled():
-    """Final review minor 1: a tuned launcher with a dynamic waves_per_eu, two
-    object constexprs, and return_compiled -- distinct records per variant, a
-    hit for an equal-but-different constexpr object, and clean GC after."""
+    """A tuned launcher keys dynamic options and object constexprs and collects.
+
+    Final review minor 1: a tuned launcher with a dynamic waves_per_eu, two
+    object constexprs, and return_compiled -- distinct records per variant, a hit
+    for an equal-but-different constexpr object, and clean GC after.
+    """
     kernel = triton.autotune(
         configs=[triton.Config({}, num_stages=1), triton.Config({}, num_stages=2)],
         key=[],
@@ -1125,8 +1170,11 @@ def warps_tag(out, n, num_warps: tl.constexpr):
 
 @pytest.mark.parametrize("layer", ["autotune", "heuristics"])
 def test_tuned_constexpr_option_parameter_feeds_the_option(layer):
-    """A config's (or heuristic's) `num_warps` reaches Triton's run as a
-    keyword, so it is both the parameter and the compile option."""
+    """A tuned `num_warps` sets both the constexpr parameter and the option.
+
+    A config's (or heuristic's) `num_warps` reaches Triton's run as a keyword, so
+    it is both the parameter and the compile option.
+    """
     if layer == "autotune":
         kernel = triton.autotune(configs=[triton.Config({}, num_warps=8)], key=["n"])(
             warps_tag

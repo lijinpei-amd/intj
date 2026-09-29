@@ -1,3 +1,16 @@
+"""Launches `@triton.jit` kernels through generated C entry points.
+
+Exports:
+    make_launcher: builds a launcher for a kernel.
+    KernelCache: the kernel cache backend selection.
+    TorchAccessMode: how generated code reads torch tensors.
+    ClassGlobalWarning: the warning for class-valued globals.
+    Annotation, Argument, Constexpr, Specialization, AUTO, NEVER, Assume, Fact,
+        EqualTo, Aligned, PointerRange, BindValue: per-argument annotations.
+    INT_TYPES, FLOAT_TYPES: scalar type names, loaded lazily from `annotation`.
+    __version__: the package version.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -26,6 +39,11 @@ if TYPE_CHECKING:
 
 
 def __getattr__(name: str) -> Any:
+    """Returns `INT_TYPES` or `FLOAT_TYPES`, imported from `annotation` on first use.
+
+    Raises:
+        AttributeError: `name` is neither.
+    """
     if name in ("INT_TYPES", "FLOAT_TYPES"):
         from . import annotation
 

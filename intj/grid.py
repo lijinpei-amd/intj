@@ -1,4 +1,4 @@
-"""Lower the supported annotated grid function subset to C."""
+"""Lowering of the supported annotated grid function subset to C."""
 
 from __future__ import annotations
 
@@ -27,6 +27,14 @@ class GridError(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class GridCode:
+    """A grid function lowered to a native `intj_eval_grid` evaluator.
+
+    Attributes:
+        extras: The keyword-only grid parameters that are not kernel
+            parameters, in the order the evaluator reads them.
+        source: The C source of the evaluator.
+    """
+
     extras: tuple[str, ...]
     source: str
 
@@ -38,12 +46,20 @@ def compile_grid(
     deps: Mapping[str, int] | None = None,
     offset: int = 0,
 ) -> GridCode:
-    """Validate `fn` without executing it and emit one checked native evaluator.
+    """Validates `fn` without executing it and emits one checked native evaluator.
 
-    `deps` maps tuned parameter names to their slot in the record's dependent
-    values. When it is given, the evaluator takes them as `const int64_t *dep`.
-    `offset` counts the dynamic values between the grid extras and the public
-    arguments.
+    Args:
+        fn: The annotated grid function.
+        params: The launcher's kernel parameters.
+        baked: Baked values by parameter index.
+        deps: Maps tuned parameter names to their slot in the record's
+            dependent values. When it is given, the evaluator takes them as
+            `const int64_t *dep`.
+        offset: The number of dynamic values between the grid extras and the
+            public arguments.
+
+    Raises:
+        GridError: `fn` is outside the native subset.
     """
     if type(fn) is not types.FunctionType:
         raise GridError("grid_cpp requires a Python def function")
@@ -192,6 +208,7 @@ def compile_grid(
         bound[name] = var, kind
 
     def emit(node: ast.AST, indent: str = "  ") -> tuple[str, str]:
+        """Emits C for `node` and returns its temp and kind ("int" or "bool")."""
         if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
             value = int(cast(int, node.value))
             if type(node.value) is int and not -(1 << 63) <= value < (1 << 63):

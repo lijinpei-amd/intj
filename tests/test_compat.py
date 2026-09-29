@@ -137,6 +137,8 @@ def test_launch_or_interpret_only_calls_triton_in_interpreter_mode():
     grid = lambda meta: (meta["n"],)
 
     class TritonOnly:
+        """A kernel stand-in that only supports Triton's `kernel[grid](...)` call."""
+
         def __getitem__(self, actual_grid):
             assert actual_grid is grid
             return lambda *args, **kwargs: (args, kwargs)
@@ -160,6 +162,8 @@ def test_launch_uses_triton_dispatch_during_compile_warmup(monkeypatch):
     grid = (1,)
 
     class TritonOnly:
+        """A kernel stand-in that only supports Triton's `kernel[grid](...)` call."""
+
         def __getitem__(self, actual_grid):
             assert actual_grid is grid
             return lambda *args, **kwargs: (args, kwargs)
@@ -405,8 +409,11 @@ def warps_tag(out, num_warps: tl.constexpr):
 
 
 def test_keyword_naming_a_parameter_and_an_option_sets_both():
-    """Triton parses options from every keyword: `num_warps=8` is the
-    parameter and the compile option."""
+    """A keyword naming both a parameter and a compile option sets both.
+
+    Triton parses options from every keyword: `num_warps=8` is the parameter and
+    the compile option.
+    """
     out = torch.zeros(64, device="cuda", dtype=torch.int32)
     compiled = launch(warps_tag, (1,), out, num_warps=8, return_compiled=True)
     assert compiled.metadata.num_warps == 8

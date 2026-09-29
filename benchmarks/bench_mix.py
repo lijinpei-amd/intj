@@ -42,7 +42,11 @@ CVALUES = {"int": (3, 5), "str": ("relu", "gelu"), "dtype": (tl.float16, tl.floa
 
 
 def bench_pair(fn, first, second, iters, batches):
-    """Two direct calls per iteration with prepared argument tuples."""
+    """Returns the median ns per call and all batch samples.
+
+    Alternates `fn(*first)` and `fn(*second)`, two direct calls per iteration with
+    prepared argument tuples, after 200 warm-up pairs.
+    """
     for _ in range(200):
         fn(*first)
         fn(*second)
@@ -62,6 +66,11 @@ def constexpr_mask(count, share):
 
 
 def load_kernel(tmp, count, share):
+    """Writes, loads and returns an empty jit kernel, plus its constexpr mask.
+
+    The kernel source goes to a file under `tmp`, loaded without registering it
+    in `sys.modules`.
+    """
     mask = constexpr_mask(count, share)
     name = f"mix_{count}_{share}"
     params = ", ".join(
@@ -80,7 +89,7 @@ def load_kernel(tmp, count, share):
 
 
 def arg_pair(mask, ckind, nkind, tensor):
-    """Two call tuples that are equal but for one key-relevant value."""
+    """Returns two launch-argument tuples equal but for one key-relevant value."""
     first, second = [], []
     flip = None
     last_c = -1
@@ -122,6 +131,11 @@ def rows():
 
 
 def main(iters, batches):
+    """Prints the version header and one timing row per repeat/alternate pattern.
+
+    Probes intj for `make_launcher` and its `no_gpu` parameter first; a row whose
+    launcher cannot be built or called prints `n/a <reason>` instead.
+    """
     import intj
 
     make_launcher = getattr(intj, "make_launcher", None)

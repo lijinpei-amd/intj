@@ -1,10 +1,16 @@
 # pyright: standard
-"""Compare cached INTJ launches with preconverted TVM FFI calls.
+r"""Compare cached INTJ launches with preconverted TVM FFI calls.
 
-Requires apache-tvm-ffi in the same environment. Run from the INTJ root with
-PYTHONPATH=. /path/to/venv/bin/python benchmarks/bench_ffi_compare.py [--iters N]
-[--batches N]. All timings are host call/enqueue times, excluding synchronization.
-Use --sweep [--counts 0 3 5 8 16 32 64] for static-compile/runtime-shim and preconverted FFI calls.
+Usage, from the INTJ root:
+
+    PYTHONPATH=. /path/to/venv/bin/python benchmarks/bench_ffi_compare.py \
+        [--iters N] [--batches N] [--sweep [--counts 0 3 5 8 16 32 64]]
+
+Requires apache-tvm-ffi in the same environment and a CUDA or ROCm GPU. All
+timings are host call/enqueue times, excluding synchronization. The default mode
+times FFI no-ops and empty/mixed GPU kernels against INTJ launchers; `--sweep`
+times static-compile and runtime-shim INTJ launchers against preconverted FFI
+calls for each argument count in `--counts`.
 """
 
 from __future__ import annotations
@@ -84,7 +90,10 @@ void launch_mixed(tvm::ffi::TensorView x, tvm::ffi::TensorView y, tvm::ffi::Tens
 
 
 def sweep_kinds(count: int) -> tuple[str, ...]:
-    """Use three tensors, then repeat int, float, tensor."""
+    """Returns the argument kinds for a sweep kernel with `count` parameters.
+
+    The first three are `"tensor"`; the rest repeat `"int"`, `"float"`, `"tensor"`.
+    """
     return tuple(
         "tensor" if i < 3 else ("int", "float", "tensor")[(i - 3) % 3]
         for i in range(count)
@@ -92,6 +101,13 @@ def sweep_kinds(count: int) -> tuple[str, ...]:
 
 
 def sweep_source(counts: list[int], device: int) -> str:
+    """Returns the TVM FFI GPU source for every sweep argument count.
+
+    For each count it defines an empty `SweepKernel_<count>`, a typed no-op
+    `typed_<count>`, and `launch_<count>`, which enqueues the kernel on the TVM FFI
+    environment stream: that of the first argument's device, or of `device` for
+    the zero-argument launcher.
+    """
     source = [
         GPU_PREAMBLE,
         r"""
@@ -136,6 +152,15 @@ constexpr int kSweepDeviceType = kDLCUDA;
 
 
 def sweep(counts: list[int], iters: int, batches: int) -> None:
+    """Times FFI and INTJ calls for each argument count and prints the medians.
+
+    Each count gets an FFI packed no-op, typed no-op and empty-kernel launch, and
+    device-bound static-compile and runtime-shim INTJ launchers with no
+    specialization key. Batches alternate the case order.
+
+    Raises:
+        RuntimeError: No CUDA or ROCm GPU is available.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA or ROCm GPU is required")
     device = torch.cuda.current_device()
@@ -226,6 +251,15 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
 
 
 def main(iters: int, batches: int) -> None:
+    """Times FFI no-ops and kernel launches against INTJ launchers and prints them.
+
+    Checks the mixed kernel's output through every launcher before timing, then
+    compares 3-tensor and mixed tensor/int/float calls, with INTJ launchers both
+    per-call-device and device-bound. Batches alternate the case order.
+
+    Raises:
+        RuntimeError: No CUDA or ROCm GPU is available.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA or ROCm GPU is required")
 

@@ -1,5 +1,7 @@
-"""Read `@triton.heuristics` functions: which names each one reads, and lower
-the ones keyed at run time to C.
+"""Reading and lowering of `@triton.heuristics` functions.
+
+Finds which names each heuristic reads, and lowers the ones keyed at run time
+to C.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ class HeuristicError(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Heuristic:
+    """One parsed `@triton.heuristics` entry."""
+
     name: str  # the value it assigns
     inputs: tuple[str, ...]  # names it reads, first-use order
     arg: str  # its one parameter
@@ -35,7 +39,12 @@ class Heuristic:
 
 
 def parse_heuristic(name: str, fn: object) -> Heuristic:
-    """Locate `fn`'s source without calling it, and list the names it reads."""
+    """Locates `fn`'s source without calling it, and lists the names it reads.
+
+    Raises:
+        HeuristicError: `fn` is not a one-argument lambda or def with a single
+            return that reads its argument only as `arg["name"]`.
+    """
     if type(fn) is not types.FunctionType:
         raise HeuristicError(f"heuristic {name!r} must be a lambda or def")
     code = fn.__code__
@@ -90,6 +99,11 @@ def parse_heuristic(name: str, fn: object) -> Heuristic:
 
 
 def _subscript_key(node: ast.AST, arg: str, where: str) -> str | None:
+    """Returns `"name"` if `node` is `arg["name"]`, or None if it does not index `arg`.
+
+    Raises:
+        HeuristicError: `node` indexes `arg` with anything but a string literal.
+    """
     if not (
         isinstance(node, ast.Subscript)
         and isinstance(node.value, ast.Name)
@@ -105,7 +119,7 @@ def _subscript_key(node: ast.AST, arg: str, where: str) -> str | None:
 
 
 def _locate(fn: types.FunctionType) -> ast.Lambda | ast.FunctionDef:
-    """The one lambda or def in `fn`'s file that compiles to `fn`'s code.
+    """Returns the one lambda or def in `fn`'s file that compiles to `fn`'s code.
 
     Several lambdas can share a line, and inspect.getsource returns lines, not
     nodes; compiling each candidate and comparing bytecode picks the right one.
@@ -141,9 +155,12 @@ def _locate(fn: types.FunctionType) -> ast.Lambda | ast.FunctionDef:
 def _same_code(
     node: ast.Lambda | ast.FunctionDef, code: types.CodeType, strict: bool
 ) -> bool:
-    """Whether `node` compiles to `code`.  The bytecode is only compared when
-    `strict`: a file that imports `triton` compiles `triton.cdiv(...)` in
-    another form than the node does alone, so it breaks ties only."""
+    """Returns whether `node` compiles to `code`.
+
+    The bytecode is only compared when `strict`: a file that imports `triton`
+    compiles `triton.cdiv(...)` in another form than the node does alone, so it
+    breaks ties only.
+    """
     if isinstance(node, ast.Lambda):
         compiled = compile(ast.Expression(body=node), code.co_filename, "eval")
     else:
@@ -203,7 +220,9 @@ def lower(
     sources: Mapping[str, Source],
     levels: int,
 ) -> str:
-    """One `intj_tuned_level_<n>` per level, writing (value, is_bool) pairs to `comp`.
+    """Lowers `computed` to one `intj_tuned_level_<n>` C function per level.
+
+    Each function writes (value, is_bool) pairs to `comp`.
 
     `computed` is level-major; its position is the comp slot.  Every read of a
     tensor attribute sits behind the short-circuit it has in Python.
@@ -232,6 +251,8 @@ def lower(
 
 
 class _Emitter:
+    """Lowers one heuristic's expression to C lines appended to a shared list."""
+
     def __init__(
         self,
         h: Heuristic,
@@ -260,7 +281,7 @@ class _Emitter:
         return v, b
 
     def fixed_kind(self, indent: str, is_bool: bool) -> tuple[str, str]:
-        """A temp for a result whose kind the syntax decides."""
+        """Returns a temp for a result whose kind the syntax decides."""
         v = self.temp()
         self.lines.append(f"{indent}int64_t {v} = 0;")
         return v, "1" if is_bool else "0"
@@ -276,6 +297,11 @@ class _Emitter:
         return found[0], found[1].index
 
     def emit(self, node: ast.expr, indent: str) -> tuple[str, str]:
+        """Emits C for `node` and returns its (value, is_bool) C expressions.
+
+        Raises:
+            HeuristicError: `node` is outside the subset intj lowers.
+        """
         found = self.input(node)
         if found is not None:
             name, source = found
@@ -457,6 +483,7 @@ class _Emitter:
         node: ast.AST,
         indent: str,
     ) -> tuple[str, str]:
+        """Emits a call of tensor method `method` on the caller tensor `target`."""
         name, index = self.tensor_arg(target, f".{method}")
         takes_index = _TENSOR_METHODS[method]
         if len(args) != int(takes_index):

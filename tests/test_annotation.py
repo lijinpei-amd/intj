@@ -213,8 +213,11 @@ def test_make_launcher_accepts_legacy_constexpr_annotations(tmp_path, future):
     ids=["evaluated", "postponed"],
 )
 def test_tensor_annotations_resolve_as_unannotated_but_tensor_only(tmp_path, future):
-    """Triton ignores `torch.Tensor` / `tl.tensor` (its `annotation_type` is
-    empty), so the canonical form is the unannotated one plus `tensor_only`."""
+    """Tensor annotations resolve to the unannotated form plus `tensor_only`.
+
+    Triton ignores `torch.Tensor` / `tl.tensor` (its `annotation_type` is empty),
+    so the canonical form is the unannotated one plus `tensor_only`.
+    """
     from intj.annotation import _resolve_annotations
 
     kernel = kernel_from_source(
@@ -248,8 +251,11 @@ def test_tensor_annotations_resolve_as_unannotated_but_tensor_only(tmp_path, fut
 def test_optional_tensor_annotations_resolve_as_unannotated_but_none_ok(
     tmp_path, future
 ):
-    """`T | None`, `Optional[T]` and `Union[T, None]` for either tensor class:
-    unannotated plus `tensor_only` and `none_ok`."""
+    """Optional tensor annotations resolve to unannotated plus `none_ok`.
+
+    `T | None`, `Optional[T]` and `Union[T, None]` for either tensor class resolve
+    to the unannotated form plus `tensor_only` and `none_ok`.
+    """
     from intj.annotation import _resolve_annotations
 
     forms = (
@@ -626,6 +632,8 @@ def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path
 
 
 class CompilerBackendStub:
+    """A Triton compiler backend reduced to `parse_attr`."""
+
     @staticmethod
     def parse_attr(desc):
         attrs = []

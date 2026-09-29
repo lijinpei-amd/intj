@@ -18,22 +18,22 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass(frozen=True)
 class Annotation:
-    pass
+    """A per-parameter annotation: the public base of `Argument` and `Constexpr`."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Specialization:
-    pass
+    """A specialization policy for an `Argument`: `AUTO`, `NEVER` or `Assume`."""
 
 
 @dataclasses.dataclass(frozen=True)
 class _Auto(Specialization):
-    pass
+    """The type of `AUTO`: retain the applicable Triton specialization."""
 
 
 @dataclasses.dataclass(frozen=True)
 class _Never(Specialization):
-    pass
+    """The type of `NEVER`: omit every specialization fact."""
 
 
 AUTO = _Auto()
@@ -42,29 +42,55 @@ NEVER = _Never()
 
 @dataclasses.dataclass(frozen=True)
 class Fact:
-    pass
+    """A specialization fact a caller promises in `Assume`."""
 
 
 @dataclasses.dataclass(frozen=True)
 class EqualTo(Fact):
+    """The fact that an integer argument equals `value` (only 1)."""
+
     value: int
 
 
 @dataclasses.dataclass(frozen=True)
 class Aligned(Fact):
+    """The fact that an argument is divisible by `value` (only 16)."""
+
     value: int
 
 
 @dataclasses.dataclass(frozen=True)
 class PointerRange(Fact):
+    """The fact that a pointer's storage is under 2 GiB (`value` must be 32).
+
+    `PointerRange(32)` means the whole underlying storage is at most
+    2**31 - 1 bytes, not just a tensor view.
+    """
+
     value: int
 
 
 @dataclasses.dataclass(frozen=True, init=False)
 class Assume(Specialization):
+    """A specialization that fixes selected facts as caller promises.
+
+    Facts omitted from `Assume` stay `AUTO`.
+
+    Attributes:
+        facts: The assumed facts, in the order given.
+    """
+
     facts: tuple[Fact, ...]
 
     def __init__(self, *facts: Fact) -> None:
+        """Builds the assumption from `facts`.
+
+        Raises:
+            TypeError: A fact is not an exact `EqualTo`, `Aligned` or
+                `PointerRange`, or its value is not an int.
+            ValueError: A fact value is not the one supported (`EqualTo(1)`,
+                `Aligned(16)`, `PointerRange(32)`).
+        """
         allowed: dict[type[Fact], int] = {
             EqualTo: 1,
             Aligned: 16,
@@ -86,13 +112,20 @@ class Assume(Specialization):
 
 @dataclasses.dataclass(frozen=True)
 class _Unset:
-    pass
+    """The type of `UNSET`: a field left unspecified, distinct from `None`."""
 
 
 UNSET = _Unset()
 
 
 class BindValue(enum.Enum):
+    """How `Argument(bind_value=...)` binds a parameter's value.
+
+    `TENSOR` binds a tensor (or `None`) and reads its current pointer and
+    storage on every call. `POINTER` captures an address once at binding and
+    needs one explicit pointer type.
+    """
+
     TENSOR = "tensor"
     POINTER = "pointer"
 
@@ -107,6 +140,27 @@ def _normalize_type_field(value: object) -> object:
 
 @dataclasses.dataclass(frozen=True)
 class Argument(Annotation):
+    """An annotation of an ordinary (non-constexpr) kernel parameter.
+
+    Every field is optional; `UNSET` fields come from the parameter's other
+    annotation source or keep Triton's behavior.
+
+    Attributes:
+        type: A dtype, pointer type, `None`, or a nonempty sequence of them as an
+            allowlist; `AUTO` or `UNSET` retains Triton's inference.
+        specialize: `AUTO`, `NEVER` or `Assume(...)`.
+        value: A value baked into the launcher, removing the parameter from
+            the public call.
+        bind_value: Binds the value later through `bind()`; exclusive with
+            `value`.
+
+    Raises:
+        TypeError: `specialize` or `bind_value` has the wrong type, or `value`
+            is unhashable.
+        ValueError: `type` is an empty sequence, or both `value` and
+            `bind_value` are given.
+    """
+
     type: Any = UNSET
     specialize: Specialization | _Unset = UNSET
     value: object = UNSET
@@ -128,6 +182,22 @@ class Argument(Annotation):
 
 @dataclasses.dataclass(frozen=True)
 class Constexpr(Annotation):
+    """An annotation of a constexpr kernel parameter.
+
+    Attributes:
+        type: A dtype, `None`, or a nonempty sequence of them; a typed constexpr
+            selects the smallest fitting type.
+        power_of_two_or_zero: Promises an integer that is zero or +-2**k, keyed
+            in one byte.
+        value: A value baked into the launcher, removing the parameter from
+            the public call.
+
+    Raises:
+        TypeError: `power_of_two_or_zero` is not a bool, or `value` is
+            unhashable.
+        ValueError: `type` is an empty sequence.
+    """
+
     type: Any = UNSET
     power_of_two_or_zero: bool = False
     value: object = UNSET
@@ -141,6 +211,7 @@ class Constexpr(Annotation):
 
 
 def __getattr__(name: str) -> Any:
+    """Returns `INT_TYPES` or `FLOAT_TYPES`, importing triton on first access."""
     if name not in ("INT_TYPES", "FLOAT_TYPES"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     import triton.language as tl
@@ -152,18 +223,38 @@ def __getattr__(name: str) -> Any:
 
 @dataclasses.dataclass(frozen=True)
 class KeyField:
+    """One field of a parameter's spec key.
+
+    Attributes:
+        kind: What the field holds (`"descriptor"`, `"payload"`, `"exact_kind"`,
+            `"exact"`, ...).
+        width: The field size in bytes.
+        offset: The byte offset in the key, or -1 until the layout places it.
+    """
+
     kind: str
     width: int
     offset: int = -1
 
 
 class DeviceBinding(str, enum.Enum):
+    """Whether a launcher is fixed to one device or keys on the device."""
+
     FIXED = "fixed"
     NOT_FIXED = "not_fixed"
 
 
 @dataclasses.dataclass(frozen=True)
 class KeyLayout:
+    """The placement of every key field in a launcher's spec key.
+
+    Attributes:
+        fields: `(parameter index, placed field)` pairs, in the input order.
+        device_offset: The byte offset of the device slot, or None when the
+            device is fixed.
+        nwords: The spec-key length, in uint64 words.
+    """
+
     fields: tuple[tuple[int, KeyField], ...]
     device_offset: int | None
     nwords: int
@@ -172,6 +263,7 @@ class KeyLayout:
 def _layout_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     fields: tuple[tuple[int, KeyField], ...], device_binding: DeviceBinding
 ) -> KeyLayout:
+    """Places `fields` in the key, widest first, then the device slot if keyed."""
     ordered = sorted(enumerate(fields), key=lambda item: -item[1][1].width)
     offsets: dict[int, int] = {}
     offset = 0
@@ -191,6 +283,12 @@ def _layout_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by laun
 
 @dataclasses.dataclass(frozen=True)
 class CanonicalAnnotation:
+    """The merged, validated annotation of one parameter, as keyed and rendered.
+
+    `equal_to_one`, `aligned_16` and `pointer_range_32` each hold `"auto"`,
+    `"never"` or `"assume"`.
+    """
+
     kind: str
     types: tuple[str | None, ...] | None
     equal_to_one: str
@@ -218,6 +316,15 @@ class CanonicalAnnotation:
 
 @dataclasses.dataclass(frozen=True)
 class ResolvedParam:
+    """A kernel parameter with its canonical annotation.
+
+    Attributes:
+        name: The parameter name.
+        index: The parameter position in the kernel signature.
+        annotation: The canonical annotation.
+        baked: The baked value, or `UNSET`; excluded from comparison.
+    """
+
     name: str
     index: int
     annotation: CanonicalAnnotation
@@ -225,6 +332,11 @@ class ResolvedParam:
 
 
 def _canonical_value(value: object) -> tuple[object, ...]:
+    """Returns a hashable, JSON-serializable tag for a baked value.
+
+    Raises:
+        ValueError: The value is not a dtype, str, `JITFunction` or scalar.
+    """
     import triton.language as tl
     from triton.runtime.jit import JITFunction
 
@@ -260,8 +372,11 @@ _OPTIONAL_TENSOR_NAMES = frozenset(
 
 
 def _tensor_annotation(value: object) -> str | None:
-    """ "tensor" for `torch.Tensor` / `tl.tensor`, "optional" for either `| None`
-    (`Optional[...]`, `Union[..., None]`), as an object or a postponed string."""
+    """Classifies a tensor annotation, given as an object or a postponed string.
+
+    Returns "tensor" for `torch.Tensor` / `tl.tensor`, "optional" for either
+    `| None` (`Optional[...]`, `Union[..., None]`), and None otherwise.
+    """
     import sys
     import types
     import typing
@@ -289,6 +404,11 @@ def _tensor_annotation(value: object) -> str | None:
 
 
 def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
+    """Returns the `Argument` or `Constexpr` a raw annotation means, or None.
+
+    Raises:
+        ValueError: The annotation is not one intj understands.
+    """
     import triton.language as tl
 
     if value is inspect.Parameter.empty:
@@ -307,6 +427,11 @@ def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
 def _merge_field(
     name: str, field: str, left: object, right: object, *, kind: str = "argument"
 ) -> object:
+    """Merges one field from two annotation sources; `UNSET` defers to the other.
+
+    Raises:
+        ValueError: Both sources set the field to different values.
+    """
     if left is UNSET:
         return right
     if right is UNSET:
@@ -335,6 +460,10 @@ _FACT_CLASSES: dict[type[Fact], tuple[str, int]] = {
 
 
 def _specialization_modes(value: object) -> tuple[object, object, object]:
+    """Returns the per-fact modes of a `specialize` field, in `_FACT_NAMES` order.
+
+    Each mode is `"auto"`, `"never"`, `"assume"` or `UNSET`.
+    """
     if value is UNSET:
         return (UNSET, UNSET, UNSET)
     if type(value) is _Auto:
@@ -357,6 +486,11 @@ def _specialization_modes(value: object) -> tuple[object, object, object]:
 
 
 def _type_name(value: object, kind: str, *, element: bool = False) -> str | None:
+    """Returns the canonical key name of a type (`"i32"`, `"*fp16"`, ...).
+
+    Raises:
+        ValueError: The type is not supported for `kind`.
+    """
     import triton.language as tl
 
     if value is None:
@@ -395,6 +529,11 @@ def _canonical_types(value: object, kind: str) -> tuple[str | None, ...] | None:
 
 
 def _inferred_scalar_type(value: object) -> str | None:
+    """Returns the type Triton infers for a baked scalar.
+
+    Raises:
+        ValueError: An integer is outside Triton's scalar range.
+    """
     if value is None:
         return None
     if type(value) is bool:
@@ -412,6 +551,7 @@ def _inferred_scalar_type(value: object) -> str | None:
 
 
 def _fits_scalar(value: object, name: str | None, kind: str) -> bool:
+    """Returns whether `value` is representable as the canonical type `name`."""
     if name is None:
         return value is None
     if name.startswith("*"):
@@ -447,6 +587,7 @@ def _applicable(name: str | None, field: str) -> bool:
 def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     annotation: CanonicalAnnotation,
 ) -> tuple[KeyField, ...]:
+    """Returns the unplaced key fields `annotation` contributes to the spec key."""
     if annotation.tuned or annotation.baked_value or annotation.bind_value is not None:
         return ()
     types = annotation.types
@@ -497,6 +638,20 @@ def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launche
 def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     jit_func: Any, extra_annotation: Mapping[str, object] | None
 ) -> tuple[ResolvedParam, ...]:
+    """Merges each parameter's inline and extra annotations and validates them.
+
+    Args:
+        jit_func: The Triton `JITFunction`.
+        extra_annotation: Annotations by parameter name, merged field by field
+            with the inline ones.
+
+    Returns:
+        One `ResolvedParam` per kernel parameter, in signature order.
+
+    Raises:
+        ValueError: An unknown parameter name, an unsupported annotation, or a
+            conflicting or impossible combination of fields.
+    """
     import triton.language as tl
     from triton.runtime.jit import JITFunction
 

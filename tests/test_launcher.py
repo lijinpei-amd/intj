@@ -217,6 +217,7 @@ def gluon_copy(x, o, n, BLOCK: gl.constexpr, WARP: gl.constexpr):
 
 
 def _kernel_from_source(tmp_path, name, signature):
+    """Returns an empty `@triton.jit` kernel written to and imported from a file."""
     import importlib.util
 
     path = tmp_path / f"{name}.py"
@@ -1051,6 +1052,8 @@ def test_bind_none_materializes_triton_constexpr(
 
 
 class _BoundPointer:
+    """A `data_ptr()` object at a fixed address that counts its reads."""
+
     def __init__(self, address):
         self.address = address
         self.reads = 0
@@ -2576,7 +2579,7 @@ def check_matches_triton(jit_func, launcher, grid, args, out_index):
 
 
 def test_bare_decorator_matches_the_call_form():
-    """Plain `@make_launcher` (no parens) keeps working: same as `make_launcher(kernel)`."""
+    """A bare `@make_launcher` (no parens) behaves like `make_launcher(kernel)`."""
 
     @make_launcher
     @triton.jit
@@ -2804,6 +2807,7 @@ def test_zero_volume_grid_does_not_launch(scale_launcher):
 
 @pytest.fixture
 def compiled_kernels(monkeypatch):
+    """Returns the list every `triton.compiler.compile` result is appended to."""
     import triton.compiler
 
     compile = triton.compiler.compile
@@ -2976,8 +2980,9 @@ def test_newer_triton_fpsan_knob_is_baked_into_compile_options(
 
 
 def test_launchers_of_one_kernel_stay_independent(compiled_kernels):
-    """Two launchers share a C symbol and a module name, so they must not share a module.
+    """Two launchers of one kernel never share a module.
 
+    They share a C symbol and a module name, so they must not share a module.
     The symbol is the kernel's name, for legible `perf` output; the digest in
     the artifact path is what keeps the two builds apart.
     """
@@ -3314,9 +3319,12 @@ def untyped_store(o, x):
     ids=lambda k: k.__name__,
 )
 def test_annotated_scalar_values_convert_like_triton(kernel):
-    """A Triton-annotated scalar takes Triton's launcher conversion: `3` into a
-    `float` is 3.0, `2.5` into an `int` is a TypeError, out-of-range ints raise
-    OverflowError -- never a reinterpretation of the Python value's bits."""
+    """A Triton-annotated scalar takes Triton's launcher conversion.
+
+    `3` into a `float` is 3.0, `2.5` into an `int` is a TypeError, out-of-range
+    ints raise OverflowError -- never a reinterpretation of the Python value's
+    bits.
+    """
     launcher = make_launcher(kernel)
     values = [3, True, False, 2.5, 2.0, -1, 2**31, 2**40, 2**63, 2**64 - 1, 2**70]
     values += [1e300, float("nan"), None]
@@ -3370,8 +3378,10 @@ def _gpu_controls():
 
 
 def test_object_constexpr_key_is_never_coarser_than_triton():
-    """The invariant for interned values: equal ids only for equal canonical
-    values, whichever object carries them."""
+    """Interned object constexprs get equal ids only for equal canonical values.
+
+    This is the invariant for interned values, whichever object carries them.
+    """
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input, _current_target, _render_params
     from triton.compiler import make_backend
@@ -3452,9 +3462,12 @@ def act_apply_store(o, x, ACT: tl.constexpr, FN: tl.constexpr):
 
 
 def test_grid_py_dynamic_options_with_str_and_jit_constexprs(monkeypatch):
-    """Final review minor 1: grid_py plus two dynamic_options (a compile
-    option and a knob) plus str/JIT constexprs -- correct outputs, a separate
-    record per variant, and clean GC after."""
+    """grid_py with dynamic options and str/JIT constexprs keeps records apart.
+
+    Final review minor 1: grid_py plus two dynamic_options (a compile option
+    and a knob) plus str/JIT constexprs -- correct outputs, a separate record
+    per variant, and clean GC after.
+    """
     from triton import knobs
 
     launch = make_launcher(
@@ -3509,9 +3522,12 @@ def bound_apply_store(o, x, FN: tl.constexpr):
 
 
 def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
-    """Final review minor 1: bind_device with a bound tensor, a dynamic
-    num_warps and object constexprs -- correct outputs, distinct spec_keys
-    and records per num_warps, and clean GC after."""
+    """bind_device with a bound tensor, dynamic num_warps and objects works.
+
+    Final review minor 1: bind_device with a bound tensor, a dynamic num_warps
+    and object constexprs -- correct outputs, distinct spec_keys and records
+    per num_warps, and clean GC after.
+    """
     factory = make_launcher(
         bound_apply_store,
         bind_device=True,
@@ -3561,8 +3577,11 @@ def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
 
 
 def test_sibling_launchers_intern_independently(monkeypatch):
-    """Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
-    and the module's compile cache compiles each variant once."""
+    """Sibling launchers of one module intern object constexprs independently.
+
+    Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
+    and the module's compile cache compiles each variant once.
+    """
     monkeypatch.setattr(launcher, "_LOADED", {})
     real, compiles = launcher._checked_compile, []
 
@@ -3619,8 +3638,10 @@ def _count_interner(monkeypatch):
 
 
 def test_alternating_objects_skip_the_interner(monkeypatch):
-    """A slot switching between known objects is answered by the C object
-    table: after warmup, no interner call, and each value keeps its key."""
+    """A slot switching between known objects is answered by the C object table.
+
+    After warmup there is no interner call, and each value keeps its key.
+    """
     calls = _count_interner(monkeypatch)
     act, cast = make_launcher(act_store), make_launcher(cast_store)
     act_module, cast_module = module_of(act), module_of(cast)
@@ -3644,8 +3665,10 @@ def test_alternating_objects_skip_the_interner(monkeypatch):
 
 
 def test_equal_strs_share_an_id_in_c(monkeypatch):
-    """Another str object with equal content hits the table by content; one
-    of equal length, kind and different bytes does not."""
+    """Another str object with equal content hits the object table by content.
+
+    One of equal length and kind but different bytes does not.
+    """
     calls = _count_interner(monkeypatch)
     launch = make_launcher(act_store)
     module = module_of(launch)
@@ -3667,8 +3690,10 @@ def test_equal_strs_share_an_id_in_c(monkeypatch):
 
 
 def test_equal_hash_different_content_is_another_str(monkeypatch):
-    """Content, not the cached hash, decides a str hit: a str whose cached
-    hash is forged to equal "neg"'s is still another value."""
+    """Content, not the cached hash, decides a str hit in the object table.
+
+    A str whose cached hash is forged to equal "neg"'s is still another value.
+    """
     calls = _count_interner(monkeypatch)
     launch = make_launcher(act_store)
     module = module_of(launch)
@@ -3688,9 +3713,11 @@ def test_equal_hash_different_content_is_another_str(monkeypatch):
 
 
 def test_fresh_dtype_objects_hit_by_name(monkeypatch):
-    """A tl.dtype built per call hits the entry for its name: no interner
-    call, and the table keeps none of those objects.  A str spelling the
-    same name is another value."""
+    """A tl.dtype built per call hits the object-table entry for its name.
+
+    There is no interner call, and the table keeps none of those objects.  A
+    str spelling the same name is another value.
+    """
     calls = _count_interner(monkeypatch)
     launch = make_launcher(act_store)
     module = module_of(launch)
@@ -3714,9 +3741,11 @@ def test_fresh_dtype_objects_hit_by_name(monkeypatch):
 
 
 def test_object_table_references_die_with_the_launcher(monkeypatch):
-    """An object the table holds (and the memo no longer does) is released
-    when the launcher is collected.  A fresh tl.dtype, not a JIT function:
-    triton keeps every JITFunction in a registry of its own."""
+    """An object the table holds is released when the launcher is collected.
+
+    The memo no longer holds it.  The object is a fresh tl.dtype, not a JIT
+    function: triton keeps every JITFunction in a registry of its own.
+    """
     monkeypatch.setattr(launcher, "_LOADED", {})
     launch = make_launcher(cast_store)
     module = module_of(launch)
@@ -4028,6 +4057,17 @@ def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key)
 def _recording_input_launcher(
     kernel, annotation, *, no_gpu, bind_device, monkeypatch, **bound_values
 ):
+    """Builds a launcher of `kernel` whose cache misses record the compiler input.
+
+    `annotation` annotates parameter `x`.  Each miss appends `(key, source)` to
+    the returned list, `source` being the ASTSource Triton would compile; with
+    `no_gpu` nothing is compiled.
+
+    Returns:
+        A `(launcher, compiler_input, calls)` tuple: the launcher (a bound
+        handle when `bind_device`), a function mapping public arguments to
+        their ASTSource, and the list of recorded misses.
+    """
     from intj.launcher import _compiler_input, _current_target, _make_compile_callback
     from triton.backends.compiler import GPUTarget
     from triton.compiler import make_backend
@@ -4311,6 +4351,7 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
 
 
 def _render_context(**overrides):
+    """Returns a valid two-parameter `RenderContext` with `overrides` applied."""
     from intj.annotation import DeviceBinding, ResolvedParam
     from intj.launcher import _render_params
 
@@ -4355,6 +4396,7 @@ def _render_context(**overrides):
 
 
 def _module_key(**overrides):
+    """Returns a valid `ModuleKey` with `overrides` applied."""
     fields = dict(
         template="aa",
         runtime_header="bb",
@@ -4659,7 +4701,10 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
 
 
 def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
-    """A failed install refuses with the reason and the retry command, and is not re-tried."""
+    """A failed install is refused once, with the reason and the retry command.
+
+    The install is not re-tried.
+    """
     attempts = []
 
     def explode(cache):
@@ -4724,8 +4769,9 @@ def test_refuses_kernel_reading_globals():
 
 @pytest.mark.parametrize("path", ["auto", "generic"])
 def test_tensor_annotated_param_takes_only_a_tensor(path):
-    """`x: torch.Tensor` / `y: tl.tensor` decode through the tensor-only path:
-    a tensor or `nn.Parameter` launches like an unannotated one; anything else,
+    """`x: torch.Tensor` / `y: tl.tensor` decode through the tensor-only path.
+
+    A tensor or `nn.Parameter` launches like an unannotated one; anything else,
     `None` included, is a TypeError (Triton would take `None` as a constexpr).
     """
     extra = {"n": Argument(type=tl.int32)} if path == "generic" else None
@@ -4742,8 +4788,10 @@ def test_tensor_annotated_param_takes_only_a_tensor(path):
 
 @pytest.mark.parametrize("path", ["auto", "generic"])
 def test_optional_tensor_param_takes_a_tensor_or_none(path):
-    """`y: torch.Tensor | None` / `o: tl.tensor | None` take a tensor or None,
-    each launched as Triton would; anything else is a TypeError."""
+    """`y: torch.Tensor | None` / `o: tl.tensor | None` take a tensor or None.
+
+    Each is launched as Triton would; anything else is a TypeError.
+    """
     extra = {"n": Argument(type=tl.int32)} if path == "generic" else None
     launch = make_launcher(axpy_optional, extra_annotation=extra)
     x = torch.randn(64, device="cuda")
@@ -4774,8 +4822,11 @@ def reads_constexpr_global(x, o, n, BLOCK: tl.constexpr):
 
 
 def test_constant_globals_are_a_caller_promise():
-    """Refused by default; `assume_constant_globals=True` launches with the
-    value triton saw when it hashed the kernel, in both call forms."""
+    """A kernel reading a constexpr global is refused unless the caller promises.
+
+    With `assume_constant_globals=True` it launches with the value triton saw
+    when it hashed the kernel, in both call forms.
+    """
     with pytest.raises(UnsupportedKernel, match="assume_constant_globals"):
         make_launcher(reads_constexpr_global)
     x = torch.randn(64, device="cuda")
@@ -4790,7 +4841,9 @@ def test_constant_globals_are_a_caller_promise():
 
 def test_constant_globals_are_not_rechecked_on_a_hit(monkeypatch):
     """No per-launch read: changing the global after the build is not seen.
-    Unsupported and undetected (docs/Usage.md); Triton raises instead."""
+
+    Unsupported and undetected (docs/Usage.md); Triton raises instead.
+    """
     launch = make_launcher(reads_constexpr_global, assume_constant_globals=True)
     x = torch.randn(64, device="cuda")
     o = torch.empty(64, device="cuda")
@@ -4944,9 +4997,11 @@ def kernel(o):
 
 
 def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
-    """A class global (the NamedTuple repro) is keyed by its qualified name:
-    refused by default, launched under `assume_constant_globals=True` with one
-    ClassGlobalWarning per `make_launcher` and none on a launch."""
+    """A class global (the NamedTuple repro) is keyed by its qualified name.
+
+    It is refused by default, and launched under `assume_constant_globals=True`
+    with one ClassGlobalWarning per `make_launcher` and none on a launch.
+    """
     from intj import ClassGlobalWarning
 
     kernel = _module_kernel(tmp_path / "class_global.py", _CLASS_KERNEL.format(cls="A"))
@@ -4969,8 +5024,11 @@ def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
 
 
 def test_different_class_globals_never_share_a_module(tmp_path):
-    """Same module name, same kernel source (so the same cache_key): only the
-    class's qualified name in the ModuleKey tells the two apart."""
+    """Kernels differing only in a class global get two modules.
+
+    Same module name, same kernel source (so the same cache_key): only the
+    class's qualified name in the ModuleKey tells the two apart.
+    """
     kernels = []
     for cls in ("A", "B"):
         (tmp_path / cls).mkdir()
@@ -5009,9 +5067,12 @@ def test_gluon_layout_class_global_launches():
 
 
 def test_decorating_under_triton_interpret_succeeds_and_defers_the_refusal():
-    """`@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
-    not a JITFunction, so a module-level `@make_launcher` must not raise at
-    decoration -- only its first call may (intj issue 1)."""
+    """`@make_launcher` under `TRITON_INTERPRET=1` defers its refusal to the call.
+
+    `@triton.jit` there returns an InterpretedFunction, not a JITFunction, so a
+    module-level `@make_launcher` must not raise at decoration -- only its
+    first call may (intj issue 1).
+    """
     from triton import knobs
     from triton.runtime.interpreter import InterpretedFunction
     from triton.runtime.jit import JITFunction
@@ -5034,8 +5095,11 @@ def test_decorating_under_triton_interpret_succeeds_and_defers_the_refusal():
 
 
 def test_fresh_launcher_builds_and_launches_normally_once_interpret_is_off():
-    """After the interpreter-mode launcher above refuses, a kernel decorated
-    with interpret off builds and launches through the usual path."""
+    """A kernel decorated with interpret off builds and launches normally.
+
+    This holds after the interpreter-mode launcher above refuses: it goes
+    through the usual path.
+    """
     from triton import knobs
 
     with knobs.runtime.scope():
@@ -5061,9 +5125,11 @@ def test_fresh_launcher_builds_and_launches_normally_once_interpret_is_off():
 def test_launcher_built_with_interpret_off_keeps_launching_if_turned_on_later(
     scale_launcher,
 ):
-    """The interpreter refusal lives only in `_build` (the first call): once
-    the module is swapped in, a later call never reads the knob again, so
-    turning interpret on afterwards does not stop it launching."""
+    """A built launcher keeps launching after interpret is turned on.
+
+    The interpreter refusal lives only in `_build` (the first call): once the
+    module is swapped in, a later call never reads the knob again.
+    """
     from triton import knobs
 
     module_of(scale_launcher)  # ensure it is already built, interpret off
@@ -5878,8 +5944,10 @@ def test_dynamic_num_warps_keys_separate_records():
 
 
 def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
-    """The live value of a declared knob is not read into the ModuleKey, so
-    flipping it before the first call builds no second module."""
+    """The live value of a declared knob is not read into the ModuleKey.
+
+    So flipping it before the first call builds no second module.
+    """
     from triton import knobs
 
     def build():
@@ -5892,9 +5960,12 @@ def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
 
 
 def test_declared_knob_only_keys_and_must_match_the_live_value(monkeypatch):
-    """intj never sets a declared knob.  A miss whose value differs from the
-    live knob raises and records nothing; each live value compiles its own
-    record, and an old value still hits its record after the knob changed."""
+    """A declared knob only keys records, and a miss must match its live value.
+
+    intj never sets a declared knob.  A miss whose value differs from the live
+    knob raises and records nothing; each live value compiles its own record,
+    and an old value still hits its record after the knob changed.
+    """
     import intj.launcher as launcher
     from triton import knobs
 
@@ -5930,9 +6001,12 @@ def test_declared_knob_only_keys_and_must_match_the_live_value(monkeypatch):
 
 
 def test_declared_knob_without_an_option_compiles_per_value(monkeypatch):
-    """knobs.compilation.disable_line_info feeds neither a compile option nor
-    the specialization: only the knob values in the compile identity keep
-    its two values apart."""
+    """A declared knob that feeds no compile option still compiles per value.
+
+    knobs.compilation.disable_line_info feeds neither a compile option nor the
+    specialization: only the knob values in the compile identity keep its two
+    values apart.
+    """
     from triton import knobs
 
     launch = make_launcher(
@@ -5952,8 +6026,11 @@ def test_declared_knob_without_an_option_compiles_per_value(monkeypatch):
 
 @needs_hip  # knobs.amd.use_buffer_ops is a HIP knob
 def test_declared_knob_reaches_the_specialization(monkeypatch):
-    """HIP's pointer specialization reads knobs.amd.use_buffer_ops: with the
-    live knob matching the passed value, the compiler input follows it."""
+    """A declared knob reaches the specialization's compiler input.
+
+    HIP's pointer specialization reads knobs.amd.use_buffer_ops: with the live
+    knob matching the passed value, the compiler input follows it.
+    """
     from triton import knobs
 
     launch = make_launcher(
@@ -6103,9 +6180,12 @@ def warps_store(o, num_warps: tl.constexpr, SCALE: tl.constexpr):
 
 @pytest.mark.parametrize("declared", [(), ("num_warps",)], ids=["plain", "declared"])
 def test_constexpr_option_parameter_feeds_the_option(declared):
-    """A `num_warps: tl.constexpr` parameter is also the compile option, as
-    Triton's `k[grid](o, num_warps=8)` makes it: one record per value, each
-    compiled with that many warps.  Declaring it in dynamic_options adds nothing."""
+    """A `num_warps: tl.constexpr` parameter is also the compile option.
+
+    As Triton's `k[grid](o, num_warps=8)` makes it: one record per value, each
+    compiled with that many warps.  Declaring it in dynamic_options adds
+    nothing.
+    """
     launch = make_launcher(warps_store, dynamic_options=declared, return_compiled=True)
     assert tuple(inspect.signature(launch).parameters)[3:] == (
         "o",
@@ -6158,9 +6238,12 @@ def option_axpy(
 
 
 def check_option_parameter_invariant():
-    """Same key => same annotated ASTSource and same canonical options, the
+    """Asserts that option parameters keep the key no coarser than Triton's.
+
+    Same key => same annotated ASTSource and same canonical options, the
     options being what Triton's keyword call makes of the parameters; and the
-    launcher really compiles with them."""
+    launcher really compiles with them.
+    """
     from triton.compiler import make_backend
 
     from intj.annotation import DeviceBinding, _resolve_annotations

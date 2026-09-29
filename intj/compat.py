@@ -1,4 +1,4 @@
-"""Route existing Triton-style host calls through ``make_launcher``.
+"""Routes existing Triton-style host calls through ``make_launcher``.
 
 This keeps the native launcher's positional fast path unchanged.  New hot call
 sites should construct and call ``make_launcher`` directly.
@@ -90,9 +90,12 @@ _CALL = threading.local()
 
 
 def _calling_grid(meta: dict[str, object]) -> object:
-    """Every cached callable-grid launcher's grid_py: the calling launch's own
-    grid, with its own wrappers, so the launcher keys on neither and holds
-    neither (a per-call lambda neither misses every call nor pins its captures)."""
+    """Evaluates the calling launch's own grid, with its own wrappers.
+
+    This is every cached callable-grid launcher's grid_py, so the launcher keys
+    on neither and holds neither (a per-call lambda would miss every call and
+    pin its captures).
+    """
     return _CALL.grid({**meta, **_CALL.wrapped})
 
 
@@ -109,8 +112,11 @@ def _cached_grid_py(
     instrumentation: object,
     fpsan_casts: object,
 ) -> Any:
-    """A callable-grid launcher, reused across calls like `_cached`'s: each
-    launcher owns its kernel cache, so a fresh one per call would miss every time."""
+    """Returns a callable-grid launcher, reused across calls like `_cached`'s.
+
+    Each launcher owns its kernel cache, so a fresh one per call would miss
+    every time.
+    """
     del source_key, target, debug, instrumentation, fpsan_casts
     return _make_grid_py(kernel, options, baked, wrapped_types, return_compiled)
 
@@ -134,11 +140,29 @@ def _make_grid_py(
 def launch(
     kernel: Any, grid: Any, /, *args: Any, return_compiled: bool = False, **kwargs: Any
 ) -> Any:
-    """Launch a JIT function with Triton's call spelling.
+    """Launches a JIT function with Triton's call spelling, `kernel[grid](...)`.
 
     This is a migration bridge, not the low-overhead API: it binds Python
     keywords and reads the current device/stream on every call.  Unsupported
     kernels and options still raise rather than falling back to Triton.
+
+    Args:
+        kernel: A `@triton.jit` function.
+        grid: An int, a tuple or list of 1 to 3 ints, or a callable over the
+            kernel's meta-parameters.
+        *args: The kernel's arguments, as Triton takes them.
+        return_compiled: Whether the launch returns the `CompiledKernel`.
+        **kwargs: Kernel arguments by keyword; any other name is a compile option.
+
+    Returns:
+        Whatever the underlying launcher returns.
+
+    Raises:
+        UnsupportedKernel: `kernel` is not a `JITFunction`, Triton launch hooks
+            are active, or the launcher refuses the kernel.
+        TypeError: `grid` has an unsupported type.
+        ValueError: `grid` has the wrong rank, or a pointer argument is an
+            unpinned CPU tensor.
     """
     if _is_compile_warmup is not None and _is_compile_warmup():
         # The test runtime intercepts indexed calls to compile with fake pointers.
@@ -276,7 +300,7 @@ def _target_key() -> tuple[str, str, int]:
 
 
 def _knob_key() -> tuple[object, object, object]:
-    """The knobs a launcher reads at its first call: a change selects another."""
+    """Returns the knobs a launcher reads at its first call; each value keys one."""
     return (
         knobs.runtime.debug,
         knobs.compilation.instrumentation_mode,
@@ -287,7 +311,7 @@ def _knob_key() -> tuple[object, object, object]:
 def launch_or_interpret(
     kernel: Any, grid: Any, /, *args: Any, return_compiled: bool = False, **kwargs: Any
 ) -> Any:
-    """Use Triton's launcher only while its interpreter is enabled."""
+    """Launches through Triton while its interpreter is enabled, else via `launch`."""
     if knobs.runtime.interpret:
         return kernel[grid](*args, **kwargs)
     return launch(kernel, grid, *args, return_compiled=return_compiled, **kwargs)

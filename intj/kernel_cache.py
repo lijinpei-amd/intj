@@ -1,4 +1,4 @@
-"""Which hash map a generated module uses for its kernel cache.
+"""Selects and provisions the hash map behind a generated module's kernel cache.
 
 The map turns a spec key into a compiled kernel when the key differs from the
 previous launch. Measured on this map-only workload -- key of N uint64 words,
@@ -124,7 +124,7 @@ _SOURCES: dict[KernelCache, Dependency] = {
 
 
 def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
-    """Include and library directories for `cache`, or None if not provisioned.
+    """Returns include and library directories for `cache`, or None if not provisioned.
 
     Only intj's own cache directory is consulted; `install` is what puts
     anything there.
@@ -155,15 +155,27 @@ def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
 
 
 def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, ...]]:
-    """Download (and build, for abseil) `cache` into intj's cache directory.
+    """Downloads (and builds, for abseil) `cache` into intj's cache directory.
 
-    Returns the same toolchain `toolchain_for` does.  Idempotent: an existing
+    Idempotent: an existing
     tree is reused unless `force`, so the common call does no work and says
     nothing.  When there *is* work, it is announced -- a silent minutes-long
     build inside `make_launcher` is indistinguishable from a hang.
 
     One installer at a time, machine-wide: the 8 ranks of a torchrun job all
     miss together, and without the lock they would cmake into one build tree.
+
+    Args:
+        cache: The backend to provision; `INTJ` needs nothing.
+        force: Discard an existing (possibly half-written) tree first.
+
+    Returns:
+        The same toolchain `toolchain_for` does.
+
+    Raises:
+        OSError: The download or a disk write failed.
+        RuntimeError: The checksum did not match or the build failed.
+        tarfile.TarError: The downloaded tarball is bad.
     """
     if cache is KernelCache.INTJ:
         return {"include_dirs": (), "library_dirs": (), "archives": ()}
@@ -189,7 +201,7 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
 
 
 def unavailable_message(cache: KernelCache, reason: object) -> str:
-    """Why an on-demand install failed, and how to do it by hand.
+    """Returns why an on-demand install failed, and how to do it by hand.
 
     The reason goes last: a cmake failure brings a screenful of compiler
     diagnostics with it, and what the reader has to act on must not be buried
@@ -213,7 +225,7 @@ def _announce(message: str) -> None:
 
 @contextlib.contextmanager
 def _install_lock(cache: KernelCache) -> Generator[None]:
-    """One installer per machine for `cache`, across processes.
+    """Holds the machine-wide install lock for `cache`, across processes.
 
     flock rather than a lock file we create and delete: the kernel drops it when
     the process dies, so a killed install does not wedge every later one.
@@ -227,7 +239,7 @@ def _install_lock(cache: KernelCache) -> Generator[None]:
 
 @functools.lru_cache(maxsize=1)
 def _deps_root() -> Path:
-    """`$TRITON_HOME/.triton/intj/deps`, beside the modules intj builds."""
+    """Returns `$TRITON_HOME/.triton/intj/deps`, beside the modules intj builds."""
     from triton import knobs
 
     return Path(knobs.cache.get_triton_dir("intj")) / "deps"
@@ -238,7 +250,7 @@ def _source_root(cache: KernelCache) -> Path:
 
 
 def _archives(directory: Path) -> tuple[str, ...]:
-    """Every abseil library under `directory`.
+    """Returns every abseil library under `directory`.
 
     All of them, because abseil's own dependency order is not something intj
     should encode: the link line wraps them in `--start-group`.
@@ -250,7 +262,13 @@ def _archives(directory: Path) -> tuple[str, ...]:
 
 
 def _unpack(source: Dependency, root: Path) -> None:
-    """Fetch, verify, extract -- then move into place, so a kill leaves nothing."""
+    """Fetches, verifies and extracts `source`, then moves it into place at `root`.
+
+    A kill leaves nothing behind.
+
+    Raises:
+        RuntimeError: The download does not match the pinned checksum.
+    """
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root.parent) as scratch:
         archive = Path(scratch) / "source.tar.gz"
@@ -275,6 +293,11 @@ def _unpack(source: Dependency, root: Path) -> None:
 
 
 def _cmake_build(root: Path) -> None:
+    """Builds the tree at `root` with cmake into `root/build`, marking it done last.
+
+    Raises:
+        RuntimeError: Configuring or building failed.
+    """
     build = root / "build"
     configure = [
         "cmake",
@@ -303,6 +326,11 @@ def _cmake_build(root: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Provisions the backends named in `argv` (default: all), as the CLI does.
+
+    Returns:
+        The exit status: 0 on success, 1 if an install failed, 2 on bad usage.
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
     force = "--force" in argv
     argv = [arg for arg in argv if arg != "--force"]

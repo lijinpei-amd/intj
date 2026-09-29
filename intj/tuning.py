@@ -24,12 +24,16 @@ from .launcher import UnsupportedKernel
 
 @dataclasses.dataclass(frozen=True)
 class Dependent:
+    """A tuned value fixed by the keys at or below `level`, stored in its record."""
+
     name: str
     level: int  # stored in this level's record
 
 
 @dataclasses.dataclass(frozen=True)
 class Computed:
+    """A heuristic over a caller var nothing keys, lowered to C and keyed at `level`."""
+
     name: str
     level: int  # keyed by this level's lookup
     heuristic: Heuristic
@@ -37,6 +41,17 @@ class Computed:
 
 @dataclasses.dataclass(frozen=True)
 class TuningPlan:
+    """The roles `analyze` gives every name of an autotune/heuristics chain.
+
+    Attributes:
+        jit_func: The innermost `JITFunction`.
+        layers: The Autotuner/Heuristics layers, outermost first.
+        exact_keys: Caller vars an autotune layer keys on, keyed by value.
+        dependent: Tuned values stored in a level's cache record.
+        computed: Heuristics lowered to C and keyed at a level.
+        levels: The number of lookup levels.
+    """
+
     jit_func: Any = dataclasses.field(compare=False)
     layers: tuple[Any, ...] = dataclasses.field(compare=False)  # outermost first
     exact_keys: tuple[str, ...] = ()
@@ -53,9 +68,20 @@ class TuningPlan:
 
 
 def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
-    """Assign roles for `kernel`, an Autotuner/Heuristics chain over a JITFunction.
+    """Assigns roles for `kernel`, an Autotuner/Heuristics chain over a JITFunction.
 
-    `fixed` names baked parameters: their values are in the module, so exact.
+    Args:
+        kernel: The outermost Autotuner or Heuristics layer.
+        fixed: Names of baked parameters; their values are in the module, so exact.
+
+    Returns:
+        The plan: every name's role and the number of lookup levels.
+
+    Raises:
+        UnsupportedKernel: The chain has no tuning layer, does not end in a
+            `@triton.jit` function, or has a layer intj cannot lower (a runtime
+            parameter tuned, a name assigned twice, a read of a value an inner
+            layer assigns, or an unparseable heuristic).
     """
     from triton.runtime.autotuner import Autotuner, Heuristics
     from triton.runtime.jit import JITFunction
@@ -171,7 +197,7 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
 
 @dataclasses.dataclass(frozen=True)
 class TunedGrid:
-    """How the miss path hands Triton a grid, per launcher grid mode."""
+    """The grid the miss path hands Triton, per launcher grid mode."""
 
     mode: str  # "dims" | "cpp" | "py"
     fn: Any = None
@@ -180,7 +206,7 @@ class TunedGrid:
 
 
 class _Shim:
-    """The innermost layer of a private chain: compiles and launches through intj.
+    """The innermost layer of a private chain, compiling and launching through intj.
 
     Triton's layers call `run` for every benchmark candidate and last for the
     final launch, so after the outermost `run` returns, `final` is that call.
@@ -200,6 +226,14 @@ class _Shim:
         self.final = None
 
     def run(self, *args: Any, grid: Any, warmup: bool, **kwargs: Any) -> Any:
+        """Compiles for this call, launches it unless `warmup`, and records it.
+
+        Keyword arguments that are not kernel parameters are compile options.
+        A grid with a zero dimension compiles but does not launch.
+
+        Returns:
+            The `CompiledKernel`.
+        """
         params = {k: v for k, v in kwargs.items() if k in self._signature.parameters}
         options = {k: v for k, v in kwargs.items() if k not in params}
         bound = self._signature.bind(*args, **params)
@@ -217,7 +251,10 @@ class _Shim:
 
 
 def _private_chain(layers: tuple[Any, ...], shim: _Shim) -> list[Any]:
-    """Shallow copies with their own tuner caches, bottoming out in `shim`."""
+    """Returns shallow copies of `layers` with their own tuner caches.
+
+    The last copy's `fn` is `shim`; each tuner's default hooks are rebound to it.
+    """
     from triton.runtime.autotuner import Autotuner
 
     private = [copy.copy(layer) for layer in layers]
@@ -239,9 +276,12 @@ def _private_chain(layers: tuple[Any, ...], shim: _Shim) -> list[Any]:
 
 
 def _rebind_default_hooks(tuner: Any) -> None:
-    """Triton's default reset_to_zero/restore_value hooks close over the tuner
-    they were built for; a copy's hooks would write the user's tuner. Rebuild
-    them over `tuner`, as `Autotuner.__init__` does. User hooks stay as given."""
+    """Rebuilds `tuner`'s default reset_to_zero/restore_value hooks over `tuner`.
+
+    Triton's default hooks close over the tuner they were built for; a copy's
+    hooks would write the user's tuner. They are rebuilt as `Autotuner.__init__`
+    does. User hooks stay as given.
+    """
     if not tuner.user_defined_pre_hook and (tuner.reset_to_zero or tuner.restore_value):
 
         def pre_hook(kwargs: dict[str, Any], reset_only: bool = False) -> None:
@@ -275,6 +315,11 @@ def _copy_back(originals: tuple[Any, ...], private: list[Any]) -> None:
 
 
 def c_scalar(name: str, value: object) -> object:
+    """Returns `value` if C can hold it: a bool or an int that fits in int64.
+
+    Raises:
+        UnsupportedKernel: `value`, tuned for `name`, is anything else.
+    """
     if type(value) is bool or type(value) is int and -(1 << 63) <= value < (1 << 63):
         return value
     raise UnsupportedKernel(
@@ -293,9 +338,14 @@ def make_tuned_callback(
     knob_values: Mapping[str, object],
     dynamic: Sequence[str] = (),
 ) -> Callable[..., tuple[Any, ...]]:
-    """The C miss callback for one bound launcher, which owns its private tuners.
-    Its arguments after the grid controls are the dynamic values, then the
-    public arguments."""
+    """Returns the C miss callback for one bound launcher.
+
+    The callback owns private copies of the plan's tuners, runs Triton's
+    tuning through them on a miss, and returns the record C caches. Its
+    arguments after the grid controls are the dynamic values, then the public
+    arguments. Misses are serialized; re-entering it while tuning raises
+    `UnsupportedKernel`.
+    """
     from triton.compiler import make_backend
 
     from .launcher import (
@@ -325,6 +375,7 @@ def make_tuned_callback(
     fed = _parameter_options(backend, params)
 
     def compile_kernel(values: dict[str, Any], config_options: dict[str, Any]) -> Any:
+        """Returns the `CompiledKernel` for one candidate, compiling it once."""
         canonical = _canonical_options(
             target,
             _knob_options(
@@ -369,6 +420,7 @@ def make_tuned_callback(
         controls: Any,
         *args: Any,
     ) -> tuple[Any, ...]:
+        """Tunes for one miss under `lock`, refusing re-entry."""
         del keyblob
         with lock:
             if running[0]:
@@ -384,6 +436,7 @@ def make_tuned_callback(
     def tune(
         nparams: int, device: int, stream: int, controls: Any, args: tuple[Any, ...]
     ) -> tuple[Any, ...]:
+        """Runs the private chain on `stream` and returns the record for C."""
         import torch
         from triton.runtime.autotuner import Autotuner
 

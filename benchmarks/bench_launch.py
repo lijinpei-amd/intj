@@ -1,7 +1,14 @@
 # pyright: standard
-"""Repeated per-launch timings for argument annotations and README comparisons.
+r"""Repeated per-launch timings for argument annotations and README comparisons.
 
-Usage: python benchmarks/bench_launch.py [--no-gpu | --readme | --sweep | --last-key | --tuned | --dynamic] [--iters N] [--batches N]
+Usage:
+
+    python benchmarks/bench_launch.py [--iters N] [--batches N] \
+        [--no-gpu | --readme | --sweep | --last-key | --tuned | --dynamic]
+
+Without a mode flag it times the INTJ annotation matrix (`--no-gpu` keeps it to
+host-only decoding and cache work). `--readme`, `--tuned` and `--dynamic` need a
+GPU; `--sweep` and `--last-key` run on the host only.
 
 The `--readme` rows report host time per launch for a trivial kernel:
 
@@ -60,7 +67,11 @@ def act_noop(x, o, n, ACT: tl.constexpr):
 
 
 def bench(fn, args, iters, batches, sync):
-    """Time calls using a tuple prepared by the caller, without a wrapper lambda."""
+    """Returns the median ns per `fn(*args)` call over `batches` batches.
+
+    Calls `fn` directly with the caller's prepared tuple, without a wrapper lambda,
+    after 100 warm-up calls. `sync` runs after each batch, outside the timer.
+    """
     for _ in range(100):
         fn(*args)
     sync()
@@ -76,7 +87,10 @@ def bench(fn, args, iters, batches, sync):
 
 
 def bench_pair(fn, first, second, iters, batches):
-    """Time two direct calls per iteration with prepared argument tuples."""
+    """Returns the median ns per call, alternating `fn(*first)` and `fn(*second)`.
+
+    Makes two direct calls per iteration with prepared argument tuples.
+    """
     for _ in range(100):
         fn(*first)
         fn(*second)
@@ -91,6 +105,11 @@ def bench_pair(fn, first, second, iters, batches):
 
 
 def bench_readme(iters, batches):
+    """Prints the README comparison of Triton and INTJ launches.
+
+    Times `grid=(1,)` and `grid=(0,)` launches through both, then each torch
+    access mode's `spec_key` and build time.
+    """
     n = 4096
     x = torch.randn(n, device="cuda")
     y = torch.randn(n, device="cuda")
@@ -132,6 +151,7 @@ def bench_readme(iters, batches):
 
 
 def bench_sweep(iters, batches):
+    """Prints host-only launch times for 4, 16 and 32 int or tensor arguments."""
     print(f"mode=sweep; host-only; {iters} calls × {batches} batches; median ns/call")
     print(f"{'count':>5} {'kind':>6} {'ns/call':>10}")
     with tempfile.TemporaryDirectory() as tmp:
@@ -153,6 +173,10 @@ def bench_sweep(iters, batches):
 
 
 def bench_last_key(iters, batches):
+    """Prints host-only launch times for repeated and alternating keys.
+
+    Uses 4, 16 and 32 int arguments; the alternate call differs in the last one.
+    """
     print(
         f"mode=last-key; host-only; {2 * iters} calls × {batches} batches; median ns/call"
     )
@@ -177,6 +201,12 @@ def bench_last_key(iters, batches):
 
 
 def main(iters=20000, batches=7, no_gpu=False):
+    """Prints launch times for each argument annotation against the automatic map.
+
+    Each row reports ns/call, its difference from the `auto map` row, and the
+    build and bind times. With `no_gpu`, tensors live on the CPU and launches
+    skip the driver.
+    """
     n = 4096
     device = "cpu" if no_gpu else "cuda"
     x = torch.randn(n, device=device)
@@ -218,6 +248,7 @@ def main(iters=20000, batches=7, no_gpu=False):
         baked_n=False,
         baked_block=False,
     ):
+        """Builds, binds and times one `noop` launcher; prints and returns ns/call."""
         start = time.perf_counter_ns()
         factory = make_launcher(
             noop,
@@ -311,7 +342,11 @@ def main(iters=20000, batches=7, no_gpu=False):
 
 
 def bench_tuned(iters, batches):
-    """A warmed autotuned launcher (hit path) against the same kernel with BLOCK baked."""
+    """Prints launch times of a warmed autotuned launcher and a baked one.
+
+    The autotuned launcher takes its hit path; the other launches the same kernel
+    with `BLOCK` baked.
+    """
     x = torch.zeros(1024, device="cuda")
     device, stream = (
         torch.cuda.current_device(),
@@ -341,9 +376,12 @@ def bench_tuned(iters, batches):
 
 
 def bench_dynamic(iters, batches):
-    """Warmed lazy launchers: plain, with two dynamic options, with a str
-    constexpr (and an int one to compare it with).  `launch` includes the ~3 us
-    driver call; `spec_key` is the host decode + key alone, at ns resolution."""
+    """Prints launch and `spec_key` times for warmed lazy launchers.
+
+    Rows: plain, with two dynamic options, with a str constexpr (and an int one to
+    compare it with). `launch` includes the ~3 us driver call; `spec_key` is the
+    host decode + key alone, at ns resolution.
+    """
     x = torch.zeros(4096, device="cuda")
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream
