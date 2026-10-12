@@ -18,6 +18,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
+from . import _imports
 from .heuristic import Heuristic, HeuristicError, parse_heuristic
 from .launcher import UnsupportedKernel
 
@@ -83,17 +84,15 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             parameter tuned, a name assigned twice, a read of a value an inner
             layer assigns, or an unparseable heuristic).
     """
-    from triton.runtime.autotuner import Autotuner, Heuristics
-    from triton.runtime.jit import JITFunction
-
+    _imports.ensure_triton_imported()
     layers: list[Any] = []
     inner = kernel
-    while type(inner) in (Autotuner, Heuristics):
+    while type(inner) in (_imports.Autotuner, _imports.Heuristics):
         layers.append(inner)
         inner = inner.fn
     if not layers:
         raise UnsupportedKernel("intj: expected an autotune or heuristics wrapper")
-    if not isinstance(inner, JITFunction):
+    if not isinstance(inner, _imports.JITFunction):
         raise UnsupportedKernel(
             f"intj: the innermost layer must be a @triton.jit function, got {type(inner).__name__}"
         )
@@ -122,7 +121,7 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
         assigned.add(name)
 
     def assigns(layer: Any) -> set[str]:
-        if type(layer) is Autotuner:
+        if type(layer) is _imports.Autotuner:
             return {str(n) for config in layer.configs for n in config.all_kwargs()}
         return set(layer.values)
 
@@ -139,7 +138,7 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             )
 
     for i, layer in enumerate(layers):
-        if type(layer) is Autotuner:
+        if type(layer) is _imports.Autotuner:
             level = 0
             for key in layer.keys:
                 if key not in params:
@@ -255,13 +254,12 @@ def _private_chain(layers: tuple[Any, ...], shim: _Shim) -> list[Any]:
 
     The last copy's `fn` is `shim`; each tuner's default hooks are rebound to it.
     """
-    from triton.runtime.autotuner import Autotuner
-
+    _imports.ensure_triton_imported()
     private = [copy.copy(layer) for layer in layers]
     for outer, inner in zip(private, [*private[1:], shim]):
         outer.fn = inner
     for layer in private:
-        if type(layer) is Autotuner:
+        if type(layer) is _imports.Autotuner:
             layer.cache = {}
             for name in (
                 "best_config",
@@ -346,8 +344,6 @@ def make_tuned_callback(
     arguments. Misses are serialized; re-entering it while tuning raises
     `UnsupportedKernel`.
     """
-    from triton.compiler import make_backend
-
     from .launcher import (
         Param,
         _canonical_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
@@ -364,7 +360,7 @@ def make_tuned_callback(
     del return_compiled  # C decides whether the record keeps the object
     jit_func = plan.jit_func
     target = _current_target()
-    backend = make_backend(target)
+    backend = _imports.make_backend(target)
     # every parameter public: the shim sees the full call Triton makes
     params = tuple(Param(p.name, p.index, p.index, p.annotation) for p in resolved)
     # keeps every CompiledKernel alive; a CompiledKernel is loaded on one device
@@ -437,9 +433,7 @@ def make_tuned_callback(
         nparams: int, device: int, stream: int, controls: Any, args: tuple[Any, ...]
     ) -> tuple[Any, ...]:
         """Runs the private chain on `stream` and returns the record for C."""
-        import torch
-        from triton.runtime.autotuner import Autotuner
-
+        _imports.ensure_torch_imported()
         current = _current_device()
         if device != current:
             raise UnsupportedKernel(
@@ -474,7 +468,8 @@ def make_tuned_callback(
         shim.reset()
         try:
             # option values reach every config through the shim's kwargs
-            with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=device)):
+            cuda = _imports.torch.cuda
+            with cuda.stream(cuda.ExternalStream(stream, device=device)):
                 private[0].run(
                     *prefix, grid=triton_grid, warmup=False, **named, **dyn_options
                 )
@@ -514,8 +509,9 @@ def make_tuned_callback(
             shim.final = None
             call_knobs[0] = {}
             for layer in private:
-                if type(layer) is Autotuner:
+                if type(layer) is _imports.Autotuner:
                     layer.nargs = None
-                    layer.restore_copies = {}  # pyright: ignore[reportAttributeAccessIssue]  # set by a closure in Autotuner.__init__, not a direct self-assignment
+                    # set by a closure in Autotuner.__init__
+                    layer.restore_copies = {}
 
     return callback

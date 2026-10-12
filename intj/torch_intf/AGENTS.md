@@ -31,5 +31,6 @@ naming the file, never skips it.
 
 ## Import torch and triton lazily
 
-Inside the function that needs them, never at module top: importing `intj` must not
-import torch, and probing must not initialize the GPU.
+Through `intj/_imports.py`, inside the function that needs them, never at module
+top (see the root `AGENTS.md`): importing `intj` must not import torch, and probing
+must not initialize the GPU.

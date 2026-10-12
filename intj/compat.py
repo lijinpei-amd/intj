@@ -10,25 +10,17 @@ import threading
 from functools import lru_cache
 from typing import Any
 
-from triton._utils import canonicalize_dtype
-from triton import knobs
-from triton import language as tl
-from triton.runtime.driver import driver
-from triton.runtime.jit import JITFunction, TensorWrapper
-
+from . import _imports
 from .annotation import Argument, Constexpr
 from .launcher import UnsupportedKernel, make_launcher
 
-try:
-    from triton._compile_warmup_state import is_compile_warmup as _is_compile_warmup  # pyright: ignore[reportMissingImports]  # optional Triton test runtime
-except ImportError:  # Triton versions without compile-warmup mode
-    _is_compile_warmup = None
-
 
 def _pointer_type(dtype: Any) -> Any:
+    _imports.ensure_triton_imported()
     try:
+        tl = _imports.tl
         if not isinstance(dtype, tl.dtype):
-            dtype = tl.str_to_ty(canonicalize_dtype(dtype), None)
+            dtype = tl.str_to_ty(_imports.canonicalize_dtype(dtype), None)
         return tl.pointer_type(dtype)
     except (KeyError, TypeError, ValueError) as error:
         raise UnsupportedKernel(
@@ -164,14 +156,17 @@ def launch(
         ValueError: `grid` has the wrong rank, or a pointer argument is an
             unpinned CPU tensor.
     """
-    if _is_compile_warmup is not None and _is_compile_warmup():
+    _imports.ensure_triton_imported()
+    warmup = _imports.is_compile_warmup
+    if warmup is not None and warmup():
         # The test runtime intercepts indexed calls to compile with fake pointers.
         return kernel[grid](*args, **kwargs)
-    hooks = (knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook)
+    runtime = _imports.knobs.runtime
+    hooks = (runtime.launch_enter_hook, runtime.launch_exit_hook)
     # HookChain is truthy even when no callbacks are registered.
     if any(getattr(hook, "calls", hook) for hook in hooks):
         raise UnsupportedKernel("intj: active Triton launch hooks are not supported")
-    if not isinstance(kernel, JITFunction):
+    if not isinstance(kernel, _imports.JITFunction):
         raise UnsupportedKernel(
             f"intj: expected a @triton.jit function, got {type(kernel).__name__}"
         )
@@ -192,7 +187,9 @@ def launch(
         for param in kernel.params
         if param.is_constexpr
         and (
-            isinstance(bound.arguments[param.name], (tl.dtype, JITFunction))
+            isinstance(
+                bound.arguments[param.name], (_imports.tl.dtype, _imports.JITFunction)
+            )
             or type(bound.arguments[param.name]) is str
         )
     )
@@ -201,7 +198,7 @@ def launch(
         param.name: bound.arguments[param.name]
         for param in kernel.params
         if not param.is_constexpr
-        and isinstance(bound.arguments[param.name], TensorWrapper)
+        and isinstance(bound.arguments[param.name], _imports.TensorWrapper)
     }
     wrapped_types = tuple((name, value.dtype) for name, value in wrapped.items())
     values = tuple(
@@ -212,12 +209,11 @@ def launch(
 
     # Triton's driver rejects ordinary CPU pointers; an empty kernel would
     # otherwise make the invalid intj launch appear to succeed.
-    import torch
-
+    _imports.ensure_torch_imported()
     for name, value in bound.arguments.items():
-        tensor = value.base if isinstance(value, TensorWrapper) else value
+        tensor = value.base if isinstance(value, _imports.TensorWrapper) else value
         if (
-            isinstance(tensor, torch.Tensor)
+            isinstance(tensor, _imports.torch.Tensor)
             and tensor.device.type == "cpu"
             and tensor.data_ptr() != 0
             and not tensor.is_pinned()
@@ -226,8 +222,9 @@ def launch(
                 f"intj: pointer argument {name!r} cannot be accessed from Triton (cpu tensor?)"
             )
 
-    device = driver.active.get_current_device()  # pyright: ignore[reportAttributeAccessIssue]  # concrete drivers provide it
-    stream = driver.active.get_current_stream(device)  # pyright: ignore[reportAttributeAccessIssue]  # concrete drivers provide it
+    active = _imports.driver.active
+    device = active.get_current_device()
+    stream = active.get_current_stream(device)
     if callable(grid):
         key = (
             kernel,
@@ -293,7 +290,8 @@ def launch(
 
 
 def _target_key() -> tuple[str, str, int]:
-    target = driver.active.get_current_target()
+    _imports.ensure_triton_imported()
+    target = _imports.driver.active.get_current_target()
     if target is None:
         raise UnsupportedKernel("intj: no active Triton target")
     return (target.backend, repr(target.arch), target.warp_size)
@@ -301,6 +299,8 @@ def _target_key() -> tuple[str, str, int]:
 
 def _knob_key() -> tuple[object, object, object]:
     """Returns the knobs a launcher reads at its first call; each value keys one."""
+    _imports.ensure_triton_imported()
+    knobs = _imports.knobs
     return (
         knobs.runtime.debug,
         knobs.compilation.instrumentation_mode,
@@ -312,6 +312,7 @@ def launch_or_interpret(
     kernel: Any, grid: Any, /, *args: Any, return_compiled: bool = False, **kwargs: Any
 ) -> Any:
     """Launches through Triton while its interpreter is enabled, else via `launch`."""
-    if knobs.runtime.interpret:
+    _imports.ensure_triton_imported()
+    if _imports.knobs.runtime.interpret:
         return kernel[grid](*args, **kwargs)
     return launch(kernel, grid, *args, return_compiled=return_compiled, **kwargs)

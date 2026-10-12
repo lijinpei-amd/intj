@@ -19,6 +19,8 @@ import subprocess
 import sysconfig
 import tempfile
 
+from .. import _imports
+
 _RUNTIME = pathlib.Path(__file__).parent.parent / "runtime"
 
 #: Member pointers to private fields, taken the one legal way: access checking
@@ -134,11 +136,11 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
     Raises:
         subprocess.CalledProcessError: The probe does not build.
     """
-    import torch
+    _imports.ensure_torch_imported()
     from torch.utils import cpp_extension
 
     includes, libs = cpp_extension.include_paths(), cpp_extension.library_paths()
-    cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)  # pyright: ignore[reportPrivateUsage]
+    cxx11_abi = int(_imports.torch._C._GLIBCXX_USE_CXX11_ABI)
     with tempfile.TemporaryDirectory() as tmp:
         src, lib = pathlib.Path(tmp, "detect.cpp"), pathlib.Path(tmp, "detect.so")
         src.write_text(_SOURCE)

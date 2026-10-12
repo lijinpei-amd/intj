@@ -157,8 +157,10 @@ def test_launch_or_interpret_only_calls_triton_in_interpreter_mode():
 
 def test_launch_uses_triton_dispatch_during_compile_warmup(monkeypatch):
     import intj.compat as compat
+    from intj import _imports
 
-    monkeypatch.setattr(compat, "_is_compile_warmup", lambda: True)
+    _imports.ensure_triton_imported()  # a first import would overwrite the patch
+    monkeypatch.setattr(_imports, "is_compile_warmup", lambda: True)
     grid = (1,)
 
     class TritonOnly:
@@ -247,7 +249,7 @@ def host_bridge(monkeypatch):
     import intj.compat as compat
     import intj.launcher as launcher_module
 
-    from intj import TorchAccessMode, make_launcher
+    from intj import TorchAccessMode, _imports, make_launcher
 
     real_make_launcher = make_launcher
 
@@ -257,8 +259,9 @@ def host_bridge(monkeypatch):
         )
 
     monkeypatch.setattr(compat, "make_launcher", host_launcher)
+    _imports.ensure_triton_imported()  # a first import would overwrite the patch
     monkeypatch.setattr(
-        compat,
+        _imports,
         "driver",
         SimpleNamespace(
             active=SimpleNamespace(
@@ -328,6 +331,7 @@ def test_per_call_grid_lambda_hits_and_is_not_retained(host_bridge):
 
 def test_fpsan_knob_change_reselects_compat_launcher(monkeypatch):
     import intj.compat as compat
+    from intj import _imports
     from triton import knobs
 
     selected = []
@@ -337,8 +341,9 @@ def test_fpsan_knob_change_reselects_compat_launcher(monkeypatch):
         return lambda *_call_args: None
 
     monkeypatch.setattr(compat, "_make", make_native)
+    _imports.ensure_triton_imported()  # a first import would overwrite the patch
     monkeypatch.setattr(
-        compat,
+        _imports,
         "driver",
         SimpleNamespace(
             active=SimpleNamespace(

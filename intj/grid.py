@@ -12,13 +12,12 @@ import types
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
-import triton
+from . import _imports
 
 if TYPE_CHECKING:
     from .launcher import Param
 
 _BUILTIN_MIN = builtins.min
-_TRITON_CDIV = triton.cdiv
 
 
 class GridError(ValueError):
@@ -140,8 +139,10 @@ def compile_grid(
         builtin_namespace.get("min") if isinstance(builtin_namespace, dict) else None
     )
     min_is_builtin = fn.__globals__.get("min", builtin_min) is _BUILTIN_MIN
+    _imports.ensure_triton_imported()
+    triton = _imports.triton
     cdiv_is_triton = (
-        fn.__globals__.get("triton") is triton and triton.cdiv is _TRITON_CDIV
+        fn.__globals__.get("triton") is triton and triton.cdiv is _imports.cdiv
     )
 
     lines = [

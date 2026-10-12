@@ -2613,6 +2613,27 @@ def test_none_kernel_is_rejected_not_a_decorator_factory():
     assert callable(make_launcher(options={"num_warps": 4}))
 
 
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"no_gpu": 1}, "no_gpu must be a bool"),
+        ({"assume_constant_globals": None}, "assume_constant_globals must be a bool"),
+        ({"options": [("num_warps", 4)]}, "options must be None or a mapping"),
+        ({"extra_annotation": {0: int}}, "extra_annotation must be None or a mapping"),
+        ({"kernel_cache": "intj"}, "kernel_cache must be a KernelCache"),
+        ({"torch_access_mode": "interpreter"}, "torch_access_mode must be None or"),
+        ({"dynamic_options": ("num_warps", 4)}, "names must be str"),
+        ({"dynamic_options": 4}, "dynamic_options must be a sequence"),
+    ],
+)
+def test_malformed_keyword_arguments_are_rejected_when_applied(kwargs, match):
+    decorate = make_launcher(**kwargs)
+    with pytest.raises(TypeError, match=match):
+        decorate(scale)
+    with pytest.raises(TypeError, match=match):
+        make_launcher(scale, **kwargs)
+
+
 def test_positional_arguments_beyond_the_kernel_are_rejected():
     with pytest.raises(TypeError, match="positional argument"):
         make_launcher(scale, False)  # pyright: ignore[reportCallIssue]
@@ -4752,11 +4773,29 @@ def test_refuses_non_jit_function():
         make_launcher(lambda: None)
 
 
+def test_importing_intj_imports_neither_triton_nor_torch():
+    """Every module reaches them through `intj._imports`, on first use."""
+    code = (
+        "import sys, intj, intj.compat, intj.grid, intj.heuristic, intj.tuning, "
+        "intj.torch_intf.abi_detect, intj.torch_intf.cpp_detect; "
+        "print(sorted({'triton', 'torch'} & set(sys.modules)))"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[1])},
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "[]"
+
+
 @pytest.mark.parametrize("version", [None, "3.6.0"])
 def test_launcher_requires_triton_extra(monkeypatch, version):
     installed = types.ModuleType("triton")
     setattr(installed, "__version__", version)
     monkeypatch.setitem(sys.modules, "triton", installed if version else None)
+    monkeypatch.setattr("intj._imports.triton", None)  # forget the cached import
 
     with pytest.raises(UnsupportedKernel, match=r"Triton >=3\.7.*intj\[launcher\]"):
         make_launcher(object())

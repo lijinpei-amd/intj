@@ -13,6 +13,7 @@ import ctypes
 import functools
 from typing import Any
 
+from .. import _imports
 from ..python_intf.cpython_abi import pyobject_size
 from .torch_abi import (
     OFFSETS,
@@ -48,7 +49,8 @@ def _probes() -> list[Any]:
       forever and picking wrong is silently correct until someone passes a
       borrowed buffer.
     """
-    import torch
+    _imports.ensure_torch_imported()
+    torch = _imports.torch
 
     base = torch.arange(4096, dtype=torch.float16)
     wide = torch.arange(300, dtype=torch.float64)
@@ -175,7 +177,8 @@ def _selfcheck(layout: TensorABI, header_size: int) -> bool:
     combines them, including the zero-element rule that `data_ptr()` applies and
     the raw offsets cannot see.
     """
-    import torch
+    _imports.ensure_torch_imported()
+    torch = _imports.torch
 
     cases = list(_probes())
     cases += [
@@ -211,7 +214,8 @@ def _expected(t: Any) -> tuple[int, int, int]:
 
 def _main() -> None:
     """Prints the entry for the running torch, to paste into `torch_abi.toml`."""
-    import torch
+    _imports.ensure_torch_imported()
+    torch = _imports.torch
 
     header_size = pyobject_size()
     layout = probe_layout(header_size)

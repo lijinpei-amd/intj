@@ -9,6 +9,8 @@ import struct
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
+from . import _imports
+
 if TYPE_CHECKING:
     import triton.language as tl
 
@@ -214,8 +216,8 @@ def __getattr__(name: str) -> Any:
     """Returns `INT_TYPES` or `FLOAT_TYPES`, importing triton on first access."""
     if name not in ("INT_TYPES", "FLOAT_TYPES"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import triton.language as tl
-
+    _imports.ensure_triton_imported()
+    tl = _imports.tl
     value = (tl.int32, tl.int64, tl.uint64) if name == "INT_TYPES" else (tl.float32,)
     globals()[name] = value
     return value
@@ -337,15 +339,14 @@ def _canonical_value(value: object) -> tuple[object, ...]:
     Raises:
         ValueError: The value is not a dtype, str, `JITFunction` or scalar.
     """
-    import triton.language as tl
-    from triton.runtime.jit import JITFunction
-
-    if isinstance(value, tl.dtype):
-        return ("dtype", value.name)
+    _imports.ensure_triton_imported()
+    if isinstance(value, _imports.tl.dtype):
+        return ("dtype", cast(Any, value).name)
     if type(value) is str:
         return ("str", value)
-    if isinstance(value, JITFunction):
-        return ("jit", value.module, value.fn.__qualname__, value.cache_key)
+    if isinstance(value, _imports.JITFunction):
+        jit: Any = value
+        return ("jit", jit.module, jit.fn.__qualname__, jit.cache_key)
     if value is None:
         return ("none",)
     if type(value) is bool:
@@ -381,15 +382,15 @@ def _tensor_annotation(value: object) -> str | None:
     import types
     import typing
 
-    import triton.language as tl
-
+    _imports.ensure_triton_imported()
     if type(value) is str:
         text = "".join(value.split()).replace("typing.", "")
         if text in _TENSOR_NAMES:
             return "tensor"
         return "optional" if text in _OPTIONAL_TENSOR_NAMES else None
     torch = sys.modules.get("torch")
-    classes = (tl.tensor,) if torch is None else (tl.tensor, torch.Tensor)
+    tensor = _imports.tl.tensor
+    classes = (tensor,) if torch is None else (tensor, torch.Tensor)
     if any(value is cls for cls in classes):
         return "tensor"
     # `X | None` is a types.UnionType from Python 3.10 on
@@ -409,17 +410,16 @@ def _annotation_source(value: object, name: str) -> Argument | Constexpr | None:
     Raises:
         ValueError: The annotation is not one intj understands.
     """
-    import triton.language as tl
-
+    _imports.ensure_triton_imported()
     if value is inspect.Parameter.empty:
         return None
     if type(value) is Argument or type(value) is Constexpr:
         return value
-    if value is tl.constexpr:
+    if value is _imports.tl.constexpr:
         return Constexpr()
     if value is int or (type(value) is str and value == "int"):
-        return Argument(type=tl.int32)
-    if value is None or isinstance(value, tl.dtype):
+        return Argument(type=_imports.tl.int32)
+    if value is None or isinstance(value, _imports.tl.dtype):
         return Argument(type=value)
     raise ValueError(f"intj: parameter {name!r} has unsupported annotation {value!r}")
 
@@ -491,20 +491,20 @@ def _type_name(value: object, kind: str, *, element: bool = False) -> str | None
     Raises:
         ValueError: The type is not supported for `kind`.
     """
-    import triton.language as tl
-
+    _imports.ensure_triton_imported()
     if value is None:
         return None
-    if type(value) is tl.pointer_type and kind == "argument":
-        if value.address_space not in (1, "global") or value.const:
+    if type(value) is _imports.tl.pointer_type and kind == "argument":
+        pointer: Any = value
+        if pointer.address_space not in (1, "global") or pointer.const:
             raise ValueError("intj: unsupported pointer type")
-        item = _type_name(value.element_ty, kind, element=True)
+        item = _type_name(pointer.element_ty, kind, element=True)
         if item is None:
             raise ValueError("intj: unsupported pointer element type")
         return "*" + item
-    if type(value) is not tl.dtype:
+    if type(value) is not _imports.tl.dtype:
         raise ValueError(f"intj: unsupported {kind} type {value!r}")
-    name = cast(str, value.name)
+    name: str = cast(Any, value).name
     if name == "int1":
         return "u1"
     if name.startswith("int") and name[3:] in ("8", "16", "32", "64"):
@@ -512,7 +512,7 @@ def _type_name(value: object, kind: str, *, element: bool = False) -> str | None
     if name.startswith("uint") and name[4:] in ("8", "16", "32", "64"):
         return "u" + name[4:]
     if name in (("fp32", "fp64") if kind == "argument" else ("fp64",)) or (
-        element and name in tl.dtype.FP_TYPES
+        element and name in _imports.tl.dtype.FP_TYPES
     ):
         return name
     raise ValueError(f"intj: unsupported {kind} type {name}")
@@ -652,9 +652,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
         ValueError: An unknown parameter name, an unsupported annotation, or a
             conflicting or impossible combination of fields.
     """
-    import triton.language as tl
-    from triton.runtime.jit import JITFunction
-
+    _imports.ensure_triton_imported()
     extra = extra_annotation or {}
     unknown = set(extra) - {param.name for param in jit_func.params}
     if unknown:
@@ -670,14 +668,16 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
         triton_type = cast(str, param.annotation_type)
         tensor_kinds: set[str] = set()
         if triton_type:
-            inline = Argument(type=tl.str_to_ty(triton_type, None))
+            inline = Argument(type=_imports.tl.str_to_ty(triton_type, None))
         elif (tensor_kind := _tensor_annotation(raw)) is not None:
             inline = None
             tensor_kinds.add(tensor_kind)
         else:
             # Preserve Triton's legacy constexpr strings, including postponed annotations.
             inline = _annotation_source(
-                tl.constexpr if isinstance(raw, str) and param.is_constexpr else raw,
+                _imports.tl.constexpr
+                if isinstance(raw, str) and param.is_constexpr
+                else raw,
                 name,
             )
         other = None
@@ -774,7 +774,7 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
             if (
                 kind == "constexpr"
                 and types is None
-                and not isinstance(baked, (tl.dtype, JITFunction))
+                and not isinstance(baked, (_imports.tl.dtype, _imports.JITFunction))
                 and type(baked) is not str
             ):
                 _inferred_scalar_type(baked)  # Enforce Triton's scalar integer domain.

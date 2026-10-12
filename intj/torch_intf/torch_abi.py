@@ -21,6 +21,7 @@ if sys.version_info >= (3, 11):
 else:  # the same parser, before it joined the stdlib
     import tomli as tomllib  # pyright: ignore[reportMissingImports]
 
+from .. import _imports
 from ..python_intf.cpython_abi import pyobject_size
 
 #: How many dtype codes the C side reserves room for; mirrors INTJ_NDTYPES.
@@ -94,11 +95,12 @@ def live_dtypes() -> dict[int, tuple[str, int]]:
     build cannot actually allocate and, unlike a zero-element `torch.empty`,
     warns for none of the experimental ones.
     """
-    import torch
+    _imports.ensure_torch_imported()
+    torch = _imports.torch
 
     found: dict[int, tuple[str, int]] = {}
     for name in dir(torch):
-        value = getattr(torch, name, None)
+        value: Any = getattr(torch, name, None)
         if not isinstance(value, torch.dtype):
             continue
         code = dtype_code(value)
@@ -159,8 +161,9 @@ def dtype_index_table() -> bytes:
     Raises:
         RuntimeError: Triton has more than 32 element types.
     """
-    import torch
-    from triton._utils import type_canonicalisation_dict
+    _imports.ensure_torch_imported()
+    torch = _imports.torch
+    _imports.ensure_triton_imported()
 
     by_code: dict[int, Any] = {}
     for name in dir(torch):
@@ -177,7 +180,9 @@ def dtype_index_table() -> bytes:
         # `str(dtype)` is what triton's own canonicalize_dtype splits; the
         # attribute name is not.  `torch.chalf` and `torch.complex32` are one
         # dtype, and only the latter spelling is ever a key in that dict.
-        canon = type_canonicalisation_dict.get(str(by_code[code]).split(".")[-1])
+        canon = _imports.type_canonicalisation_dict.get(
+            str(by_code[code]).split(".")[-1]
+        )
         if canon is None:
             continue
         table[code] = indices.setdefault(canon, len(indices))
@@ -298,7 +303,8 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
 @functools.lru_cache(maxsize=1)
 def torch_version() -> tuple[int, int]:
     """Returns the running torch's (major, minor)."""
-    import torch
+    _imports.ensure_torch_imported()
+    torch = _imports.torch
 
     major, _, rest = torch.__version__.partition(".")
     minor = rest.partition(".")[0]

@@ -16,7 +16,7 @@ import types
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
-import triton
+from . import _imports
 
 # Python 3.8 wraps a subscript's index in ast.Index; later versions do not.
 _INDEX: Any = getattr(ast, "Index", ())
@@ -178,7 +178,7 @@ def _same_code(
 
 
 _BUILTIN = {"min": builtins.min, "max": builtins.max}
-_TRITON = {"cdiv": triton.cdiv, "next_power_of_2": triton.next_power_of_2}
+_TRITON = ("cdiv", "next_power_of_2")
 #: tensor method -> takes one literal index
 _TENSOR_METHODS = {
     "numel": False,
@@ -266,7 +266,8 @@ class _Emitter:
             name: namespace.get(name, getattr(builtins, name)) is fn
             for name, fn in _BUILTIN.items()
         }
-        self.triton_ok = namespace.get("triton") is triton
+        _imports.ensure_triton_imported()
+        self.triton_ok = namespace.get("triton") is _imports.triton
 
     def fail(self, node: ast.AST, message: str) -> HeuristicError:
         return HeuristicError(f"{self.h.where}: heuristic {self.h.name!r}: {message}")

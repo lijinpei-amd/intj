@@ -74,6 +74,17 @@ keeps it to one installer per machine, and a tree is only visible to
 `toolchain_for` once it is complete. Anything that reaches the network belongs
 on that slow path, never on a launch.
 
+## triton and torch are imported on first use, through `_imports`
+
+`import intj` loads neither, so nothing in `intj/` imports them at module top. A
+function calls `_imports.ensure_triton_imported()` (or `ensure_torch_imported()`),
+then reads the cached name as `_imports.knobs`, `_imports.torch`, ... -- never
+`from ._imports import knobs`, which copies the None it starts as. A new name goes
+in `_imports.py`. Three imports stay local, each commented: Gluon's runtime and
+`torch.utils.cpp_extension` cost tens of ms, and `triton.backends.amd` is absent
+from a triton built without it. `test_importing_intj_imports_neither_triton_nor_torch`
+guards the rule.
+
 ## Refusals are loud and early
 
 Anything intj cannot do raises `UnsupportedKernel`, preferably in `make_launcher`,

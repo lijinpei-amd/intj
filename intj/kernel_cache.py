@@ -59,6 +59,8 @@ import urllib.request
 from collections.abc import Generator
 from pathlib import Path
 
+from . import _imports
+
 #: What a failed `install` raises: network and disk (OSError, which
 #: urllib.error.URLError subclasses), a bad tarball, a failed compiler, and the
 #: RuntimeErrors raised here.  Narrow on purpose -- an internal bug should not
@@ -240,9 +242,8 @@ def _install_lock(cache: KernelCache) -> Generator[None]:
 @functools.lru_cache(maxsize=1)
 def _deps_root() -> Path:
     """Returns `$TRITON_HOME/.triton/intj/deps`, beside the modules intj builds."""
-    from triton import knobs
-
-    return Path(knobs.cache.get_triton_dir("intj")) / "deps"
+    _imports.ensure_triton_imported()
+    return Path(_imports.knobs.cache.get_triton_dir("intj")) / "deps"
 
 
 def _source_root(cache: KernelCache) -> Path:

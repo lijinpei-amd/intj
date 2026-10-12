@@ -29,7 +29,7 @@ from collections.abc import (
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, overload
 
-from . import lazy
+from . import _imports, lazy
 from ._version import __version__
 from .annotation import (
     CanonicalAnnotation,
@@ -149,10 +149,10 @@ class CompilerInput:
 
     def ast_source(self, jit_func: JitFunction) -> Any:
         """Returns the triton `ASTSource` (`GluonASTSource` for Gluon) to compile."""
-        from triton.compiler import ASTSource
-
-        source_type = ASTSource
+        _imports.ensure_triton_imported()
+        source_type = _imports.ASTSource
         if jit_func.is_gluon():
+            # not cached with the rest: importing gluon costs ~35 ms
             from triton.experimental.gluon._runtime import GluonASTSource
 
             source_type = GluonASTSource
@@ -345,17 +345,16 @@ class LauncherFactory:
         missing = names - values.keys()
         if missing:
             raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
-        import torch
-        from triton._utils import type_canonicalisation_dict
-
+        _imports.ensure_torch_imported()
+        _imports.ensure_triton_imported()
         resolved: list[ResolvedParam] = []
         for p in self.params:
             annotation = p.annotation
             if annotation.bind_value == "tensor":
                 value = values[p.name]
                 if value is not None and type(value) not in (
-                    torch.Tensor,
-                    torch.nn.Parameter,
+                    _imports.torch.Tensor,
+                    _imports.torch.nn.Parameter,
                 ):
                     raise TypeError(
                         f"intj: bound tensor {p.name!r} must be a tensor or None"
@@ -367,8 +366,8 @@ class LauncherFactory:
                 if annotation.types is None:
                     ty = None
                     if value is not None:
-                        tensor = cast(torch.Tensor, value)
-                        dtype = type_canonicalisation_dict.get(
+                        tensor: Any = value
+                        dtype = _imports.type_canonicalisation_dict.get(
                             str(tensor.dtype).split(".")[-1]
                         )
                         if dtype is None:
@@ -421,9 +420,8 @@ class LauncherFactory:
         again, so a launcher built with the interpreter off keeps launching if
         it is turned on later.
         """
-        from triton import knobs
-
-        if knobs.runtime.interpret:
+        _imports.ensure_triton_imported()
+        if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
         # a declared knob is per call: leaving its live value out keeps it out
         # of the ModuleKey, so it cannot build a module per value
@@ -486,44 +484,6 @@ class LauncherFactory:
             )
         grid_py = () if self.grid_py is None else (self.grid_py, hidden)
         return module.init_bound(header, callback, _Interner(), *grid_py, *args)
-
-
-def _validate_grid_kwargs(
-    dynamic_options: Sequence[str],
-    grid_arg: int | None,
-    grid_cpp: object | None,
-    grid_py: Callable[[dict[str, object]], object] | None,
-    return_compiled: bool,
-    no_gpu: bool,
-) -> None:
-    """Runs the cheap checks on `make_launcher`'s grid/compile kwargs.
-
-    No imports, no GPU, no build. Runs eagerly both in the factory form (at
-    decoration time, before the kernel exists) and in the direct-call form.
-
-    Raises:
-        ValueError: `grid_arg` is out of range, or more than one grid option
-            is given.
-        TypeError: `grid_py` is not callable, or `dynamic_options` is a str.
-        UnsupportedKernel: `dynamic_options` or `return_compiled` with
-            `no_gpu=True`.
-    """
-    if grid_arg is not None and (
-        type(grid_arg) is not int or grid_arg not in (1, 2, 3)
-    ):
-        raise ValueError("intj: grid_arg must be 1, 2, or 3")
-    if sum(value is not None for value in (grid_arg, grid_cpp, grid_py)) > 1:
-        raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
-    if grid_py is not None and not callable(grid_py):
-        raise TypeError("intj: grid_py must be callable")
-    if isinstance(dynamic_options, str):
-        raise TypeError("intj: dynamic_options is a sequence of names, not one string")
-    if dynamic_options and no_gpu:
-        raise UnsupportedKernel(
-            "intj: dynamic_options needs GPU mode; no_gpu=True compiles nothing"
-        )
-    if return_compiled and no_gpu:
-        raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
 
 
 def _interpreter_deferred(bind_device_requested: bool) -> Any:
@@ -637,8 +597,8 @@ def make_launcher(
         @triton.jit
         def k(...): ...
 
-    The cheap keyword checks (grid option ranges and exclusivity) run at
-    decoration time.  make_launcher does no GPU work: the returned launcher
+    The arguments are checked when the decorator is applied to the kernel.
+    make_launcher does no GPU work: the returned launcher
     builds its module on its first call (see docs/Usage.md, "Lazy build").
 
     Without bindings, the returned callable is a C function:
@@ -706,16 +666,6 @@ def make_launcher(
         ClassGlobalWarning: `assume_constant_globals=True` keyed a class
             global by its qualified name.
     """
-    _validate_grid_kwargs(
-        dynamic_options,
-        grid_arg,
-        grid_cpp,
-        grid_py,
-        return_compiled,
-        no_gpu,
-    )
-    if jit_func is None:
-        raise TypeError("intj: make_launcher got None instead of a kernel")
     if jit_func is _NO_KERNEL:
         return functools.partial(
             make_launcher,
@@ -733,29 +683,75 @@ def make_launcher(
             return_compiled=return_compiled,
             assume_constant_globals=assume_constant_globals,
         )
-    kernel: JitFunction = jit_func
-    triton_hint = "intj: Triton >=3.7 is required; install `intj[launcher]`"
+    if jit_func is None:
+        raise TypeError("intj: make_launcher got None instead of a kernel")
+    # Cheap checks on every argument: no imports, no GPU, no build.
+    flags: dict[str, object] = {
+        "no_gpu": no_gpu,
+        "verify_annotation": verify_annotation,
+        "bind_device": bind_device,
+        "return_compiled": return_compiled,
+        "assume_constant_globals": assume_constant_globals,
+    }
+    for name, flag in flags.items():
+        if type(flag) is not bool:
+            raise TypeError(f"intj: {name} must be a bool, got {flag!r}")
+    mappings: dict[str, object] = {
+        "extra_annotation": extra_annotation,
+        "options": options,
+    }
+    for name, mapping in mappings.items():
+        if mapping is not None and not (
+            isinstance(mapping, Mapping) and all(type(k) is str for k in mapping)
+        ):
+            raise TypeError(f"intj: {name} must be None or a mapping keyed by str")
+    if type(kernel_cache) is not KernelCache:
+        raise TypeError(
+            f"intj: kernel_cache must be a KernelCache, got {kernel_cache!r}"
+        )
+    if torch_access_mode is not None and type(torch_access_mode) is not TorchAccessMode:
+        raise TypeError(
+            "intj: torch_access_mode must be None or a TorchAccessMode, "
+            f"got {torch_access_mode!r}"
+        )
+    if isinstance(dynamic_options, str):
+        raise TypeError("intj: dynamic_options is a sequence of names, not one string")
     try:
-        import triton
-    except ModuleNotFoundError as e:
-        if e.name != "triton":
-            raise
-        raise UnsupportedKernel(triton_hint) from e
-    if tuple(map(int, triton.__version__.split(".")[:2])) < (3, 7):
-        raise UnsupportedKernel(f"{triton_hint} (found {triton.__version__})")
-    _verified_cpython_header()
-    options = dict(sorted((options or {}).items()))
+        declared = tuple(dynamic_options)
+    except TypeError:
+        raise TypeError(
+            "intj: dynamic_options must be a sequence of names, "
+            f"got {dynamic_options!r}"
+        ) from None
+    for name in declared:
+        if type(name) is not str:
+            raise TypeError(f"intj: dynamic_options names must be str, got {name!r}")
+    if grid_arg is not None and (
+        type(grid_arg) is not int or grid_arg not in (1, 2, 3)
+    ):
+        raise ValueError("intj: grid_arg must be 1, 2, or 3")
+    if sum(value is not None for value in (grid_arg, grid_cpp, grid_py)) > 1:
+        raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
+    if grid_py is not None and not callable(grid_py):
+        raise TypeError("intj: grid_py must be callable")
+    if no_gpu and declared:
+        raise UnsupportedKernel(
+            "intj: dynamic_options needs GPU mode; no_gpu=True compiles nothing"
+        )
     if no_gpu and options:
         raise UnsupportedKernel(
             "intj: no_gpu=True supports only default compile options"
         )
-    from triton.runtime.autotuner import Autotuner, Heuristics
-    from triton.runtime.interpreter import InterpretedFunction
-
+    if no_gpu and return_compiled:
+        raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
+    kernel: JitFunction = jit_func
+    _imports.ensure_triton_imported()
+    _verified_cpython_header()
+    options = dict(sorted((options or {}).items()))
     chain = kernel
-    while type(kernel) in (Autotuner, Heuristics):
+    while type(kernel) in (_imports.Autotuner, _imports.Heuristics):
         kernel = kernel.fn
-    if isinstance(kernel, InterpretedFunction):
+    if isinstance(kernel, _imports.InterpretedFunction):
         # `@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
         # not a JITFunction: it has none of the attributes the analysis below
         # needs (`.params`, `.cache_key`, ...), so there is nothing to decorate.
@@ -765,7 +761,7 @@ def make_launcher(
         # first call, exactly like `_build`'s live `knobs.runtime.interpret`
         # check does for a kernel that decoded to a real JITFunction.
         return _interpreter_deferred(bind_device)
-    kernel = _check_kernel(kernel, options, bool(assume_constant_globals))
+    kernel = _check_kernel(kernel, options, assume_constant_globals)
     global_values = _global_values(kernel) if assume_constant_globals else ()
     resolved = _resolve_annotations(kernel, extra_annotation)
     tuned: _Tuned | None = None
@@ -791,7 +787,6 @@ def make_launcher(
             raise UnsupportedKernel(
                 f"intj: parameter {p.name!r} is {kind}; only positional parameters are supported"
             )
-    declared = tuple(dynamic_options)
     _check_dynamic(declared, options, kernel, tuned)
     # a tl.constexpr parameter feeds its option on every call already: no slot
     dynamic = tuple(n for n in declared if n not in kernel.arg_names)
@@ -847,13 +842,13 @@ def make_launcher(
         tuple(options.items()),
         access,
         kernel_cache,
-        bool(verify_annotation),
+        verify_annotation,
         no_gpu,
-        bool(bind_device),
+        bind_device,
         grid_arg,
         grid_py,
         compiled_grid,
-        bool(return_compiled),
+        return_compiled,
         tuned,
         grid_cpp,
         dynamic=dynamic,
@@ -1057,10 +1052,9 @@ def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
 @functools.lru_cache(maxsize=1)
 def _stub() -> types.ModuleType:
     """Returns the process's one `_intj_lazy`, beside the modules intj renders."""
-    from triton import knobs
-
+    _imports.ensure_triton_imported()
     return lazy.load_stub(
-        Path(knobs.cache.get_triton_dir("intj")) / "lazy", _compiler_path("c")
+        Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy", _compiler_path("c")
     )
 
 
@@ -1136,12 +1130,11 @@ def _live_knobs() -> dict[str, object]:
 
     Read at a launcher's first call and fixed for it.
     """
-    from triton import knobs
-
+    _imports.ensure_triton_imported()
     values: dict[str, object] = {}
     for path, _ in _KNOB_OPTIONS:
         _, group, name = path.split(".")
-        values[path] = getattr(getattr(knobs, group), name, None)
+        values[path] = getattr(getattr(_imports.knobs, group), name, None)
     return values
 
 
@@ -1188,16 +1181,11 @@ def _check_dynamic(
     Unknown compile-option names wait for the target, in `_materialize_module`.
 
     Raises:
-        TypeError: A name is not a str.
         UnsupportedKernel: A repeated, unknown, forbidden or overwritten name,
             a runtime parameter, a name also in `options`, or one the autotune
             configs set.
     """
-    from triton import knobs
-
-    for name in dynamic:
-        if type(name) is not str:
-            raise TypeError(f"intj: dynamic_options names must be str, got {name!r}")
+    _imports.ensure_triton_imported()
     if len(set(dynamic)) != len(dynamic):
         raise UnsupportedKernel(
             f"intj: dynamic_options repeats a name: {list(dynamic)}"
@@ -1205,14 +1193,14 @@ def _check_dynamic(
     for name in dynamic:
         if name.startswith("knobs."):
             parts = name.split(".")
-            group = getattr(knobs, parts[1], None) if len(parts) == 3 else None
+            group = getattr(_imports.knobs, parts[1], None) if len(parts) == 3 else None
             attr = (
                 type(group).__dict__.get(parts[2])
-                if isinstance(group, knobs.base_knobs)
+                if isinstance(group, _imports.knobs.base_knobs)
                 else None
             )
             if not (
-                isinstance(attr, knobs.env_base)
+                isinstance(attr, _imports.knobs.env_base)
                 or type(attr) in (bool, int, float, str)
             ):
                 raise UnsupportedKernel(
@@ -1287,11 +1275,10 @@ def _check_live_knobs(values: Mapping[str, object]) -> None:
     Raises:
         ValueError: A passed value differs from the knob's current value.
     """
-    from triton import knobs
-
+    _imports.ensure_triton_imported()
     for path, passed in values.items():
         _, group, name = path.split(".")
-        live = getattr(getattr(knobs, group), name)
+        live = getattr(getattr(_imports.knobs, group), name)
         if passed != live:
             raise ValueError(
                 f"intj: dynamic knob {path!r} passed {passed!r} but the current "
@@ -1350,9 +1337,8 @@ def _unverified_torch_message() -> str:
 
 
 def _torch_version_string() -> str:
-    import torch
-
-    return str(torch.__version__)
+    _imports.ensure_torch_imported()
+    return str(_imports.torch.__version__)
 
 
 def _cxx_abi() -> int:
@@ -1360,9 +1346,8 @@ def _cxx_abi() -> int:
 
     A mismatch here links, then misbehaves at runtime.
     """
-    import torch
-
-    return int(torch._C._GLIBCXX_USE_CXX11_ABI)  # pyright: ignore[reportPrivateUsage]
+    _imports.ensure_torch_imported()
+    return int(_imports.torch._C._GLIBCXX_USE_CXX11_ABI)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1377,6 +1362,7 @@ def _cxx_toolchain() -> tuple[list[str], list[str]] | None:
     except Exception:
         return None
     try:
+        # not cached with torch: importing it costs ~65 ms
         from torch.utils import cpp_extension
     except Exception:  # pragma: no cover - torch without the build helpers
         return None
@@ -1466,13 +1452,11 @@ def _load(
     An existing `.so` is loaded as-is: its path already encodes the digest, so
     rendering the source again would only reproduce what was compiled from it.
     """
-    from triton import knobs
-
+    _imports.ensure_triton_imported()
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
     # a sibling of triton's own cache
-    directory = (
-        Path(knobs.cache.get_triton_dir("intj")) / key.digest() / jit_func.__module__
-    )
+    triton_dir = Path(_imports.knobs.cache.get_triton_dir("intj"))
+    directory = triton_dir / key.digest() / jit_func.__module__
     so_path = directory / f"{context.module_name}{suffix}"
     if not so_path.exists():
         _build(so_path, context)
@@ -1510,13 +1494,10 @@ def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
 
     Falls back to its 3.7-era command when the helper is absent.
     """
-    from triton.runtime import build
-
-    compile_so = getattr(build, "compile_so_from_src", None)
+    _imports.ensure_triton_imported()
+    compile_so = getattr(_imports.build, "compile_so_from_src", None)
     if compile_so is not None:
         return Path(compile_so(src=src, name=name, **flags)).read_bytes()
-
-    from triton import knobs
 
     language = flags["language"]
     with tempfile.TemporaryDirectory() as directory:
@@ -1528,7 +1509,7 @@ def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
             *flags.get("include_dirs", ()),
             directory,
             lazy.python_include(),
-            *knobs.build.backend_dirs,
+            *_imports.knobs.build.backend_dirs,
         ]
         command = [
             _compiler_path(language),
@@ -1671,7 +1652,8 @@ class HipBackend(Backend):
     pointer_range = True
 
     def library_path(self) -> str:
-        # private, but it is the resolution order triton itself launches through
+        # private, but it is the resolution order triton itself launches through;
+        # imported here, as a triton built without the AMD backend lacks it
         from triton.backends.amd import driver
 
         return driver._get_path_to_hip_runtime_dylib()  # pyright: ignore[reportPrivateUsage]
@@ -1717,19 +1699,17 @@ def _current_target() -> Any:
     Raises:
         UnsupportedKernel: There is no active target (no visible GPU).
     """
-    from triton.runtime.driver import driver
-
-    target = driver.active.get_current_target()
+    _imports.ensure_triton_imported()
+    target = _imports.driver.active.get_current_target()
     if target is None:
         raise UnsupportedKernel("intj: no active triton target; is a GPU visible?")
     return target
 
 
 def _current_device() -> int:
-    from triton.runtime.driver import driver
-
+    _imports.ensure_triton_imported()
     # get_current_device() is on every concrete driver, just not on DriverBase
-    return driver.active.get_current_device()  # pyright: ignore[reportAttributeAccessIssue]
+    return _imports.driver.active.get_current_device()
 
 
 def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
@@ -1743,9 +1723,8 @@ def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
     `parse_options` ignores keys it does not know, so unknown ones are caught
     here -- otherwise a typo would silently compile with the default.
     """
-    from triton.compiler import make_backend
-
-    parsed: Any = make_backend(target).parse_options(dict(options))
+    _imports.ensure_triton_imported()
+    parsed: Any = _imports.make_backend(target).parse_options(dict(options))
     _refuse_unknown_options(parsed, options)
     return parsed
 
@@ -1773,9 +1752,8 @@ def _check_kernel(
             without `assume_constant_globals`, or `options` names an option a
             launch fixes itself.
     """
-    from triton.runtime.jit import JITFunction
-
-    if not isinstance(jit_func, JITFunction):
+    _imports.ensure_triton_imported()
+    if not isinstance(jit_func, _imports.JITFunction):
         raise UnsupportedKernel(
             "intj: expected a @triton.jit function, optionally wrapped in "
             f"@triton.autotune / @triton.heuristics, got {type(jit_func).__name__}"
@@ -1805,10 +1783,9 @@ def _canonical_global(value: object) -> tuple[object, ...]:
     Raises:
         ValueError: The value, or one inside it, cannot be canonicalized.
     """
-    import triton.language as tl
-
-    if isinstance(value, tl.constexpr):
-        return ("constexpr", _canonical_global(value.value))
+    _imports.ensure_triton_imported()
+    if isinstance(value, _imports.tl.constexpr):
+        return ("constexpr", _canonical_global(cast(Any, value).value))
     if type(value) is tuple:
         return ("tuple", *(_canonical_global(item) for item in value))
     # a Python or pybind11 enum member (Gluon's `PropagateNan.ALL`), by name
@@ -1925,11 +1902,10 @@ def _config_options(
     plan: Any, resolved: tuple[ResolvedParam, ...]
 ) -> Iterable[dict[str, Any]]:
     """Yields each autotune config's compile options: its kwargs naming no parameter."""
-    from triton.runtime.autotuner import Autotuner
-
+    _imports.ensure_triton_imported()
     names = {p.name for p in resolved}
     for layer in plan.layers:
-        if type(layer) is Autotuner:
+        if type(layer) is _imports.Autotuner:
             for config in layer.configs:
                 yield {
                     str(k): v for k, v in config.all_kwargs().items() if k not in names
@@ -1963,11 +1939,10 @@ def _tuning_render(
     """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
 
     `computed_fields` is left empty: `_materialize_module` places it."""
-    from triton.runtime.autotuner import Autotuner
-
     from .heuristic import HeuristicError, Source, lower
     from .tuning import c_scalar
 
+    _imports.ensure_triton_imported()
     by_name = {p.name: p for p in _render_params(resolved, DeviceBinding.NOT_FIXED)[0]}
     grid_code = getattr(grid_cpp, "__code__", None)
     grid_reads: tuple[str, ...] = (
@@ -1997,7 +1972,7 @@ def _tuning_render(
     dep_names = tuple(sorted(dict.fromkeys(wanted), key=lambda n: dependent_level[n]))
     # C reads these; config values are static, so check them now, not on a miss
     for layer in plan.layers:
-        if type(layer) is Autotuner:
+        if type(layer) is _imports.Autotuner:
             for config in layer.configs:
                 for name, value in config.all_kwargs().items():
                     if name in dep_names:
@@ -2157,11 +2132,10 @@ class _Interner:
     """
 
     def __init__(self) -> None:
-        import triton.language as tl
-
+        _imports.ensure_triton_imported()
         self._ids: dict[tuple[object, ...], int] = {}
         self._lock = threading.Lock()
-        self.dtype_type: type = tl.dtype  # read once by init_bound
+        self.dtype_type: type = _imports.tl.dtype  # read once by init_bound
 
     def __call__(self, value: object) -> int | None:
         try:
@@ -2177,8 +2151,7 @@ class _Interner:
 
 def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:
     """Resolves explicit pointer names through the same live dtypes as the ABI table."""
-    from triton._utils import type_canonicalisation_dict
-
+    _imports.ensure_triton_imported()
     wanted = {
         ty[1:]
         for p in params
@@ -2191,18 +2164,17 @@ def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:
         sorted(
             ("*" + canonical, code)
             for code, (name, _) in live_dtypes().items()
-            if (canonical := type_canonicalisation_dict.get(name)) in wanted
+            if (canonical := _imports.type_canonicalisation_dict.get(name)) in wanted
         )
     )
 
 
 @functools.lru_cache(maxsize=1)
 def _triton_identity() -> tuple[Any, ...]:
-    import triton
-
-    libtriton = Path(triton.__file__).parent / "_C" / "libtriton.so"
+    _imports.ensure_triton_imported()
+    libtriton = Path(_imports.triton.__file__).parent / "_C" / "libtriton.so"
     stat = libtriton.stat()
-    return (triton.__version__, stat.st_size, stat.st_mtime)
+    return (_imports.triton.__version__, stat.st_size, stat.st_mtime)
 
 
 @functools.lru_cache(maxsize=2)
@@ -2212,9 +2184,8 @@ def _compiler_path(language: str) -> str:
     Raises:
         RuntimeError: No such compiler is found.
     """
-    from triton.runtime import build
-
-    find_compiler = getattr(build, "_find_compiler", None)
+    _imports.ensure_triton_imported()
+    find_compiler = getattr(_imports.build, "_find_compiler", None)
     if find_compiler is not None:
         cc = find_compiler(language)
         return str(cc[0] if isinstance(cc, tuple) else cc)
@@ -2246,9 +2217,8 @@ def _compiler_identity(language: str = "c") -> tuple[str, ...]:
 def _triton_specialize(
     value: object, *, backend: Any, is_const: bool, specialize: bool, align: bool
 ) -> tuple[str, Any]:
-    from triton._C.libtriton import native_specialize_impl
-
-    return native_specialize_impl(backend, value, is_const, specialize, align)
+    _imports.ensure_triton_imported()
+    return _imports.native_specialize_impl(backend, value, is_const, specialize, align)
 
 
 def _compiler_input(
@@ -2265,6 +2235,7 @@ def _compiler_input(
     None and fixed ones come from `baked_values`. Annotated facts apply as
     declared; `auto` ones are specialized the way triton does.
     """
+    _imports.ensure_triton_imported()
     signature: list[tuple[str, str]] = []
     constants: list[tuple[tuple[int, ...], tuple[object, ...]]] = []
     attrs: list[tuple[tuple[int, ...], tuple[tuple[str, int], ...]]] = []
@@ -2309,10 +2280,8 @@ def _compiler_input(
                     and effective.startswith("*")
                     and (value is None or type(value) is int and value == 0)
                 ):
-                    from triton.runtime.jit import MockTensor
-
                     # Both public null spellings have pointer 0 and storage range 0.
-                    inference_value = MockTensor(effective[1:])
+                    inference_value = _imports.MockTensor(effective[1:])
                 inferred, inferred_desc = _triton_specialize(
                     inference_value,
                     backend=backend,
@@ -2372,9 +2341,9 @@ def _checked_compile(
     canonical_options: Any,
 ) -> CompiledKernel:
     """Compiles, loads on the current device, and refuses what intj cannot launch."""
-    from triton.compiler import compile as triton_compile
-
-    kernel = triton_compile(
+    _imports.ensure_triton_imported()
+    # through the module, so a patched `triton.compiler.compile` is the one called
+    kernel = _imports.triton.compiler.compile(
         compiler_input.ast_source(jit_func),
         target=target,
         options=canonical_options.__dict__,
@@ -2455,10 +2424,8 @@ def _make_compile_callback(
     callback: `(seen, keyblob, nparams, device, *args)`, `args` being the
     dynamic values, then the public arguments.
     """
-    from triton.compiler import make_backend
-
     target = _current_target()
-    backend = make_backend(target)
+    backend = _imports.make_backend(target)
     fed = {p.name: p for p in params if p.name in _parameter_options(backend, params)}
     options = {
         **options,
