@@ -47,12 +47,33 @@ static void intj_lazy_unlock(intj_launcher *h) {
   PyThread_release_lock(h->build_lock);
 }
 
+/* Until checked, run the subclass's `_prepare` if it has one: 0, or -1 with
+ * an error set.  Outside the build lock: what it computes is shared by every
+ * launcher from one make_launcher call (delayed, the analysis), and computing
+ * it under one launcher's lock deadlocks two threads first-calling two of
+ * them when `delayed` calls a sibling. */
+static int intj_lazy_prepare(intj_launcher *h) {
+  if (__atomic_load_n(&h->plan, __ATOMIC_ACQUIRE))
+    return 0;
+  PyObject *prepare = PyObject_GetAttrString((PyObject *)h, "_prepare");
+  if (!prepare) {
+    if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+      return -1;
+    PyErr_Clear(); /* the bare type: nothing to prepare */
+    return 0;
+  }
+  PyObject *result = PyObject_CallObject(prepare, NULL);
+  Py_DECREF(prepare);
+  Py_XDECREF(result);
+  return result ? 0 : -1;
+}
+
 /* Run the builder once: 0, or -1 with an error set.  A failure leaves the
  * shim in place, so the next call retries. */
 static int intj_lazy_build(intj_launcher *h) {
   if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) != INTJ_SHIM)
     return 0;
-  if (intj_lazy_lock(h) != 0)
+  if (intj_lazy_prepare(h) != 0 || intj_lazy_lock(h) != 0)
     return -1;
   int rc = 0;
   PyObject *done = NULL;
@@ -98,7 +119,7 @@ static PyObject *intj_lazy_check(PyObject *self, PyObject *unused) {
   intj_launcher *h = (intj_launcher *)self;
   if (__atomic_load_n(&h->plan, __ATOMIC_ACQUIRE))
     Py_RETURN_NONE;
-  if (intj_lazy_lock(h) != 0)
+  if (intj_lazy_prepare(h) != 0 || intj_lazy_lock(h) != 0)
     return NULL;
   PyObject *result;
   if (__atomic_load_n(&h->plan, __ATOMIC_ACQUIRE)) {

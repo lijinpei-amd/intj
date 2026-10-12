@@ -622,13 +622,21 @@ class Launcher:
         derived = options.then(edit) if isinstance(options, Delayed) else edit(options)
         return _new_launcher(derived, self._origin)
 
+    def _resolved(self) -> tuple[MakeLauncherOption, _Analysis]:
+        options = self.options
+        option = options() if isinstance(options, Delayed) else options
+        return option, self._origin.analysis.get(lambda: _analyze(option))
+
+    def _prepare(self) -> None:
+        # the C side runs it before the build lock: the work every launcher
+        # from one make_launcher call shares runs under no launcher's lock
+        self._resolved()
+
     def _check(self) -> None:
         # check()'s body: the C method calls it under the build lock, as does _build
         if self._plan is not None:
             return
-        options = self.options
-        option = options() if isinstance(options, Delayed) else options
-        analysis = self._origin.analysis.get(lambda: _analyze(option))
+        option, analysis = self._resolved()
         binding = _bind(analysis, option)
         self._set_plan(option, _Plan(analysis, binding), binding.doc)
 
@@ -722,20 +730,11 @@ class LaunchFunction(Protocol):
     def __call__(self, *args: Any) -> Any: ...
 
 
-@functools.lru_cache(maxsize=1)
-def _launcher_type() -> type[Launcher]:
-    """Returns `Launcher` over this process's `_intj_lazy.Launcher`."""
-    namespace = {"__slots__": (), "__module__": __name__, "__qualname__": "Launcher"}
-    return cast(
-        "type[Launcher]", type("Launcher", (Launcher, _stub().Launcher), namespace)
-    )
-
-
 def _new_launcher(
     options: MakeLauncherOption | Delayed, origin: _Origin
 ) -> LaunchFunction:
-    cls = _launcher_type()
-    return _stub().new_launcher(cls, options, origin, cls._build)  # pyright: ignore[reportPrivateUsage]  # the builder
+    stub, cls = _stub_and_type()
+    return stub.new_launcher(cls, options, origin, cls._build)  # pyright: ignore[reportPrivateUsage]  # the builder
 
 
 @overload
@@ -1047,14 +1046,36 @@ def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
     raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
 
 
-@functools.lru_cache(maxsize=1)
+_stub_loaded: tuple[types.ModuleType, type[Launcher]] | None = None
+_STUB_LOCK = threading.Lock()
+
+
+def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
+    """Returns the process's one `_intj_lazy` and the `Launcher` type over it.
+
+    Loaded beside the modules intj renders, once, under a lock: a second load
+    has its own `_intj_lazy.Launcher`, and `new_launcher` refuses a type over
+    another load's.
+    """
+    global _stub_loaded
+    loaded = _stub_loaded
+    if loaded is None:
+        with _STUB_LOCK:
+            loaded = _stub_loaded
+            if loaded is None:
+                _imports.ensure_triton_imported()
+                stub = lazy.load_stub(
+                    Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy",
+                    compiler_path("c"),
+                )
+                namespace = {"__slots__": (), "__module__": __name__}
+                cls = type("Launcher", (Launcher, stub.Launcher), namespace)
+                loaded = _stub_loaded = (stub, cast("type[Launcher]", cls))
+    return loaded
+
+
 def _stub() -> types.ModuleType:
-    """Returns the process's one `_intj_lazy`, beside the modules intj renders."""
-    _imports.ensure_triton_imported()
-    return lazy.load_stub(
-        Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy",
-        compiler_path("c"),
-    )
+    return _stub_and_type()[0]
 
 
 def module_of(launcher: Callable[..., Any]) -> types.ModuleType:

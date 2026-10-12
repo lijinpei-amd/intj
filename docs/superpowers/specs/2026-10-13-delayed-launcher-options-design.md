@@ -63,7 +63,9 @@ cache directory and compiler.
 
 ### `MakeLauncherOption` (`intj/options.py`, exported from `intj`)
 
-A frozen dataclass. Values are stored as given; nothing is validated here.
+A frozen dataclass. Nothing is validated here; mappings and `dynamic_options`
+are copied, so a caller changing its dict or list later does not change the
+launcher (review fix).
 
 | Field | Type | Default |
 |---|---|---|
@@ -218,8 +220,11 @@ within +1 ns of `main`. If over budget, apply in order:
 
 ### `check()`
 
-Runs under `build_lock` (the builder, already holding it, calls the unlocked
-form):
+Steps 1 and 2 are shared by every launcher of one `make_launcher` call, so they
+run first under no launcher's lock (`_prepare`, called by the C side before
+`build_lock`; a sibling called from `delayed` then gets `RuntimeError`, not a
+deadlock). The rest runs under `build_lock` (the builder, already holding it,
+calls the unlocked form):
 
 1. **Resolve.** `Delayed()` runs the user's function once per origin,
    validates the mapping, raises on a conflict with an explicit name, merges,
@@ -259,7 +264,7 @@ ones do, and two options that analyze alike share one module.
 |---|---|
 | `make_launcher` | `TypeError` only: unknown keyword, None kernel, non-callable `delayed` |
 | `check()` / first call | Everything else, same types and messages as today; `delayed`'s own exception unwrapped |
-| Retry | A failed check or build leaves `plan` NULL and the shim in place; the next call retries from the failed step. `_provision` keeps its one-failure-per-process memo. |
+| Retry | A failed check leaves `plan` NULL; a failed build leaves the shim in place (a successful check stays cached); the next call retries from the failed step. `_provision` keeps its one-failure-per-process memo. |
 
 Warnings (`ClassGlobalWarning`, bound-pointer `RuntimeWarning`) fire at
 `check()` or the first call.

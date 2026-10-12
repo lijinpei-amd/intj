@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from intj import MakeLauncherOption, make_launcher
-from intj.annotation import NEVER, Argument, BindValue
+from intj.annotation import NEVER, Argument, BindValue, Constexpr
 from intj.launcher import Launcher
 from intj.options import OPTION_FIELDS, MakeLauncherKwargs
 from intj.torch_intf.torch_abi import TorchAccessMode
@@ -46,7 +46,8 @@ def test_unknown_keyword_fails_at_decoration():
         make_launcher(bogus=1)  # pyright: ignore[reportCallIssue]
 
 
-def test_decoration_imports_no_torch(tmp_path):
+@pytest.fixture
+def kern_dir(tmp_path):
     (tmp_path / "kern.py").write_text(
         textwrap.dedent(
             """
@@ -59,6 +60,11 @@ def test_decoration_imports_no_torch(tmp_path):
             """
         )
     )
+    return tmp_path
+
+
+def test_decoration_imports_no_torch(kern_dir):
+    tmp_path = kern_dir
     probe = f"""
 import sys
 sys.path.insert(0, {str(tmp_path)!r})
@@ -130,3 +136,53 @@ def test_bind_device_true_points_at_the_method():
 def test_kwargs_typeddict_matches_the_dataclass():
     assert set(MakeLauncherKwargs.__annotations__) == OPTION_FIELDS
     assert "jit_func" not in OPTION_FIELDS and "delayed" not in OPTION_FIELDS
+
+
+def test_decoration_snapshots_mutable_arguments():
+    annotations: dict[str, object] = {"x": _POINTER}
+    values, dynamic = {"x": 0}, []
+    launch = make_launcher(
+        store,
+        extra_annotation=annotations,
+        bind_values=values,
+        dynamic_options=dynamic,
+        **_HOST,
+    )
+    annotations["n"] = Constexpr(value=5)
+    values["x"] = 2**64  # would overflow the bound pointer at the first call
+    dynamic.append("num_warps")  # would be refused: no_gpu compiles nothing
+    assert launch(0, 0, 1, 4) is None
+    option = _option(launch)
+    assert option.extra_annotation == {"x": _POINTER}
+    assert option.bind_values == {"x": 0} and option.dynamic_options == ()
+
+
+def test_concurrent_first_decorations_share_one_stub(kern_dir):
+    probe = f"""
+import sys, threading, time
+sys.path.insert(0, {str(kern_dir)!r})
+import intj.lazy as lazy
+real, loads = lazy.load_stub, []
+def slow(*args):
+    loads.append(1)
+    time.sleep(0.2)  # every thread misses the stub before any load returns
+    return real(*args)
+lazy.load_stub = slow
+import intj, kern
+barrier, errors = threading.Barrier(8), []
+def decorate():
+    barrier.wait()
+    try:
+        intj.make_launcher(kern.k, no_gpu=True)
+    except BaseException as error:
+        errors.append(repr(error))
+threads = [threading.Thread(target=decorate) for _ in range(8)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+assert errors == [], errors
+assert len(loads) == 1, loads
+intj.make_launcher(kern.k, no_gpu=True)  # and every later decoration
+"""
+    subprocess.run([sys.executable, "-c", probe], check=True)

@@ -16,6 +16,8 @@ class MakeLauncherOption:
 
     Nothing is validated here: `k.__self__.check()`, at the latest the first
     call, checks the values with the errors `make_launcher` used to raise.
+    Mappings and the `dynamic_options` sequence are copied, so a caller
+    changing its dict or list afterwards does not change the launcher.
     `k.__self__.options` is a launcher's; `dataclasses.replace` makes variants.
     """
 
@@ -34,6 +36,19 @@ class MakeLauncherOption:
     grid_py: Callable[[dict[str, object]], object] | None = None
     return_compiled: bool = False
     assume_constant_globals: bool = False
+
+    def __post_init__(self) -> None:
+        # a snapshot: check() reads these later; anything else stays as given
+        # for check() to report
+        for name in ("extra_annotation", "options", "bind_values"):
+            value: object = getattr(self, name)
+            if isinstance(value, Mapping):
+                object.__setattr__(self, name, dict(value))
+        if not isinstance(self.dynamic_options, str):
+            try:
+                object.__setattr__(self, "dynamic_options", tuple(self.dynamic_options))
+            except TypeError:
+                pass  # not iterable
 
 
 class MakeLauncherKwargs(TypedDict, total=False):

@@ -32,8 +32,8 @@ and `check()`. Call it once, outside any hot loop.
 ### Lazy build
 
 `make_launcher` returns a launcher at once and does no work: it records its
-keywords as a `MakeLauncherOption` (`launcher.__self__.options`), and an
-unknown keyword is the only error it raises. `launcher.__self__.check()` does
+keywords as a `MakeLauncherOption` (`launcher.__self__.options`, with dicts
+and lists copied), and an unknown keyword is the only error it raises. `launcher.__self__.check()` does
 the rest without touching the GPU: it runs `delayed`, validates arguments,
 resolves annotations, analyzes an autotune/heuristics chain, lowers
 `grid_cpp`, checks bound values, and provisions a non-default `kernel_cache`.
