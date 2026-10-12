@@ -47,6 +47,7 @@ target as separate invocations.
 
 - `gpu.yml` and the rocm images are untested until a `[self-hosted, gfx942]`
   runner is registered. CUDA has no images (no NVIDIA GPU to test on).
-- The self-hosted runner must provide `docker`, `ninja` and `python3`
+- The self-hosted runner must be Actions Runner >= 2.327.1 (the actions run on
+  Node 24) and provide `docker`, `ninja` and `python3`
   (`gpu.yml` runs `image.py` and `ninja` directly on the host, outside a
   container).

@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       cells: ${{ steps.read.outputs.cells }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: pipx install ninja
       - run: ninja -C ci matrix
       - id: read
@@ -31,8 +31,8 @@ jobs:
         cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
     name: image ${{ matrix.cell.id }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -43,15 +43,15 @@ jobs:
           FLAVOR: rocm
 
   wheel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pipx install ninja
       - run: ninja -C ci wheel
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel
           path: ci/out/dist/
@@ -73,15 +73,15 @@ jobs:
     env:
       INTJ_MODE: wheel
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: wheel
           path: ci/out/dist/
       - run: ninja -C ci install
       - run: ninja -C ci test-gpu
       - run: ninja -C ci bench-gpu
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-gpu-${{ matrix.cell.id }}
           path: ci/out/bench/

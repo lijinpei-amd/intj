@@ -18,12 +18,12 @@ concurrency:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       cells: ${{ steps.read.outputs.cells }}
       primary: ${{ steps.read.outputs.primary }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: pipx install ninja
       - run: ninja -C ci matrix
       - id: read
@@ -33,16 +33,16 @@ jobs:
 
   images:
     needs: matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
     name: image ${{ matrix.cell.id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: pipx install ninja
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -52,23 +52,29 @@ jobs:
           CELL: ${{ matrix.cell.id }}
           FLAVOR: cpu
 
+  # Built on both runner OSes to check the build itself; the tests install
+  # the ubuntu-24.04 one.
   wheel:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    name: wheel ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pipx install ninja
       - run: ninja -C ci wheel
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: wheel
+          name: wheel-${{ matrix.os }}
           path: ci/out/dist/
 
   test:
     needs: [matrix, images, wheel]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -83,10 +89,10 @@ jobs:
       INTJ_MODE: wheel
     if: ${{ !cancelled() && needs.wheel.result == 'success' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
-          name: wheel
+          name: wheel-ubuntu-24.04
           path: ci/out/dist/
       - run: ninja -C ci install
       - run: ninja -C ci test-cpu
@@ -95,34 +101,34 @@ jobs:
     needs: [matrix, images]
     # Runs in the primary image, so another cell's image failing must not skip it.
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: ${{ needs.matrix.outputs.primary }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: ninja -C ci lint
 
   typecheck:
     needs: [matrix, images]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: ${{ needs.matrix.outputs.primary }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ninja -C ci typecheck
 
   bench-host:
     needs: [matrix, images, wheel]
     if: ${{ !cancelled() && needs.wheel.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: ${{ needs.matrix.outputs.primary }}
       credentials:
@@ -131,14 +137,14 @@ jobs:
     env:
       INTJ_MODE: wheel
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
-          name: wheel
+          name: wheel-ubuntu-24.04
           path: ci/out/dist/
       - run: ninja -C ci install
       - run: ninja -C ci bench-host
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-host
           path: ci/out/bench/

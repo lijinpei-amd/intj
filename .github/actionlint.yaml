@@ -1,2 +1,4 @@
 self-hosted-runner:
-  labels: [gfx942]
+  # gfx942: our self-hosted GPU runner.  ubuntu-26.04: a GitHub-hosted label
+  # newer than actionlint's built-in list.
+  labels: [gfx942, ubuntu-26.04]
