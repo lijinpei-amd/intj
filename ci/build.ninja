@@ -17,6 +17,14 @@ build lint: sh
   script = lint.sh
 build typecheck: sh
   script = typecheck.sh
+build wheel: sh
+  script = wheel.sh
+build install: sh
+  script = install.sh
+build test-cpu: sh
+  script = test-cpu.sh
+build test-gpu: sh
+  script = test-gpu.sh
 
-build check: phony lint typecheck
+build check: phony lint typecheck test-cpu
 default check
