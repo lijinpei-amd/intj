@@ -93,6 +93,8 @@ jobs:
 
   lint:
     needs: [matrix, images]
+    # Runs in the primary image, so another cell's image failing must not skip it.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.matrix.outputs.primary }}
@@ -106,6 +108,7 @@ jobs:
 
   typecheck:
     needs: [matrix, images]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.matrix.outputs.primary }}
@@ -118,6 +121,7 @@ jobs:
 
   bench-host:
     needs: [matrix, images, wheel]
+    if: ${{ !cancelled() && needs.wheel.result == 'success' }}
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.matrix.outputs.primary }}
