@@ -72,19 +72,22 @@ assert _imports.torch is None
     subprocess.run([sys.executable, "-c", probe], check=True)
 
 
+def _option(launch):
+    option = launch.__self__.options
+    assert isinstance(option, MakeLauncherOption)
+    return option
+
+
 def test_bind_and_unbind_derive_new_launchers():
     base = make_launcher(store, extra_annotation={"x": _POINTER}, **_HOST)
     bound = base.__self__.bind(x=0)
     fixed = bound.__self__.bind_device(3)
-    assert base.__self__.options.bind_values is None
-    assert bound.__self__.options.bind_values == {"x": 0}
-    assert (fixed.__self__.options.bind_device, fixed.__self__.options.bind_values) == (
-        3,
-        {"x": 0},
-    )
-    assert fixed.__self__.unbind_device().__self__.options == bound.__self__.options
-    assert bound.__self__.unbind().__self__.options == base.__self__.options
-    assert fixed.__self__.bind_device(None).__self__.options.bind_device is None
+    assert _option(base).bind_values is None
+    assert _option(bound).bind_values == {"x": 0}
+    assert (_option(fixed).bind_device, _option(fixed).bind_values) == (3, {"x": 0})
+    assert _option(fixed.__self__.unbind_device()) == _option(bound)
+    assert _option(bound.__self__.unbind()) == _option(base)
+    assert _option(fixed.__self__.bind_device(None)).bind_device is None
     assert bound(0, 0, 1, 4) is None and fixed(0, 1, 4) is None
     with pytest.raises(TypeError, match="missing"):
         bound.__self__.unbind()(0, 0, 1, 4)
