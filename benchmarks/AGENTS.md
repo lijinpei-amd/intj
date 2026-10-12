@@ -73,8 +73,11 @@ PYTHONPATH=$PWD python -m pytest tests/test_kernel_cache.py -s
   INTJ. FFI checks TensorView shape and receives preconverted tensors; INTJ
   receives Torch tensors. The older `bench_ffi_compare.py` uses different
   GPU binaries and must not be described as a same-kernel comparison.
-- CUDA runtime cannot be tested on this development machine; mark it untested
-  when reporting GPU results. A skipped cache benchmark supplies no timing data.
+- Two GPU machines, so always name the one a number came from: gfx942 (MI308X /
+  MI300X, ROCm) and sm_89 (RTX 4080 SUPER, CUDA). Their CPUs differ too, so
+  Triton's own host rows are not comparable across them -- only INTJ-versus-Triton
+  ratios within one machine are. A skipped cache benchmark supplies no timing data.
+- `bench_hip_module_launch.py` needs ROCm and skips on the CUDA machine.
 
 ## Result journals
 

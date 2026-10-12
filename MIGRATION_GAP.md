@@ -55,6 +55,5 @@ Several converted sites run on hardware or builds not available here, so they ar
 untested:
 
 - **gfx1250:** compile-identity checked only.
-- **CUDA:** compile-checked only.
 - **Proton sites.**
 - **Free-threaded builds with Triton installed.**

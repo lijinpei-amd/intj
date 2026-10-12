@@ -1115,6 +1115,7 @@ def act_apply(o, x, ACT: tl.constexpr, FN: tl.constexpr):
     tl.store(o, v)
 
 
+@needs_hip  # waves_per_eu is a HIP compile option
 def test_tuned_dynamic_waves_per_eu_object_constexprs_return_compiled():
     """A tuned launcher keys dynamic options and object constexprs and collects.
 

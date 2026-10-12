@@ -12,7 +12,8 @@ GPU; `--sweep` and `--last-key` run on the host only.
 
 The `--readme` rows report host time per launch for a trivial kernel:
 
-- `grid=(1,)` includes the driver launch call (`hipModuleLaunchKernel` on HIP).
+- `grid=(1,)` includes the driver launch call (`hipModuleLaunchKernel` on HIP,
+  `cuLaunchKernel` on CUDA).
 - `grid=(0,)` skips the driver call. intj also returns before decoding arguments,
   so this row measures its early-out path, not its full host cost.
 - `spec_key` measures intj's argument decoding plus key computation, the work
