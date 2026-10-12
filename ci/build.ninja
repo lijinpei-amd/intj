@@ -25,6 +25,10 @@ build test-cpu: sh
   script = test-cpu.sh
 build test-gpu: sh
   script = test-gpu.sh
+build bench-host: sh
+  script = bench-host.sh
+build bench-gpu: sh
+  script = bench-gpu.sh
 
 build check: phony lint typecheck test-cpu
 default check
