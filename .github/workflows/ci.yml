@@ -20,7 +20,7 @@ jobs:
   matrix:
     runs-on: ubuntu-24.04
     outputs:
-      cells: ${{ steps.read.outputs.cells }}
+      tests: ${{ steps.read.outputs.tests }}
       unpublished: ${{ steps.read.outputs.unpublished }}
       primary: ${{ steps.read.outputs.primary }}
     steps:
@@ -35,7 +35,7 @@ jobs:
       - id: read
         run: |
           {
-            echo "cells=$(jq -c .cpu ci/out/matrix.json)"
+            echo "tests=$(jq -c .tests ci/out/matrix.json)"
             echo "unpublished=$(jq -c .cpu_unpublished ci/out/matrix.json)"
             echo "primary=$(jq -r .primary ci/out/matrix.json)"
           } >> "$GITHUB_OUTPUT"
@@ -84,14 +84,16 @@ jobs:
           name: wheel-${{ matrix.os }}
           path: ci/out/dist/
 
+  # Every cell x every pinned torch its python has a wheel for, each in every
+  # Torch access mode.
   test:
     needs: [matrix, images, wheel]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
-    name: test ${{ matrix.cell.id }}
+        cell: ${{ fromJSON(needs.matrix.outputs.tests) }}
+    name: test ${{ matrix.cell.id }} torch ${{ matrix.cell.torch }}
     container:
       image: ${{ matrix.cell.image }}
       credentials:
@@ -99,6 +101,8 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       INTJ_MODE: wheel
+      TORCH: ${{ matrix.cell.torch }}
+      INTJ_TEST_TORCH_MODES: interpreter,runtime_shim,static_compile
     if: ${{ !cancelled() && needs.wheel.result == 'success' }}
     steps:
       - uses: actions/checkout@v7

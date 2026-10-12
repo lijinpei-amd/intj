@@ -13,3 +13,5 @@ RUN apt-get update \
 COPY install-venv.sh /tmp/install-venv.sh
 RUN sh /tmp/install-venv.sh
 ENV PATH=/opt/venv/bin:$PATH PYTHON=/opt/venv/bin/python
+# where `TORCH=<version> ninja -C ci install` gets another torch from
+ENV INTJ_TORCH_INDEX=${TORCH_INDEX}

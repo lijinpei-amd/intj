@@ -1,6 +1,11 @@
 # editable: pip install -e the checkout.  wheel: install the one wheel in
 # ci/out/dist, replacing an installed intj even at the same version.
+# TORCH=<version> first replaces torch with that version from
+# $INTJ_TORCH_INDEX (set in the CI images; default the CPU index).
 . "$(dirname "$0")/env.sh"
+if [ -n "${TORCH:-}" ]; then
+  pip_ install --index-url "${INTJ_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}" "torch==$TORCH"
+fi
 if [ "$INTJ_MODE" = editable ]; then
   pip_ install -e "$ROOT"
   exit

@@ -12,10 +12,12 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
 CI = pathlib.Path(__file__).resolve().parent
+TORCH_ABI = CI.parent / "intj" / "torch_intf" / "torch_abi.toml"
 DOCKERFILES = CI / "dockerfiles"
 REPO = os.environ.get("INTJ_IMAGE_REPO", "ghcr.io/lijinpei-amd/intj-ci")
 PINS = {
@@ -96,6 +98,30 @@ def push(cell, flavor):
     subprocess.run(["docker", "push", name], check=True)
 
 
+def tests(data):
+    """Every cell x pinned torch whose python has a wheel: one cpu test job each.
+
+    The pins must cover exactly the torch versions intj has verified layouts
+    for, so a new torch_abi.toml row cannot go untested.
+    """
+    pinned = {".".join(v.split(".")[:2]) for v in data["torch"]}
+    verified = set(re.findall(r'^\["(\d+\.\d+)"\]', TORCH_ABI.read_text(), re.M))
+    if pinned != verified:
+        die(
+            "matrix.json pins torch %s, torch_abi.toml verifies %s"
+            % (sorted(pinned), sorted(verified))
+        )
+    out = []
+    for cell in data["cells"]:
+        python = cell["id"].rsplit("-py", 1)[1]
+        versions = [v for v, pythons in data["torch"].items() if python in pythons]
+        if not versions:
+            die("no pinned torch has a wheel for %s" % cell["id"])
+        image = tag(cell, "cpu")
+        out += [{"id": cell["id"], "image": image, "torch": v} for v in versions]
+    return out
+
+
 def matrix():
     data = load()
     cells = data["cells"]
@@ -103,6 +129,7 @@ def matrix():
         "primary": tag(next(c for c in cells if c["id"] == data["primary"]), "cpu"),
         "cpu": [{"id": c["id"], "image": tag(c, "cpu")} for c in cells],
         "rocm": [{"id": c["id"], "image": tag(c, "rocm")} for c in cells if c["gpu"]],
+        "tests": tests(data),
     }
     # The cells the workflows' image jobs still have to build; an unreachable
     # registry counts as unpublished, and push checks again after login.
@@ -117,11 +144,12 @@ def matrix():
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=1) + "\n")
     print(
-        "ci: wrote %s (%d cpu, %d rocm cells; %d, %d unpublished)"
+        "ci: wrote %s (%d cpu, %d rocm cells; %d tests; %d, %d unpublished)"
         % (
             path,
             len(out["cpu"]),
             len(out["rocm"]),
+            len(out["tests"]),
             len(out["cpu_unpublished"]),
             len(out["rocm_unpublished"]),
         )

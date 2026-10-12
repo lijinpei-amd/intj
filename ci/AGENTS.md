@@ -13,6 +13,8 @@ Ninja has no command-line variables, so scripts read the environment:
 | `PYTHON` | interpreter | `python3`; `/opt/venv/bin/python` in images |
 | `CELL` | a `matrix.json` cell id | image targets only |
 | `FLAVOR` | `cpu`, `rocm` | `cpu` |
+| `TORCH` | a torch version for `install` to put in first, from `$INTJ_TORCH_INDEX` | the venv's torch |
+| `INTJ_TEST_TORCH_MODES` | Torch access modes `tests/test_runtime.py` must run, comma-separated | every available one |
 
 ## Targets
 
@@ -43,6 +45,12 @@ target as separate invocations.
 - A published tag is never rebuilt; to refresh base images and unpinned
   packages, change any file in `ci/dockerfiles/` (e.g. bump a comment). The
   workflows start an image job only for unpublished tags.
+- `matrix.json`'s `torch` pins one version per minor in
+  `intj/torch_intf/torch_abi.toml`, with the pythons that have a CPU wheel for
+  it; `image.py matrix` refuses a mismatch. Adding a toml row means adding a
+  pin. 2.9.1 leaves out its free-threaded wheels: from several threads,
+  `tensor.untyped_storage()` crashes it in `PyObject_ClearWeakRefs`, without
+  intj (2.10 is fine).
 
 ## Known gaps
 

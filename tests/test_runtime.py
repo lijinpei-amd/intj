@@ -6,11 +6,15 @@ driver that records each launch, so it runs on any CPython intj supports, with
 nothing but torch installed.  That is what makes the python-version matrix
 testable: triton 3.8 has no wheel below 3.10.  See `tests/run_python_matrix.sh`.
 
-The c++ access mode is left to `test_launcher.py`: its toolchain comes from triton.
+Every Torch access mode this torch supports is built: STATIC_COMPILE when torch
+ships its headers and a C++ compiler is found, RUNTIME_SHIM when torch has a
+verified layout.  `INTJ_TEST_TORCH_MODES=interpreter,runtime_shim,...` names the
+modes instead, and fails on one that is unavailable rather than dropping it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import dis
@@ -84,10 +88,6 @@ _PARAMS, _DEVICE_OFFSET, _NWORDS = launcher._render_params(
     DeviceBinding.NOT_FIXED,
 )
 
-_MODES = [TorchAccessMode.INTERPRETER] + (
-    [TorchAccessMode.RUNTIME_SHIM] if layout_for() else []
-)
-
 
 def _cc(language: str) -> str:
     return (
@@ -95,6 +95,35 @@ def _cc(language: str) -> str:
         if language == "c++"
         else os.environ.get("CC", "cc")
     )
+
+
+@contextlib.contextmanager
+def _test_compiler():
+    """Points intj's compiler lookup, which asks triton, at `_cc`."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(launcher, "_compiler_path", _cc)
+        launcher._cxx_toolchain.cache_clear()
+        try:
+            yield
+        finally:
+            launcher._cxx_toolchain.cache_clear()
+
+
+def _available(mode: TorchAccessMode) -> bool:
+    if mode is TorchAccessMode.RUNTIME_SHIM:
+        return layout_for() is not None
+    if mode is TorchAccessMode.STATIC_COMPILE:
+        with _test_compiler():
+            return launcher._cxx_toolchain() is not None
+    return True
+
+
+_REQUIRED = os.environ.get("INTJ_TEST_TORCH_MODES")
+_MODES = (
+    [TorchAccessMode(m) for m in _REQUIRED.split(",")]
+    if _REQUIRED
+    else [m for m in TorchAccessMode if _available(m)]
+)
 
 
 @pytest.fixture(scope="module")
@@ -134,6 +163,12 @@ def built(request, stub, tmp_path_factory):
     """
     lib, lib_path = stub
     mode = request.param
+    if not _available(mode):
+        pytest.fail(
+            f"INTJ_TEST_TORCH_MODES names {mode.value}, unavailable on torch "
+            f"{torch.__version__}"
+        )
+    static = mode is TorchAccessMode.STATIC_COMPILE
     context = RenderContext(
         module_name=f"rt_{mode.value}",
         kernel_repr="test_runtime.kernel",
@@ -154,13 +189,14 @@ def built(request, stub, tmp_path_factory):
         kernel_cache="intj",
         cache_include_dirs=(),
         cache_archives=(),
-        torch_version=None,
-        cxx_abi=None,
+        torch_version=torch_version() if static else None,
+        cxx_abi=launcher._cxx_abi() if static else None,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=cpython_abi.header_for() or "",
     )
-    flags = launcher._build_flags(context)
+    with _test_compiler():
+        flags = launcher._build_flags(context)
     template = jinja2.Template(
         launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined
     )
@@ -187,6 +223,8 @@ def built(request, stub, tmp_path_factory):
             str(src),
             "-o",
             str(so),
+            *(f"-L{d}" for d in flags.get("library_dirs", [])),
+            *(f"-l{lib}" for lib in flags.get("libraries", [])),
         ],
         check=True,
     )
