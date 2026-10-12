@@ -96,7 +96,7 @@ def test_return_compiled_refuses_host_mode_before_provision(monkeypatch):
 
     monkeypatch.setattr("intj.launcher._provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="return_compiled.*GPU"):
-        make_launcher(store_value, no_gpu=True, return_compiled=True)
+        make_launcher(store_value, no_gpu=True, return_compiled=True).__self__.check()
 
 
 def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
@@ -105,7 +105,6 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
     stream = torch.cuda.current_stream().cuda_stream
     factory = make_launcher(
         store_value,
-        bind_device=True,
         return_compiled=True,
         extra_annotation={
             "x": Argument(
@@ -116,7 +115,7 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
             "value": Argument(type=tl.int32, specialize=NEVER),
         },
     )
-    bound = factory.bind_device(device, x=x)
+    bound = factory.__self__.bind_device(device, x=x)
     import intj.launcher as launcher_module
 
     built = module_of(bound)
@@ -323,7 +322,6 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
     factory = make_launcher(
         gc_resize_store,
         kernel_cache=cache,
-        bind_device=fixed_device,
         return_compiled=True,
         extra_annotation=(
             {
@@ -338,7 +336,7 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
         ),
     )
     if fixed_device:
-        bound = factory.bind_device(device, x=x)
+        bound = factory.__self__.bind_device(device, x=x)
         owner = bound.__self__
         module = module_of(bound)
 
@@ -384,7 +382,6 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     factory = make_launcher(
         gc_cycle_store,
-        bind_device=True,
         return_compiled=True,
         extra_annotation={
             "x": Argument(
@@ -395,7 +392,7 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
             "value": Argument(type=tl.int32, specialize=NEVER),
         },
     )
-    bound = factory.bind_device(torch.cuda.current_device(), x=x)
+    bound = factory.__self__.bind_device(torch.cuda.current_device(), x=x)
     built = module_of(bound)
     module = next(
         module

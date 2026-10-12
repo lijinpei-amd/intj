@@ -31,9 +31,9 @@ at a pinned version and checksum.  Nothing installed on the machine is searched
 for or used: what a module was built against is then a property of intj's cache,
 not of the host.
 
-`make_launcher` provisions on demand, so the first use of a backend fetches it
-(abseil also builds its 90 libraries: 28 s on 224 cores, minutes on a few).  It
-says so on stderr first, because an implicit download is otherwise
+A launcher's `check()` provisions on demand, so the first use of a backend
+fetches it (abseil also builds its 90 libraries: 28 s on 224 cores, minutes on
+a few).  It says so on stderr first, because an implicit download is otherwise
 indistinguishable from a hang.  To get it over with ahead of time, or on a
 machine that will later be offline:
 
@@ -162,7 +162,7 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
     Idempotent: an existing
     tree is reused unless `force`, so the common call does no work and says
     nothing.  When there *is* work, it is announced -- a silent minutes-long
-    build inside `make_launcher` is indistinguishable from a hang.
+    build inside `check()` is indistinguishable from a hang.
 
     One installer at a time, machine-wide: the 8 ranks of a torchrun job all
     miss together, and without the lock they would cmake into one build tree.

@@ -238,7 +238,7 @@ def build_flags(key: RenderKey) -> dict[str, Any]:
         return flags
 
     toolchain = cxx_toolchain()
-    assert toolchain is not None, "make_launcher validated this"
+    assert toolchain is not None, "check() validated this"
     includes, libs = toolchain
     flags["include_dirs"] += includes
     flags["library_dirs"] = list(libs)

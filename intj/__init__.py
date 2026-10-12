@@ -2,6 +2,7 @@
 
 Exports:
     make_launcher: builds a launcher for a kernel.
+    MakeLauncherOption: every make_launcher keyword but delayed, as one value.
     KernelCache: the kernel cache backend selection.
     TorchAccessMode: how generated code reads torch tensors.
     ClassGlobalWarning: the warning for class-valued globals.
@@ -32,6 +33,7 @@ from .annotation import (
 )
 from .kernel_cache import KernelCache
 from .launcher import ClassGlobalWarning, make_launcher
+from .options import MakeLauncherOption
 from .torch_intf.torch_abi import TorchAccessMode
 
 if TYPE_CHECKING:
@@ -55,6 +57,7 @@ __all__ = [
     "KernelCache",
     "TorchAccessMode",
     "make_launcher",
+    "MakeLauncherOption",
     "ClassGlobalWarning",
     "Annotation",
     "Argument",

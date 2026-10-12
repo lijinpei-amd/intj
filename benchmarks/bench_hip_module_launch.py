@@ -104,7 +104,7 @@ def main(iters: int, batches: int) -> None:
         functions=["load_hsaco", "launch_empty"],
     )
     mod.load_hsaco(hsaco, block_threads)
-    bound = make_launcher(empty_kernel, bind_device=True).bind_device(device)
+    bound = make_launcher(empty_kernel).__self__.bind_device(device)
     callback_count = 0
 
     def compiled_function(_key, nparams, ordinal, *_args):

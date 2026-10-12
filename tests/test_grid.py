@@ -78,9 +78,10 @@ def test_decorator_factory_form_matches_call_form_with_grid_arg():
 def test_grid_arg_zero_skips_launch_and_argument_decode():
     launcher = make_launcher(write_programs, grid_arg=2, no_gpu=True)
     assert launcher(0, 0, 0, 3, object(), object(), object()) is None
-    fixed = make_launcher(
-        write_programs, grid_arg=3, bind_device=True, no_gpu=True
-    ).bind_device(0)
+    fixed = make_launcher(write_programs, grid_arg=3, no_gpu=True).__self__.bind_device(
+        0
+    )
+    fixed.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(fixed).parameters) == (
         "stream",
         "grid_x",
@@ -97,16 +98,16 @@ def test_grid_modes_validate_options_and_keep_separate_modules():
     assert callable(make_launcher(write_programs, dynamic_options=(), no_gpu=True))
     for value in (0, 4, True, 1.0, "2"):
         with pytest.raises(ValueError, match="grid_arg must be 1, 2, or 3"):
-            make_launcher(write_programs, grid_arg=value, no_gpu=True)  # pyright: ignore[reportArgumentType]
+            make_launcher(write_programs, grid_arg=value, no_gpu=True).__self__.check()  # pyright: ignore[reportArgumentType]
     for modes in (
         {"grid_arg": 1, "grid_cpp": compiled_grid},
         {"grid_arg": 2, "grid_py": lambda meta: (1,)},
         {"grid_cpp": compiled_grid, "grid_py": lambda meta: (1,)},
     ):
         with pytest.raises(ValueError, match="choose only one"):
-            make_launcher(write_programs, no_gpu=True, **modes)
+            make_launcher(write_programs, no_gpu=True, **modes).__self__.check()
     with pytest.raises(TypeError, match="grid_py must be callable"):
-        make_launcher(write_programs, grid_py=3, no_gpu=True)  # pyright: ignore[reportArgumentType]
+        make_launcher(write_programs, grid_py=3, no_gpu=True).__self__.check()  # pyright: ignore[reportArgumentType]
 
     def first_grid(X: int):
         return (1,)
@@ -190,7 +191,6 @@ def test_grid_py_receives_baked_and_bound_values():
     factory = make_launcher(
         write_programs,
         grid_py=grid,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={
             "out": Argument(
@@ -201,7 +201,8 @@ def test_grid_py_receives_baked_and_bound_values():
             "X": Constexpr(value=3),
         },
     )
-    launch = factory.bind_device(0, out=0)
+    launch = factory.__self__.bind_device(0, out=0)
+    launch.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(launch).parameters) == ("stream", "Y")
     assert launch(0, 2) is None
     assert seen == [{"out": 0, "X": 3, "Y": 2}]
@@ -307,7 +308,6 @@ def test_grid_cpp_fixed_device_reuses_baked_value_and_prepends_extra():
     factory = make_launcher(
         write_programs,
         grid_cpp=grid,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={
             "out": Argument(
@@ -318,7 +318,8 @@ def test_grid_cpp_fixed_device_reuses_baked_value_and_prepends_extra():
             "X": Constexpr(value=3),
         },
     )
-    launch = factory.bind_device(0, out=0)
+    launch = factory.__self__.bind_device(0, out=0)
+    launch.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(launch).parameters) == ("stream", "cap", "Y")
     assert launch(0, 7, 4) is None  # 3 + 4 - 7 = 0
     with pytest.raises(ValueError, match="grid dimensions"):
@@ -392,10 +393,14 @@ def test_grid_cpp_refuses_unannotated_or_captured_names():
         return (X,)
 
     with pytest.raises(UnsupportedKernel, match="annotat"):
-        make_launcher(write_programs, grid_cpp=unannotated, no_gpu=True)
+        make_launcher(
+            write_programs, grid_cpp=unannotated, no_gpu=True
+        ).__self__.check()
     unannotated.__annotations__["X"] = int
     with pytest.raises(UnsupportedKernel, match="annotat"):
-        make_launcher(write_programs, grid_cpp=unannotated, no_gpu=True)
+        make_launcher(
+            write_programs, grid_cpp=unannotated, no_gpu=True
+        ).__self__.check()
 
     captured = 3
 
@@ -403,7 +408,9 @@ def test_grid_cpp_refuses_unannotated_or_captured_names():
         return (X + captured,)
 
     with pytest.raises(UnsupportedKernel, match="free variable"):
-        make_launcher(write_programs, grid_cpp=uses_capture, no_gpu=True)
+        make_launcher(
+            write_programs, grid_cpp=uses_capture, no_gpu=True
+        ).__self__.check()
 
 
 def test_grid_cpp_refuses_invalid_source_and_unsupported_syntax():
@@ -435,12 +442,14 @@ def test_grid_cpp_refuses_invalid_source_and_unsupported_syntax():
         (lambda X: (X,), "one Python def function"),
     ):
         with pytest.raises(UnsupportedKernel, match=message):
-            make_launcher(write_programs, grid_cpp=grid, no_gpu=True)
+            make_launcher(write_programs, grid_cpp=grid, no_gpu=True).__self__.check()
 
     generated = {}
     exec("def grid(X: int):\n    return (X,)\n", generated)
     with pytest.raises(UnsupportedKernel, match="available Python source"):
-        make_launcher(write_programs, grid_cpp=generated["grid"], no_gpu=True)
+        make_launcher(
+            write_programs, grid_cpp=generated["grid"], no_gpu=True
+        ).__self__.check()
 
 
 def test_grid_cpp_refuses_shadowed_helpers(tmp_path):
@@ -463,7 +472,7 @@ def test_grid_cpp_refuses_shadowed_helpers(tmp_path):
         (local_triton, "triton"),
     ):
         with pytest.raises(UnsupportedKernel, match=helper):
-            make_launcher(write_programs, grid_cpp=grid, no_gpu=True)
+            make_launcher(write_programs, grid_cpp=grid, no_gpu=True).__self__.check()
 
     path = tmp_path / "shadowed_builtin_grid.py"
     path.write_text("def grid(X: int):\n    return (min(X, 2),)\n")
@@ -473,4 +482,6 @@ def test_grid_cpp_refuses_shadowed_helpers(tmp_path):
     module.__dict__["__builtins__"] = {**vars(builtins), "min": max}
     spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # Loader stubs lack exec_module
     with pytest.raises(UnsupportedKernel, match="min"):
-        make_launcher(write_programs, grid_cpp=module.grid, no_gpu=True)
+        make_launcher(
+            write_programs, grid_cpp=module.grid, no_gpu=True
+        ).__self__.check()

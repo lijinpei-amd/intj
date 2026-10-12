@@ -151,7 +151,8 @@ def main(iters, batches):
     if make_launcher is None:
         print("n/a all rows: intj has no make_launcher")
         return
-    if "no_gpu" not in inspect.signature(make_launcher).parameters:
+    params = inspect.signature(make_launcher).parameters
+    if "no_gpu" not in params and "kwargs" not in params:
         print("n/a all rows: make_launcher has no no_gpu parameter")
         return
     tensor = torch.empty(4096)

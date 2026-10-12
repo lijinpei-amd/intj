@@ -87,9 +87,7 @@ def callback(iters: int, batches: int) -> None:
     callback and inserts a cache entry; the callback count is checked afterwards.
     """
     tensors = tuple(torch.zeros(1, device="cuda") for _ in range(3))
-    launch = make_launcher(callback_kernel, bind_device=True, no_gpu=True).bind_device(
-        0
-    )
+    launch = make_launcher(callback_kernel, no_gpu=True).__self__.bind_device(0)
     module = module_of(launch)
     count = 0
 
@@ -146,7 +144,7 @@ def kwargs(iters: int, batches: int) -> None:
     ):
         report(label, time_calls(fn, iters, batches))
     try:
-        launch(0, 0, 1, x=1, y=2, z=3)
+        launch(0, 0, 1, x=1, y=2, z=3)  # pyright: ignore[reportCallIssue]
     except TypeError:
         print("INTJ native kwargs: unsupported (verified TypeError)")
     else:

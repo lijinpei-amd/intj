@@ -6,6 +6,7 @@ import abc
 import dataclasses
 import functools
 import inspect
+import os
 import sysconfig
 import threading
 import types
@@ -20,7 +21,7 @@ from collections.abc import (
     Sequence,
 )
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast, overload
 
 from . import _imports, lazy
 from ._version import __version__
@@ -42,6 +43,7 @@ from .kernel_cache import (
     toolchain_for,
     unavailable_message,
 )
+from .options import OPTION_FIELDS, MakeLauncherKwargs, MakeLauncherOption
 from .python_intf import cpython_abi
 from .render.build import (
     build_flags,
@@ -69,6 +71,8 @@ JitFunction = Any
 CompiledKernel = Any
 
 if TYPE_CHECKING:
+    from typing_extensions import Unpack
+
     from .grid import GridCode
 
 
@@ -117,14 +121,41 @@ class CompilerInput:
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class LauncherFactory:
-    """A kernel's launcher configuration, fixed at `make_launcher` time.
+T = TypeVar("T")
 
-    `make_launcher` returns one directly when the kernel has bound parameters
-    or `bind_device=True` was requested; `bind` or `bind_device` then creates
-    the launchers. Otherwise it returns `bind()`'s launcher. Nothing here
-    touches a GPU; every launcher builds its module on its first call.
+
+class _Once(Generic[T]):
+    # a value computed once, under a lock; a failure is not kept, and the
+    # computing thread re-entering is refused rather than deadlocked
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._running = False
+        self._result: tuple[T] | None = None  # one load: all or nothing
+
+    def get(self, compute: Callable[[], T]) -> T:
+        result = self._result
+        if result is None:
+            with self._lock:
+                result = self._result
+                if result is None:
+                    if self._running:
+                        raise RuntimeError(
+                            "intj: a launcher was called while it was being built"
+                        )
+                    self._running = True
+                    try:
+                        result = self._result = (compute(),)
+                    finally:
+                        self._running = False
+        return result[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Analysis:
+    """What `check()` derives from a `make_launcher` call's non-bind options.
+
+    Computed once per `make_launcher` call and shared by every launcher
+    derived from it: bind fields are not inputs.
     """
 
     jit_func: JitFunction
@@ -134,7 +165,6 @@ class LauncherFactory:
     kernel_cache: KernelCache
     verify_annotation: bool
     no_gpu: bool
-    bind_device_requested: bool
     grid_arg: int | None = None
     grid_py: Callable[[dict[str, object]], object] | None = None
     grid_cpp: GridCode | None = None
@@ -147,418 +177,77 @@ class LauncherFactory:
     #: checked to be a compile option once the target is known
     declared_parameters: tuple[str, ...] = ()
 
-    def bind(self, /, **values: object) -> Callable[..., Any]:
-        """Returns a lazy launcher with the bound parameters fixed to `values`.
 
-        Args:
-            **values: One value per bound parameter, by name. A bound tensor
-                takes an exact `torch.Tensor`, `torch.nn.Parameter`, or None.
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Binding:
+    """One launcher's checked bind fields."""
 
-        Returns:
-            The launcher, called as `(device, stream, grid, ...)` without the
-            bound parameters.
-
-        Raises:
-            TypeError: `bind_device=True` was requested, or `values` misses,
-                adds or mistypes a bound parameter.
-        """
-        if self.bind_device_requested:
-            raise TypeError("intj: use bind_device(device_ordinal, **values)")
-        return self._bind(None, values)
-
-    def bind_device(self, /, *args: object, **values: object) -> Callable[..., Any]:
-        """Returns a lazy launcher fixed to one device and the bound `values`.
-
-        Args:
-            *args: Exactly one device ordinal, an int in `[0, 2**31)`.
-            **values: One value per bound parameter, by name, as for `bind`.
-
-        Returns:
-            The launcher, called as `(stream, grid, ...)` without the bound
-            parameters.
-
-        Raises:
-            TypeError: `bind_device=True` was not requested, the ordinal is
-                missing or out of range, or `values` is wrong as for `bind`.
-        """
-        if not self.bind_device_requested:
-            raise TypeError("intj: bind_device was not requested")
-        if len(args) != 1:
-            raise TypeError(
-                "intj: bind_device requires exactly one positional device ordinal"
-            )
-        ordinal = args[0]
-        # here, not on the first call, so a bad ordinal fails where it is written
-        if type(ordinal) is not int or not 0 <= ordinal <= 2**31 - 1:
-            raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
-        return self._bind(ordinal, values)
-
-    def _binding(self) -> DeviceBinding:
-        return (
-            DeviceBinding.FIXED
-            if self.bind_device_requested
-            else DeviceBinding.NOT_FIXED
-        )
-
-    def _bind(self, device: object, values: Mapping[str, object]) -> Callable[..., Any]:
-        """Returns a lazy launcher; GPU-free, `_build` runs on its first call."""
-        names = {p.name for p in self.params if p.annotation.bind_value is not None}
-        unknown = values.keys() - names
-        if unknown:
-            raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
-        missing = names - values.keys()
-        if missing:
-            raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
-        _imports.ensure_torch_imported()
-        _imports.ensure_triton_imported()
-        resolved: list[ResolvedParam] = []
-        for p in self.params:
-            annotation = p.annotation
-            if annotation.bind_value == "tensor":
-                value = values[p.name]
-                if value is not None and type(value) not in (
-                    _imports.torch.Tensor,
-                    _imports.torch.nn.Parameter,
-                ):
-                    raise TypeError(
-                        f"intj: bound tensor {p.name!r} must be a tensor or None"
-                    )
-                if annotation.types == (None,) and value is not None:
-                    raise TypeError(
-                        f"intj: bound tensor {p.name!r} must match declared None type"
-                    )
-                if annotation.types is None:
-                    ty = None
-                    if value is not None:
-                        tensor: Any = value
-                        dtype = _imports.type_canonicalisation_dict.get(
-                            str(tensor.dtype).split(".")[-1]
-                        )
-                        if dtype is None:
-                            raise TypeError(
-                                f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}"
-                            )
-                        ty = "*" + dtype
-                    annotation = dataclasses.replace(annotation, types=(ty,))
-            resolved.append(dataclasses.replace(p, annotation=annotation))
-        state = tuple(resolved)
-        bound_values = tuple(values[p.name] for p in state if p.name in names)
-        hidden = tuple(
-            values[p.name] if p.name in names else p.baked
-            for p in state
-            if p.annotation.bind_value is not None or p.annotation.baked_value
-        )
-        args = (*((device,) if self.bind_device_requested else ()), *bound_values)
-        params, _, _ = _render_params(state, self._binding())
-        doc = _launch_doc(
-            params,
-            self.bind_device_requested,
-            self.grid_arg,
-            self.grid_cpp,
-            self.grid_py is not None,
-            dynamic=self.dynamic,
-        )
-
-        def build(header: object) -> int:
-            return self._build(header, state, args, hidden)
-
-        stub = _stub()
-        launch = stub.new_launcher(stub.Launcher, None, None, build)
-        launch.__self__._set_plan(None, None, doc)
-        return launch
-
-    def _build(
-        self,
-        header: object,
-        resolved: tuple[ResolvedParam, ...],
-        args: tuple[object, ...],
-        hidden: tuple[object, ...],
-    ) -> int:
-        """Builds a launcher on its first call and returns the rendered entry.
-
-        Queries the target, renders, compiles, loads, and fills `header`. The
-        returned address is the rendered entry, for `_intj_lazy` to swap in.
-
-        `TRITON_INTERPRET=1` is refused here, not at `make_launcher`, so a
-        module-level decorator does not make its module unimportable under the
-        interpreter: decoration never runs a kernel, only the first call does.
-        Once this call succeeds the swapped-in entry never reads the knob
-        again, so a launcher built with the interpreter off keeps launching if
-        it is turned on later.
-        """
-        _imports.ensure_triton_imported()
-        if _imports.knobs.runtime.interpret:
-            raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
-        # a declared knob is per call: leaving its live value out keeps it out
-        # of the RenderKey, so it cannot build a module per value
-        knob_values = (
-            None
-            if self.no_gpu
-            else {k: v for k, v in _live_knobs().items() if k not in self.dynamic}
-        )
-        if self.tuned is not None:
-            assert knob_values is not None, "_plan_tuning refuses no_gpu"
-            _check_tuned_configs(
-                self.tuned.plan, resolved, dict(self.options), knob_values
-            )
-        module = _materialize_module(
-            self.jit_func,
-            resolved,
-            dict(self.options),
-            self.torch_access_mode,
-            self.kernel_cache,
-            self.no_gpu,
-            self.verify_annotation,
-            self._binding(),
-            grid_arg=self.grid_arg,
-            grid_py_mode=self.grid_py is not None,
-            grid_cpp=self.grid_cpp,
-            return_compiled=self.return_compiled,
-            tuning=self.tuned.render if self.tuned else None,
-            knob_values=knob_values,
-            dynamic=self.dynamic,
-            global_values=self.global_values,
-            declared_parameters=self.declared_parameters,
-        )
-        if self.tuned is None:
-            callback: Callable[..., Any] = _launcher_compile(module)
-        else:
-            from .tuning import TunedGrid, make_tuned_callback
-
-            assert self.tuned.render is not None and knob_values is not None
-            if self.grid_py is not None:
-                grid = TunedGrid("py", self.grid_py)
-            elif self.grid_cpp is not None:
-                code = getattr(self.grid_fn, "__code__")
-                grid = TunedGrid(
-                    "cpp",
-                    self.grid_fn,
-                    tuple(code.co_varnames[: code.co_argcount]),
-                    self.grid_cpp.extras,
-                )
-            else:
-                grid = TunedGrid("dims")
-            callback = make_tuned_callback(
-                self.tuned.plan,
-                resolved,
-                dict(self.options),
-                grid,
-                self.tuned.render,
-                self.return_compiled,
-                knob_values,
-                self.dynamic,
-            )
-        grid_py = () if self.grid_py is None else (self.grid_py, hidden)
-        return module._init(header, callback, _Interner(), *grid_py, *args)
+    device_binding: DeviceBinding
+    params: tuple[ResolvedParam, ...]  # bound tensors' types resolved
+    args: tuple[object, ...]  # `_init`'s trailing arguments: [device], *bound values
+    hidden: tuple[object, ...]  # grid_py's fixed values
+    doc: bytes  # the launcher's `__text_signature__`
 
 
-def _interpreter_deferred(bind_device_requested: bool) -> Any:
-    """Returns a stand-in for a launcher over an `InterpretedFunction`.
-
-    GPU-free, like a real `_bind`: the refusal itself only fires on the first
-    call, so it costs nothing beyond that (there is no second call -- this
-    build never succeeds). With `bind_device_requested` it returns a factory
-    whose `bind_device` checks its ordinal as the real one does.
-    """
-
-    def build(header: object) -> int:
-        raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
-
-    def make() -> Any:
-        stub = _stub()
-        launch = stub.new_launcher(stub.Launcher, None, None, build)
-        launch.__self__._set_plan(None, None, b"(*args, **kwargs)\x00")
-        return launch
-
-    if not bind_device_requested:
-        return make()
-
-    class _DeferredFactory:
-        """A `bind_device` factory whose launchers refuse on their first call."""
-
-        def bind(self, /, **values: object) -> Any:
-            raise TypeError("intj: use bind_device(device_ordinal, **values)")
-
-        def bind_device(self, /, *args: object, **values: object) -> Any:
-            if len(args) != 1:
-                raise TypeError(
-                    "intj: bind_device requires exactly one positional device ordinal"
-                )
-            ordinal = args[0]
-            if type(ordinal) is not int or not 0 <= ordinal <= 2**31 - 1:
-                raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
-            return make()
-
-    return _DeferredFactory()
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Plan:
+    analysis: _Analysis
+    binding: _Binding
 
 
-@overload
-def make_launcher(
-    jit_func: JitFunction,
-    *,
-    dynamic_options: Sequence[str] = (),
-    extra_annotation: Mapping[str, object] | None = None,
-    options: Mapping[str, Any] | None = None,
-    torch_access_mode: TorchAccessMode | None = None,
-    kernel_cache: KernelCache = KernelCache.INTJ,
-    no_gpu: bool = False,
-    verify_annotation: bool = False,
-    bind_device: bool = False,
-    grid_arg: int | None = None,
-    grid_cpp: object | None = None,
-    grid_py: Callable[[dict[str, object]], object] | None = None,
-    return_compiled: bool = False,
-    assume_constant_globals: bool = False,
-) -> Any: ...
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Origin:
+    """One `make_launcher` call, shared by every launcher derived from it."""
+
+    explicit: MakeLauncherOption
+    names: frozenset[str]  # the keywords passed explicitly
+    analysis: _Once[_Analysis] = dataclasses.field(default_factory=_Once)
 
 
-@overload
-def make_launcher(
-    *,
-    dynamic_options: Sequence[str] = (),
-    extra_annotation: Mapping[str, object] | None = None,
-    options: Mapping[str, Any] | None = None,
-    torch_access_mode: TorchAccessMode | None = None,
-    kernel_cache: KernelCache = KernelCache.INTJ,
-    no_gpu: bool = False,
-    verify_annotation: bool = False,
-    bind_device: bool = False,
-    grid_arg: int | None = None,
-    grid_cpp: object | None = None,
-    grid_py: Callable[[dict[str, object]], object] | None = None,
-    return_compiled: bool = False,
-    assume_constant_globals: bool = False,
-) -> Callable[[Any], Any]: ...
+_PACKAGE = os.path.dirname(__file__) + os.sep
 
 
-#: make_launcher's "no kernel given" default: a positional None is an error, not
-#: the decorator-factory form (an optional kernel whose import failed).
-_NO_KERNEL: Any = object()
+def _warn(message: str, category: type[Warning]) -> None:
+    # check() is reached from C, so no fixed stacklevel finds the caller:
+    # point at the first frame outside intj instead
+    frame, level = inspect.currentframe(), 1
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE):
+        frame, level = frame.f_back, level + 1
+    warnings.warn(message, category, stacklevel=level)
 
 
-def make_launcher(
-    jit_func: JitFunction = _NO_KERNEL,
-    *,
-    dynamic_options: Sequence[str] = (),
-    extra_annotation: Mapping[str, object] | None = None,
-    options: Mapping[str, Any] | None = None,
-    torch_access_mode: TorchAccessMode | None = None,
-    kernel_cache: KernelCache = KernelCache.INTJ,
-    no_gpu: bool = False,
-    verify_annotation: bool = False,
-    bind_device: bool = False,
-    grid_arg: int | None = None,
-    grid_cpp: object | None = None,
-    grid_py: Callable[[dict[str, object]], object] | None = None,
-    return_compiled: bool = False,
-    assume_constant_globals: bool = False,
-) -> Any:
-    """Builds a fast launcher for `jit_func`.
-
-    Called without `jit_func` (keyword arguments only), this is a decorator
-    factory instead: `make_launcher(grid_cpp=grid)(kernel)` builds the same
-    launcher `make_launcher(kernel, grid_cpp=grid)` would, so a kernel (plain
-    or wrapped in `triton.autotune`/`triton.heuristics`) can be decorated
-    directly:
-
-        @intj.make_launcher(grid_cpp=grid)
-        @triton.autotune(...)
-        @triton.jit
-        def k(...): ...
-
-    The arguments are checked when the decorator is applied to the kernel.
-    make_launcher does no GPU work: the returned launcher
-    builds its module on its first call (see docs/Usage.md, "Lazy build").
-
-    Without bindings, the returned callable is a C function:
-
-        launcher(device, stream, grid, arg0, arg1, ...)
-
-    `device` is a device index in `[0, 256)` -- one byte of the spec key holds
-    it -- and `stream` is a raw stream handle (both ints). The default `grid`
-    is an int or a tuple/list of up to 3 ints. Declared `dynamic_options`
-    values follow the grid controls. The remaining call arguments are the
-    kernel's public parameters, positionally, in declaration order. Baked
-    Argument and Constexpr values are omitted from the call.
-
-    Args:
-        jit_func: A `@triton.jit` kernel, optionally wrapped in
-            `triton.autotune`/`triton.heuristics`. Omit it for the decorator
-            factory form.
-        dynamic_options: Compile options and `knobs.<group>.<name>` paths
-            passed per call, right after the grid controls, and keyed.
-        extra_annotation: Parameter name -> annotation or shorthand: fixes
-            types or specialization facts, bakes values, or marks values for
-            binding.
-        options: Triton compile options (`num_warps`, `num_stages`, ...)
-            baked into every launch.
-        torch_access_mode: How the module reads a tensor; None selects
-            automatically. See `TorchAccessMode`.
-        kernel_cache: The hash map behind the kernel cache; see `KernelCache`.
-        no_gpu: Decode and cache on the host without compiling or launching a
-            GPU kernel.
-        verify_annotation: Check declared types, ranges and assumed facts;
-            otherwise these are caller promises.
-        bind_device: Return a factory whose `.bind_device(ordinal, **values)`
-            fixes a non-negative int32 device ordinal and returns
-            `(stream, grid, ...)`. It owns a separate kernel cache, or one
-            kernel when no dynamic specialization key remains.
-        grid_arg: Take that many (1, 2 or 3) separate grid dimensions instead
-            of `grid`.
-        grid_cpp: An annotated def computing the grid in the extension from
-            same-name JIT inputs and keyword-only extra inputs.
-        grid_py: A callable given a fresh dict of JIT inputs on every launch,
-            returning the grid. `grid_arg`, `grid_cpp` and `grid_py` are
-            mutually exclusive.
-        return_compiled: Return the cached Triton CompiledKernel after a
-            successful launch, including on a zero-volume grid. Requires GPU
-            mode.
-        assume_constant_globals: Accept a kernel that reads global variables:
-            their values when triton first hashed the kernel become part of
-            the module identity, and are never checked again. Changing one
-            afterwards is unsupported and not detected.
-
-    Returns:
-        The launcher; without `jit_func`, a decorator that makes one. With
-        bound parameters or `bind_device=True`, a non-callable
-        `LauncherFactory` instead: `.bind(**values)` creates the native
-        callable and removes those parameters from its signature. The return
-        shape depends on `bind_device` and annotations on the JITFunction.
+def _analyze(option: MakeLauncherOption) -> _Analysis:
+    """Runs every check on `option`'s non-bind fields: `make_launcher`'s old body.
 
     Raises:
         UnsupportedKernel: The kernel or an option is outside intj's scope,
             or the kernel cache's library cannot be provisioned.
-        TypeError: A None kernel or a malformed keyword argument.
+        TypeError: A malformed option.
         ValueError: A malformed grid option.
 
     Warns:
         ClassGlobalWarning: `assume_constant_globals=True` keyed a class
             global by its qualified name.
+        RuntimeWarning: `verify_annotation=True` cannot verify a bound
+            pointer's range assumption.
     """
-    if jit_func is _NO_KERNEL:
-        return functools.partial(
-            make_launcher,
-            dynamic_options=dynamic_options,
-            extra_annotation=extra_annotation,
-            options=options,
-            torch_access_mode=torch_access_mode,
-            kernel_cache=kernel_cache,
-            no_gpu=no_gpu,
-            verify_annotation=verify_annotation,
-            bind_device=bind_device,
-            grid_arg=grid_arg,
-            grid_cpp=grid_cpp,
-            grid_py=grid_py,
-            return_compiled=return_compiled,
-            assume_constant_globals=assume_constant_globals,
-        )
-    if jit_func is None:
-        raise TypeError("intj: make_launcher got None instead of a kernel")
-    # Cheap checks on every argument: no imports, no GPU, no build.
+    jit_func = option.jit_func
+    dynamic_options = option.dynamic_options
+    extra_annotation = option.extra_annotation
+    options = option.options
+    torch_access_mode = option.torch_access_mode
+    kernel_cache = option.kernel_cache
+    no_gpu = option.no_gpu
+    verify_annotation = option.verify_annotation
+    grid_arg = option.grid_arg
+    grid_cpp = option.grid_cpp
+    grid_py = option.grid_py
+    return_compiled = option.return_compiled
+    assume_constant_globals = option.assume_constant_globals
+    # Cheap checks on every argument first: no imports, no GPU, no build.
     flags: dict[str, object] = {
         "no_gpu": no_gpu,
         "verify_annotation": verify_annotation,
-        "bind_device": bind_device,
         "return_compiled": return_compiled,
         "assume_constant_globals": assume_constant_globals,
     }
@@ -623,13 +312,9 @@ def make_launcher(
     if isinstance(kernel, _imports.InterpretedFunction):
         # `@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
         # not a JITFunction: it has none of the attributes the analysis below
-        # needs (`.params`, `.cache_key`, ...), so there is nothing to decorate.
-        # Decoration still must not raise -- a module-level `@make_launcher`
-        # would make its module unimportable under the interpreter -- so this
-        # stands in for the real launcher and defers the actual refusal to the
-        # first call, exactly like `_build`'s live `knobs.runtime.interpret`
-        # check does for a kernel that decoded to a real JITFunction.
-        return _interpreter_deferred(bind_device)
+        # needs.  Decoration never gets here, so a module-level `@make_launcher`
+        # still imports under the interpreter; this is the first call's refusal.
+        raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
     kernel = _check_kernel(kernel, options, assume_constant_globals)
     global_values = _global_values(kernel) if assume_constant_globals else ()
     resolved = _resolve_annotations(kernel, extra_annotation)
@@ -688,24 +373,20 @@ def make_launcher(
         except GridError as error:
             raise UnsupportedKernel(f"intj: {error}") from error
     access = _resolve_torch_access_mode(torch_access_mode)
-    needs_binding = bind_device or any(
-        p.annotation.bind_value is not None for p in resolved
-    )
-    if needs_binding and verify_annotation:
+    if verify_annotation:
         for p in resolved:
             if (
                 p.annotation.bind_value == "pointer"
                 and p.annotation.pointer_range_32 == "assume"
             ):
-                warnings.warn(
+                _warn(
                     f"intj: pointer-range assumption for bound pointer {p.name!r} "
                     "cannot be verified from an address and will be trusted",
                     RuntimeWarning,
-                    stacklevel=2,
                 )
-    # GPU-free but may reach the network: here, never on a call
+    # GPU-free but may reach the network: here, never on a build
     _provision(kernel_cache)
-    factory = LauncherFactory(
+    analysis = _Analysis(
         kernel,
         resolved,
         tuple(options.items()),
@@ -713,7 +394,6 @@ def make_launcher(
         kernel_cache,
         verify_annotation,
         no_gpu,
-        bind_device,
         grid_arg,
         grid_py,
         compiled_grid,
@@ -728,14 +408,379 @@ def make_launcher(
         {".".join(c[1:]) for _, _, v in global_values for c in _class_globals(v)}
     )
     if classes:
-        warnings.warn(
+        _warn(
             f"intj: {kernel.fn.__qualname__} reads class global(s) {classes}; intj "
             "keys a class by its qualified name and will not detect if it is "
             "replaced (assume_constant_globals=True)",
             ClassGlobalWarning,
-            stacklevel=2,
         )
-    return factory if needs_binding else factory.bind()
+    return analysis
+
+
+def _bind(a: _Analysis, option: MakeLauncherOption) -> _Binding:
+    """Checks one launcher's `bind_device` and `bind_values` against its analysis."""
+    device = option.bind_device
+    if type(device) is bool:
+        raise TypeError(
+            "intj: bind_device takes an int device ordinal, not a flag; "
+            "use k.__self__.bind_device(ordinal)"
+        )
+    if device is not None and (type(device) is not int or not 0 <= device <= 2**31 - 1):
+        raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
+    values = cast(object, option.bind_values)  # as given: nothing checked it
+    if values is None:
+        values = {}
+    if not (isinstance(values, Mapping) and all(type(k) is str for k in values)):
+        raise TypeError("intj: bind_values must be None or a mapping keyed by str")
+    names = {p.name for p in a.params if p.annotation.bind_value is not None}
+    unknown = values.keys() - names
+    if unknown:
+        raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
+    missing = names - values.keys()
+    if missing:
+        raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
+    _imports.ensure_torch_imported()
+    _imports.ensure_triton_imported()
+    resolved: list[ResolvedParam] = []
+    for p in a.params:
+        annotation = p.annotation
+        if annotation.bind_value == "tensor":
+            value = values[p.name]
+            if value is not None and type(value) not in (
+                _imports.torch.Tensor,
+                _imports.torch.nn.Parameter,
+            ):
+                raise TypeError(
+                    f"intj: bound tensor {p.name!r} must be a tensor or None"
+                )
+            if annotation.types == (None,) and value is not None:
+                raise TypeError(
+                    f"intj: bound tensor {p.name!r} must match declared None type"
+                )
+            if annotation.types is None:
+                ty = None
+                if value is not None:
+                    tensor: Any = value
+                    dtype = _imports.type_canonicalisation_dict.get(
+                        str(tensor.dtype).split(".")[-1]
+                    )
+                    if dtype is None:
+                        raise TypeError(
+                            f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}"
+                        )
+                    ty = "*" + dtype
+                annotation = dataclasses.replace(annotation, types=(ty,))
+        resolved.append(dataclasses.replace(p, annotation=annotation))
+    state = tuple(resolved)
+    bound_values = tuple(values[p.name] for p in state if p.name in names)
+    hidden = tuple(
+        values[p.name] if p.name in names else p.baked
+        for p in state
+        if p.annotation.bind_value is not None or p.annotation.baked_value
+    )
+    binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
+    args = (*(() if device is None else (device,)), *bound_values)
+    params, _, _ = _render_params(state, binding)
+    doc = _launch_doc(
+        params,
+        device is not None,
+        a.grid_arg,
+        a.grid_cpp,
+        a.grid_py is not None,
+        dynamic=a.dynamic,
+    )
+    return _Binding(binding, state, args, hidden, doc)
+
+
+class Launcher:
+    """A launcher's object: `k.__self__` for `k = make_launcher(...)`.
+
+    `k` is a C function whose entry is a build shim until its first call
+    succeeds, then the rendered launch.  This object holds that entry, the
+    options and, once built, the module's per-launcher state.  The C base
+    (`_intj_lazy.Launcher`) adds `options`, `check()`, `build()`,
+    `spec_key()` and `key_chain()`.
+    """
+
+    __slots__ = ()
+
+    if TYPE_CHECKING:
+
+        @property
+        def options(self) -> MakeLauncherOption: ...
+        @property
+        def _origin(self) -> _Origin: ...
+        @property
+        def _plan(self) -> _Plan | None: ...
+        @property
+        def _module(self) -> types.ModuleType | None: ...
+        def check(self) -> None: ...
+        def build(self) -> types.ModuleType: ...
+        def spec_key(self, *args: object) -> tuple[bytes, int]: ...
+        def key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]: ...
+        def _set_plan(
+            self, options: MakeLauncherOption, plan: _Plan, doc: bytes
+        ) -> None: ...
+
+    def bind(self, /, **values: object) -> LaunchFunction:
+        """Returns a new launcher with `values` merged into `bind_values`.
+
+        Validates nothing: a missing, unknown or mistyped value fails in the
+        new launcher's `check()`.  A bound tensor takes an exact
+        `torch.Tensor`, `torch.nn.Parameter`, or None.
+        """
+        return self._derive(
+            lambda o: dataclasses.replace(
+                o, bind_values={**(o.bind_values or {}), **values}
+            )
+        )
+
+    def bind_device(self, ordinal: int | None, /, **values: object) -> LaunchFunction:
+        """Returns a new launcher fixed to device `ordinal`, `values` merged as for `bind`.
+
+        It is called as `(stream, grid, ...)` and owns a separate kernel
+        cache, or one kernel when no dynamic specialization key remains.
+        None is `unbind_device()`.
+        """
+        return self._derive(
+            lambda o: dataclasses.replace(
+                o, bind_device=ordinal, bind_values={**(o.bind_values or {}), **values}
+            )
+        )
+
+    def unbind(self) -> LaunchFunction:
+        """Returns a new launcher with no bound values."""
+        return self._derive(lambda o: dataclasses.replace(o, bind_values=None))
+
+    def unbind_device(self) -> LaunchFunction:
+        """Returns a new launcher that takes the device per call."""
+        return self._derive(lambda o: dataclasses.replace(o, bind_device=None))
+
+    def _derive(
+        self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]
+    ) -> LaunchFunction:
+        return _new_launcher(edit(self.options), self._origin)
+
+    def _check(self) -> None:
+        # check()'s body: the C method calls it under the build lock, as does _build
+        if self._plan is not None:
+            return
+        option = self.options
+        analysis = self._origin.analysis.get(lambda: _analyze(option))
+        binding = _bind(analysis, option)
+        self._set_plan(option, _Plan(analysis, binding), binding.doc)
+
+    def _build(self) -> int:
+        """Builds this launcher on its first call and returns the rendered entry.
+
+        Checks, then queries the target, renders, compiles, loads, and fills
+        this launcher's state block. The returned address is the rendered
+        entry, for `_intj_lazy` to swap in.
+
+        `TRITON_INTERPRET=1` is refused here, on the first call: decoration
+        never runs a kernel, so a module-level decorator does not make its
+        module unimportable under the interpreter.
+        Once this call succeeds the swapped-in entry never reads the knob
+        again, so a launcher built with the interpreter off keeps launching if
+        it is turned on later.
+        """
+        self._check()
+        plan = self._plan
+        assert plan is not None
+        a, b = plan.analysis, plan.binding
+        _imports.ensure_triton_imported()
+        if _imports.knobs.runtime.interpret:
+            raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
+        # a declared knob is per call: leaving its live value out keeps it out
+        # of the RenderKey, so it cannot build a module per value
+        knob_values = (
+            None
+            if a.no_gpu
+            else {k: v for k, v in _live_knobs().items() if k not in a.dynamic}
+        )
+        if a.tuned is not None:
+            assert knob_values is not None, "_plan_tuning refuses no_gpu"
+            _check_tuned_configs(a.tuned.plan, b.params, dict(a.options), knob_values)
+        module = _materialize_module(
+            a.jit_func,
+            b.params,
+            dict(a.options),
+            a.torch_access_mode,
+            a.kernel_cache,
+            a.no_gpu,
+            a.verify_annotation,
+            b.device_binding,
+            grid_arg=a.grid_arg,
+            grid_py_mode=a.grid_py is not None,
+            grid_cpp=a.grid_cpp,
+            return_compiled=a.return_compiled,
+            tuning=a.tuned.render if a.tuned else None,
+            knob_values=knob_values,
+            dynamic=a.dynamic,
+            global_values=a.global_values,
+            declared_parameters=a.declared_parameters,
+        )
+        if a.tuned is None:
+            callback: Callable[..., Any] = _launcher_compile(module)
+        else:
+            from .tuning import TunedGrid, make_tuned_callback
+
+            assert a.tuned.render is not None and knob_values is not None
+            if a.grid_py is not None:
+                grid = TunedGrid("py", a.grid_py)
+            elif a.grid_cpp is not None:
+                code = getattr(a.grid_fn, "__code__")
+                grid = TunedGrid(
+                    "cpp",
+                    a.grid_fn,
+                    tuple(code.co_varnames[: code.co_argcount]),
+                    a.grid_cpp.extras,
+                )
+            else:
+                grid = TunedGrid("dims")
+            callback = make_tuned_callback(
+                a.tuned.plan,
+                b.params,
+                dict(a.options),
+                grid,
+                a.tuned.render,
+                a.return_compiled,
+                knob_values,
+                a.dynamic,
+            )
+        grid_py = () if a.grid_py is None else (a.grid_py, b.hidden)
+        return module._init(self, callback, _Interner(), *grid_py, *b.args)
+
+
+class LaunchFunction(Protocol):
+    """What `make_launcher` returns: a C function whose `__self__` is its `Launcher`."""
+
+    @property
+    def __self__(self) -> Launcher: ...
+    def __call__(self, *args: Any) -> Any: ...
+
+
+@functools.lru_cache(maxsize=1)
+def _launcher_type() -> type[Launcher]:
+    """Returns `Launcher` over this process's `_intj_lazy.Launcher`."""
+    namespace = {"__slots__": (), "__module__": __name__, "__qualname__": "Launcher"}
+    return cast(
+        "type[Launcher]", type("Launcher", (Launcher, _stub().Launcher), namespace)
+    )
+
+
+def _new_launcher(options: MakeLauncherOption, origin: _Origin) -> LaunchFunction:
+    cls = _launcher_type()
+    return _stub().new_launcher(cls, options, origin, cls._build)  # pyright: ignore[reportPrivateUsage]  # the builder
+
+
+@overload
+def make_launcher(
+    jit_func: JitFunction, /, **kwargs: Unpack[MakeLauncherKwargs]
+) -> LaunchFunction: ...
+
+
+@overload
+def make_launcher(
+    **kwargs: Unpack[MakeLauncherKwargs],
+) -> Callable[[JitFunction], LaunchFunction]: ...
+
+
+#: make_launcher's "no kernel given" default: a positional None is an error, not
+#: the decorator-factory form (an optional kernel whose import failed).
+_NO_KERNEL: Any = object()
+
+
+def make_launcher(
+    jit_func: JitFunction = _NO_KERNEL, /, **kwargs: Unpack[MakeLauncherKwargs]
+) -> Any:
+    """Returns a fast launcher for `jit_func`, checked and built on first use.
+
+    Called without `jit_func` (keyword arguments only), this is a decorator
+    factory instead: `make_launcher(grid_cpp=grid)(kernel)` builds the same
+    launcher `make_launcher(kernel, grid_cpp=grid)` would, so a kernel (plain
+    or wrapped in `triton.autotune`/`triton.heuristics`) can be decorated
+    directly:
+
+        @intj.make_launcher(grid_cpp=grid)
+        @triton.autotune(...)
+        @triton.jit
+        def k(...): ...
+
+    Decoration only records a `MakeLauncherOption`: no check, no GPU, no
+    torch import.  `k.__self__.check()` runs every check now; otherwise the
+    first call does, then builds the module (see docs/Usage.md, "Lazy
+    build").
+
+    The returned callable is a C function:
+
+        launcher(device, stream, grid, arg0, arg1, ...)
+
+    `device` is a device index in `[0, 256)` -- one byte of the spec key holds
+    it -- and `stream` is a raw stream handle (both ints). The default `grid`
+    is an int or a tuple/list of up to 3 ints. Declared `dynamic_options`
+    values follow the grid controls. The remaining call arguments are the
+    kernel's public parameters, positionally, in declaration order. Baked
+    Argument and Constexpr values, and bound parameters, are omitted.
+
+    Args:
+        jit_func: A `@triton.jit` kernel, optionally wrapped in
+            `triton.autotune`/`triton.heuristics`. Omit it for the decorator
+            factory form.
+        dynamic_options: Compile options and `knobs.<group>.<name>` paths
+            passed per call, right after the grid controls, and keyed.
+        extra_annotation: Parameter name -> annotation or shorthand: fixes
+            types or specialization facts, bakes values, or marks values for
+            binding.
+        options: Triton compile options (`num_warps`, `num_stages`, ...)
+            baked into every launch.
+        torch_access_mode: How the module reads a tensor; None selects
+            automatically. See `TorchAccessMode`.
+        kernel_cache: The hash map behind the kernel cache; see `KernelCache`.
+        no_gpu: Decode and cache on the host without compiling or launching a
+            GPU kernel.
+        verify_annotation: Check declared types, ranges and assumed facts;
+            otherwise these are caller promises.
+        bind_device: A non-negative int32 device ordinal: the launcher is
+            called as `(stream, grid, ...)` and owns a separate kernel cache,
+            or one kernel when no dynamic specialization key remains.
+        bind_values: Bound parameter name -> value; see `Launcher.bind`.
+        grid_arg: Take that many (1, 2 or 3) separate grid dimensions instead
+            of `grid`.
+        grid_cpp: An annotated def computing the grid in the extension from
+            same-name JIT inputs and keyword-only extra inputs.
+        grid_py: A callable given a fresh dict of JIT inputs on every launch,
+            returning the grid. `grid_arg`, `grid_cpp` and `grid_py` are
+            mutually exclusive.
+        return_compiled: Return the cached Triton CompiledKernel after a
+            successful launch, including on a zero-volume grid. Requires GPU
+            mode.
+        assume_constant_globals: Accept a kernel that reads global variables:
+            their values when triton first hashed the kernel become part of
+            the module identity, and are never checked again. Changing one
+            afterwards is unsupported and not detected.
+
+    Returns:
+        The launcher, a C function whose `__self__` is its `Launcher`
+        (`bind`, `bind_device`, `unbind`, `unbind_device`, `check`). Without
+        `jit_func`, a decorator that makes one.
+
+    Raises:
+        TypeError: A None kernel or an unknown keyword. Everything else
+            raises from `check()` or the first call.
+    """
+    unknown = kwargs.keys() - OPTION_FIELDS
+    if unknown:
+        raise TypeError(
+            "intj: make_launcher() got unexpected keyword argument(s) "
+            f"{sorted(unknown)}"
+        )
+    if jit_func is _NO_KERNEL:
+        return functools.partial(make_launcher, **kwargs)
+    if jit_func is None:
+        raise TypeError("intj: make_launcher got None instead of a kernel")
+    option = MakeLauncherOption(jit_func, **kwargs)
+    return _new_launcher(option, _Origin(option, frozenset(kwargs)))
 
 
 def _materialize_module(
@@ -799,7 +844,7 @@ def _materialize_module(
         tuning = dataclasses.replace(tuning, computed_fields=computed_fields)
     # tuned levels always use a map
     nwords = max(nwords, 1) if tuning is not None else nwords
-    # make_launcher provisioned already: this is the idempotent, no-network
+    # check() provisioned already: this is the idempotent, no-network
     # lookup of the toolchain it installed
     cache_toolchain = _provision(kernel_cache)
     # the kernel's own name, unless python allows something C does not
@@ -900,7 +945,7 @@ _INSTALL_FAILED: dict[KernelCache, Exception] = {}
 def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
     """Returns the toolchain for `cache`, fetching and building it the first time.
 
-    Only ever reached from `make_launcher`, on the slow path that was already
+    Only ever reached from `check()`, on the slow path that was already
     going to invoke a compiler.  A failure is remembered: a script that builds
     twenty launchers offline should wait out one connect timeout, not twenty.
     """

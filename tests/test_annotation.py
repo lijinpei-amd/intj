@@ -559,7 +559,7 @@ def test_make_launcher_resolves_before_target_discovery(tmp_path, monkeypatch):
         launcher, "_current_target", lambda: pytest.fail("target discovered")
     )
     with pytest.raises(ValueError, match="unsupported"):
-        intj.make_launcher(kernel)
+        intj.make_launcher(kernel).__self__.check()
 
 
 @pytest.mark.parametrize(

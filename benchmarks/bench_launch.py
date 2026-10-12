@@ -256,7 +256,6 @@ def main(iters=20000, batches=7, no_gpu=False):
             extra_annotation=annotation,
             no_gpu=no_gpu,
             verify_annotation=verify,
-            bind_device=fixed_device,
         )
         build_ms = (time.perf_counter_ns() - start) / 1e6
         bind_ms = None
@@ -268,9 +267,9 @@ def main(iters=20000, batches=7, no_gpu=False):
                 else {}
             )
             launcher = (
-                factory.bind_device(ordinal, **values)
+                factory.__self__.bind_device(ordinal, **values)
                 if fixed_device
-                else factory.bind(**values)
+                else factory.__self__.bind(**values)
             )
             bind_ms = (time.perf_counter_ns() - start) / 1e6
         else:

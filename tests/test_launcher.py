@@ -301,25 +301,23 @@ def pointer_kernel(tmp_path):
     return _kernel_from_source(tmp_path, "pointer_kernel", "x")
 
 
-def test_bind_device_requires_one_positional_ordinal(device_kernel):
-    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True)
-    assert not callable(factory)
-    with pytest.raises(TypeError, match="bind_device"):
-        factory.bind()
-    with pytest.raises(TypeError, match="exactly one positional"):
-        factory.bind_device()
-    with pytest.raises(TypeError, match="exactly one positional"):
-        factory.bind_device(0, 1)
-    with pytest.raises(TypeError, match="exactly one positional"):
-        factory.bind_device(device_ordinal=0)
-    launch = factory.bind_device(0)
-    assert tuple(inspect.signature(launch).parameters) == ("stream", "grid", "x")
-    assert type(launch).__flags__ & (1 << 11)  # Py_TPFLAGS_HAVE_VECTORCALL
-    assert launch(0, 1, 7) is None
+def test_bind_device_takes_one_positional_ordinal(device_kernel):
+    launch = make_launcher(device_kernel, no_gpu=True)
+    with pytest.raises(TypeError):
+        launch.__self__.bind_device()  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError):
+        launch.__self__.bind_device(0, 1)  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError):
+        launch.__self__.bind_device(device_ordinal=0)  # pyright: ignore[reportCallIssue]
+    fixed = launch.__self__.bind_device(0)
+    fixed.__self__.check()
+    assert tuple(inspect.signature(fixed).parameters) == ("stream", "grid", "x")
+    assert type(fixed).__flags__ & (1 << 11)  # Py_TPFLAGS_HAVE_VECTORCALL
+    assert fixed(0, 1, 7) is None
     with pytest.raises(TypeError, match="arguments"):
-        launch(0, 0, 1, 7)
+        fixed(0, 0, 1, 7)
     with pytest.raises(TypeError, match="keyword"):
-        launch(0, 1, x=7)
+        fixed(0, 1, x=7)  # pyright: ignore[reportCallIssue]
 
 
 def test_bind_device_validates_exact_nonnegative_int32(device_kernel):
@@ -328,14 +326,14 @@ def test_bind_device_validates_exact_nonnegative_int32(device_kernel):
 
     factory = make_launcher(
         device_kernel,
-        bind_device=True,
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    launch = factory.bind_device(0)
-    for value in (None, True, False, 0.0, "0", IntSubclass(0), -1, 2**31, 2**65):
+    launch = factory.__self__.bind_device(0)
+    # None is unbind_device(): not an error
+    for value in (True, False, 0.0, "0", IntSubclass(0), -1, 2**31, 2**65):
         with pytest.raises(TypeError, match="device.*int"):
-            factory.bind_device(value)
+            factory.__self__.bind_device(value).__self__.check()  # pyright: ignore[reportArgumentType]
     assert launch(0, 1, 7) is None
 
 
@@ -357,12 +355,13 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
         monkeypatch.setattr(f"intj.launcher.{name}", forbidden)
     factory = make_launcher(
         device_kernel,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    handles = [factory.bind_device(ordinal) for ordinal in (0, 255, 256, 2**31 - 1)]
+    handles = [
+        factory.__self__.bind_device(ordinal) for ordinal in (0, 255, 256, 2**31 - 1)
+    ]
     module = module_of(handles[0])
     assert all(module_of(handle) is module for handle in handles)
     key = next(key for key, loaded in _LOADED.items() if loaded is module)
@@ -387,7 +386,6 @@ def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
     )
     factory = make_launcher(
         kernel,
-        bind_device=True,
         extra_annotation={
             name: Argument(
                 type=tl.pointer_type(tl.float32),
@@ -401,10 +399,11 @@ def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
     )
     values = dict.fromkeys(names, 0)
     with pytest.raises(TypeError, match="missing"):
-        factory.bind_device(0)
+        factory.__self__.bind_device(0).__self__.check()
     with pytest.raises(TypeError, match="unknown.*other"):
-        factory.bind_device(0, **values, other=1)
-    launch = factory.bind_device(0, **values)
+        factory.__self__.bind_device(0, **values, other=1).__self__.check()
+    launch = factory.__self__.bind_device(0, **values)
+    launch.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(launch).parameters) == ("stream", "grid", "n")
     assert launch(0, 1, 7) is None
 
@@ -414,10 +413,10 @@ def test_bind_device_signature_avoids_public_control_names(tmp_path):
     kernel = _kernel_from_source(tmp_path, "fixed_control_names", ", ".join(names))
     launch = make_launcher(
         kernel,
-        bind_device=True,
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind_device(0)
+    ).__self__.bind_device(0)
+    launch.__self__.check()  # the signature is set by check()
     signature = inspect.signature(launch)
     assert tuple(signature.parameters) == ("stream__", "grid__", *names)
     assert all(
@@ -428,9 +427,9 @@ def test_bind_device_signature_avoids_public_control_names(tmp_path):
 
 
 def test_fixed_device_handles_own_independent_caches(device_kernel):
-    factory = make_launcher(device_kernel, bind_device=True, no_gpu=True)
-    first = factory.bind_device(0)
-    second = factory.bind_device(0)
+    factory = make_launcher(device_kernel, no_gpu=True)
+    first = factory.__self__.bind_device(0)
+    second = factory.__self__.bind_device(0)
     calls = []
 
     def compile_once_per_handle(key, nparams, device, *args):
@@ -448,12 +447,11 @@ def test_fixed_device_handles_own_independent_caches(device_kernel):
 def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
     factory = make_launcher(
         device_kernel,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={"x": Constexpr(type=tl.int32)},
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    first, second = factory.bind_device(0), factory.bind_device(0)
+    first, second = factory.__self__.bind_device(0), factory.__self__.bind_device(0)
     calls = []
 
     def compile_each_constant(key, nparams, device, value):
@@ -479,12 +477,11 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
 def test_repeated_key_uses_last_lookup_before_hash(device_kernel, bind_device):
     factory = make_launcher(
         device_kernel,
-        bind_device=bind_device,
         no_gpu=True,
         extra_annotation={"x": Constexpr(type=tl.int32)},
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    launch = factory.bind_device(0) if bind_device else factory
+    launch = factory.__self__.bind_device(0) if bind_device else factory
     module = module_of(launch)
     compiled = []
 
@@ -524,13 +521,12 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(
 ):
     factory = make_launcher(
         device_kernel,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
         torch_access_mode=mode,
         kernel_cache=cache,
     )
-    launch = factory.bind_device(0)
+    launch = factory.__self__.bind_device(0)
     calls = []
 
     def compile_once(key, nparams, device, value):
@@ -541,7 +537,7 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(
     launch(0, 1, 7)
     launch(0, 1, 9)
     assert calls == [(b"", 1, 0, 7)]
-    other = factory.bind_device(0)
+    other = factory.__self__.bind_device(0)
     other(0, 1, 9)
     assert calls == [(b"", 1, 0, 7), (b"", 1, 0, 9)], (
         "each no-map handle must own its fixed kernel"
@@ -574,11 +570,10 @@ def test_bind_device_retry_and_reentrant_miss(device_kernel, has_key):
     )
     launch = make_launcher(
         device_kernel,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={"x": annotation},
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind_device(0)
+    ).__self__.bind_device(0)
     calls = []
 
     def compile_reentrant(key, nparams, device, value):
@@ -614,7 +609,7 @@ def test_bound_handles_each_own_a_cache(pointer_kernel):
         },
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    first, second = factory.bind(x=4096), factory.bind(x=8192)
+    first, second = factory.__self__.bind(x=4096), factory.__self__.bind(x=8192)
     calls = []
 
     def compile_for_device(key, nparams, device):
@@ -639,7 +634,6 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
 
     factory = make_launcher(
         bound_kernel,
-        bind_device=True,
         no_gpu=True,
         extra_annotation={
             "x": Argument(
@@ -659,11 +653,11 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
         torch_access_mode=mode,
     )
     owner = _BoundPointer(4096)
-    bound = factory.bind_device(0, x=owner, p=0)
+    bound = factory.__self__.bind_device(0, x=owner, p=0)
     module = module_of(bound)
     owner_refs = sys.getrefcount(owner)
     for _ in range(3):
-        bad = factory.bind_device(
+        bad = factory.__self__.bind_device(
             0, x=owner, p=2**64
         )  # p fails in C, on the first call
         with pytest.raises(OverflowError, match="p"):
@@ -671,7 +665,7 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
         del bad
     assert sys.getrefcount(owner) == owner_refs
     assert bound(0, 1, 7) is None
-    other = factory.bind_device(0, x=0, p=0)
+    other = factory.__self__.bind_device(0, x=0, p=0)
     assert other(0, 1, 7) is None
     module_ref, owner_ref = weakref.ref(module), weakref.ref(owner)
     key = next(key for key, loaded in _LOADED.items() if loaded is module)
@@ -742,9 +736,9 @@ def test_bind_device_resolves_without_changing_current_and_checks_first_compile(
     current = torch.cuda.current_device()
     ordinal = (current + 1) % torch.cuda.device_count()
     factory = make_launcher(
-        device_kernel, bind_device=True, torch_access_mode=TorchAccessMode.INTERPRETER
+        device_kernel, torch_access_mode=TorchAccessMode.INTERPRETER
     )
-    launch = factory.bind_device(ordinal)
+    launch = factory.__self__.bind_device(ordinal)
     assert torch.cuda.current_device() == current
     monkeypatch.setattr("intj.launcher._current_device", lambda: ordinal + 1)
     with pytest.raises(
@@ -764,7 +758,7 @@ def test_bind_device_reports_driver_lookup_failure(device_kernel):
             "from intj import make_launcher\n"
             "from intj import TorchAccessMode\n"
             "kernel = runpy.run_path(sys.argv[1])['device_kernel']\n"
-            "make_launcher(kernel, bind_device=True, torch_access_mode=TorchAccessMode.INTERPRETER).bind_device(2**31 - 1)(0, 1, 7)\n",
+            "make_launcher(kernel, torch_access_mode=TorchAccessMode.INTERPRETER).__self__.bind_device(2**31 - 1)(0, 1, 7)\n",
             inspect.getfile(device_kernel.fn),
         ],
         capture_output=True,
@@ -782,7 +776,6 @@ def test_bind_device_launches_annotated_ast_source_on_gpu(compiled_kernels, has_
     output = torch.empty(1, dtype=torch.int32, device="cuda")
     factory = make_launcher(
         annotated_store,
-        bind_device=True,
         extra_annotation={
             "o": Argument(type=tl.pointer_type(tl.int32), specialize=NEVER),
             "x": Constexpr(type=tl.int32)
@@ -791,7 +784,7 @@ def test_bind_device_launches_annotated_ast_source_on_gpu(compiled_kernels, has_
         },
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    bound = factory.bind_device(torch.cuda.current_device())
+    bound = factory.__self__.bind_device(torch.cuda.current_device())
     stream = torch.cuda.current_stream().cuda_stream
     for value in (1, 17, -31, 1):
         bound(stream, 1, output, value)
@@ -817,12 +810,12 @@ def test_bind_requires_every_bound_name_once(bound_kernel):
         },
         no_gpu=True,
     )
-    with pytest.raises(TypeError, match="not callable"):
-        factory(0, 0, 1, 4)
+    with pytest.raises(TypeError, match="missing"):
+        factory(0, 0, 1, 4)  # the first call checks: nothing bound
     with pytest.raises(TypeError, match="missing.*p"):
-        factory.bind(x=torch.ones(4))
+        factory.__self__.bind(x=torch.ones(4)).__self__.check()
     with pytest.raises(TypeError, match="unknown.*other"):
-        factory.bind(x=torch.ones(4), p=0, other=1)
+        factory.__self__.bind(x=torch.ones(4), p=0, other=1).__self__.check()
 
 
 def test_bound_launcher_is_fastcall_and_hides_bound_parameters(bound_kernel):
@@ -842,7 +835,8 @@ def test_bound_launcher_is_fastcall_and_hides_bound_parameters(bound_kernel):
         },
         no_gpu=True,
     )
-    launch = factory.bind(x=torch.ones(4), p=0)
+    launch = factory.__self__.bind(x=torch.ones(4), p=0)
+    launch.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(launch).parameters) == (
         "device",
         "stream",
@@ -866,10 +860,13 @@ def test_bound_launchers_are_fastcall_builtins(bound_kernel, bind_device):
             for name in ("x", "p")
         },
         no_gpu=True,
-        bind_device=bind_device,
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    launch = factory.bind_device(0, x=0, p=0) if bind_device else factory.bind(x=0, p=0)
+    launch = (
+        factory.__self__.bind_device(0, x=0, p=0)
+        if bind_device
+        else factory.__self__.bind(x=0, p=0)
+    )
     assert isinstance(launch, types.BuiltinFunctionType)
     flags = ctypes.pythonapi.PyCFunction_GetFlags
     flags.argtypes = [ctypes.py_object]
@@ -908,13 +905,11 @@ def test_bind_validates_names_before_loading(bound_kernel, monkeypatch):
         ({"x": None, "p": 0, "n": 4}, "unknown.*n"),
     ]:
         with pytest.raises(TypeError, match=error):
-            factory.bind(**values)
+            factory.__self__.bind(**values).__self__.check()
     with pytest.raises(TypeError):
-        factory.bind(None, p=0)
+        factory.__self__.bind(None, p=0).__self__.check()  # pyright: ignore[reportCallIssue]
     with pytest.raises(TypeError, match="multiple values"):
-        factory.bind(x=None, **{"x": None, "p": 0})
-    with pytest.raises(TypeError, match="bind_device"):
-        factory.bind_device(0, x=None, p=0)
+        factory.__self__.bind(x=None, **{"x": None, "p": 0}).__self__.check()
 
 
 def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path):
@@ -932,7 +927,8 @@ def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    bound = factory.bind(args=12288, values=8192, self=4096)
+    bound = factory.__self__.bind(args=12288, values=8192, self=4096)
+    bound.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(bound).parameters) == (
         "device",
         "stream",
@@ -943,7 +939,7 @@ def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path
     with pytest.raises(TypeError, match="arguments"):
         bound(0, 0, 1, 4096, 4, 8192, 12288)
     with pytest.raises(TypeError, match="keyword"):
-        bound(0, 0, 1, n=4)
+        bound(0, 0, 1, n=4)  # pyright: ignore[reportCallIssue]
     for attr in ("__signature__", "__self__"):
         with pytest.raises(AttributeError):
             setattr(bound, attr, None)
@@ -984,14 +980,17 @@ def test_bind_signature_control_names_avoid_kernel_names(
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    bound = factory.bind(x=0)
+    bound = factory.__self__.bind(x=0)
+    bound.__self__.check()  # the signature is set by check()
     signature = inspect.signature(bound)
     assert tuple(signature.parameters) == (*control_names, *public_names)
     assert all(
         p.kind is inspect.Parameter.POSITIONAL_ONLY
         for p in signature.parameters.values()
     )
-    assert inspect.signature(factory.bind(x=4096)) == signature
+    other = factory.__self__.bind(x=4096)
+    other.__self__.check()
+    assert inspect.signature(other) == signature
     assert bound(0, 0, 1, *range(4, 4 + len(public_names))) is None
 
 
@@ -1014,9 +1013,9 @@ def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mo
         no_gpu=True,
         torch_access_mode=mode,
     )
-    first = factory.bind(x=torch.empty(4))
-    second = factory.bind(x=torch.empty(16))
-    wide = factory.bind(x=torch.empty(4, dtype=torch.float64))
+    first = factory.__self__.bind(x=torch.empty(4))
+    second = factory.__self__.bind(x=torch.empty(16))
+    wide = factory.__self__.bind(x=torch.empty(4, dtype=torch.float64))
     assert first is not second
     assert first.__self__ is not second.__self__
     assert module_of(first) is module_of(second)
@@ -1055,12 +1054,11 @@ def test_bind_none_materializes_triton_constexpr(
         no_gpu=True,
         verify_annotation=verify,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-        bind_device=bind_device,
     )
     bind = (
-        (lambda **values: factory.bind_device(0, **values))
+        (lambda **values: factory.__self__.bind_device(0, **values))
         if bind_device
-        else factory.bind
+        else factory.__self__.bind
     )
     bound = bind(x=None)
     built = module_of(bound)
@@ -1076,7 +1074,7 @@ def test_bind_none_materializes_triton_constexpr(
     assert bound(*((0, 1) if bind_device else (0, 0, 1))) is None
     if annotation.type is None or annotation.type == (None,):
         with pytest.raises(TypeError, match="x.*None"):
-            bind(x=torch.empty(4))
+            bind(x=torch.empty(4)).__self__.check()
 
 
 class _BoundPointer:
@@ -1116,10 +1114,10 @@ def test_binding_null_and_structural_rules(mode, value, valid, pointer_kernel):
         no_gpu=True,
     )
     if valid:
-        factory.bind(x=value)
+        factory.__self__.bind(x=value)
     else:
         with pytest.raises(TypeError, match="x"):
-            factory.bind(x=value)
+            factory.__self__.bind(x=value).__self__.check()
 
 
 @pytest.mark.parametrize(
@@ -1152,10 +1150,12 @@ def test_bind_nulls_and_structural_safety(pointer_kernel, mode, binding, verify)
     else:
         bad += [0, 4096, _BoundPointer(4096)]
     for value in values:
-        assert factory.bind(x=value)(0, 0, 1) is None
+        assert factory.__self__.bind(x=value)(0, 0, 1) is None
     for value in bad:
         with pytest.raises((TypeError, OverflowError), match="x"):
-            factory.bind(x=value)(0, 0, 1)  # C-side checks run on the first call
+            factory.__self__.bind(x=value)(
+                0, 0, 1
+            )  # C-side checks run on the first call
 
 
 @pytest.mark.parametrize(
@@ -1176,7 +1176,7 @@ def test_bind_checked_dtype_and_unchecked_promises(pointer_kernel, mode, binding
     wrong = torch.empty(4, dtype=torch.float64)
     unchecked = make_launcher(
         pointer_kernel, extra_annotation=annotation, no_gpu=True, torch_access_mode=mode
-    ).bind(x=wrong)
+    ).__self__.bind(x=wrong)
     assert unchecked(0, 0, 1) is None
     checked = make_launcher(
         pointer_kernel,
@@ -1186,7 +1186,7 @@ def test_bind_checked_dtype_and_unchecked_promises(pointer_kernel, mode, binding
         torch_access_mode=mode,
     )
     with pytest.raises(TypeError, match="x.*type"):
-        checked.bind(x=wrong)(0, 0, 1)
+        checked.__self__.bind(x=wrong)(0, 0, 1)
 
 
 @pytest.mark.parametrize(
@@ -1213,13 +1213,16 @@ def test_bind_tensor_rechecks_storage_after_set(
             ),
         },
         no_gpu=no_gpu,
-        bind_device=bind_device,
         verify_annotation=True,
         torch_access_mode=mode,
     )
     device = "cpu" if no_gpu else "cuda"
     tensor = torch.empty(4, device=device)
-    bound = factory.bind_device(0, x=tensor) if bind_device else factory.bind(x=tensor)
+    bound = (
+        factory.__self__.bind_device(0, x=tensor)
+        if bind_device
+        else factory.__self__.bind(x=tensor)
+    )
     calls = []
     if no_gpu:
 
@@ -1253,7 +1256,7 @@ def test_bind_tensor_rechecks_storage_after_set(
     ],
 )
 @pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "gpu"])
-def test_bind_pointer_checks_once_and_warns_at_creation(
+def test_bind_pointer_checks_once_and_warns_at_check(
     pointer_kernel, verify, mode, no_gpu
 ):
     with warnings.catch_warnings(record=True) as caught:
@@ -1271,17 +1274,19 @@ def test_bind_pointer_checks_once_and_warns_at_creation(
             verify_annotation=verify,
             torch_access_mode=mode,
         )
+        assert caught == []  # decoration checks nothing
+        factory.__self__.bind(x=4096).__self__.check()
         assert len(caught) == int(verify)
         if verify:
             assert caught[0].category is RuntimeWarning
             assert "'x'" in str(caught[0].message)
             assert "cannot be verified from an address" in str(caught[0].message)
             with pytest.raises(ValueError, match="x.*aligned_16"):
-                factory.bind(x=4100)(0, 0, 1)
+                factory.__self__.bind(x=4100)(0, 0, 1)
         else:
-            assert factory.bind(x=4100)(0, 0, 1) is None
+            assert factory.__self__.bind(x=4100)(0, 0, 1) is None
         owner = _BoundPointer(4096)
-        bound = factory.bind(x=owner)
+        bound = factory.__self__.bind(x=owner)
         assert bound(0, 0, 1) is None  # the first call reads the pointer, once
         owner.address = 4100
         assert bound(0, 0, 1) is None
@@ -1292,9 +1297,7 @@ def test_bind_pointer_checks_once_and_warns_at_creation(
 
 @pytest.mark.parametrize("verify", [False, True])
 @pytest.mark.parametrize("bind_device", [False, True])
-def test_binding_warnings_are_per_parameter_at_factory_creation(
-    bound_kernel, verify, bind_device
-):
+def test_binding_warnings_are_per_parameter_at_check(bound_kernel, verify, bind_device):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         factory = make_launcher(
@@ -1309,8 +1312,20 @@ def test_binding_warnings_are_per_parameter_at_factory_creation(
             },
             no_gpu=True,
             verify_annotation=verify,
-            bind_device=bind_device,
         )
+        assert caught == []  # decoration checks nothing
+        # Even a tensor's known >2 GiB range is deliberately trusted in POINTER mode.
+        large = torch.empty(2**29)
+        for _ in range(2):
+            bound = (
+                factory.__self__.bind_device(0, x=large, p=4096)
+                if bind_device
+                else factory.__self__.bind(x=large, p=4096)
+            )
+            controls = (0, 1) if bind_device else (0, 0, 1)
+            for n in (7, 9):
+                assert bound(*controls, n) is None
+        # the analysis warns once per make_launcher call, at the first check
         assert [str(w.message) for w in caught] == (
             [
                 f"intj: pointer-range assumption for bound pointer {name!r} "
@@ -1323,18 +1338,6 @@ def test_binding_warnings_are_per_parameter_at_factory_creation(
         assert all(
             w.category is RuntimeWarning and w.filename == __file__ for w in caught
         )
-        # Even a tensor's known >2 GiB range is deliberately trusted in POINTER mode.
-        large = torch.empty(2**29)
-        for _ in range(2):
-            bound = (
-                factory.bind_device(0, x=large, p=4096)
-                if bind_device
-                else factory.bind(x=large, p=4096)
-            )
-            controls = (0, 1) if bind_device else (0, 0, 1)
-            for n in (7, 9):
-                assert bound(*controls, n) is None
-        assert len(caught) == 2 * int(verify)
 
 
 @pytest.mark.parametrize(
@@ -1363,7 +1366,7 @@ def test_binding_unchecked_assumptions_keep_structural_safety(
     )
     large = torch.empty(2**28 + 1, dtype=torch.float64)
     wrong = large[1:2]  # Wrong dtype, unaligned pointer, and >2 GiB storage.
-    assert factory.bind(x=wrong)(0, 0, 1) is None
+    assert factory.__self__.bind(x=wrong)(0, 0, 1) is None
 
     class TensorSubclass(torch.Tensor):
         pass
@@ -1374,7 +1377,7 @@ def test_binding_unchecked_assumptions_keep_structural_safety(
         bad = bad[:-1] + (_BoundPointer(True), _BoundPointer(0.0), _BoundPointer(2**64))
     for value in bad:
         with pytest.raises((TypeError, OverflowError), match="x"):
-            factory.bind(x=value)(0, 0, 1)
+            factory.__self__.bind(x=value)(0, 0, 1)
 
 
 @pytest.mark.parametrize(
@@ -1410,13 +1413,13 @@ def test_binding_checked_source_checks_only_where_values_change(
                 no_gpu=True,
                 verify_annotation=verify,
                 torch_access_mode=mode,
-                bind_device=cache_owner != "module",
             )
             bound = (
-                factory.bind(x=None, p=0)
+                factory.__self__.bind(x=None, p=0)
                 if cache_owner == "module"
-                else factory.bind_device(0, x=None, p=0)
+                else factory.__self__.bind_device(0, x=None, p=0)
             )
+            bound.__self__.check()  # where the ignored warning fires
         suffix = ".cpp" if mode is TorchAccessMode.STATIC_COMPILE else ".c"
         source = (
             pathlib.Path(str(module_of(bound).__file__))
@@ -1507,9 +1510,8 @@ def test_checked_failures_precede_cold_and_hot_lookup(
         extra_annotation={"x": annotation},
         no_gpu=True,
         verify_annotation=True,
-        bind_device=bind_device,
     )
-    bound = factory.bind_device(0) if bind_device else factory
+    bound = factory.__self__.bind_device(0) if bind_device else factory
     calls = []
 
     def record(key, slots, device, value):
@@ -1556,7 +1558,7 @@ def test_baked_constraints_fail_before_materialization(
             extra_annotation={"x": annotation},
             no_gpu=True,
             verify_annotation=verify,
-        )
+        ).__self__.check()
 
 
 @pytest.mark.parametrize(
@@ -1583,7 +1585,7 @@ def test_bind_gpu_storage_and_owner_lifetime(mode, binding):
     tensor = original.detach()
     out = torch.empty_like(tensor)
     native_references = getattr(tensor, "_use_count")()
-    bound = factory.bind(x=tensor)
+    bound = factory.__self__.bind(x=tensor)
     owns_native_tensor = (
         mode is TorchAccessMode.STATIC_COMPILE and binding is BindValue.TENSOR
     )
@@ -1630,7 +1632,7 @@ def test_bind_pointer_snapshots_data_ptr_object_on_gpu():
             ),
         },
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind(x=owner)
+    ).__self__.bind(x=owner)
     launch(bound, (1,), out, 16, 2.0, 16)  # the first call snapshots data_ptr()
     owner.address = 0
     out.zero_()
@@ -1658,7 +1660,7 @@ def test_bind_null_pointer_reaches_gpu(binding, value):
         },
         verify_annotation=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind(x=value)
+    ).__self__.bind(x=value)
     launch(bound, (1,), out)
     assert out.item() == 1
 
@@ -1673,7 +1675,7 @@ def test_bind_inferred_none_reaches_gpu_as_constexpr(compiled_kernels):
         },
         verify_annotation=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind(bias=None)
+    ).__self__.bind(bias=None)
     launch(bound, (1,), tensor, tensor, out, 16, 2.0, False, 16)
     torch.testing.assert_close(out, tensor * 2)
     assert compiled_kernels[-1].src.signature["bias"] == "constexpr"
@@ -1702,7 +1704,8 @@ def test_bind_mixed_and_baked_values_follow_declaration_order_on_gpu():
         verify_annotation=True,
         torch_access_mode=TorchAccessMode.STATIC_COMPILE,
     )
-    bound = factory.bind(o=out, x=tensor)
+    bound = factory.__self__.bind(o=out, x=tensor)
+    bound.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(bound).parameters) == (
         "device",
         "stream",
@@ -1734,7 +1737,7 @@ def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkey
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
     for value in (None, torch.empty(4)):
-        bound = factory.bind(x=value)
+        bound = factory.__self__.bind(x=value)
         assert bound(0, 0, 1) is None
 
 
@@ -1764,8 +1767,10 @@ def test_bind_retains_extension_and_collects_owner_cycles(
         torch_access_mode=mode,
     )
     owner = torch.empty(4) if binding is BindValue.TENSOR else _BoundPointer(4096)
-    bound = factory.bind(x=owner)
-    other = factory.bind(x=torch.empty(4) if binding is BindValue.TENSOR else 8192)
+    bound = factory.__self__.bind(x=owner)
+    other = factory.__self__.bind(
+        x=torch.empty(4) if binding is BindValue.TENSOR else 8192
+    )
     assert bound is not other and bound.__self__ is not other.__self__
     assert module_of(bound) is module_of(other)
     module = module_of(bound)
@@ -1810,14 +1815,15 @@ def test_bind_native_failure_releases_partial_owners(bound_kernel, mode):
         torch_access_mode=mode,
     )
     tensor = torch.empty(4)
-    bound = factory.bind(x=tensor, p=2**64)  # p fails in C, on the first call
+    bound = factory.__self__.bind(x=tensor, p=2**64)  # p fails in C, on the first call
+    bound.__self__.check()  # the plan holds the tensor from the first check on
     references, native = sys.getrefcount(tensor), getattr(tensor, "_use_count")()
     for _ in range(3):
         with pytest.raises(OverflowError, match="p"):
             bound(0, 0, 1, 4)
     assert sys.getrefcount(tensor) == references
     assert getattr(tensor, "_use_count")() == native
-    module = module_of(factory.bind(x=None, p=0))
+    module = module_of(factory.__self__.bind(x=None, p=0))
     with pytest.raises(TypeError, match="arguments"):
         module._init(tensor)
 
@@ -1834,7 +1840,7 @@ def test_bind_hot_fastcall_creates_no_python_frame(pointer_kernel):
         },
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind(x=4096)
+    ).__self__.bind(x=4096)
     bound(0, 0, 1)
     calls = []
 
@@ -2108,7 +2114,7 @@ def test_constexpr_rejects_lower_precision_float_types(power_kernel, name):
             power_kernel,
             extra_annotation={"N": Constexpr(type=tl.dtype(name))},
             no_gpu=True,
-        )
+        ).__self__.check()
 
 
 @pytest.mark.parametrize(
@@ -2170,7 +2176,7 @@ def test_baked_constexpr_invalid_at_creation(power_kernel, annotation, verify):
             extra_annotation={"N": annotation},
             verify_annotation=verify,
             no_gpu=True,
-        )
+        ).__self__.check()
 
 
 @pytest.mark.parametrize(
@@ -2411,7 +2417,7 @@ def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
                 "x": Argument(specialize=Assume(EqualTo(1), Aligned(16)))
             },
             no_gpu=True,
-        )
+        ).__self__.check()
     equal = make_launcher(
         scalar_kernel,
         extra_annotation={"x": Argument(type=tl.int32, specialize=Assume(EqualTo(1)))},
@@ -2552,7 +2558,7 @@ def test_no_gpu_rejects_real_backend_options(monkeypatch):
 
     monkeypatch.setattr(launcher, "_provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="no_gpu.*options"):
-        make_launcher(scale, no_gpu=True, options={"num_warps": 8})
+        make_launcher(scale, no_gpu=True, options={"num_warps": 8}).__self__.check()
 
 
 def test_no_gpu_does_not_read_gpu_compilation_knobs(scalar_kernel, monkeypatch):
@@ -2632,9 +2638,9 @@ def test_bare_decorator_matches_the_call_form():
 def test_none_kernel_is_rejected_not_a_decorator_factory():
     """An optional kernel whose import failed must not become the factory form."""
     with pytest.raises(TypeError, match="None instead of a kernel"):
-        make_launcher(None)
+        make_launcher(None).__self__.check()
     with pytest.raises(TypeError, match="None instead of a kernel"):
-        make_launcher(None, options={"num_warps": 4})
+        make_launcher(None, options={"num_warps": 4}).__self__.check()
     assert callable(make_launcher(options={"num_warps": 4}))
 
 
@@ -2654,14 +2660,14 @@ def test_none_kernel_is_rejected_not_a_decorator_factory():
 def test_malformed_keyword_arguments_are_rejected_when_applied(kwargs, match):
     decorate = make_launcher(**kwargs)
     with pytest.raises(TypeError, match=match):
-        decorate(scale)
+        decorate(scale).__self__.check()
     with pytest.raises(TypeError, match=match):
-        make_launcher(scale, **kwargs)
+        make_launcher(scale, **kwargs).__self__.check()
 
 
 def test_positional_arguments_beyond_the_kernel_are_rejected():
     with pytest.raises(TypeError, match="positional argument"):
-        make_launcher(scale, False)  # pyright: ignore[reportCallIssue]
+        make_launcher(scale, False).__self__.check()  # pyright: ignore[reportCallIssue]
 
 
 @pytest.fixture(scope="module")
@@ -3211,8 +3217,8 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
         else None
     )
     if bind_device:
-        launch = make_launcher(jit, bind_device=True, extra_annotation=extra)
-        launch = launch.bind_device(torch.cuda.current_device())
+        launch = make_launcher(jit, extra_annotation=extra)
+        launch = launch.__self__.bind_device(torch.cuda.current_device())
     else:
         launch = (
             axpy_launcher
@@ -3574,7 +3580,6 @@ def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
     """
     factory = make_launcher(
         bound_apply_store,
-        bind_device=True,
         extra_annotation={
             "x": Argument(
                 type=tl.pointer_type(tl.float32),
@@ -3586,7 +3591,7 @@ def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
         return_compiled=True,
     )
     x = torch.tensor([3.0], device="cuda")
-    bound = factory.bind_device(torch.cuda.current_device(), x=x)
+    bound = factory.__self__.bind_device(torch.cuda.current_device(), x=x)
     module = module_of(bound)
     o = torch.zeros(1, device="cuda")
     stream = torch.cuda.current_stream().cuda_stream
@@ -4119,11 +4124,10 @@ def _recording_input_launcher(
         kernel,
         extra_annotation={"x": annotation},
         no_gpu=no_gpu,
-        bind_device=bind_device,
         verify_annotation=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
-    native = factory.bind_device(0, **bound_values) if bind_device else factory
+    native = factory.__self__.bind_device(0, **bound_values) if bind_device else factory
     module = _launcher_module(native)
     # Use the placed, resolved annotations, including the inferred bound dtype.
     from intj.launcher import _LOADED
@@ -4736,7 +4740,9 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
 
     monkeypatch.setattr("intj.launcher._loaded_module", capture)
     launch = make_launcher(scale, kernel_cache=KernelCache.TSL)
-    assert calls == [KernelCache.TSL]  # at make_launcher, never on a call
+    assert calls == []  # decoration provisions nothing
+    launch.__self__.check()
+    assert calls == [KernelCache.TSL]  # at check(), never on a build
     with pytest.raises(Captured):
         module_of(launch)
     # the requested backend, and what install returned actually reaches the build
@@ -4764,7 +4770,7 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
             match=rf"`{re.escape(pathlib.Path(sys.executable).name)} -m "
             r"intj\.kernel_cache tsl`.*no network",
         ):
-            make_launcher(scale, kernel_cache=KernelCache.TSL)
+            make_launcher(scale, kernel_cache=KernelCache.TSL).__self__.check()
     assert attempts == [KernelCache.TSL]  # remembered, not re-attempted
 
 
@@ -4773,7 +4779,7 @@ def test_kernel_cache_install_bug_is_not_dressed_up_as_a_download_failure(monkey
     monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
     monkeypatch.setattr("intj.launcher.install", lambda cache: cache.no_such_attribute)
     with pytest.raises(AttributeError):
-        make_launcher(scale, kernel_cache=KernelCache.TSL)
+        make_launcher(scale, kernel_cache=KernelCache.TSL).__self__.check()
 
 
 def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
@@ -4788,12 +4794,12 @@ def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
 
     monkeypatch.setattr("intj.launcher.install", explode)
     with pytest.raises(UnsupportedKernel, match="global variable"):
-        make_launcher(uses_global, kernel_cache=KernelCache.ABSL)
+        make_launcher(uses_global, kernel_cache=KernelCache.ABSL).__self__.check()
 
 
 def test_refuses_non_jit_function():
     with pytest.raises(UnsupportedKernel):
-        make_launcher(lambda: None)
+        make_launcher(lambda: None).__self__.check()
 
 
 def test_importing_intj_imports_neither_triton_nor_torch():
@@ -4821,12 +4827,12 @@ def test_launcher_requires_triton_extra(monkeypatch, version):
     monkeypatch.setattr("intj._imports.triton", None)  # forget the cached import
 
     with pytest.raises(UnsupportedKernel, match=r"Triton >=3\.7.*intj\[launcher\]"):
-        make_launcher(object())
+        make_launcher(object()).__self__.check()
 
 
 def test_refuses_kernel_reading_globals():
     with pytest.raises(UnsupportedKernel, match="global variable"):
-        make_launcher(uses_global)
+        make_launcher(uses_global).__self__.check()
 
 
 @pytest.mark.parametrize("path", ["auto", "generic"])
@@ -4890,7 +4896,7 @@ def test_constant_globals_are_a_caller_promise():
     when it hashed the kernel, in both call forms.
     """
     with pytest.raises(UnsupportedKernel, match="assume_constant_globals"):
-        make_launcher(reads_constexpr_global)
+        make_launcher(reads_constexpr_global).__self__.check()
     x = torch.randn(64, device="cuda")
     for launch in (
         make_launcher(reads_constexpr_global, assume_constant_globals=True),
@@ -5034,7 +5040,7 @@ def test_global_values_canonicalize_or_refuse(tmp_path):
         tmp_path / "opaque_global.py", _TILES_KERNEL.format(tiles="object()")
     )
     with pytest.raises(UnsupportedKernel, match="'TILES' holds a object") as info:
-        make_launcher(opaque, assume_constant_globals=True)
+        make_launcher(opaque, assume_constant_globals=True).__self__.check()
     assert "as an argument" not in str(info.value)
 
 
@@ -5068,9 +5074,10 @@ def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
 
     kernel = _module_kernel(tmp_path / "class_global.py", _CLASS_KERNEL.format(cls="A"))
     with pytest.raises(UnsupportedKernel, match="assume_constant_globals"):
-        make_launcher(kernel)
+        make_launcher(kernel).__self__.check()
     with pytest.warns(ClassGlobalWarning, match=r"\['class_global\.A'\]") as record:
         launch = make_launcher(kernel, assume_constant_globals=True)
+        launch.__self__.check()
     assert len(record) == 1
     assert record[0].filename == __file__  # stacklevel points at the caller
     o = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -5082,7 +5089,9 @@ def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         warnings.filterwarnings("ignore", category=ClassGlobalWarning)
-        make_launcher(kernel, assume_constant_globals=True)  # filterable
+        make_launcher(
+            kernel, assume_constant_globals=True
+        ).__self__.check()  # filterable
 
 
 def test_different_class_globals_never_share_a_module(tmp_path):
@@ -5100,6 +5109,8 @@ def test_different_class_globals_never_share_a_module(tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", intj.ClassGlobalWarning)
         launches = [make_launcher(k, assume_constant_globals=True) for k in kernels]
+        for launch in launches:
+            launch.__self__.check()  # where the ignored warning fires
     assert module_of(launches[0]) is not module_of(launches[1])
 
 
@@ -5123,6 +5134,7 @@ def test_gluon_layout_class_global_launches():
     warp = target.warp_size
     with pytest.warns(intj.ClassGlobalWarning, match="BlockedLayout"):
         launch = make_launcher(gluon_class_global, assume_constant_globals=True)
+        launch.__self__.check()
     o = torch.full((256,), -1, device="cuda", dtype=torch.int32)
     launch(0, 0, 1, o, 256, warp)
     torch.testing.assert_close(o, torch.arange(256, device="cuda", dtype=torch.int32))
@@ -5670,7 +5682,9 @@ def test_runtime_shim_is_refused_rather_than_guessed(monkeypatch):
 
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
-        make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
+        make_launcher(
+            scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM
+        ).__self__.check()
 
 
 def test_static_compile_needs_no_table(monkeypatch):
@@ -5885,13 +5899,12 @@ def test_every_launcher_shares_one_fixed_size_object(bound_kernel, device_kernel
         extra_annotation={"x": pointer, "p": pointer},
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind(x=0, p=0)
+    ).__self__.bind(x=0, p=0)
     none = make_launcher(
         device_kernel,
-        bind_device=True,
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
-    ).bind_device(0)
+    ).__self__.bind_device(0)
     assert two(0, 0, 1, 7) is None and none(0, 1, 7) is None
     t2, t0 = type(two.__self__), type(none.__self__)
     assert t2 is t0 and issubclass(t2, _stub().Launcher)
@@ -5929,7 +5942,7 @@ def test_sibling_launchers_compile_once(monkeypatch):
 
 
 def test_decoration_needs_no_gpu(monkeypatch):
-    """make_launcher, the decorator form and bind_device never query a target."""
+    """Decoration, the decorator form, bind_device and check() never query a target."""
     import intj.launcher as launcher
 
     def forbidden(*args, **kwargs):
@@ -5939,9 +5952,9 @@ def test_decoration_needs_no_gpu(monkeypatch):
         patch.setattr(launcher, "_current_target", forbidden)
         patch.setattr(launcher, "_current_device", forbidden)
         plain = make_launcher(grid_arg=1)(scale)
-        fixed = make_launcher(scale, bind_device=True).bind_device(
-            torch.cuda.current_device()
-        )
+        fixed = make_launcher(scale).__self__.bind_device(torch.cuda.current_device())
+        plain.__self__.check()
+        fixed.__self__.check()  # check() is GPU-free too
     x = torch.ones(64, device="cuda")
     o = torch.zeros_like(x)
     device, stream = (
@@ -6130,7 +6143,7 @@ def test_declared_knob_reaches_the_specialization(monkeypatch):
 )
 def test_dynamic_option_refusals(kwargs, match):
     with pytest.raises(UnsupportedKernel, match=match):
-        make_launcher(act_store, **kwargs)
+        make_launcher(act_store, **kwargs).__self__.check()
 
 
 def test_unknown_dynamic_option_is_refused_on_the_first_call():
@@ -6243,6 +6256,7 @@ def test_constexpr_option_parameter_feeds_the_option(declared):
     nothing.
     """
     launch = make_launcher(warps_store, dynamic_options=declared, return_compiled=True)
+    launch.__self__.check()  # the signature is set by check()
     assert tuple(inspect.signature(launch).parameters)[3:] == (
         "o",
         "num_warps",
@@ -6273,7 +6287,7 @@ def test_baked_constexpr_option_parameter_feeds_its_value():
 
 def test_static_option_naming_a_constexpr_parameter_is_refused():
     with pytest.raises(UnsupportedKernel, match=r"options \['num_warps'\] name"):
-        make_launcher(warps_store, options={"num_warps": 8})
+        make_launcher(warps_store, options={"num_warps": 8}).__self__.check()
 
 
 def test_dynamic_constexpr_parameter_that_is_no_option_is_refused():

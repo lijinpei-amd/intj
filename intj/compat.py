@@ -51,9 +51,9 @@ def _make(
         grid_arg=dimensions,
         options=dict(options),
         extra_annotation=_annotations(baked, wrapped_types),
-        bind_device=True,
+        bind_device=device,
         return_compiled=return_compiled,
-    ).bind_device(device)
+    )
 
 
 @lru_cache(maxsize=256)

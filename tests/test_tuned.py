@@ -392,7 +392,7 @@ def test_autotune_key_refuses_a_tensor_at_call():
 def test_refusals(kwargs, match):
     kernel = triton.autotune(configs=configs(), key=["n"])(tagged)
     with pytest.raises(UnsupportedKernel, match=match):
-        make_launcher(kernel, **kwargs)
+        make_launcher(kernel, **kwargs).__self__.check()
 
 
 @pytest.mark.parametrize("block", [32.0, 1 << 63, "32"])
@@ -401,7 +401,7 @@ def test_config_value_read_by_c_must_be_int_or_bool(block):
         configs=[triton.Config({"TAG": 1, "BLOCK": block})], key=["n"]
     )(tagged)
     with pytest.raises(UnsupportedKernel, match="'BLOCK'.*only int and bool"):
-        make_launcher(kernel, grid_cpp=grid)
+        make_launcher(kernel, grid_cpp=grid).__self__.check()
 
 
 def test_tuned_callback_block_dim_zero_is_refused(monkeypatch):
@@ -926,7 +926,9 @@ def test_tuned_decoration_needs_no_gpu(monkeypatch):
 def test_dynamic_option_clashing_with_a_config_is_refused():
     kernel = triton.autotune(configs=configs(), key=["n"])(tagged)
     with pytest.raises(UnsupportedKernel, match="set by the autotune configs"):
-        make_launcher(kernel, grid_cpp=grid, dynamic_options=("num_warps",))
+        make_launcher(
+            kernel, grid_cpp=grid, dynamic_options=("num_warps",)
+        ).__self__.check()
 
 
 @triton.jit
@@ -1189,4 +1191,4 @@ def test_tuned_constexpr_option_parameter_feeds_the_option(layer):
     torch.cuda.synchronize()
     assert (out == 8).all()
     with pytest.raises(UnsupportedKernel, match="set by the autotune configs"):
-        make_launcher(kernel, dynamic_options=("num_warps",))
+        make_launcher(kernel, dynamic_options=("num_warps",)).__self__.check()
