@@ -1,0 +1,41 @@
+# Every intj check: ninja -C ci <target>.  Targets never produce their output
+# file, so they always rerun; parameters come from the environment (AGENTS.md).
+ninja_required_version = 1.10
+builddir = out
+
+rule sh
+  command = bash $script
+  description = $script
+  pool = console
+
+rule image
+  command = python3 image.py $cmd
+  description = image.py $cmd
+  pool = console
+
+build lint: sh
+  script = lint.sh
+build typecheck: sh
+  script = typecheck.sh
+build wheel: sh
+  script = wheel.sh
+build install: sh
+  script = install.sh
+build test-cpu: sh
+  script = test-cpu.sh
+build test-gpu: sh
+  script = test-gpu.sh
+build bench-host: sh
+  script = bench-host.sh
+build bench-gpu: sh
+  script = bench-gpu.sh
+
+build matrix: image
+  cmd = matrix
+build image: image
+  cmd = build
+build push-image: image
+  cmd = push
+
+build check: phony lint typecheck test-cpu
+default check

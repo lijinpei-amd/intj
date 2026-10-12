@@ -1,0 +1,20 @@
+{
+  "primary": "ubuntu24.04-py3.12",
+  "cells": [
+    {"id": "ubuntu22.04-py3.10", "dockerfile": "deb.Dockerfile", "base": "ubuntu:22.04", "py_pkgs": "python3.10 python3.10-dev python3.10-venv", "py_ensure": "", "py_bin": "/usr/bin/python3.10", "gpu": true},
+    {"id": "ubuntu24.04-py3.12", "dockerfile": "deb.Dockerfile", "base": "ubuntu:24.04", "py_pkgs": "python3.12 python3.12-dev python3.12-venv", "py_ensure": "", "py_bin": "/usr/bin/python3.12", "gpu": true},
+    {"id": "debian12-py3.11", "dockerfile": "deb.Dockerfile", "base": "debian:12", "py_pkgs": "python3.11 python3.11-dev python3.11-venv", "py_ensure": "", "py_bin": "/usr/bin/python3.11", "gpu": true},
+    {"id": "alma9-py3.9", "dockerfile": "rhel.Dockerfile", "base": "almalinux:9", "py_pkgs": "python3 python3-devel", "py_ensure": "", "py_bin": "/usr/bin/python3.9", "gpu": false},
+    {"id": "alma9-py3.11", "dockerfile": "rhel.Dockerfile", "base": "almalinux:9", "py_pkgs": "python3.11 python3.11-devel", "py_ensure": "", "py_bin": "/usr/bin/python3.11", "gpu": true},
+    {"id": "alma9-py3.12", "dockerfile": "rhel.Dockerfile", "base": "almalinux:9", "py_pkgs": "python3.12 python3.12-devel", "py_ensure": "", "py_bin": "/usr/bin/python3.12", "gpu": true},
+    {"id": "manylinux_2_28-py3.8", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "python38 python38-devel", "py_ensure": "", "py_bin": "/usr/bin/python3.8", "gpu": false},
+    {"id": "manylinux_2_28-py3.9", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp39-cp39", "py_bin": "/opt/python/cp39-cp39/bin/python", "gpu": false},
+    {"id": "manylinux_2_28-py3.10", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp310-cp310", "py_bin": "/opt/python/cp310-cp310/bin/python", "gpu": true},
+    {"id": "manylinux_2_28-py3.11", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp311-cp311", "py_bin": "/opt/python/cp311-cp311/bin/python", "gpu": true},
+    {"id": "manylinux_2_28-py3.12", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp312-cp312", "py_bin": "/opt/python/cp312-cp312/bin/python", "gpu": true},
+    {"id": "manylinux_2_28-py3.13", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp313-cp313", "py_bin": "/opt/python/cp313-cp313/bin/python", "gpu": true},
+    {"id": "manylinux_2_28-py3.13t", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp313-cp313t", "py_bin": "/opt/python/cp313-cp313t/bin/python", "gpu": false},
+    {"id": "manylinux_2_28-py3.14", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp314-cp314", "py_bin": "/opt/python/cp314-cp314/bin/python", "gpu": true},
+    {"id": "manylinux_2_28-py3.14t", "dockerfile": "rhel.Dockerfile", "base": "quay.io/pypa/manylinux_2_28_x86_64", "py_pkgs": "", "py_ensure": "cp314-cp314t", "py_bin": "/opt/python/cp314-cp314t/bin/python", "gpu": true}
+  ]
+}

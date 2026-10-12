@@ -9,6 +9,7 @@ import sysconfig
 
 import pytest
 
+import intj
 from intj.python_intf import cpython_abi
 
 
@@ -53,7 +54,7 @@ PyMODINIT_FUNC PyInit__intj_int_probe(void) {
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     assert isinstance(suffix, str)
     built = tmp_path / f"_intj_int_probe{suffix}"
-    runtime = pathlib.Path(__file__).parents[1] / "intj" / "runtime"
+    runtime = pathlib.Path(intj.__file__).parent / "runtime"
     python_intf = runtime.parent / "python_intf"
     header = cpython_abi.header_for()
     assert header is not None

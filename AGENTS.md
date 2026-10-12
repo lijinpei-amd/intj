@@ -124,6 +124,13 @@ PYTHONPATH=$PWD /tmp/gb2/bin/python -m pytest tests -q     # triton 3.8.0, torch
 PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py
 ```
 
+The same checks, as CI runs them, are `ninja -C ci` targets (`ci/AGENTS.md`):
+
+```
+PYTHON=<venv>/bin/python ninja -C ci            # lint, typecheck, test-cpu
+PYTHON=<venv>/bin/python ninja -C ci test-gpu
+```
+
 On the NVIDIA machine, `.venv` (uv, CPython 3.12, torch 2.14.1+cu130, triton
 3.8.0, RTX 4080 SUPER / sm_89):
 

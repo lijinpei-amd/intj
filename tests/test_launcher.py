@@ -79,6 +79,26 @@ from intj.torch_intf.torch_abi import (
 )
 
 
+def _tested_intj_env():
+    # A subprocess must import the intj under test: the checkout, or the
+    # installed wheel when ci/ runs the suite against one.
+    return {**os.environ, "PYTHONPATH": str(pathlib.Path(intj.__file__).parents[1])}
+
+
+def test_subprocesses_import_the_tested_intj(tmp_path):
+    script = tmp_path / "which_intj.py"
+    script.write_text("import intj\nprint(intj.__file__)\n")
+    run = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=pathlib.Path(__file__).parents[1],
+        env=_tested_intj_env(),
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == intj.__file__
+
+
 @pytest.mark.parametrize("sweep", [False, True])
 def test_benchmark_matrix_runs_without_gpu(sweep):
     run = subprocess.run(
@@ -93,7 +113,7 @@ def test_benchmark_matrix_runs_without_gpu(sweep):
             "3",
         ],
         cwd=pathlib.Path(__file__).parents[1],
-        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[1])},
+        env=_tested_intj_env(),
         capture_output=True,
         text=True,
     )
@@ -132,7 +152,7 @@ def test_readme_benchmark_matrix_runs():
             "1",
         ],
         cwd=pathlib.Path(__file__).parents[1],
-        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[1])},
+        env=_tested_intj_env(),
         capture_output=True,
         text=True,
     )
@@ -4703,8 +4723,8 @@ for value in range(8):
 """
     run = subprocess.run(
         [sys.executable, "-c", script, str(source), cache.value],
-        cwd=pathlib.Path(__file__).parents[1],
-        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[1])},
+        cwd=tmp_path,
+        env=_tested_intj_env(),
         capture_output=True,
         text=True,
     )

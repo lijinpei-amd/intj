@@ -1,0 +1,139 @@
+# Lint, typecheck and the GPU-free tests of the freshly built wheel on every
+# distro x python cell.  All logic lives in `ninja -C ci`; see ci/AGENTS.md.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.read.outputs.cells }}
+      primary: ${{ steps.read.outputs.primary }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx install ninja
+      - run: ninja -C ci matrix
+      - id: read
+        run: |
+          echo "cells=$(jq -c .cpu ci/out/matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "primary=$(jq -r .primary ci/out/matrix.json)" >> "$GITHUB_OUTPUT"
+
+  images:
+    needs: matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
+    name: image ${{ matrix.cell.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx install ninja
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: ninja -C ci push-image
+        env:
+          CELL: ${{ matrix.cell.id }}
+          FLAVOR: cpu
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx install ninja
+      - run: ninja -C ci wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: ci/out/dist/
+
+  test:
+    needs: [matrix, images, wheel]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
+    name: test ${{ matrix.cell.id }}
+    container:
+      image: ${{ matrix.cell.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      INTJ_MODE: wheel
+    if: ${{ !cancelled() && needs.wheel.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: ci/out/dist/
+      - run: ninja -C ci install
+      - run: ninja -C ci test-cpu
+
+  lint:
+    needs: [matrix, images]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.matrix.outputs.primary }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: ninja -C ci lint
+
+  typecheck:
+    needs: [matrix, images]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.matrix.outputs.primary }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ninja -C ci typecheck
+
+  bench-host:
+    needs: [matrix, images, wheel]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.matrix.outputs.primary }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      INTJ_MODE: wheel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: ci/out/dist/
+      - run: ninja -C ci install
+      - run: ninja -C ci bench-host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-host
+          path: ci/out/bench/
