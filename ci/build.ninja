@@ -30,5 +30,12 @@ build bench-host: sh
 build bench-gpu: sh
   script = bench-gpu.sh
 
+build matrix: image
+  cmd = matrix
+build image: image
+  cmd = build
+build push-image: image
+  cmd = push
+
 build check: phony lint typecheck test-cpu
 default check
