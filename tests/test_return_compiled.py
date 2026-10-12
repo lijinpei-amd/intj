@@ -123,7 +123,7 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
 
     built = module_of(bound)
     assert any(
-        key.context.nwords == 0 and module.__file__ == built.__file__
+        key.nwords == 0 and module.__file__ == built.__file__
         for key, module in launcher_module._LOADED.items()
     )
     kernel = bound(stream, (1,), 11)

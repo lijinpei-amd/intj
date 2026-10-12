@@ -766,7 +766,7 @@ is just the kernel's, a label rather than a lookup key — two builds of one ker
 it and are told apart by `__file__`.
 
 `make_launcher` looks for its module in three places, in order: the process-level
-`ModuleKey` dict (same module, so the same compile cache), the `.so` on disk (loaded
+`RenderKey` dict (same module, so the same compile cache), the `.so` on disk (loaded
 as-is, nothing rendered or compiled), and only then renders and builds. A warm
 process takes ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build.
 

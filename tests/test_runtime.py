@@ -36,7 +36,7 @@ import torch
 
 from intj import launcher, lazy
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
-from intj.launcher import RenderContext
+from intj.launcher import RenderKey
 from intj.python_intf import cpython_abi
 from intj.torch_intf.torch_abi import (
     NDTYPES,
@@ -169,7 +169,7 @@ def built(request, stub, tmp_path_factory):
             f"{torch.__version__}"
         )
     static = mode is TorchAccessMode.STATIC_COMPILE
-    context = RenderContext(
+    key = RenderKey(
         module_name=f"rt_{mode.value}",
         kernel_repr="test_runtime.kernel",
         params=_PARAMS,
@@ -194,16 +194,28 @@ def built(request, stub, tmp_path_factory):
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=cpython_abi.header_for() or "",
+        # rendered and built here directly, so never hashed or read
+        template="",
+        runtime_header="",
+        cache_key="",
+        target=(),
+        options="",
+        triton=(),
+        compiler=(),
+        build_flags=(),
+        ext_suffix=None,
+        intj_version=(0, 0),
+        global_values=(),
     )
     with _test_compiler():
-        flags = launcher._build_flags(context)
+        flags = launcher._build_flags(key)
     template = jinja2.Template(
         launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined
     )
     out = tmp_path_factory.mktemp(mode.value)
     src = out / "entry.c"
-    so = out / f"{context.module_name}{sysconfig.get_config_var('EXT_SUFFIX')}"
-    src.write_text(template.render(**dataclasses.asdict(context)))
+    so = out / f"{key.module_name}{sysconfig.get_config_var('EXT_SUFFIX')}"
+    src.write_text(template.render(**dataclasses.asdict(key)))
     subprocess.run(
         [
             _cc(flags["language"]),
@@ -228,7 +240,7 @@ def built(request, stub, tmp_path_factory):
         ],
         check=True,
     )
-    spec = importlib.util.spec_from_file_location(context.module_name, so)
+    spec = importlib.util.spec_from_file_location(key.module_name, so)
     module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportArgumentType]
     spec.loader.exec_module(module)  # pyright: ignore
 

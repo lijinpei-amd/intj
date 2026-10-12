@@ -17,11 +17,13 @@ first thing that actually needs sharing.
 `intj/runtime/` also holds the launcher runtime itself: `intj_runtime.h` (helpers
 included by every rendered module) and `entry.c.jinja` (the rendered entry point).
 
-## RenderContext and ModuleKey are value types
+## RenderKey is a value type
 
-Frozen, every field immutable (tuples, never lists), so both compare by value, hash,
-and serialize to JSON (what `ModuleKey.digest()` hashes). A list field anywhere in either compares fine and
-blows up on `hash()`; `test_value_types_compare_hash_and_serialize` guards that.
+Frozen, every field immutable (tuples, never lists), so it compares by value, hashes,
+and serializes to JSON (what `RenderKey.digest()` hashes). One type is both what
+`entry.c.jinja` renders from and what the module is keyed on. A list field anywhere in
+it compares fine and blows up on `hash()`; `test_value_types_compare_hash_and_serialize`
+guards that.
 
 ## Backends are data, not branches
 

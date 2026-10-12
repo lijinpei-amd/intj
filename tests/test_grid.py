@@ -371,9 +371,9 @@ def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
     backend = BACKENDS["cuda"]
     for name, launcher in launchers.items():
         module = module_of(launcher)
-        context = next(key.context for key, value in _LOADED.items() if value is module)
-        context = dataclasses.replace(
-            context,
+        key = next(key for key, value in _LOADED.items() if value is module)
+        key = dataclasses.replace(
+            key,
             no_gpu=False,
             driver_path="/intj-test-no-driver.so",
             launch_symbol=backend.launch_symbol,
@@ -382,7 +382,7 @@ def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
             error_style=backend.error_style,
         )
         binary = tmp_path / f"{name}.so"
-        _build(binary, context)
+        _build(binary, key)
         assert binary.is_file()
 
 

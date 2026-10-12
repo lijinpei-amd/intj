@@ -165,13 +165,39 @@ class CompilerInput:
 
 
 @dataclasses.dataclass(frozen=True)
-class RenderContext:
-    """Everything `entry.c.jinja` renders from, and nothing else.
+class RenderKey:
+    """Everything the rendered `.so` depends on, hashed into its digest.
+
+    Anything that changes the generated code, the compiled binary, or which
+    kernel the module's callback compiles has to appear here: two launchers
+    whose keys match share one `.so`, so a missing field means a stale module.
+    `entry.c.jinja` renders from these same fields.
 
     Fixed fields on purpose: a typo fails here instead of silently rendering an
     empty value into C (the template also runs with `StrictUndefined`).
     """
 
+    # What the template does not read: the render is a pure function of the
+    # template, the runtime headers and the fields after these.
+    template: str  # entry.c.jinja bytes, hex
+    runtime_header: str  # runtime/*.h bytes, hex
+    cache_key: str  # jit_func.cache_key plus AST language: source and callees
+    target: tuple[Any, ...]  # backend, arch, warp size
+    options: str  # canonicalized compile options, hashed by triton
+    triton: tuple[Any, ...]  # triton version and libtriton identity
+    compiler: tuple[str, ...]  # the C compiler triton would invoke
+    build_flags: tuple[
+        str, ...
+    ]  # changes to compiler flags invalidate cached .so files
+    ext_suffix: str | None
+    intj_version: tuple[int, int]
+    #: `assume_constant_globals=True`: the globals the kernel reads, by value.
+    #: triton's `cache_key` hashes only the `tl.constexpr` ones; a plain global
+    #: (a tuple read by a `constexpr_function`) would otherwise let two
+    #: different values share a module -- and its compile callback's kernel.
+    global_values: tuple[tuple[str, str, tuple[object, ...]], ...]
+
+    # What the template reads.
     module_name: str
     kernel_repr: str
     params: tuple[Param, ...]
@@ -216,35 +242,6 @@ class RenderContext:
     tuning: TuningRender | None = None
     #: `dynamic_options`, in call order: they shape the call and the key
     dynamic: tuple[DynamicSlot, ...] = ()
-
-
-@dataclasses.dataclass(frozen=True)
-class ModuleKey:
-    """Everything the rendered `.so` depends on, hashed into its digest.
-
-    Anything that changes the generated code, the compiled binary, or which
-    kernel the module's callback compiles has to appear here: two launchers
-    whose keys match share one `.so`, so a missing field means a stale module.
-    """
-
-    template: str  # entry.c.jinja bytes, hex
-    runtime_header: str  # runtime/*.h bytes, hex
-    context: RenderContext  # the render is a pure function of this and the template
-    cache_key: str  # jit_func.cache_key plus AST language: source and callees
-    target: tuple[Any, ...]  # backend, arch, warp size
-    options: str  # canonicalized compile options, hashed by triton
-    triton: tuple[Any, ...]  # triton version and libtriton identity
-    compiler: tuple[str, ...]  # the C compiler triton would invoke
-    build_flags: tuple[
-        str, ...
-    ]  # changes to compiler flags invalidate cached .so files
-    ext_suffix: str | None
-    intj_version: tuple[int, int]
-    #: `assume_constant_globals=True`: the globals the kernel reads, by value.
-    #: triton's `cache_key` hashes only the `tl.constexpr` ones; a plain global
-    #: (a tuple read by a `constexpr_function`) would otherwise let two
-    #: different values share a module -- and its compile callback's kernel.
-    global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
 
     def digest(self) -> str:
         """Returns the SHA-256 hex digest of every field, independent of field order."""
@@ -424,7 +421,7 @@ class LauncherFactory:
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
         # a declared knob is per call: leaving its live value out keeps it out
-        # of the ModuleKey, so it cannot build a module per value
+        # of the RenderKey, so it cannot build a module per value
         knob_values = (
             None
             if self.no_gpu
@@ -890,8 +887,8 @@ def _materialize_module(
 ) -> types.ModuleType:
     """Returns the loaded module for this kernel and configuration.
 
-    Queries the target (unless `no_gpu`), renders the `RenderContext`, and
-    loads, building if needed, the module for its `ModuleKey`.
+    Queries the target (unless `no_gpu`), and loads, building if needed, the
+    module for its `RenderKey`.
 
     Raises:
         UnsupportedKernel: The target's backend is not registered, or a
@@ -919,7 +916,7 @@ def _materialize_module(
             [n for n in dynamic if not n.startswith("knobs.")]
             + list(declared_parameters),
         )
-    params, device_offset, nwords, computed_fields, slots = _render_key(
+    params, device_offset, nwords, computed_fields, slots = _spec_key_layout(
         resolved,
         device_binding,
         tuning.computed[0] if tuning is not None else 0,
@@ -937,7 +934,9 @@ def _materialize_module(
     module_name = jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
         module_name = "kernel"
-    context = RenderContext(
+    # The rendered source is a pure function of the template, the runtime header
+    # and the fields it reads, so hash those rather than the render itself.
+    key = RenderKey(
         module_name=module_name,
         kernel_repr=get_full_name(jit_func),
         params=params,
@@ -980,15 +979,8 @@ def _materialize_module(
         return_compiled=return_compiled,
         tuning=tuning,
         dynamic=slots,
-    )
-
-    # The rendered source is a pure function of the template, the runtime header
-    # and the context, so hash those rather than the render itself.
-    build = _build_flags(context)
-    key = ModuleKey(
         template=_ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=_runtime_headers().hex(),
-        context=context,
         cache_key=jit_func.cache_key + (":gluon" if jit_func.is_gluon() else ""),
         target=(target.backend, target.arch, target.warp_size)
         if target is not None
@@ -997,11 +989,18 @@ def _materialize_module(
         if canonical_options is not None
         else "host-defaults",
         triton=_triton_identity(),
-        compiler=_compiler_identity(build["language"]),
-        build_flags=tuple(build["ccflags"]),
+        # `_build_flags` derives these from the fields above: filled in below
+        compiler=(),
+        build_flags=(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
         global_values=global_values,
+    )
+    build = _build_flags(key)
+    key = dataclasses.replace(
+        key,
+        compiler=_compiler_identity(build["language"]),
+        build_flags=tuple(build["ccflags"]),
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
@@ -1014,7 +1013,6 @@ def _materialize_module(
     return _loaded_module(
         key,
         jit_func,
-        context,
         params,
         options,
         layout,
@@ -1374,14 +1372,13 @@ def _cxx_toolchain() -> tuple[list[str], list[str]] | None:
     return (includes, libs)
 
 
-_LOADED: dict[ModuleKey, types.ModuleType] = {}
+_LOADED: dict[RenderKey, types.ModuleType] = {}
 _LOAD_LOCK = threading.Lock()
 
 
 def _loaded_module(
-    key: ModuleKey,
+    key: RenderKey,
     jit_func: JitFunction,
-    context: RenderContext,
     params: Sequence[Param],
     options: Mapping[str, Any],
     layout: TensorABI | None,
@@ -1403,7 +1400,7 @@ def _loaded_module(
     with _LOAD_LOCK:
         module = _LOADED.get(key)
         if module is None:
-            module = _load(key, jit_func, context)
+            module = _load(key, jit_func)
             if module.header_size() != _stub().header_size():
                 raise ImportError(
                     f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
@@ -1414,15 +1411,15 @@ def _loaded_module(
                 module,
                 "_intj_compile",
                 _refuse_module_compile
-                if context.tuning is not None
+                if key.tuning is not None
                 else _make_host_compile_callback()
-                if context.no_gpu
+                if key.no_gpu
                 else _make_compile_callback(
                     jit_func,
                     params,
                     options,
                     baked_values,
-                    return_compiled=context.return_compiled,
+                    return_compiled=key.return_compiled,
                     knob_values=knob_values or {},
                     dynamic=dynamic,
                 ),
@@ -1438,9 +1435,7 @@ def _loaded_module(
         return module
 
 
-def _load(
-    key: ModuleKey, jit_func: JitFunction, context: RenderContext
-) -> types.ModuleType:
+def _load(key: RenderKey, jit_func: JitFunction) -> types.ModuleType:
     """Loads the extension for this key, rendering and building it only if needed.
 
     The `.so` lands in `$TRITON_HOME/.triton/intj/<digest>/<module>/<kernel>`, so the
@@ -1457,13 +1452,13 @@ def _load(
     # a sibling of triton's own cache
     triton_dir = Path(_imports.knobs.cache.get_triton_dir("intj"))
     directory = triton_dir / key.digest() / jit_func.__module__
-    so_path = directory / f"{context.module_name}{suffix}"
+    so_path = directory / f"{key.module_name}{suffix}"
     if not so_path.exists():
-        _build(so_path, context)
+        _build(so_path, key)
 
     # Loading by hand, rather than through import_module, keeps the module out of
     # sys.modules.
-    spec = importlib.util.spec_from_file_location(context.module_name, so_path)
+    spec = importlib.util.spec_from_file_location(key.module_name, so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so_path}")
     module = importlib.util.module_from_spec(spec)
@@ -1471,21 +1466,21 @@ def _load(
     return module
 
 
-def _build(so_path: Path, context: RenderContext) -> None:
+def _build(so_path: Path, key: RenderKey) -> None:
     """Renders and compiles, then installs both artifacts next to each other."""
     import jinja2
 
     template = jinja2.Template(
         _ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined
     )
-    src = template.render(**dataclasses.asdict(context))
-    flags = _build_flags(context)
-    binary = _compile_so_bytes(src, context.module_name, flags)
+    src = template.render(**dataclasses.asdict(key))
+    flags = _build_flags(key)
+    binary = _compile_so_bytes(src, key.module_name, flags)
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
     # misbehaves, and what you recompile by hand to debug it.
     suffix = ".cpp" if flags["language"] == "c++" else ".c"
-    _install(src.encode(), so_path.with_name(f"{context.module_name}{suffix}"))
+    _install(src.encode(), so_path.with_name(f"{key.module_name}{suffix}"))
     _install(binary, so_path)
 
 
@@ -1534,7 +1529,7 @@ def _runtime_header_flag() -> str:
 
     `_compile_so` keys on the source bytes plus the *names* of the include
     directories, not on the contents of the headers found there.  So an edit to
-    a runtime header moves intj's own `ModuleKey` digest, intj re-renders, and
+    a runtime header moves intj's own `RenderKey` digest, intj re-renders, and
     triton then serves the object it compiled from the previous headers.  Feeding
     the digest in as a define puts it in triton's key too.
     """
@@ -1542,7 +1537,7 @@ def _runtime_header_flag() -> str:
     return f"-DINTJ_RUNTIME_HEADER=0x{digest}"
 
 
-def _build_flags(context: RenderContext) -> dict[str, Any]:
+def _build_flags(key: RenderKey) -> dict[str, Any]:
     """Returns the compiler arguments beyond intj's own include directory.
 
     The c++ access mode needs torch's headers, and `libc10` for the handful of
@@ -1555,27 +1550,25 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
     A kernel cache other than intj's is a C++ map, so it drags the whole module
     into C++ even where the tensor reader would not have.
     """
-    torch_static_compile = (
-        context.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
-    )
-    cxx_cache = context.kernel_cache != KernelCache.INTJ.value
+    torch_static_compile = key.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
+    cxx_cache = key.kernel_cache != KernelCache.INTJ.value
     # No -falign-loops=64 (tests/test_kernel_cache.py uses it): measured
     # 2026-09-27, it leaves the launch path's instruction count unchanged -- the
     # memo-hit path runs no loop -- and moves rows +-1 ns either way by layout
     # alone.
     flags: dict[str, Any] = {
-        "include_dirs": [str(_RUNTIME), str(_PYTHON_INTF), *context.cache_include_dirs],
+        "include_dirs": [str(_RUNTIME), str(_PYTHON_INTF), *key.cache_include_dirs],
         "ccflags": [
             _runtime_header_flag(),
-            f"-DINTJ_CACHE_{context.kernel_cache.upper()}",
+            f"-DINTJ_CACHE_{key.kernel_cache.upper()}",
         ],
     }
-    if context.cache_archives:
+    if key.cache_archives:
         # abseil's own link order is not intj's to encode, so the archives go in
         # a group and the linker sorts it out.
         flags["ccflags"] += [
             "-Wl,--start-group",
-            *context.cache_archives,
+            *key.cache_archives,
             "-Wl,--end-group",
         ]
     if not torch_static_compile and not cxx_cache:
@@ -1600,7 +1593,7 @@ def _build_flags(context: RenderContext) -> dict[str, Any]:
         # the tensor reader and PyFloat_AS_DOUBLE into the decode, costing a
         # real call per argument.  Measured: ~5 ns per launch on a 3-tensor
         # kernel.  Nothing here is about the torch code itself.
-        f"-D_GLIBCXX_USE_CXX11_ABI={context.cxx_abi}",
+        f"-D_GLIBCXX_USE_CXX11_ABI={key.cxx_abi}",
         *(f"-Wl,-rpath,{d}" for d in libs),
     ]
     return flags
@@ -1775,7 +1768,7 @@ def _check_kernel(
 
 
 def _canonical_global(value: object) -> tuple[object, ...]:
-    """Canonicalizes one global's value for the `ModuleKey`.
+    """Canonicalizes one global's value for the `RenderKey`.
 
     Beyond `_canonical_value`: tl.constexpr wrappers, tuples, enum members (by
     name) and classes (by qualified name).
@@ -1827,7 +1820,7 @@ def _class_globals(canonical: tuple[object, ...]) -> Iterator[tuple[str, str, st
 def _global_values(
     jit_func: JitFunction,
 ) -> tuple[tuple[str, str, tuple[object, ...]], ...]:
-    """Returns the globals `jit_func` reads, canonicalized for the `ModuleKey`.
+    """Returns the globals `jit_func` reads, canonicalized for the `RenderKey`.
 
     The values are triton's snapshot from when it first computed `cache_key`.
 
@@ -2010,7 +2003,7 @@ def _tuning_render(
     )
 
 
-def _render_key(
+def _spec_key_layout(
     resolved: tuple[ResolvedParam, ...],
     device_binding: DeviceBinding,
     computed0: int = 0,
@@ -2099,7 +2092,7 @@ def _render_params(
     resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
 ) -> tuple[tuple[Param, ...], int | None, int]:
     """Places canonical key fields and numbers the arguments in the public call."""
-    params, device_offset, nwords, _, _ = _render_key(resolved, device_binding)
+    params, device_offset, nwords, _, _ = _spec_key_layout(resolved, device_binding)
     return params, device_offset, nwords
 
 
@@ -2121,7 +2114,7 @@ class _Interner:
 
     Per launcher, like its kernel cache: an id means one value within one
     launcher and nothing outside it.  Ids live for the process and never enter
-    a `ModuleKey`.  A JIT function's `cache_key` is read once, when its object
+    a `RenderKey`.  A JIT function's `cache_key` is read once, when its object
     is first seen, as triton does.  New ids are taken under this table's own
     lock rather than the launcher's C write lock: same effect, and the C side
     never holds a lock while calling Python.

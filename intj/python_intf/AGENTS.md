@@ -82,17 +82,17 @@ free-threaded CPython 3.13t and 3.14t. This is a CPython-specific interface.
    Every supported entry currently selects `cpython_abi.h`. An unlisted
    version returns `None`; `make_launcher` raises `UnsupportedKernel` before
    building a module.
-2. `RenderContext` records the full `(major, minor, micro)` version, selected
+2. `RenderKey` records the full `(major, minor, micro)` version, selected
    header, and `free_threaded` build flag. The flag comes from
    `sysconfig.get_config_var("Py_GIL_DISABLED")`, independently of whether the
    GIL is currently enabled.
-3. `ModuleKey` includes that context, the header contents, and the full
+3. `RenderKey` also includes the header contents and the full
    `EXT_SUFFIX`. A patch release, a regular/free-threaded build change, or a
    header edit therefore changes the module digest. The suffix also preserves
    platform and other ABI tags, such as the debug-build tag.
 4. The [entry template](../runtime/entry.c.jinja) rejects compilation if the
    included headers have a different major/minor/micro version or GIL build
-   from the render context.
+   from the `RenderKey`.
 
 The allowlist selects which versions may build; the module key controls reuse
 of a cached extension for a particular version and build ABI. Subinterpreters

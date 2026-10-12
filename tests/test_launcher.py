@@ -52,8 +52,7 @@ from intj import (
 )
 from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
-    ModuleKey,
-    RenderContext,
+    RenderKey,
     UnsupportedKernel,
     module_of,
     override_compile,
@@ -363,9 +362,9 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
     handles = [factory.bind_device(ordinal) for ordinal in (0, 255, 256, 2**31 - 1)]
     module = module_of(handles[0])
     assert all(module_of(handle) is module for handle in handles)
-    context = next(key.context for key, loaded in _LOADED.items() if loaded is module)
-    assert context.device_binding is DeviceBinding.FIXED
-    assert context.device_offset is None and context.nwords == 0
+    key = next(key for key, loaded in _LOADED.items() if loaded is module)
+    assert key.device_binding is DeviceBinding.FIXED
+    assert key.device_offset is None and key.nwords == 0
     calls = []
 
     def compile_for_ordinal(key, nparams, device, *args):
@@ -708,7 +707,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
         ),
         DeviceBinding.FIXED,
     )
-    context = _render_context(
+    key = _make_render_key(
         params=params,
         nwords=nwords,
         device_binding=DeviceBinding.FIXED,
@@ -723,7 +722,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
         return_compiled=return_compiled,
     )
     binary = tmp_path / "m.so"
-    _build(binary, context)  # Build both real-driver branches, but load neither driver.
+    _build(binary, key)  # Build both real-driver branches, but load neither driver.
     assert binary.is_file()
     source = binary.with_suffix(".c").read_text()
     if no_gpu:
@@ -1021,9 +1020,9 @@ def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mo
     assert module_of(first) is not module_of(wide)
     for bound, ty in ((first, "*fp32"), (wide, "*fp64")):
         key = next(key for key, module in _LOADED.items() if module is module_of(bound))
-        assert key.context.params[0].annotation.types == (ty,)
-        assert key.context.params[0].annotation.bind_value == "tensor"
-        assert key.context.params[0].annotation.key_fields == ()
+        assert key.params[0].annotation.types == (ty,)
+        assert key.params[0].annotation.bind_value == "tensor"
+        assert key.params[0].annotation.key_fields == ()
         assert hash(key) and key.digest()
         assert bound(0, 0, 1) is None
 
@@ -1063,9 +1062,9 @@ def test_bind_none_materializes_triton_constexpr(
     bound = bind(x=None)
     built = module_of(bound)
     key = next(key for key, module in _LOADED.items() if module is built)
-    assert key.context.params[0].annotation.types == (None,)
+    assert key.params[0].annotation.types == (None,)
     source = _compiler_input(
-        pointer_kernel, key.context.params, (), make_backend(_current_target())
+        pointer_kernel, key.params, (), make_backend(_current_target())
     )
     assert source.signature == (("x", "constexpr"),)
     assert source.constants == (((0,), ("none",)),)
@@ -2384,12 +2383,11 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
             launch, 0, large
         )
         key = next(key for key, module in _LOADED.items() if module is baseline)
-        context = dataclasses.replace(key.context, spec_pointer_range=1)
+        ranged_key = dataclasses.replace(key, spec_pointer_range=1)
         ranged = _loaded_module(
-            dataclasses.replace(key, context=context),
+            ranged_key,
             pointer_kernel,
-            context,
-            context.params,
+            ranged_key.params,
             {},
             None,
             {},
@@ -2963,7 +2961,7 @@ def test_annotated_effective_compile_options_and_identity(
         raise CompilationCaptured
 
     def capture_module(
-        key, fn, context, params, options, layout, baked_values, knob_values, *rest
+        key, fn, params, options, layout, baked_values, knob_values, *rest
     ):
         callback = launcher._make_compile_callback(
             fn, params, options, baked_values, knob_values=knob_values
@@ -4133,9 +4131,7 @@ def _recording_input_launcher(
     # Use the placed, resolved annotations, including the inferred bound dtype.
     from intj.launcher import _LOADED
 
-    params = next(
-        key.context.params for key, value in _LOADED.items() if value is module
-    )
+    params = next(key.params for key, value in _LOADED.items() if value is module)
     backend = make_backend(
         GPUTarget("hip", "gfx942", 64) if no_gpu else _current_target()
     )
@@ -4427,8 +4423,8 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     assert nwords == (device_offset + 8) // 8
 
 
-def _render_context(**overrides):
-    """Returns a valid two-parameter `RenderContext` with `overrides` applied."""
+def _make_render_key(**overrides):
+    """Returns a valid two-parameter `RenderKey` with `overrides` applied."""
     from intj.annotation import DeviceBinding, ResolvedParam
     from intj.launcher import _render_params
 
@@ -4468,16 +4464,8 @@ def _render_context(**overrides):
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=cpython_abi.header_for() or "",
         pointer_types=(),
-    )
-    return RenderContext(**{**fields, **overrides})
-
-
-def _module_key(**overrides):
-    """Returns a valid `ModuleKey` with `overrides` applied."""
-    fields = dict(
         template="aa",
         runtime_header="bb",
-        context=_render_context(module_name=""),
         cache_key="c",
         target=("hip", "gfx942", 64),
         options="o",
@@ -4486,8 +4474,9 @@ def _module_key(**overrides):
         build_flags=(),
         ext_suffix=".so",
         intj_version=(0, 1),
+        global_values=(),
     )
-    return ModuleKey(**{**fields, **overrides})
+    return RenderKey(**{**fields, **overrides})
 
 
 def test_package_version_has_one_source():
@@ -4500,7 +4489,7 @@ def test_package_version_has_one_source():
     assert intj.__version__ == "0.1.0"
 
 
-def test_module_key_uses_major_minor_version_only(monkeypatch):
+def test_render_key_uses_major_minor_version_only(monkeypatch):
     import intj.launcher as launcher
 
     monkeypatch.setattr(launcher, "__version__", "7.8.9")
@@ -4519,7 +4508,7 @@ def test_module_key_uses_major_minor_version_only(monkeypatch):
         (KernelCache.ABSL, "c++"),
     ],
 )
-def test_module_key_tracks_cache_compiler_language(
+def test_render_key_tracks_cache_compiler_language(
     scalar_kernel, monkeypatch, cache, language
 ):
     import intj.launcher as launcher
@@ -4552,18 +4541,19 @@ def test_module_key_tracks_cache_compiler_language(
 
 
 @pytest.mark.parametrize(
-    "build,differing",
+    "differing",
     [
-        (_render_context, {"nwords": 5}),
-        (_render_context, {"dynamic": (launcher.DynamicSlot("num_warps", 8, 16, 0),)}),
-        (_module_key, {"cache_key": "d"}),
+        {"nwords": 5},
+        {"dynamic": (launcher.DynamicSlot("num_warps", 8, 16, 0),)},
+        {"cache_key": "d"},
     ],
 )
-def test_value_types_compare_hash_and_serialize(build, differing):
-    """Both carry only immutable fields, so they behave as values.
+def test_value_types_compare_hash_and_serialize(differing):
+    """A `RenderKey` carries only immutable fields, so it behaves as a value.
 
-    A list field anywhere in either would compare fine and raise on hash().
+    A list field anywhere in it would compare fine and raise on hash().
     """
+    build = _make_render_key
     one, same, other = build(), build(), build(**differing)
     assert one == same and one != other
     assert hash(one) == hash(same) and hash(one) != hash(other)
@@ -4572,58 +4562,38 @@ def test_value_types_compare_hash_and_serialize(build, differing):
     assert dump(one) == dump(same) and dump(one) != dump(other)
 
 
-def test_module_key_digest_tracks_every_field():
-    key = _module_key()
+def test_render_key_digest_tracks_every_field():
+    key = _make_render_key()
     for field in dataclasses.fields(key):
         value = getattr(key, field.name)
-        if isinstance(value, str):
-            changed = "zz"
-        elif isinstance(value, int):
-            changed = value + 1
-        elif isinstance(value, tuple):
-            changed = value + ("zz",)
-        else:
-            continue  # context has a separate field test
-        assert (
-            dataclasses.replace(key, **{field.name: changed}).digest() != key.digest()
-        ), field.name
-
-
-def test_render_context_digest_tracks_every_field():
-    """`context` is one field of ModuleKey, so the loop above never varies its parts."""
-    base = _module_key()
-    for field in dataclasses.fields(base.context):
-        value = getattr(base.context, field.name)
         if isinstance(value, bool):
             changed = not value
         elif isinstance(value, str):
             changed = "zz"
         elif isinstance(value, int):
             changed = value + 1
+        elif isinstance(value, tuple):
+            changed = value + ("zz",)
         else:
             changed = (1, 2)
-        if value == changed:
-            continue
-        other = dataclasses.replace(
-            base, context=dataclasses.replace(base.context, **{field.name: changed})
-        )
-        assert other.digest() != base.digest(), field.name
+        assert (
+            dataclasses.replace(key, **{field.name: changed}).digest() != key.digest()
+        ), field.name
 
 
 def test_free_threaded_build_changes_module_digest():
-    key = _module_key()
-    free_threaded = dataclasses.replace(key.context, free_threaded=True)
-    assert dataclasses.replace(key, context=free_threaded).digest() != key.digest()
+    key = _make_render_key()
+    assert dataclasses.replace(key, free_threaded=True).digest() != key.digest()
 
 
 def test_render_rejects_mismatched_free_threaded_headers(tmp_path, capfd):
-    context = _render_context(
+    key = _make_render_key(
         python_version=cpython_abi.python_version(),
         cpython_static_compile_header=cpython_abi.header_for() or "",
         free_threaded=not bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
     )
     with pytest.raises(subprocess.CalledProcessError):
-        launcher._build(tmp_path / "m.so", context)
+        launcher._build(tmp_path / "m.so", key)
     assert (
         "intj: compiling against headers of the wrong GIL build"
         in capfd.readouterr().err
@@ -4648,7 +4618,7 @@ def test_artifact_layout_and_nested_kernels():
     path = pathlib.Path(str(module.__file__))
     assert path.name.startswith("inner.")
     assert path.parent.name == nested.__module__
-    assert len(path.parent.parent.name) == 64  # the ModuleKey digest
+    assert len(path.parent.parent.name) == 64  # the RenderKey digest
 
     x = torch.randn(1024, device="cuda")
     o = torch.empty(1024, device="cuda")
@@ -4758,13 +4728,13 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
 
     # stop before the real build: the point is what reaches it, not that a
     # fabricated include directory compiles
-    contexts: list[RenderContext] = []
+    keys: list[RenderKey] = []
 
     class Captured(Exception):
         pass
 
-    def capture(key, fn, context, *rest):
-        contexts.append(context)
+    def capture(key, *rest):
+        keys.append(key)
         raise Captured
 
     monkeypatch.setattr("intj.launcher._loaded_module", capture)
@@ -4774,7 +4744,7 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
         module_of(launch)
     # the requested backend, and what install returned actually reaches the build
     assert calls == [KernelCache.TSL]
-    assert contexts[-1].cache_include_dirs == toolchain["include_dirs"]
+    assert keys[-1].cache_include_dirs == toolchain["include_dirs"]
 
 
 def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
@@ -4996,7 +4966,7 @@ def test_different_global_values_never_share_a_module(tmp_path, kind):
 
     Triton's `cache_key` hashes a `tl.constexpr` global's value but not a plain
     one's (a tuple read by a `constexpr_function`, like aiter's
-    `_SUPPORTED_TILES`), so for `plain` only the values in the `ModuleKey`
+    `_SUPPORTED_TILES`), so for `plain` only the values in the `RenderKey`
     keep the second launcher off the first's module.  The binaries are
     Triton's business: its own compile cache keys on `cache_key` too, so for
     `plain` it hands both the first kernel compiled, exactly as `kernel[grid]`
@@ -5061,7 +5031,7 @@ def test_global_values_canonicalize_or_refuse(tmp_path):
         "ALL",
     )
     json.dumps(
-        _module_key(global_values=(("G", "m", _canonical_global((1,))),)).digest()
+        _make_render_key(global_values=(("G", "m", _canonical_global((1,))),)).digest()
     )
     opaque = _module_kernel(
         tmp_path / "opaque_global.py", _TILES_KERNEL.format(tiles="object()")
@@ -5122,7 +5092,7 @@ def test_different_class_globals_never_share_a_module(tmp_path):
     """Kernels differing only in a class global get two modules.
 
     Same module name, same kernel source (so the same cache_key): only the
-    class's qualified name in the ModuleKey tells the two apart.
+    class's qualified name in the RenderKey tells the two apart.
     """
     kernels = []
     for cls in ("A", "B"):
@@ -5450,14 +5420,12 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     }
     launch = make_launcher(kernel.k, extra_annotation=annotation)
     module = module_of(launch)
-    context = next(
-        key.context
-        for key, loaded in launcher_module._LOADED.items()
-        if loaded is module
+    key = next(
+        key for key, loaded in launcher_module._LOADED.items() if loaded is module
     )
     suffix = (
         ".cpp"
-        if context.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
+        if key.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
         else ".c"
     )
     source = pathlib.Path(str(module.__file__)).with_name(f"k{suffix}").read_text()
@@ -5468,7 +5436,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     ]
     assert "((uint8_t *)key)" not in pack
     assert "intj_key_store16" not in pack and "intj_key_store32" not in pack
-    for word in range(context.nwords):
+    for word in range(key.nwords):
         assert pack.count(f"intj_key_store64(key + {word}, key_word_{word});") == 1
 
     b_i32 = 128  # INTJ_B_I32, +1 when the value is divisible by 16
@@ -5480,30 +5448,26 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     ]
     blob, np_ = module.spec_key(launch, 0, *args)
 
-    assert (len(blob), np_) == (context.nwords * 8, nparams)
-    for param in context.params[:nparams]:
+    assert (len(blob), np_) == (key.nwords * 8, nparams)
+    for param in key.params[:nparams]:
         (field,) = param.annotation.key_fields
         assert (field.kind, field.width) == ("descriptor", 1)
         assert blob[field.offset] == b_i32
-    for param, value, width in zip(
-        context.params[nparams:], args[nparams:], (8, 4, 2, 1)
-    ):
+    for param, value, width in zip(key.params[nparams:], args[nparams:], (8, 4, 2, 1)):
         (field,) = param.annotation.key_fields
         assert (field.kind, field.width) == ("payload", width)
         assert blob[field.offset : field.offset + width] == value.to_bytes(
             width, "little"
         )
-    assert context.device_offset is not None
-    assert blob[context.device_offset] == 0
-    assert blob[context.device_offset + 1 :] == bytes(
-        len(blob) - context.device_offset - 1
-    )
+    assert key.device_offset is not None
+    assert blob[key.device_offset] == 0
+    assert blob[key.device_offset + 1 :] == bytes(len(blob) - key.device_offset - 1)
 
     for i in range(nparams):
         alt = list(args)
         alt[i] = 16
         other, _ = module.spec_key(launch, 0, *alt)
-        offset = context.params[i].annotation.key_fields[0].offset
+        offset = key.params[i].annotation.key_fields[0].offset
         assert other[offset] == b_i32 + 1
         assert [b for j, b in enumerate(other) if j != offset] == [
             b for j, b in enumerate(blob) if j != offset
@@ -6038,8 +6002,8 @@ def test_dynamic_num_warps_keys_separate_records():
         launch(*_gpu_controls(), 3, o, 1.0, "pos")
 
 
-def test_declared_knob_stays_out_of_the_module_key(monkeypatch):
-    """The live value of a declared knob is not read into the ModuleKey.
+def test_declared_knob_stays_out_of_the_render_key(monkeypatch):
+    """The live value of a declared knob is not read into the RenderKey.
 
     So flipping it before the first call builds no second module.
     """
