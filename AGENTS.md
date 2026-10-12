@@ -106,10 +106,24 @@ where triton has no public equivalent, with a targeted
 
 ## Testing
 
-No NVIDIA GPU on the development machine, so the CUDA path is compile-checked only.
 Mark anything untested as untested in the docs.
 
 ```
 PYTHONPATH=$PWD /tmp/gb2/bin/python -m pytest tests -q     # triton 3.8.0, torch 2.14+rocm7.2, gfx942
 PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py
 ```
+
+On the NVIDIA machine, `.venv` (uv, CPython 3.12, torch 2.14.1+cu130, triton
+3.8.0, RTX 4080 SUPER / sm_89):
+
+```
+PYTHONPATH=$PWD .venv/bin/python -m pytest tests -q
+PYTHONPATH=$PWD .venv/bin/python benchmarks/bench_launch.py --readme
+.venv/bin/pyright --pythonpath .venv/bin/python
+```
+
+A backend-conditional test keys off a `Backend` field, not a target name:
+`knob_helpers.POINTER_RANGE` / `needs_pointer_range` gate what only a backend
+with AMD's `S` bit does, the same way the renderer branches on
+`spec_pointer_range`. `needs_hip` stays for what is genuinely HIP-only, such as
+the `waves_per_eu` compile option and `knobs.amd.*`.

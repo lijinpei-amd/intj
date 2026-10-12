@@ -59,7 +59,13 @@ from intj.launcher import (
     override_compile,
     triton_specialization,
 )
-from knob_helpers import ON_HIP, live_knob_values, needs_hip
+from knob_helpers import (
+    ON_HIP,
+    POINTER_RANGE,
+    live_knob_values,
+    needs_hip,
+    needs_pointer_range,
+)
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
 from intj.python_intf import cpython_abi
 from intj.torch_intf.abi_detect import probe_layout
@@ -1169,7 +1175,7 @@ def test_bind_checked_dtype_and_unchecked_promises(pointer_kernel, mode, binding
         TorchAccessMode.INTERPRETER,
     ],
 )
-@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "gpu"])
 @pytest.mark.parametrize("bind_device", [False, True], ids=["module", "no-map"])
 def test_bind_tensor_rechecks_storage_after_set(
     pointer_kernel, mode, no_gpu, bind_device, monkeypatch
@@ -1224,7 +1230,7 @@ def test_bind_tensor_rechecks_storage_after_set(
         TorchAccessMode.INTERPRETER,
     ],
 )
-@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "gpu"])
 def test_bind_pointer_checks_once_and_warns_at_creation(
     pointer_kernel, verify, mode, no_gpu
 ):
@@ -4119,7 +4125,7 @@ def _recording_input_launcher(
     return native, compiler_input, calls
 
 
-@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "gpu"])
 @pytest.mark.parametrize("bind_device", [False, True], ids=["module", "handle-map"])
 @pytest.mark.parametrize(
     "annotation,groups,field",
@@ -4208,7 +4214,15 @@ def test_runtime_compiler_input_invariant(
 
 
 @pytest.mark.parametrize("bind_device", [False, True], ids=["module", "handle-map"])
-@pytest.mark.parametrize("fact", ["dtype", "alignment", "range"])
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "dtype",
+        "alignment",
+        # only a backend with pointer_range splits on the 2 GiB storage bound
+        pytest.param("range", marks=needs_pointer_range),
+    ],
+)
 def test_runtime_pointer_compiler_input_invariant(
     pointer_kernel, monkeypatch, bind_device, fact
 ):
@@ -4232,7 +4246,27 @@ def test_runtime_pointer_compiler_input_invariant(
     )
 
 
-@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "amd"])
+def _attrs_for_backend(attrs, no_gpu):
+    """Drops `tt.pointer_range` where the launcher's backend does not specialize on it.
+
+    An `Assume(PointerRange(...))` is parsed by the triton backend itself, and
+    one without `pointer_range` (NVIDIA) does not know the `S` descriptor: the
+    annotation is accepted and contributes no attribute. A path left with no
+    attributes is omitted, as `_compiler_input` omits it.
+
+    `no_gpu` launchers are keyed against the gfx942 target
+    `_recording_input_launcher` pins, so they always carry it.
+    """
+    if no_gpu or POINTER_RANGE:
+        return attrs
+    kept = (
+        (path, tuple(a for a in parsed if a[0] != "tt.pointer_range"))
+        for path, parsed in attrs
+    )
+    return tuple((path, parsed) for path, parsed in kept if parsed)
+
+
+@pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "gpu"])
 @pytest.mark.parametrize(
     "annotation,values,signature,constants,attrs",
     [
@@ -4286,7 +4320,9 @@ def test_no_map_compiler_input_invariant(
         monkeypatch=monkeypatch,
         **bound_values,
     )
-    expected = CompilerInput((("x", signature),), constants, attrs, ())
+    expected = CompilerInput(
+        (("x", signature),), constants, _attrs_for_backend(attrs, no_gpu), ()
+    )
     saved = None
     for value in values:
         if bound_values:

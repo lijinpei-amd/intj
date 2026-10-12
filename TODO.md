@@ -20,7 +20,8 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   `ml_meth` with a plain load; the build publishes `state` before a release store
   of `ml_meth`, which x86-64 orders. Recheck (or have the entry fall back to an
   acquire reload of `state`) when ARM64 is supported.
-- **Run the NVIDIA path on an NVIDIA GPU.** It is compile-checked only.
+- **Multi-GPU on NVIDIA.** The sm_89 machine has one card, so
+  `test_tuned.py`'s two-GPU case is still skipped there; it passes on AMD.
 - **`noexcept` at the CPython boundary in C++ builds.** STATIC_COMPILE tensor
   access and non-intj cache backends compile the extension as C++. An
   exception escaping `entry` into CPython's C frames is UB; `INTJ_NOEXCEPT` on the

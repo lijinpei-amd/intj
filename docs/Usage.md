@@ -46,7 +46,7 @@ nothing once the launcher is built (the swapped-in entry never reads the knob
 again). A few other checks need the target and surface on the first call
 too: an unknown `options=` name, an invalid compile option in an autotune
 config, and the C-side checks on bound values (an out-of-range pointer, a
-failing `hipDeviceGet`). Triton's `debug`, `instrumentation_mode` and
+failing `hipDeviceGet` / `cuDeviceGet`). Triton's `debug`, `instrumentation_mode` and
 `fpsan_homomorphic_casts` knobs are read then too, and fixed for the launcher.
 Every launcher is a builtin function whose `__self__` is an
 `_intj_lazy.Launcher`, whatever it binds; `intj.launcher.module_of(launcher)`
@@ -332,9 +332,8 @@ Triton itself cannot run), a heuristic or autotune key reading a value an
 inner layer assigns, heuristics outside the subset above, and a tuned value
 read by C that is not an `int` or `bool` (autotune config values at
 `make_launcher`, heuristic results on the miss). Each bound launcher (every
-`bind()`/`bind_device()`) owns its own tuner caches and tunes again. CUDA is
-compile-checked only (untested); free-threaded Python builds are
-compile-untested.
+`bind()`/`bind_device()`) owns its own tuner caches and tunes again.
+Free-threaded Python builds are compile-untested.
 
 ## Triton-style migration bridge
 
@@ -543,8 +542,8 @@ hits it:
   `CudaBackend` ship; any triton backend whose driver exposes a
   `cuLaunchKernel`-shaped entry point is supported by subclassing `Backend` (dylib,
   launch symbol, error-string convention, whether it specializes pointers on a 2 GiB
-  range) and calling `register()`. **CUDA is compile-checked but runtime-untested** --
-  there is no NVIDIA GPU on the development machine.
+  range) and calling `register()`. Both shipped backends run the full GPU test
+  suite: HIP on gfx942, CUDA on sm_89.
 - `TRITON_INTERPRET=1` -- refused on the first call, never at `make_launcher`,
   so a module-level `@make_launcher` still imports under the interpreter (a
   `@triton.jit` kernel decorated while it is on is an `InterpretedFunction`,
@@ -748,8 +747,7 @@ batches, absolute and percentage deltas against the same kernel's `auto map`
 baseline, and separate factory construction and binding times in milliseconds.
 The matrix covers reduced keys, checked and unchecked facts, baked values,
 bound tensor and pointer handles, fixed-device map, and fixed-device no-map.
-These are measurements, not pytest performance limits. CUDA remains
-compile-checked but runtime-untested on the development machine.
+These are measurements, not pytest performance limits.
 
 ## Cache
 
