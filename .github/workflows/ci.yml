@@ -85,7 +85,7 @@ jobs:
           path: ci/out/dist/
 
   # Every cell x every pinned torch its python has a wheel for, each in every
-  # Torch access mode.
+  # Torch access mode but those matrix.json's torch_skip_modes lists.
   test:
     needs: [matrix, images, wheel]
     runs-on: ubuntu-24.04
@@ -102,7 +102,7 @@ jobs:
     env:
       INTJ_MODE: wheel
       TORCH: ${{ matrix.cell.torch }}
-      INTJ_TEST_TORCH_MODES: interpreter,runtime_shim,static_compile
+      INTJ_TEST_TORCH_MODES: ${{ matrix.cell.modes }}
     if: ${{ !cancelled() && needs.wheel.result == 'success' }}
     steps:
       - uses: actions/checkout@v7

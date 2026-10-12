@@ -98,8 +98,14 @@ def push(cell, flavor):
     subprocess.run(["docker", "push", name], check=True)
 
 
+MODES = ("interpreter", "runtime_shim", "static_compile")
+
+
 def tests(data):
     """Every cell x pinned torch whose python has a wheel: one cpu test job each.
+
+    `modes` is what INTJ_TEST_TORCH_MODES requires: every Torch access mode,
+    less the ones `torch_skip_modes` lists for that torch and python.
 
     The pins must cover exactly the torch versions intj has verified layouts
     for, so a new torch_abi.toml row cannot go untested.
@@ -118,7 +124,12 @@ def tests(data):
         if not versions:
             die("no pinned torch has a wheel for %s" % cell["id"])
         image = tag(cell, "cpu")
-        out += [{"id": cell["id"], "image": image, "torch": v} for v in versions]
+        for v in versions:
+            skip = data["torch_skip_modes"].get(v, {}).get(python, [])
+            if set(skip) - set(MODES):
+                die("torch_skip_modes names unknown modes %s" % skip)
+            modes = ",".join(m for m in MODES if m not in skip)
+            out.append({"id": cell["id"], "image": image, "torch": v, "modes": modes})
     return out
 
 

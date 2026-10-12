@@ -48,9 +48,13 @@ target as separate invocations.
 - `matrix.json`'s `torch` pins one version per minor in
   `intj/torch_intf/torch_abi.toml`, with the pythons that have a CPU wheel for
   it; `image.py matrix` refuses a mismatch. Adding a toml row means adding a
-  pin. 2.9.1 leaves out its free-threaded wheels: from several threads,
-  `tensor.untyped_storage()` crashes it in `PyObject_ClearWeakRefs`, without
-  intj (2.10 is fine).
+  pin. `torch_skip_modes` drops Torch access modes for one torch and python;
+  each entry needs its reason here. 2.9.1 on 3.14t skips INTERPRETER: from
+  several threads, `tensor.untyped_storage()` crashes it in
+  `PyObject_ClearWeakRefs`, without intj, and no lock around the call helps.
+  torch's PyObject preservation was not thread-safe until 2.10
+  (pytorch/pytorch#167564). RUNTIME_SHIM and STATIC_COMPILE never create the
+  storage's Python object.
 
 ## Known gaps
 
