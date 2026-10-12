@@ -1,6 +1,7 @@
 # Every intj check: ninja -C ci <target>.  Targets never produce their output
 # file, so they always rerun; parameters come from the environment (AGENTS.md).
 ninja_required_version = 1.10
+builddir = out
 
 rule sh
   command = bash $script
