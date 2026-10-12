@@ -90,7 +90,7 @@ free-threaded CPython 3.13t and 3.14t. This is a CPython-specific interface.
    `EXT_SUFFIX`. A patch release, a regular/free-threaded build change, or a
    header edit therefore changes the module digest. The suffix also preserves
    platform and other ABI tags, such as the debug-build tag.
-4. The [entry template](../runtime/entry.c.jinja) rejects compilation if the
+4. The [entry template](../render/entry.c.jinja) rejects compilation if the
    included headers have a different major/minor/micro version or GIL build
    from the `RenderKey`.
 

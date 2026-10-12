@@ -52,7 +52,6 @@ from intj import (
 )
 from intj.annotation import CanonicalAnnotation
 from intj.launcher import (
-    RenderKey,
     UnsupportedKernel,
     module_of,
     override_compile,
@@ -67,6 +66,8 @@ from knob_helpers import (
 )
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
 from intj.python_intf import cpython_abi
+from intj.render.build import build, compiler_identity
+from intj.render.key import DynamicSlot, RenderKey
 from intj.torch_intf.abi_detect import probe_layout
 from intj.torch_intf.torch_abi import (
     NDTYPES,
@@ -691,7 +692,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
     tmp_path, device_kernel, backend_name, no_gpu, return_compiled
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import BACKENDS, _build, _render_params
+    from intj.launcher import BACKENDS, _render_params
 
     backend = BACKENDS[backend_name]
     assert (
@@ -722,7 +723,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
         return_compiled=return_compiled,
     )
     binary = tmp_path / "m.so"
-    _build(binary, key)  # Build both real-driver branches, but load neither driver.
+    build(binary, key)  # Build both real-driver branches, but load neither driver.
     assert binary.is_file()
     source = binary.with_suffix(".c").read_text()
     if no_gpu:
@@ -3063,9 +3064,10 @@ def test_one_module_per_key():
     assert first is not second  # each launcher owns its cache
 
 
-def test_cached_build_is_reused_without_rendering():
+def test_cached_build_is_reused_without_rendering(monkeypatch):
     """A dict miss with the .so already on disk must not render or compile again."""
     import intj.launcher as launcher_module
+    import intj.render.build as render_build
 
     module_of(make_launcher(scale, options={"num_stages": 5}))
     launcher_module._LOADED.clear()
@@ -3073,11 +3075,8 @@ def test_cached_build_is_reused_without_rendering():
     def fail(*args, **kwargs):
         raise AssertionError("rebuilt a module that was already on disk")
 
-    original, launcher_module._build = launcher_module._build, fail
-    try:
-        module_of(make_launcher(scale, options={"num_stages": 5}))
-    finally:
-        launcher_module._build = original
+    monkeypatch.setattr(render_build, "build", fail)
+    module_of(make_launcher(scale, options={"num_stages": 5}))
 
 
 def test_modules_stay_out_of_the_import_system():
@@ -4536,7 +4535,7 @@ def test_render_key_tracks_cache_compiler_language(
             )
         )
     assert len(keys) == 1
-    assert keys[0].compiler == launcher._compiler_identity(language)
+    assert keys[0].compiler == compiler_identity(language)
     assert ("-fvisibility=hidden" in keys[0].build_flags) == (language == "c++")
 
 
@@ -4544,7 +4543,7 @@ def test_render_key_tracks_cache_compiler_language(
     "differing",
     [
         {"nwords": 5},
-        {"dynamic": (launcher.DynamicSlot("num_warps", 8, 16, 0),)},
+        {"dynamic": (DynamicSlot("num_warps", 8, 16, 0),)},
         {"cache_key": "d"},
     ],
 )
@@ -4593,7 +4592,7 @@ def test_render_rejects_mismatched_free_threaded_headers(tmp_path, capfd):
         free_threaded=not bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
     )
     with pytest.raises(subprocess.CalledProcessError):
-        launcher._build(tmp_path / "m.so", key)
+        build(tmp_path / "m.so", key)
     assert (
         "intj: compiling against headers of the wrong GIL build"
         in capfd.readouterr().err
@@ -5612,12 +5611,12 @@ def test_default_resolves_and_explicit_modes_validate(monkeypatch):
     from intj import launcher as launcher_mod
 
     resolve = launcher_mod._resolve_torch_access_mode
-    monkeypatch.setattr(launcher_mod, "_cxx_toolchain", lambda: ([], []))
+    monkeypatch.setattr(launcher_mod, "cxx_toolchain", lambda: ([], []))
     monkeypatch.setattr(launcher_mod, "layout_for", lambda: object())
     for m in ACCESS_MODES:
         assert resolve(m) is m
     assert resolve(None) is TorchAccessMode.STATIC_COMPILE
-    monkeypatch.setattr(launcher_mod, "_cxx_toolchain", lambda: None)
+    monkeypatch.setattr(launcher_mod, "cxx_toolchain", lambda: None)
     assert resolve(None) is TorchAccessMode.RUNTIME_SHIM
     monkeypatch.setattr(launcher_mod, "layout_for", lambda: None)
     assert resolve(None) is TorchAccessMode.INTERPRETER
@@ -5652,11 +5651,11 @@ def test_hardcoded_layout_matches_torch_headers():
     headers know none of them.  Codes the headers declare past the recorded ones
     must be sizeless placeholders, or the table is missing a dtype.
     """
-    from intj.launcher import _cxx_toolchain
+    from intj.render.build import cxx_toolchain
     from intj.torch_intf.cpp_detect import detect
     from intj.torch_intf.torch_abi import OFFSETS
 
-    if _cxx_toolchain() is None:
+    if cxx_toolchain() is None:
         pytest.skip("no C++ compiler and torch headers")
     table = layout_for()
     assert table is not None, "no entry for the torch the suite is running against"

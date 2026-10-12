@@ -346,7 +346,8 @@ def test_grid_controls_do_not_change_kernel_specialization():
 
 
 def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
-    from intj.launcher import BACKENDS, _LOADED, _build
+    from intj.launcher import BACKENDS, _LOADED
+    from intj.render.build import build
 
     launchers = {
         "grid_arg": make_launcher(
@@ -382,7 +383,7 @@ def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
             error_style=backend.error_style,
         )
         binary = tmp_path / f"{name}.so"
-        _build(binary, key)
+        build(binary, key)
         assert binary.is_file()
 
 

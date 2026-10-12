@@ -14,15 +14,36 @@ sync" with a header; that copy goes stale silently. Nothing crosses the boundary
 so there is no `_python.h` and no nanobind dependency in the tree — add both with the
 first thing that actually needs sharing.
 
-`intj/runtime/` also holds the launcher runtime itself: `intj_runtime.h` (helpers
-included by every rendered module) and `entry.c.jinja` (the rendered entry point).
+`intj/runtime/` also holds the launcher runtime itself: `intj_runtime.h`, the helpers
+included by every rendered module.
+
+## Rendering lives in `intj/render/`
+
+- `key.py`: `RenderKey`, everything a module depends on, and the values it holds.
+- `context.py`: `RenderContext.from_key(key)`, what the template renders from.
+- `entry.c.jinja`: the rendered entry point.
+- `build.py`: build flags, compiling, and loading the `.so`.
+
+`launcher.py` builds the key and owns the per-process module dict and the compile
+callback; nothing there renders, compiles or loads.
+
+**`RenderContext` computes, the template writes C.** Every count, offset, slot, flag
+and choice (which decoder, which checks, the order of type tests) is a
+`RenderContext` field; `RenderContext` contains no C. The template branches on a
+boolean, a `none` test, or one field against a literal, loops, interpolates, and
+spells C names (`{% set d = 'decoded_' ~ i %}`). It does no arithmetic and uses no
+filters, list building or `namespace`. A change to the template that needs a new
+value adds a field.
+
+To check that a refactor of either side renders the same C, pickle the `RenderKey`s
+a test run builds (wrap `intj.render.build.build`), then compare the old and new
+renders of each with blank lines dropped.
 
 ## RenderKey is a value type
 
 Frozen, every field immutable (tuples, never lists), so it compares by value, hashes,
-and serializes to JSON (what `RenderKey.digest()` hashes). One type is both what
-`entry.c.jinja` renders from and what the module is keyed on. A list field anywhere in
-it compares fine and blows up on `hash()`; `test_value_types_compare_hash_and_serialize`
+and serializes to JSON (what `RenderKey.digest()` hashes). A list field anywhere in it
+compares fine and blows up on `hash()`; `test_value_types_compare_hash_and_serialize`
 guards that.
 
 ## Backends are data, not branches

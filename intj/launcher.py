@@ -1,19 +1,12 @@
-"""Render, build and load the C launcher for a `@triton.jit` kernel."""
+"""Make the C launcher for a `@triton.jit` kernel; `intj.render` renders and builds it."""
 
 from __future__ import annotations
 
 import abc
 import dataclasses
 import functools
-import hashlib
-import importlib.util
 import inspect
-import json
-import os
-import shutil
-import subprocess
 import sysconfig
-import tempfile
 import threading
 import types
 import warnings
@@ -50,6 +43,16 @@ from .kernel_cache import (
     unavailable_message,
 )
 from .python_intf import cpython_abi
+from .render.build import (
+    build_flags,
+    compiler_identity,
+    compiler_path,
+    cxx_toolchain,
+    load,
+    runtime_headers,
+)
+from .render.context import ENTRY_TEMPLATE
+from .render.key import DynamicSlot, Param, RenderKey, TuningRender
 from .torch_intf.torch_abi import (
     TensorABI,
     TorchAccessMode,
@@ -68,20 +71,6 @@ CompiledKernel = Any
 if TYPE_CHECKING:
     from .grid import GridCode
 
-_RUNTIME = Path(__file__).parent / "runtime"
-_ENTRY_TEMPLATE = _RUNTIME / "entry.c.jinja"
-_PYTHON_INTF = Path(__file__).parent / "python_intf"
-
-
-def _runtime_headers() -> bytes:
-    """Returns every header the rendered module can include, concatenated.
-
-    That is the runtime's own headers, and the CPython layer `intj_runtime.h`
-    includes from `python_intf/`.
-    """
-    headers = [*sorted(_RUNTIME.glob("*.h")), *sorted(_PYTHON_INTF.glob("*.h"))]
-    return b"".join(p.read_bytes() for p in headers)
-
 
 class UnsupportedKernel(NotImplementedError):
     """A kernel or option outside intj's (deliberately small) scope."""
@@ -98,42 +87,6 @@ class ClassGlobalWarning(RuntimeWarning):
 def _cache_version() -> tuple[int, int]:
     major, minor, *_ = __version__.split(".")
     return int(major), int(minor)
-
-
-@dataclasses.dataclass(frozen=True)
-class Param:
-    """One declared kernel parameter, as the template needs it."""
-
-    name: str
-    index: int
-    call_index: int | None
-    annotation: CanonicalAnnotation
-    memo: int | None = None  # this slot's intj_memo, if it takes objects
-
-
-@dataclasses.dataclass(frozen=True)
-class TuningRender:
-    """What `entry.c.jinja` renders for an autotune/heuristics launcher."""
-
-    levels: int  # lookups per launch
-    computed: tuple[int, ...]  # computed keys keyed at each level
-    #: level-0 computed keys: (value, kind) byte offsets in the level-0 key
-    computed_fields: tuple[tuple[int, int], ...]
-    computed_names: tuple[str, ...]  # level-major; the callback's `computed`
-    deps: tuple[int, ...]  # dependent values C reads, stored per level
-    dep_names: tuple[str, ...]  # level-major; the callback's `deps`
-    meta_names: tuple[str, ...]  # grid_py: tuned parameters, declaration order
-    source: str  # generated `intj_tuned_level_<n>` functions
-
-
-@dataclasses.dataclass(frozen=True)
-class DynamicSlot:
-    """One `dynamic_options` entry as `entry.c.jinja` renders it."""
-
-    name: str  # compile option or `knobs.<group>.<name>`
-    value_offset: int | None  # None only under an invariant test's mutation
-    kind_offset: int | None
-    memo: int  # its intj_memo in the launcher's trailing arrays
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,92 +115,6 @@ class CompilerInput:
             dict(self.values),
             {path: [list(attr) for attr in attrs] for path, attrs in self.attrs},
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class RenderKey:
-    """Everything the rendered `.so` depends on, hashed into its digest.
-
-    Anything that changes the generated code, the compiled binary, or which
-    kernel the module's callback compiles has to appear here: two launchers
-    whose keys match share one `.so`, so a missing field means a stale module.
-    `entry.c.jinja` renders from these same fields.
-
-    Fixed fields on purpose: a typo fails here instead of silently rendering an
-    empty value into C (the template also runs with `StrictUndefined`).
-    """
-
-    # What the template does not read: the render is a pure function of the
-    # template, the runtime headers and the fields after these.
-    template: str  # entry.c.jinja bytes, hex
-    runtime_header: str  # runtime/*.h bytes, hex
-    cache_key: str  # jit_func.cache_key plus AST language: source and callees
-    target: tuple[Any, ...]  # backend, arch, warp size
-    options: str  # canonicalized compile options, hashed by triton
-    triton: tuple[Any, ...]  # triton version and libtriton identity
-    compiler: tuple[str, ...]  # the C compiler triton would invoke
-    build_flags: tuple[
-        str, ...
-    ]  # changes to compiler flags invalidate cached .so files
-    ext_suffix: str | None
-    intj_version: tuple[int, int]
-    #: `assume_constant_globals=True`: the globals the kernel reads, by value.
-    #: triton's `cache_key` hashes only the `tl.constexpr` ones; a plain global
-    #: (a tuple read by a `constexpr_function`) would otherwise let two
-    #: different values share a module -- and its compile callback's kernel.
-    global_values: tuple[tuple[str, str, tuple[object, ...]], ...]
-
-    # What the template reads.
-    module_name: str
-    kernel_repr: str
-    params: tuple[Param, ...]
-    nwords: int  # spec-key length, in uint64 words
-    device_binding: DeviceBinding
-    device_offset: int | None
-    verify_annotation: bool
-    no_gpu: bool
-    max_slots: int  # kernel param slots, upper bound
-    spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
-    driver_path: str
-    launch_symbol: str
-    device_symbol: str
-    error_symbol: str
-    error_style: str  # "return" | "outparam"
-    torch_access_mode: str  # resolved TorchAccessMode value
-    kernel_cache: str  # KernelCache value: which hash map holds the kernels
-    #: where that map comes from, when it is not intj's own. In the digest
-    #: because the module is built against it.
-    cache_include_dirs: tuple[str, ...]
-    cache_archives: tuple[str, ...]
-    #: STATIC_COMPILE only: what the binary was compiled against. The other modes
-    #: discover everything at load, so their `.so` is torch-version-independent
-    #: and these stay None -- which is what keeps them out of the digest.
-    torch_version: tuple[int, int] | None
-    cxx_abi: int | None
-    #: The interpreter the module is built for and loaded into.  Every mode reads
-    #: CPython internals (see intj/python_intf), so a module is never shared
-    #: across versions, patch releases included; the render refuses to compile
-    #: against any other `Python.h`.  ABI flags (`t`, `d`) are also in `ext_suffix`.
-    python_version: tuple[int, int, int]
-    free_threaded: bool
-    cpython_static_compile_header: str  # intj/python_intf header for that version
-    # Explicit pointer names -> live torch ScalarType codes. Their compact key
-    # indices still come from the runtime ABI table, in every access mode.
-    pointer_types: tuple[tuple[str, int], ...] = ()
-    grid_arg: int | None = None
-    grid_py_mode: bool = False
-    grid_cpp_source: str = ""
-    grid_extra: tuple[str, ...] = ()
-    return_compiled: bool = False
-    tuning: TuningRender | None = None
-    #: `dynamic_options`, in call order: they shape the call and the key
-    dynamic: tuple[DynamicSlot, ...] = ()
-
-    def digest(self) -> str:
-        """Returns the SHA-256 hex digest of every field, independent of field order."""
-        # sort_keys so the digest does not depend on field order
-        blob = json.dumps(dataclasses.asdict(self), sort_keys=True)
-        return hashlib.sha256(blob.encode()).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -979,8 +846,8 @@ def _materialize_module(
         return_compiled=return_compiled,
         tuning=tuning,
         dynamic=slots,
-        template=_ENTRY_TEMPLATE.read_bytes().hex(),
-        runtime_header=_runtime_headers().hex(),
+        template=ENTRY_TEMPLATE.read_bytes().hex(),
+        runtime_header=runtime_headers().hex(),
         cache_key=jit_func.cache_key + (":gluon" if jit_func.is_gluon() else ""),
         target=(target.backend, target.arch, target.warp_size)
         if target is not None
@@ -989,18 +856,18 @@ def _materialize_module(
         if canonical_options is not None
         else "host-defaults",
         triton=_triton_identity(),
-        # `_build_flags` derives these from the fields above: filled in below
+        # `build_flags` derives these from the fields above: filled in below
         compiler=(),
         build_flags=(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
         global_values=global_values,
     )
-    build = _build_flags(key)
+    flags = build_flags(key)
     key = dataclasses.replace(
         key,
-        compiler=_compiler_identity(build["language"]),
-        build_flags=tuple(build["ccflags"]),
+        compiler=compiler_identity(flags["language"]),
+        build_flags=tuple(flags["ccflags"]),
     )
     # the c++ mode gets it too, not to read from but to check its own
     # compiled-in offset against
@@ -1052,7 +919,8 @@ def _stub() -> types.ModuleType:
     """Returns the process's one `_intj_lazy`, beside the modules intj renders."""
     _imports.ensure_triton_imported()
     return lazy.load_stub(
-        Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy", _compiler_path("c")
+        Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy",
+        compiler_path("c"),
     )
 
 
@@ -1309,14 +1177,14 @@ def _resolve_torch_access_mode(requested: TorchAccessMode | None) -> TorchAccess
     """
     if requested is TorchAccessMode.RUNTIME_SHIM and layout_for() is None:
         raise UnsupportedKernel(_unverified_torch_message())
-    if requested is TorchAccessMode.STATIC_COMPILE and not _cxx_toolchain():
+    if requested is TorchAccessMode.STATIC_COMPILE and not cxx_toolchain():
         raise UnsupportedKernel(
             "intj: STATIC_COMPILE needs a C++ compiler and torch's headers; "
             "set $CXX or pass torch_access_mode=TorchAccessMode.RUNTIME_SHIM"
         )
     if requested is not None:
         return requested
-    if _cxx_toolchain():
+    if cxx_toolchain():
         return TorchAccessMode.STATIC_COMPILE
     if layout_for() is not None:
         return TorchAccessMode.RUNTIME_SHIM
@@ -1348,30 +1216,6 @@ def _cxx_abi() -> int:
     return int(_imports.torch._C._GLIBCXX_USE_CXX11_ABI)
 
 
-@functools.lru_cache(maxsize=1)
-def _cxx_toolchain() -> tuple[list[str], list[str]] | None:
-    """Returns (include dirs, library dirs) for the c++ mode, or None.
-
-    Both come from the loaded torch rather than from `torch.__file__`, so a torch
-    that reorganises its tree, or one built out of tree, keeps working.
-    """
-    try:
-        _compiler_path("c++")
-    except Exception:
-        return None
-    try:
-        # not cached with torch: importing it costs ~65 ms
-        from torch.utils import cpp_extension
-    except Exception:  # pragma: no cover - torch without the build helpers
-        return None
-    includes = [p for p in cpp_extension.include_paths() if os.path.isdir(p)]
-    libs = [p for p in cpp_extension.library_paths() if os.path.isdir(p)]
-    header = "torch/csrc/autograd/python_variable.h"
-    if not libs or not any(os.path.exists(os.path.join(d, header)) for d in includes):
-        return None
-    return (includes, libs)
-
-
 _LOADED: dict[RenderKey, types.ModuleType] = {}
 _LOAD_LOCK = threading.Lock()
 
@@ -1400,7 +1244,7 @@ def _loaded_module(
     with _LOAD_LOCK:
         module = _LOADED.get(key)
         if module is None:
-            module = _load(key, jit_func)
+            module = load(key, jit_func.__module__)
             if module.header_size() != _stub().header_size():
                 raise ImportError(
                     f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
@@ -1433,177 +1277,6 @@ def _loaded_module(
             )
             _LOADED[key] = module
         return module
-
-
-def _load(key: RenderKey, jit_func: JitFunction) -> types.ModuleType:
-    """Loads the extension for this key, rendering and building it only if needed.
-
-    The `.so` lands in `$TRITON_HOME/.triton/intj/<digest>/<module>/<kernel>`, so the
-    artifact says where the kernel came from and which build it is. Its leaf name
-    is the kernel's own name, because CPython derives `PyInit_<leaf>` from the
-    last dotted component of the spec name -- that is also what `perf` and
-    /proc/<pid>/maps show.
-
-    An existing `.so` is loaded as-is: its path already encodes the digest, so
-    rendering the source again would only reproduce what was compiled from it.
-    """
-    _imports.ensure_triton_imported()
-    suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-    # a sibling of triton's own cache
-    triton_dir = Path(_imports.knobs.cache.get_triton_dir("intj"))
-    directory = triton_dir / key.digest() / jit_func.__module__
-    so_path = directory / f"{key.module_name}{suffix}"
-    if not so_path.exists():
-        _build(so_path, key)
-
-    # Loading by hand, rather than through import_module, keeps the module out of
-    # sys.modules.
-    spec = importlib.util.spec_from_file_location(key.module_name, so_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"intj: cannot load {so_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
-    return module
-
-
-def _build(so_path: Path, key: RenderKey) -> None:
-    """Renders and compiles, then installs both artifacts next to each other."""
-    import jinja2
-
-    template = jinja2.Template(
-        _ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined
-    )
-    src = template.render(**dataclasses.asdict(key))
-    flags = _build_flags(key)
-    binary = _compile_so_bytes(src, key.module_name, flags)
-    so_path.parent.mkdir(parents=True, exist_ok=True)
-    # The source is kept next to the binary: it is what you read when a launch
-    # misbehaves, and what you recompile by hand to debug it.
-    suffix = ".cpp" if flags["language"] == "c++" else ".c"
-    _install(src.encode(), so_path.with_name(f"{key.module_name}{suffix}"))
-    _install(binary, so_path)
-
-
-def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
-    """Compiles `src` into shared-object bytes with Triton's compiler.
-
-    Falls back to its 3.7-era command when the helper is absent.
-    """
-    _imports.ensure_triton_imported()
-    compile_so = getattr(_imports.build, "compile_so_from_src", None)
-    if compile_so is not None:
-        return Path(compile_so(src=src, name=name, **flags)).read_bytes()
-
-    language = flags["language"]
-    with tempfile.TemporaryDirectory() as directory:
-        source = Path(directory) / f"{name}{'.cpp' if language == 'c++' else '.c'}"
-        source.write_text(src)
-        suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-        binary = Path(directory) / f"{name}{suffix}"
-        includes = [
-            *flags.get("include_dirs", ()),
-            directory,
-            lazy.python_include(),
-            *_imports.knobs.build.backend_dirs,
-        ]
-        command = [
-            _compiler_path(language),
-            str(source),
-            "-O3",
-            "-shared",
-            "-fPIC",
-            "-Wno-psabi",
-            "-o",
-            str(binary),
-        ]
-        command += [f"-l{lib}" for lib in flags.get("libraries", ())]
-        command += [f"-L{path}" for path in flags.get("library_dirs", ())]
-        command += [f"-I{path}" for path in includes if path is not None]
-        command += list(flags.get("ccflags", ()))
-        subprocess.check_call(command, stdout=subprocess.DEVNULL)
-        return binary.read_bytes()
-
-
-def _runtime_header_flag() -> str:
-    """Returns a define that makes triton's compile cache key on the runtime headers.
-
-    `_compile_so` keys on the source bytes plus the *names* of the include
-    directories, not on the contents of the headers found there.  So an edit to
-    a runtime header moves intj's own `RenderKey` digest, intj re-renders, and
-    triton then serves the object it compiled from the previous headers.  Feeding
-    the digest in as a define puts it in triton's key too.
-    """
-    digest = hashlib.sha256(_runtime_headers()).hexdigest()[:16]
-    return f"-DINTJ_RUNTIME_HEADER=0x{digest}"
-
-
-def _build_flags(key: RenderKey) -> dict[str, Any]:
-    """Returns the compiler arguments beyond intj's own include directory.
-
-    The c++ access mode needs torch's headers, and `libc10` for the handful of
-    error-path symbols `THPVariable_Unpack` pulls in.  Those are the reason it
-    cannot be header-only -- torch loads libc10 `RTLD_LOCAL`, so an unlinked
-    module builds fine and then fails at import with an undefined
-    `throw_data_ptr_access_error`.  libtorch_cpu and libtorch_python are *not*
-    needed.
-
-    A kernel cache other than intj's is a C++ map, so it drags the whole module
-    into C++ even where the tensor reader would not have.
-    """
-    torch_static_compile = key.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
-    cxx_cache = key.kernel_cache != KernelCache.INTJ.value
-    # No -falign-loops=64 (tests/test_kernel_cache.py uses it): measured
-    # 2026-09-27, it leaves the launch path's instruction count unchanged -- the
-    # memo-hit path runs no loop -- and moves rows +-1 ns either way by layout
-    # alone.
-    flags: dict[str, Any] = {
-        "include_dirs": [str(_RUNTIME), str(_PYTHON_INTF), *key.cache_include_dirs],
-        "ccflags": [
-            _runtime_header_flag(),
-            f"-DINTJ_CACHE_{key.kernel_cache.upper()}",
-        ],
-    }
-    if key.cache_archives:
-        # abseil's own link order is not intj's to encode, so the archives go in
-        # a group and the linker sorts it out.
-        flags["ccflags"] += [
-            "-Wl,--start-group",
-            *key.cache_archives,
-            "-Wl,--end-group",
-        ]
-    if not torch_static_compile and not cxx_cache:
-        return {"language": "c", **flags}
-
-    flags["language"] = "c++"
-    # triton puts its own -std=c++17 early and appends ccflags last, so this
-    # wins.  torch >= 2.14 needs c++20 to compile warning-clean.
-    flags["ccflags"][:0] = ["-std=c++20", "-fvisibility=hidden"]
-    if not torch_static_compile:
-        return flags
-
-    toolchain = _cxx_toolchain()
-    assert toolchain is not None, "make_launcher validated this"
-    includes, libs = toolchain
-    flags["include_dirs"] += includes
-    flags["library_dirs"] = list(libs)
-    flags["libraries"] = ["c10"]
-    flags["ccflags"] += [
-        # torch's headers make the translation unit ~7x bigger, and g++'s
-        # inlining budget is per unit: past a size threshold it stops inlining
-        # the tensor reader and PyFloat_AS_DOUBLE into the decode, costing a
-        # real call per argument.  Measured: ~5 ns per launch on a 3-tensor
-        # kernel.  Nothing here is about the torch code itself.
-        f"-D_GLIBCXX_USE_CXX11_ABI={key.cxx_abi}",
-        *(f"-Wl,-rpath,{d}" for d in libs),
-    ]
-    return flags
-
-
-def _install(content: bytes, path: Path) -> None:
-    """Writes `content` to `path` atomically, so a racing build cannot be half-read."""
-    staged = path.with_name(f".{path.name}.{os.getpid()}")
-    staged.write_bytes(content)
-    os.replace(staged, path)
 
 
 class Backend(abc.ABC):
@@ -2168,43 +1841,6 @@ def _triton_identity() -> tuple[Any, ...]:
     libtriton = Path(_imports.triton.__file__).parent / "_C" / "libtriton.so"
     stat = libtriton.stat()
     return (_imports.triton.__version__, stat.st_size, stat.st_mtime)
-
-
-@functools.lru_cache(maxsize=2)
-def _compiler_path(language: str) -> str:
-    """Returns the `"c"` or `"c++"` compiler triton would invoke.
-
-    Raises:
-        RuntimeError: No such compiler is found.
-    """
-    _imports.ensure_triton_imported()
-    find_compiler = getattr(_imports.build, "_find_compiler", None)
-    if find_compiler is not None:
-        cc = find_compiler(language)
-        return str(cc[0] if isinstance(cc, tuple) else cc)
-    variable, candidates = (
-        ("CC", ("gcc", "clang")) if language == "c" else ("CXX", ("g++", "clang++"))
-    )
-    configured = os.environ.get(variable)
-    if configured is not None:
-        return configured
-    for candidate in candidates:
-        found = shutil.which(candidate)
-        if found is not None:
-            return found
-    raise RuntimeError(f"Failed to find {language} compiler; set {variable}")
-
-
-@functools.lru_cache(maxsize=2)
-def _compiler_identity(language: str = "c") -> tuple[str, ...]:
-    cc = _compiler_path(language)
-    try:
-        version = subprocess.run(
-            [cc, "--version"], capture_output=True, text=True
-        ).stdout.splitlines()[0]
-    except Exception:  # pragma: no cover - compiler without --version
-        version = ""
-    return (str(cc), version)
 
 
 def _triton_specialize(

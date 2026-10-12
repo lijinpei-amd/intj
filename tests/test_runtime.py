@@ -30,13 +30,14 @@ import time
 import weakref
 from collections.abc import Callable
 
-import jinja2
 import pytest
 import torch
 
 from intj import launcher, lazy
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
-from intj.launcher import RenderKey
+from intj.render import build
+from intj.render.context import render
+from intj.render.key import RenderKey
 from intj.python_intf import cpython_abi
 from intj.torch_intf.torch_abi import (
     NDTYPES,
@@ -101,12 +102,12 @@ def _cc(language: str) -> str:
 def _test_compiler():
     """Points intj's compiler lookup, which asks triton, at `_cc`."""
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(launcher, "_compiler_path", _cc)
-        launcher._cxx_toolchain.cache_clear()
+        patch.setattr(build, "compiler_path", _cc)
+        build.cxx_toolchain.cache_clear()
         try:
             yield
         finally:
-            launcher._cxx_toolchain.cache_clear()
+            build.cxx_toolchain.cache_clear()
 
 
 def _available(mode: TorchAccessMode) -> bool:
@@ -114,7 +115,7 @@ def _available(mode: TorchAccessMode) -> bool:
         return layout_for() is not None
     if mode is TorchAccessMode.STATIC_COMPILE:
         with _test_compiler():
-            return launcher._cxx_toolchain() is not None
+            return build.cxx_toolchain() is not None
     return True
 
 
@@ -208,14 +209,11 @@ def built(request, stub, tmp_path_factory):
         global_values=(),
     )
     with _test_compiler():
-        flags = launcher._build_flags(key)
-    template = jinja2.Template(
-        launcher._ENTRY_TEMPLATE.read_text(), undefined=jinja2.StrictUndefined
-    )
+        flags = build.build_flags(key)
     out = tmp_path_factory.mktemp(mode.value)
     src = out / "entry.c"
     so = out / f"{key.module_name}{sysconfig.get_config_var('EXT_SUFFIX')}"
-    src.write_text(template.render(**dataclasses.asdict(key)))
+    src.write_text(render(key))
     subprocess.run(
         [
             _cc(flags["language"]),
