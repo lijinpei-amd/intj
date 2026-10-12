@@ -6,7 +6,7 @@ INTJ (INcompatible Triton Jit) is a host side python launcher for triton kernel,
 - Lookup compiled kernel using the cache key. If missing, compile it.
 - Launch the compiled kernel.
 
-INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunction` has a launch overhead of ~14us, while INTJ has a launch overhead of ~0.3us (overhead defined as the time excluding cuLaunchKernel/hipLaunchKernel).
+INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunction` has a launch overhead of ~10us, while INTJ has a launch overhead of ~0.3us (overhead defined as the time excluding cuLaunchKernel/hipLaunchKernel, which itself takes ~3us).
 
 This is an early version with limited argument types and grid expressions. Unsupported cases are refused; see `docs/Usage.md`. AMD is tested on gfx942; the NVIDIA path is implemented (`cuLaunchKernel`) but untested, no NVIDIA GPU here.
 
@@ -36,24 +36,38 @@ Triton 3.7 requirement.
 ## Usage
 
 ```python
-import torch, triton, triton.language as tl
+import torch
+import triton
+import triton.language as tl
 from intj import make_launcher
 
+# line #1: defer backend-dependent options until the first call.
+@make_launcher(
+    delayed=lambda: {
+        "options": {
+            "num_warps": {"hip": 4, "cuda": 8}[
+                triton.runtime.driver.active.get_current_target().backend
+            ],
+        },
+    },
+)
 @triton.jit
 def my_kernel(x, y, o, n, BLOCK: tl.constexpr):
-  ...
+    ...
 
-# line #1: create jit launcher.
-# Speed doesn't matter much here.
-launcher = make_launcher(my_kernel, options={"num_warps": 4})
-
-# line #2: call the jit launcher.
-# Calling the launcher should be fast.
-launcher(torch.cuda.current_device(),
-         torch.cuda.current_stream().cuda_stream,
-         (triton.cdiv(n, 128),),
-         x, y, o, n, 128)
+# line #2: build on the first call; subsequent calls use the native entry.
+my_kernel(
+    torch.cuda.current_device(),
+    torch.cuda.current_stream().cuda_stream,
+    (triton.cdiv(n, 128),),
+    x, y, o, n, 128,
+)
 ```
+
+At line `#1`, the decorator records the kernel and the `delayed` callback
+without querying the GPU. On the first call at line `#2`, the callback selects
+four warps for HIP or eight for CUDA. INTJ then builds and loads the C
+extension and launches the kernel. Later calls use the native entry.
 
 To compute the grid in the extension from launch values, use an annotated
 Python `def` with `grid_cpp`:
@@ -62,10 +76,16 @@ Python `def` with `grid_cpp`:
 def grid(n: int, BLOCK: int):
     return (triton.cdiv(n, BLOCK),)
 
-launcher = make_launcher(my_kernel, grid_cpp=grid)
-launcher(torch.cuda.current_device(),
-         torch.cuda.current_stream().cuda_stream,
-         x, y, o, n, 128)
+@make_launcher(grid_cpp=grid)
+@triton.jit
+def my_kernel(x, y, o, n, BLOCK: tl.constexpr):
+    ...
+
+my_kernel(
+    torch.cuda.current_device(),
+    torch.cuda.current_stream().cuda_stream,
+    x, y, o, n, 128,
+)
 ```
 
 `grid_arg=1`, `2`, or `3` accepts that many dimensions before the kernel
@@ -89,12 +109,11 @@ When studying the host launch overhead of triton `JitFunction`, we found that th
 ```
 key = hash(source, args, options, knobs)
 kernel = cache.get_or_create(key, lambda: compile(source, args, options, knobs)
-launch(kernel, device, stream, args)
+grid = grid_func(args)
+launch(kernel, device, stream, grid, args)
 ```
 
 So I decide to reimplemen the above using C++.
-
-In the usage example above, line `#1` will render a python C extension, and load it, line `#2` will call the C extension to do the 3 steps above.
 
 ### Not feature-complete as `JitFunction`
 
