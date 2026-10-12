@@ -225,7 +225,7 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
                     bind_device=True,
                     torch_access_mode=mode,
                 ).bind_device(device)
-                assert module_of(launch).spec_key(launch, 0, *args) == (b"", count)
+                assert launch.__self__.spec_key(0, *args) == (b"", count)
                 cases.append(
                     (count, f"INTJ {mode.value} kernel", launch, (stream, (1,), *args))
                 )
@@ -295,12 +295,8 @@ def main(iters: int, batches: int) -> None:
     mixed_args = (*tensors, 1, 1.5)
     mixed_converted = (*converted, 1, 1.5)
     other_args = (*(tensor[1:] for tensor in tensors), 7, 2.0)
-    spec_key = module_of(intj_mixed_bound).spec_key
-    assert (
-        spec_key(intj_mixed_bound, 0, *mixed_args)
-        == spec_key(intj_mixed_bound, 0, *other_args)
-        == (b"", 5)
-    )
+    spec_key = intj_mixed_bound.__self__.spec_key
+    assert spec_key(0, *mixed_args) == spec_key(0, *other_args) == (b"", 5)
 
     cases = [
         ("FFI packed nop", packed_nop, converted),

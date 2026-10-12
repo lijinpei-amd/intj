@@ -127,7 +127,7 @@ class ParamView:
     exact: KeyWrite | None
     exact_kind: KeyWrite | None
     bound_slot: int | None  # its index among the bound parameters
-    init_arg: int | None  # its argument of init_bound
+    init_arg: int | None  # its argument of _init
     hidden_slot: int | None  # grid_py: its index in the fixed-value tuple
     meta_slot: int | None  # tuned grid_py: its index in a record's meta
 
@@ -218,7 +218,7 @@ class RenderContext:
     stream_arg: int
     ncontrols: int
     grid_py_offset: int
-    init_extra: int  # init_bound's arguments before the bound values
+    init_extra: int  # _init's arguments before the bound values
     launch_signature: str
     controls_doc: str
     torch_access_name: str

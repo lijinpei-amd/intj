@@ -262,8 +262,10 @@ class LauncherFactory:
         def build(header: object) -> int:
             return self._build(header, state, args, hidden)
 
-        nmemo = sum(p.memo is not None for p in params) + len(self.dynamic)
-        return _stub().new_launcher(_tail_bytes(nmemo, len(bound_values)), doc, build)
+        stub = _stub()
+        launch = stub.new_launcher(stub.Launcher, None, None, build)
+        launch.__self__._set_plan(None, None, doc)
+        return launch
 
     def _build(
         self,
@@ -347,7 +349,7 @@ class LauncherFactory:
                 self.dynamic,
             )
         grid_py = () if self.grid_py is None else (self.grid_py, hidden)
-        return module.init_bound(header, callback, _Interner(), *grid_py, *args)
+        return module._init(header, callback, _Interner(), *grid_py, *args)
 
 
 def _interpreter_deferred(bind_device_requested: bool) -> Any:
@@ -363,7 +365,10 @@ def _interpreter_deferred(bind_device_requested: bool) -> Any:
         raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
 
     def make() -> Any:
-        return _stub().new_launcher(_tail_bytes(0, 0), b"(*args, **kwargs)\x00", build)
+        stub = _stub()
+        launch = stub.new_launcher(stub.Launcher, None, None, build)
+        launch.__self__._set_plan(None, None, b"(*args, **kwargs)\x00")
+        return launch
 
     if not bind_device_requested:
         return make()
@@ -924,20 +929,11 @@ def _stub() -> types.ModuleType:
     )
 
 
-def _tail_bytes(nmemo: int, nbound: int) -> int:
-    """Returns sizeof(intj_bound_tail) in intj_runtime.h.
-
-    That is 32 for the object table, 16 per memo and 24 per bound slot, each
-    at least one.  The rendered module static_asserts the same.
-    """
-    return 32 + 16 * max(nmemo, 1) + 24 * max(nbound, 1)
-
-
 def module_of(launcher: Callable[..., Any]) -> types.ModuleType:
     """Returns the rendered module behind `launcher`, building it if needed.
 
-    Builds now if the launcher's first call has not.  For tests and debugging:
-    `module_of(k).spec_key(k, ...)`.
+    Builds now if the launcher's first call has not.  For tests and debugging;
+    `k.__self__.spec_key(...)` builds the same way.
     """
     return getattr(launcher, "__self__").build()
 
@@ -1245,7 +1241,7 @@ def _loaded_module(
         module = _LOADED.get(key)
         if module is None:
             module = load(key, jit_func.__module__)
-            if module.header_size() != _stub().header_size():
+            if module._header_size() != _stub()._header_size():
                 raise ImportError(
                     f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
                     "header; it was built by another intj -- delete it to rebuild"
@@ -1270,7 +1266,7 @@ def _loaded_module(
             )
             # Pass relative cdata; the compiled setter saves the absolute offset
             # for the torch running now before exposing the module.
-            module.set_torch_version(
+            module._set_torch_version(
                 torch_version(),
                 layout.as_args() if layout else None,
                 dtype_index_table(),
@@ -1801,7 +1797,7 @@ class _Interner:
         _imports.ensure_triton_imported()
         self._ids: dict[tuple[object, ...], int] = {}
         self._lock = threading.Lock()
-        self.dtype_type: type = _imports.tl.dtype  # read once by init_bound
+        self.dtype_type: type = _imports.tl.dtype  # read once by _init
 
     def __call__(self, value: object) -> int | None:
         try:

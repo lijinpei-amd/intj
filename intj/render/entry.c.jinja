@@ -95,8 +95,8 @@ static_assert(sizeof(intj_cache_slot) == 8 * (INTJ_NWORDS + (INTJ_NWORDS > 2)) +
 #define INTJ_V0_RELEASE {{ rec_release(levels[0]) }}
 
 #include "intj_runtime.h"
-static_assert(sizeof(intj_cache) <= sizeof(((intj_bound_header *)0)->cache),
-              "intj: intj_cache fits the header's storage");
+static_assert(sizeof(intj_cache) <= sizeof(((intj_bound_launcher *)0)->cache),
+              "intj: intj_cache fits the state block's storage");
 
 #define INTJ_NPARAMS {{ nparams }}
 #define INTJ_NDYN {{ ndyn }}
@@ -288,7 +288,7 @@ INTJ_B_PTR({% if t.dtype is not none %}st->abi.dtype_index[{{ t.dtype }}]{% else
     } else {
       /* every auto-path constexpr is untyped and public, so it has a memo */
       code = INTJ_B_CX_OBJECT;
-      if (intj_object_id(bound, &INTJ_TAIL(bound)->memo[{{ p.memo }}], o,
+      if (intj_object_id(bound, &bound->memo[{{ p.memo }}], o,
                          intj_param_names[{{ p.index }}], &bits) != 0)
         return -1;
     }
@@ -339,7 +339,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% else %}
   intj_decoded {{ d }};
 {% if p.decoder == 'bound_pointer' %}
-  {{ d }} = (intj_decoded){INTJ_VALUE_TENSOR, INTJ_TAIL(bound)->pointer_bits[{{ p.bound_slot }}], NULL, 0, 0};
+  {{ d }} = (intj_decoded){INTJ_VALUE_TENSOR, bound->pointer_bits[{{ p.bound_slot }}], NULL, 0, 0};
 {% elif p.decoder == 'bound_tensor' %}
   if (intj_decode_bound_tensor(&st->abi, st->tensor_type, st->param_type,
                                bound, {{ p.bound_slot }},
@@ -348,7 +348,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
     return -1;
 {% elif p.decoder == 'constexpr_memo' %}
   if (intj_decode_value(args[{{ p.call_index }}], intj_param_names[{{ i }}], bound,
-                        &INTJ_TAIL(bound)->memo[{{ p.memo }}], &{{ d }}) != 0)
+                        &bound->memo[{{ p.memo }}], &{{ d }}) != 0)
     return -1;
 {% elif p.decoder == 'constexpr' %}
   if (intj_decode_constexpr(args[{{ p.call_index }}], intj_param_names[{{ i }}], &{{ d }}) != 0)
@@ -449,7 +449,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
   {
     intj_decoded dv;
     if (intj_decode_value(dyn[{{ loop.index0 }}], "{{ slot.name }}", bound,
-                          &INTJ_TAIL(bound)->memo[{{ slot.memo }}], &dv) != 0)
+                          &bound->memo[{{ slot.memo }}], &dv) != 0)
       return -1;
 {% if slot.value is not none %}
 {{ key_accumulate(slot.kind, 'dv.kind') }}
@@ -610,8 +610,7 @@ static int intj_fill(intj_state *st, intj_bound_launcher *bound,
                      const uint64_t *key, int np, int64_t device_ordinal,
                      PyObject *const *call_args) {
   (void)st;
-  /* set by init_bound before the launcher was published; only tp_clear of an
-   * unreachable launcher drops it */
+  /* set by _init before the state block was published; only release drops it */
   PyObject *cb = Py_NewRef(bound->compile_cb);
   PyObject *blob = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
   PyObject *nparams_obj = blob ? PyLong_FromLong(np) : NULL;
@@ -1032,7 +1031,7 @@ static INTJ_ALWAYS_INLINE int intj_parse_call(intj_state *st,
                                               int64_t *device, uint64_t *stream) {
   if (INTJ_UNLIKELY(!st->abi.ready)) {
     PyErr_SetString(PyExc_RuntimeError,
-                    "intj: set_torch_version has not been called");
+                    "intj: _set_torch_version has not been called");
     return -1;
   }
   if (INTJ_UNLIKELY(nargs != {{ ncontrols }} + INTJ_NDYN + INTJ_NPARAMS)) {
@@ -1239,12 +1238,12 @@ static PyObject *intj_call(intj_state *st,
 
 static PyObject *intj_bound_entry(PyObject *self, PyObject *const *args,
                                  Py_ssize_t nargs) {
-  intj_bound_launcher *bound = (intj_bound_launcher *)self;
-  intj_state *st = (intj_state *)bound->state;
-  if (INTJ_UNLIKELY(!st)) {
+  intj_bound_launcher *bound = (intj_bound_launcher *)((intj_launcher *)self)->state;
+  if (INTJ_UNLIKELY(!bound)) {
     PyErr_SetString(PyExc_RuntimeError, "intj: bound launcher has been cleared");
     return NULL;
   }
+  intj_state *st = (intj_state *)bound->st;
   int64_t device{{ ' = bound->device_ordinal' if fixed_device }};
   uint64_t stream;
   if (intj_parse_call(st, args, nargs, &device, &stream) != 0)
@@ -1275,28 +1274,27 @@ static PyObject *intj_bound_entry(PyObject *self, PyObject *const *args,
   return result;
 }
 
-static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
-  intj_bound_launcher *bound = (intj_bound_launcher *)self;
-  intj_bound_tail *tail = INTJ_TAIL(bound);
-  /* `_intj_lazy` visits the type and the module; never twice */
+static int intj_traverse_state(void *state, visitproc visit, void *arg) {
+  intj_bound_launcher *bound = (intj_bound_launcher *)state;
+  /* `_intj_lazy` visits the type and the object's members; never twice */
   Py_VISIT(bound->grid_py);
   Py_VISIT(bound->grid_hidden);
   Py_VISIT(bound->compile_cb);
   Py_VISIT(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
-    Py_VISIT(tail->memo[k].obj);
+    Py_VISIT(bound->memo[k].obj);
   {
-    int err = intj_objtab_traverse(bound, &tail->objtab, visit, arg);
+    int err = intj_objtab_traverse(bound, &bound->objtab, visit, arg);
     if (err)
       return err;
   }
   for (int i = 0; i < INTJ_NBOUND; i++)
-    Py_VISIT(tail->owners[i]);
+    Py_VISIT(bound->owners[i]);
 {% if traverse_cache %}
-  if (bound->cache_ready && bound->state)
+  if (bound->cache_ready)
     return intj_cache_traverse(bound, visit, arg);
 {% elif traverse_fixed %}
-  if (bound->state) {
+  {
     intj_snapshot s = {NULL, 0, 0};
     INTJ_RDLOCK(&bound->lock);
     int failed = bound->fixed_kernel ? intj_final_collect((intj_final *)bound->fixed_kernel, &s) : 0;
@@ -1307,24 +1305,20 @@ static int intj_bound_traverse(PyObject *self, visitproc visit, void *arg) {
   return 0;
 }
 
-static int intj_bound_clear(PyObject *self) {
-  intj_bound_launcher *bound = (intj_bound_launcher *)self;
-  intj_bound_tail *tail = INTJ_TAIL(bound);
-  /* Mark closed before dropping owners whose finalizers can reenter Python. */
-  bound->state = NULL;
-  Py_CLEAR(bound->module);
+static void intj_release(void *state) {
+  intj_bound_launcher *bound = (intj_bound_launcher *)state;
   Py_CLEAR(bound->grid_py);
   Py_CLEAR(bound->grid_hidden);
   Py_CLEAR(bound->compile_cb);
   Py_CLEAR(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
-    Py_CLEAR(tail->memo[k].obj);
-  intj_objtab_clear(&tail->objtab);
+    Py_CLEAR(bound->memo[k].obj);
+  intj_objtab_clear(&bound->objtab);
   for (int i = 0; i < INTJ_NBOUND; i++) {
-    Py_CLEAR(tail->owners[i]);
+    Py_CLEAR(bound->owners[i]);
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
-    delete (at::Tensor *)tail->tensors[i];
-    tail->tensors[i] = NULL;
+    delete (at::Tensor *)bound->tensors[i];
+    bound->tensors[i] = NULL;
 #endif
   }
 {% if nwords %}
@@ -1340,50 +1334,59 @@ static int intj_bound_clear(PyObject *self) {
     PyMem_RawFree(kernel);
   }
 {% endif %}
-  return 0;
+  INTJ_RWLOCK_DESTROY(&bound->lock);
+  PyMem_RawFree(bound);
 }
 
-/* init_bound(header, callback, interner, [grid_py, fixed values], [device], *bound)
- * -> the entry's address.  Fills an unbuilt `_intj_lazy` header in place.  On
- * failure the header is left unbuilt, so the launcher's next call retries.
+static PyObject *intj_spec_key(void *state, PyObject *const *args, Py_ssize_t nargs);
+{% if tuned %}
+static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t nargs);
+{% endif %}
+static const intj_launcher_ops intj_ops = {intj_traverse_state, intj_release, intj_spec_key,
+                                           {{ 'intj_key_chain' if tuned else 'NULL' }}};
+
+/* _init(launcher, callback, interner, [grid_py, fixed values], [device], *bound)
+ * -> the entry's address.  Allocates and fills the launcher's state block, then
+ * publishes it.  On failure the launcher is left unbuilt, so its next call
+ * retries.
  * `callback` is this launcher's miss callback: the tuned callback, or a
  * per-launcher wrapper of the module's compile function.  `interner` is the
  * launcher's own intern table: object value -> id, or None if unsupported. */
-static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
+static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
+  intj_bound_launcher *bound = NULL;
   if (nargs != 3 + {{ init_extra }} + INTJ_NBOUND) {
-    PyErr_Format(PyExc_TypeError, "intj: init_bound takes %d arguments, got %zd",
+    PyErr_Format(PyExc_TypeError, "intj: _init takes %d arguments, got %zd",
                  3 + {{ init_extra }} + INTJ_NBOUND, nargs);
     return NULL;
   }
   PyTypeObject *type = Py_TYPE(args[0]);
-  intj_bound_launcher *bound = (intj_bound_launcher *)args[0];
-  if (type->tp_basicsize != (Py_ssize_t)sizeof(intj_bound_header) || type->tp_itemsize != 1 ||
-      Py_SIZE(bound) != (Py_ssize_t)sizeof(intj_bound_tail) || bound->state || bound->module) {
-    PyErr_SetString(PyExc_TypeError,
-                    "intj: init_bound needs an unbuilt launcher sized for this module");
+  intj_launcher *h = (intj_launcher *)args[0];
+  if (type->tp_basicsize != (Py_ssize_t)sizeof(intj_launcher) || type->tp_itemsize != 0 ||
+      h->state || h->module) {
+    PyErr_SetString(PyExc_TypeError, "intj: _init needs an unbuilt launcher");
     return NULL;
   }
   PyObject *callback = args[1];
   if (!PyCallable_Check(callback)) {
-    PyErr_SetString(PyExc_TypeError, "intj: init_bound needs the launcher's miss callback");
+    PyErr_SetString(PyExc_TypeError, "intj: _init needs the launcher's miss callback");
     return NULL;
   }
   PyObject *interner = args[2];
   if (!PyCallable_Check(interner)) {
-    PyErr_SetString(PyExc_TypeError, "intj: init_bound needs the launcher's interner");
+    PyErr_SetString(PyExc_TypeError, "intj: _init needs the launcher's interner");
     return NULL;
   }
   args += 3;
   if (!st->abi.ready) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: set_torch_version has not been called");
+    PyErr_SetString(PyExc_RuntimeError, "intj: _set_torch_version has not been called");
     return NULL;
   }
 {% if grid_py_mode %}
   if (!PyCallable_Check(args[0]) || !PyTuple_CheckExact(args[1]) ||
       PyTuple_GET_SIZE(args[1]) != {{ nhidden }}) {
     PyErr_SetString(PyExc_TypeError,
-                    "intj: init_bound needs a callable grid_py and a fixed-value tuple");
+                    "intj: _init needs a callable grid_py and a fixed-value tuple");
     return NULL;
   }
 {% endif %}
@@ -1396,17 +1399,21 @@ static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     return NULL;
   }
 {% endif %}
+  bound = (intj_bound_launcher *)PyMem_RawCalloc(1, sizeof *bound);
+  if (!bound)
+    return PyErr_NoMemory();
+  INTJ_RWLOCK_INIT(&bound->lock);
+  bound->st = st;
 #ifdef __cplusplus
   try {
 #endif
-    bound->module = Py_NewRef(self);
     bound->compile_cb = Py_NewRef(callback);
     bound->intern = Py_NewRef(interner);
     {
       /* optional: the type the object table keys by `name` (tl.dtype) */
       PyObject *dtype_type = PyObject_GetAttrString(interner, "dtype_type");
       if (dtype_type && PyType_Check(dtype_type))
-        INTJ_TAIL(bound)->objtab.dtype_type = dtype_type;
+        bound->objtab.dtype_type = dtype_type;
       else if (dtype_type)
         Py_DECREF(dtype_type);
       else if (PyErr_ExceptionMatches(PyExc_AttributeError))
@@ -1470,17 +1477,19 @@ static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
     }
     INTJ_ASSUME(valid_{{ i }});
 {% endif %}
-    INTJ_TAIL(bound)->pointer_bits[{{ p.bound_slot }}] = decoded_{{ i }}.bits;
+    bound->pointer_bits[{{ p.bound_slot }}] = decoded_{{ i }}.bits;
     if (!PyLong_CheckExact(args[{{ p.init_arg }}]))
-      INTJ_TAIL(bound)->owners[{{ p.bound_slot }}] = Py_NewRef(args[{{ p.init_arg }}]);
+      bound->owners[{{ p.bound_slot }}] = Py_NewRef(args[{{ p.init_arg }}]);
 {% endif %}
 {% endfor %}
     PyObject *entry = PyLong_FromVoidPtr((void *)intj_bound_entry);
     if (!entry)
       goto fail;
-    bound->traverse = intj_bound_traverse;
-    bound->clear = intj_bound_clear;
-    bound->state = st; /* last: the entry reads it first */
+    h->ops = &intj_ops;
+    Py_BEGIN_CRITICAL_SECTION((PyObject *)h);
+    h->module = Py_NewRef(self);
+    Py_END_CRITICAL_SECTION();
+    h->state = bound; /* last: the entry reads it first */
     return entry;
 #ifdef __cplusplus
   } catch (const std::bad_alloc &) {
@@ -1492,82 +1501,67 @@ static PyObject *init_bound(PyObject *self, PyObject *const *args, Py_ssize_t na
   }
 #endif
 fail:
-  intj_bound_clear((PyObject *)bound); /* drops whatever was filled; the header stays unbuilt */
+  if (bound)
+    intj_release(bound); /* drops whatever was filled; the launcher stays unbuilt */
   return NULL;
 }
 
 static PyObject *header_size(PyObject *self, PyObject *unused) {
   (void)self;
   (void)unused;
-  return PyLong_FromSize_t(sizeof(intj_bound_header));
+  return PyLong_FromSize_t(sizeof(intj_launcher));
 }
 
 /* Debug/test entry point: the spec key intj would compute for these arguments,
  * without compiling or launching anything.  Used by the differential tests to
  * assert that intj's key is never coarser than triton's specialization. */
-static PyObject *spec_key(PyObject *self, PyObject *const *args,
-                          Py_ssize_t nargs) {
-  intj_state *st = (intj_state *)PyModule_GetState(self);
+static PyObject *intj_spec_key(void *state, PyObject *const *args, Py_ssize_t nargs) {
+  intj_bound_launcher *bound = (intj_bound_launcher *)state;
+  intj_state *st = (intj_state *)bound->st;
   int64_t device = 0;
-  if (!st->abi.ready) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: set_torch_version has not been called");
-    return NULL;
-  }
-  if (nargs != 2 + INTJ_NDYN + INTJ_NPARAMS || !PyCFunction_Check(args[0]) ||
-      !PyLong_CheckExact(args[1]) || intj_as_i64(args[1], &device) != 0 ||
-      device < 0 || device > 255) {
+  if (nargs != 1 + INTJ_NDYN + INTJ_NPARAMS || !PyLong_CheckExact(args[0]) ||
+      intj_as_i64(args[0], &device) != 0 || device < 0 || device > 255) {
     PyErr_Format(PyExc_TypeError,
-                 "intj: spec_key(launcher, device, *%d dynamic values, *%d public args)",
+                 "intj: spec_key(device, *%d dynamic values, *%d public args)",
                  INTJ_NDYN, INTJ_NPARAMS);
     return NULL;
   }
-  PyObject *owner = PyCFunction_GET_SELF(args[0]);
-  if (!owner || Py_TYPE(owner)->tp_basicsize != (Py_ssize_t)sizeof(intj_bound_header) ||
-      ((intj_bound_launcher *)owner)->module != self) {
-    PyErr_SetString(PyExc_TypeError, "intj: spec_key needs a built launcher of this module");
-    return NULL;
-  }
-  intj_bound_launcher *bound = (intj_bound_launcher *)owner;
   uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
 {% if tuned %}
   int64_t comp[{{ comp_len }}];
 {% endif %}
-  if (intj_pack(st, args + 2, args + 2 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound{{ ', comp' if tuned }}) != 0)
+  if (intj_pack(st, args + 1, args + 1 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound{{ ', comp' if tuned }}) != 0)
     return NULL;
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)INTJ_KEY_BYTES, np);
 }
 
 {% if tuned %}
 /* Debug: the key of every level this call would walk, and whether its final
- * record exists.  key_chain(launcher, device, *dynamic, *public_args) -> ((bytes, ...), found) */
-static PyObject *key_chain(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
-  intj_state *st = (intj_state *)PyModule_GetState(self);
+ * record exists.  key_chain(device, *dynamic, *public_args) -> ((bytes, ...), found) */
+static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t nargs) {
+  intj_bound_launcher *bound = (intj_bound_launcher *)state;
+  intj_state *st = (intj_state *)bound->st;
   int64_t device = 0;
-  if (nargs != 2 + INTJ_NDYN + INTJ_NPARAMS || !PyCFunction_Check(args[0]) ||
-      !PyLong_CheckExact(args[1]) || intj_as_i64(args[1], &device) != 0 ||
-      device < 0 || device > 255) {
-    PyErr_SetString(PyExc_TypeError, "intj: key_chain(launcher, device, *dynamic, *public_args)");
+  if (nargs != 1 + INTJ_NDYN + INTJ_NPARAMS || !PyLong_CheckExact(args[0]) ||
+      intj_as_i64(args[0], &device) != 0 || device < 0 || device > 255) {
+    PyErr_SetString(PyExc_TypeError, "intj: key_chain(device, *dynamic, *public_args)");
     return NULL;
   }
-  PyObject *owner = PyCFunction_GET_SELF(args[0]);
-  if (!owner || Py_TYPE(owner)->tp_basicsize != (Py_ssize_t)sizeof(intj_bound_header) ||
-      ((intj_bound_launcher *)owner)->module != self ||
-      !((intj_bound_launcher *)owner)->cache_ready) {
-    PyErr_SetString(PyExc_TypeError, "intj: key_chain needs a live launcher of this module");
+  if (!bound->cache_ready) {
+    PyErr_SetString(PyExc_TypeError, "intj: key_chain needs a live launcher");
     return NULL;
   }
-  intj_bound_launcher *bound = (intj_bound_launcher *)owner;
   uint64_t key[INTJ_NWORDS];
   uint64_t vals[INTJ_NSLOTS];
   int64_t comp[{{ comp_len }}];
   int64_t dep[{{ dep_len }}];
   int np = 0;
-  if (intj_pack(st, args + 2, args + 2 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp) != 0)
+  if (intj_pack(st, args + 1, args + 1 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp) != 0)
     return NULL;
   int missed = 0;
-  intj_final *kernel = intj_walk(st, bound, args + 2 + INTJ_NDYN, key, comp, dep, &missed);
+  intj_final *kernel = intj_walk(st, bound, args + 1 + INTJ_NDYN, key, comp, dep, &missed);
   if (kernel)
     INTJ_RWUNLOCK(&bound->lock);
   else if (missed < 0)
@@ -1593,7 +1587,7 @@ static PyObject *key_chain(PyObject *self, PyObject *const *args, Py_ssize_t nar
 }
 {% endif %}
 
-/* set_torch_version((major, minor), layout, dtype_index) -- install the torch ABI.
+/* _set_torch_version((major, minor), layout, dtype_index) -- install the torch ABI.
  *
  * RUNTIME_SHIM installs offsets from the torch running now. STATIC_COMPILE can
  * check its compiled cdata offset against that layout when one is verified;
@@ -1607,14 +1601,14 @@ static PyObject *key_chain(PyObject *self, PyObject *const *args, Py_ssize_t nar
  * race one.  The launcher calls it once, under its load lock, before the module
  * is reachable.
  */
-static PyObject *set_torch_version(PyObject *self, PyObject *const *args,
+static PyObject *intj_set_torch_version(PyObject *self, PyObject *const *args,
                                    Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   PyObject *layout;
   if (nargs != 3) {
     PyErr_SetString(
         PyExc_TypeError,
-        "intj: set_torch_version takes (version, layout, dtype_index)");
+        "intj: _set_torch_version takes (version, layout, dtype_index)");
     return NULL;
   }
   layout = args[1];
@@ -1833,13 +1827,9 @@ static int intj_clear(PyObject *m) {
 }
 
 static PyMethodDef intj_methods[] = {
-    {"init_bound", (PyCFunction)(void (*)(void))init_bound, METH_FASTCALL, NULL},
-    {"header_size", header_size, METH_NOARGS, NULL},
-    {"spec_key", (PyCFunction)(void (*)(void))spec_key, METH_FASTCALL, NULL},
-{% if tuned %}
-    {"key_chain", (PyCFunction)(void (*)(void))key_chain, METH_FASTCALL, NULL},
-{% endif %}
-    {"set_torch_version", (PyCFunction)(void (*)(void))set_torch_version,
+    {"_init", (PyCFunction)(void (*)(void))intj_init, METH_FASTCALL, NULL},
+    {"_header_size", header_size, METH_NOARGS, NULL},
+    {"_set_torch_version", (PyCFunction)(void (*)(void))intj_set_torch_version,
      METH_FASTCALL, NULL},
     {NULL, NULL, 0, NULL}};
 

@@ -263,12 +263,14 @@ def _launcher_module(launcher):
 
 def _launcher_over(module):
     """A built, binding-free launcher of `module`, for its `spec_key`."""
-    from intj.launcher import _Interner, _launcher_compile, _stub, _tail_bytes
+    from intj.launcher import _Interner, _launcher_compile, _stub
 
-    launch = _stub().new_launcher(
-        _tail_bytes(0, 0),
-        b"",
-        lambda h: module.init_bound(h, _launcher_compile(module), _Interner()),
+    stub = _stub()
+    launch = stub.new_launcher(
+        stub.Launcher,
+        None,
+        None,
+        lambda h: module._init(h, _launcher_compile(module), _Interner()),
     )
     module_of(launch)
     return launch
@@ -1427,7 +1429,7 @@ def test_binding_checked_source_checks_only_where_values_change(
             )
         ]
         bind = source[
-            source.index("static PyObject *init_bound") : source.index(
+            source.index("static PyObject *intj_init") : source.index(
                 "/* Debug/test entry"
             )
         ]
@@ -1817,7 +1819,7 @@ def test_bind_native_failure_releases_partial_owners(bound_kernel, mode):
     assert getattr(tensor, "_use_count")() == native
     module = module_of(factory.bind(x=None, p=0))
     with pytest.raises(TypeError, match="arguments"):
-        module.init_bound(tensor)
+        module._init(tensor)
 
 
 def test_bind_hot_fastcall_creates_no_python_frame(pointer_kernel):
@@ -1871,7 +1873,7 @@ def test_power_of_two_or_zero_encoding(power_kernel, value, encoded):
         no_gpu=True,
     )
     module = module_of(launch)
-    key, slots = module.spec_key(launch, 0, value)
+    key, slots = launch.__self__.spec_key(0, value)
     assert key == bytes((encoded,)) + bytes(7)
     assert slots == 0
 
@@ -1892,10 +1894,10 @@ def test_power_of_two_full_signed_domain(power_kernel, annotation):
     )
     module = module_of(launch)
     values = [0] + [sign * 2**exponent for sign in (1, -1) for exponent in range(64)]
-    assert len({module.spec_key(launch, 0, value) for value in values}) == 129
+    assert len({launch.__self__.spec_key(0, value) for value in values}) == 129
     for bad in (3, -3, True, 1.0, None):
         with pytest.raises(ValueError, match="N"):
-            module.spec_key(launch, 0, bad)
+            launch.__self__.spec_key(0, bad)
 
 
 @pytest.mark.parametrize("signed", [False, True])
@@ -1912,14 +1914,14 @@ def test_typed_constexpr_integer_widths(power_kernel, signed, width):
     )
     module = module_of(launch)
     for value in (low, high):
-        key, slots = module.spec_key(launch, 0, value)
+        key, slots = launch.__self__.spec_key(0, value)
         payload = value.to_bytes(width // 8, "little", signed=signed)
         assert key == payload + bytes(len(key) - len(payload))
         assert slots == 0
         assert launch(0, 0, 1, value) is None
     for value in (low - 1, high + 1, True, 1.0, None):
         with pytest.raises((TypeError, OverflowError), match="N"):
-            module.spec_key(launch, 0, value)
+            launch.__self__.spec_key(0, value)
         with pytest.raises((TypeError, OverflowError), match="N"):
             launch(0, 0, 1, value)
 
@@ -1941,13 +1943,13 @@ def test_bare_constexpr_preserves_descriptor_and_binary64(power_kernel, annotati
         (1.0 + 2**-52, 142, struct.pack("<d", 1.0 + 2**-52)),
     ]
     for value, descriptor, payload in values:
-        assert module.spec_key(launch, 0, value) == (
+        assert launch.__self__.spec_key(0, value) == (
             payload + bytes((descriptor,)) + bytes(7),
             0,
         )
-    assert len({module.spec_key(launch, 0, value)[0] for value, _, _ in values}) == len(
-        values
-    )
+    assert len(
+        {launch.__self__.spec_key(0, value)[0] for value, _, _ in values}
+    ) == len(values)
 
 
 @pytest.mark.parametrize(
@@ -1968,13 +1970,13 @@ def test_constexpr_type_list_selects_smallest_then_name(power_kernel, choices):
     # i8 wins the equal-width tie; u8 wins over i16 where i8 no longer fits.
     for value, code in [(-1, 144), (127, 144), (128, 146), (256, 148), (2**63, 132)]:
         payload = (value % 2**64).to_bytes(8, "little")
-        assert module.spec_key(launch, 0, value) == (
+        assert launch.__self__.spec_key(0, value) == (
             payload + bytes((code,)) + bytes(7),
             0,
         )
     for bad in (True, 1.0, None, -32769):
         with pytest.raises(TypeError, match="N.*type"):
-            module.spec_key(launch, 0, bad)
+            launch.__self__.spec_key(0, bad)
 
 
 def test_constexpr_type_list_distinguishes_python_kinds(power_kernel):
@@ -1991,7 +1993,7 @@ def test_constexpr_type_list_distinguishes_python_kinds(power_kernel):
         (0, 144, bytes(8)),
         (0.0, 143, bytes(8)),
     ]:
-        assert module.spec_key(launch, 0, value) == (
+        assert launch.__self__.spec_key(0, value) == (
             payload + bytes((code,)) + bytes(7),
             0,
         )
@@ -2011,7 +2013,7 @@ def test_constexpr_byte_list_uses_placed_descriptor_and_payload(power_kernel):
         (-1, 144, 255),
         (128, 146, 128),
     ]:
-        assert module.spec_key(launch, 0, value) == (
+        assert launch.__self__.spec_key(0, value) == (
             bytes((code, payload)) + bytes(6),
             0,
         )
@@ -2025,7 +2027,7 @@ def test_constexpr_exact_none_stays_public(power_kernel):
         no_gpu=True,
     )
     module = module_of(launch)
-    assert module.spec_key(launch, 0, None) == (bytes(8), 0)
+    assert launch.__self__.spec_key(0, None) == (bytes(8), 0)
     assert launch(0, 0, 1, None) is None
     with pytest.raises(TypeError, match="arguments"):
         launch(0, 0, 1)
@@ -2043,7 +2045,7 @@ def test_baked_constexpr_removes_public_value_and_key(bound_kernel, value):
         no_gpu=True,
     )
     assert launch(0, 0, 1, 7, 17) is None
-    assert module_of(launch).spec_key(launch, 0, 7, 17) == (
+    assert launch.__self__.spec_key(0, 7, 17) == (
         bytes((128, 128)) + bytes(6),
         2,
     )
@@ -2068,7 +2070,7 @@ def test_typed_constexpr_bool_and_float_bits(power_kernel, annotation, values):
     module = module_of(launch)
     keys = []
     for value in values:
-        key, slots = module.spec_key(launch, 0, value)
+        key, slots = launch.__self__.spec_key(0, value)
         payload = (
             bytes((int(value),)) if type(value) is bool else struct.pack("<d", value)
         )
@@ -2077,7 +2079,7 @@ def test_typed_constexpr_bool_and_float_bits(power_kernel, annotation, values):
         keys.append(key)
     assert len(set(keys)) == len(keys)
     with pytest.raises(TypeError, match="N.*type"):
-        module.spec_key(launch, 0, 1)
+        launch.__self__.spec_key(0, 1)
 
 
 def test_constexpr_binary64_preserves_nonfinite_bits(power_kernel):
@@ -2096,7 +2098,7 @@ def test_constexpr_binary64_preserves_nonfinite_bits(power_kernel):
     ):
         payload = bits.to_bytes(8, "little")
         (value,) = struct.unpack("<d", payload)
-        assert module.spec_key(launch, 0, value) == (payload + bytes(8), 0)
+        assert launch.__self__.spec_key(0, value) == (payload + bytes(8), 0)
 
 
 @pytest.mark.parametrize("name", [name for name in tl.dtype.FP_TYPES if name != "fp64"])
@@ -2130,7 +2132,7 @@ def test_power_of_two_checked_before_cache_lookup(power_kernel, dtype, bad):
         with pytest.raises(ValueError, match="N"):
             launch(0, 0, 1, value)
         with pytest.raises(ValueError, match="N"):
-            module_of(launch).spec_key(launch, 0, value)
+            launch.__self__.spec_key(0, value)
 
 
 def test_power_of_two_unchecked_can_alias_but_keeps_structural_checks(power_kernel):
@@ -2140,12 +2142,12 @@ def test_power_of_two_unchecked_can_alias_but_keeps_structural_checks(power_kern
         no_gpu=True,
     )
     module = module_of(launch)
-    assert module.spec_key(launch, 0, 1) == module.spec_key(launch, 0, 3)
+    assert launch.__self__.spec_key(0, 1) == launch.__self__.spec_key(0, 3)
     for value in (3, -3, 128, True, 1.0, None):
         assert launch(0, 0, 1, value) is None
     for bad in (object(), torch.empty(1), 2**64, -(2**63) - 1):
         with pytest.raises((TypeError, OverflowError), match="N"):
-            module.spec_key(launch, 0, bad)
+            launch.__self__.spec_key(0, bad)
 
 
 @pytest.mark.parametrize("verify", [False, True])
@@ -2253,7 +2255,7 @@ def test_checked_ordinary_integer_widths(scalar_kernel, signed, width):
     )
     for value in (low, high):
         assert launch(0, 0, 1, value) is None
-        assert module_of(launch).spec_key(launch, 0, value)[1] == 1
+        assert launch.__self__.spec_key(0, value)[1] == 1
     for value in (low - 1, high + 1, True, 1.0, None):
         with pytest.raises((TypeError, ValueError, OverflowError), match="x"):
             launch(0, 0, 1, value)
@@ -2321,7 +2323,7 @@ def test_checked_ordinary_pointer_null_and_dtype(pointer_kernel, mode):
     )
     for value in (None, 0, torch.empty(4)):
         assert launch(0, 0, 1, value) is None
-        assert module_of(launch).spec_key(launch, 0, value)[1] == 1
+        assert launch.__self__.spec_key(0, value)[1] == 1
     for value in (True, 1, -1, 0.0, torch.empty(4, dtype=torch.int32)):
         with pytest.raises((TypeError, ValueError), match="x"):
             launch(0, 0, 1, value)
@@ -2355,13 +2357,13 @@ def test_ordinary_unannotated_none_and_never(scalar_kernel):
         no_gpu=True,
     )
     never = module_of(never_launch)
-    assert auto.spec_key(launch, 0, None)[1] == 0
-    assert auto.spec_key(launch, 0, 0)[1] == 1
-    assert len({auto.spec_key(launch, 0, value) for value in (1, 16, 17)}) == 3
-    assert len({never.spec_key(never_launch, 0, value) for value in (1, 16, 17)}) == 1
+    assert launch.__self__.spec_key(0, None)[1] == 0
+    assert launch.__self__.spec_key(0, 0)[1] == 1
+    assert len({launch.__self__.spec_key(0, value) for value in (1, 16, 17)}) == 3
+    assert len({never_launch.__self__.spec_key(0, value) for value in (1, 16, 17)}) == 1
     tensor = torch.empty(8)
-    assert never.spec_key(never_launch, 0, tensor) == never.spec_key(
-        never_launch, 0, tensor[1:]
+    assert never_launch.__self__.spec_key(0, tensor) == never_launch.__self__.spec_key(
+        0, tensor[1:]
     )
 
 
@@ -2380,9 +2382,7 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
             torch_access_mode=TorchAccessMode.INTERPRETER,
         )
         baseline = module_of(launch)
-        assert baseline.spec_key(launch, 0, small) == baseline.spec_key(
-            launch, 0, large
-        )
+        assert launch.__self__.spec_key(0, small) == launch.__self__.spec_key(0, large)
         key = next(key for key, module in _LOADED.items() if module is baseline)
         ranged_key = dataclasses.replace(key, spec_pointer_range=1)
         ranged = _loaded_module(
@@ -2394,13 +2394,13 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
             {},
         )
         ranged_launch = _launcher_over(ranged)
-        small_key = ranged.spec_key(ranged_launch, 0, small)
-        large_key = ranged.spec_key(ranged_launch, 0, large)
+        small_key = ranged_launch.__self__.spec_key(0, small)
+        large_key = ranged_launch.__self__.spec_key(0, large)
         if specialization is AUTO:
             assert small_key != large_key
-            assert large_key == baseline.spec_key(launch, 0, large)
+            assert large_key == launch.__self__.spec_key(0, large)
         else:
-            assert small_key == large_key == baseline.spec_key(launch, 0, small)
+            assert small_key == large_key == launch.__self__.spec_key(0, small)
 
 
 def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
@@ -2418,7 +2418,7 @@ def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
         verify_annotation=True,
         no_gpu=True,
     )
-    assert module_of(equal).spec_key(equal, 0, 1)[1] == 0
+    assert equal.__self__.spec_key(0, 1)[1] == 0
     with pytest.raises(ValueError, match="x.*equal_to_one"):
         equal(0, 0, 1, 2)
     pointer = make_launcher(
@@ -2432,7 +2432,7 @@ def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
         verify_annotation=True,
         no_gpu=True,
     )
-    assert module_of(pointer).spec_key(pointer, 0, torch.empty(8)) == (bytes(8), 1)
+    assert pointer.__self__.spec_key(0, torch.empty(8)) == (bytes(8), 1)
     with pytest.raises(ValueError, match="x.*aligned_16"):
         pointer(0, 0, 1, torch.empty(8)[1:])
     # CPU empty storage is virtual; the test never touches these bytes.
@@ -2448,7 +2448,7 @@ def test_baked_argument_removes_public_value_and_key(bound_kernel, value, slots)
         no_gpu=True,
     )
     assert launch(0, 0, 1, 7, 17) is None
-    blob, count = module_of(launch).spec_key(launch, 0, 7, 17)
+    blob, count = launch.__self__.spec_key(0, 7, 17)
     assert count == slots
     assert len(blob) == 8
     assert blob[2:] == bytes(6)
@@ -2469,7 +2469,7 @@ def test_baked_argument_preserves_float_bits(scalar_kernel, value, bits):
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
     assert launch(0, 0, 1) is None
-    assert module_of(launch).spec_key(launch, 0) == (bytes(8), 1)
+    assert launch.__self__.spec_key(0) == (bytes(8), 1)
     path = pathlib.Path(str(module_of(launch).__file__))
     assert f"UINT64_C(0x{bits})" in path.with_name("scalar_kernel.c").read_text()
 
@@ -3169,10 +3169,10 @@ def test_int_boundaries_match_triton(axpy_launcher):
             spec = repr(triton_specialization(axpy, args)[3])
         except OverflowError:
             with pytest.raises(OverflowError):
-                module.spec_key(axpy_launcher, 0, *args)
+                axpy_launcher.__self__.spec_key(0, *args)
             continue
 
-        key, _ = module.spec_key(axpy_launcher, 0, *args)
+        key, _ = axpy_launcher.__self__.spec_key(0, *args)
         previous = seen.setdefault(key, (spec, value))
         assert previous[0] == spec, (
             f"{previous[1]} and {value} share a key, {previous[0]} != {spec}"
@@ -3262,7 +3262,7 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
 
     seen = {}
     for args in cases:
-        key, nparams = module.spec_key(launch, 0, *args)
+        key, nparams = launch.__self__.spec_key(0, *args)
         source = _compiler_input(jit, params, args, backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
@@ -3323,7 +3323,7 @@ def test_python_annotated_params_compile_like_triton():
         assert dict(source.values) == {
             (i,): args[i] for i, (ty, _) in enumerate(spec) if ty == "constexpr"
         }, args
-        key, _ = module.spec_key(launch, 0, *args)
+        key, _ = launch.__self__.spec_key(0, *args)
         assert seen.setdefault(key, source) == source, args
 
 
@@ -3457,7 +3457,7 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     ]
     seen, keys = {}, set()
     for value in values:
-        key, _ = module.spec_key(launch, 0, o, 2.0, value)
+        key, _ = launch.__self__.spec_key(0, o, 2.0, value)
         source = _compiler_input(act_store, params, (o, 2.0, value), backend)
         assert seen.setdefault(key, source) == source, value
         keys.add(key)
@@ -3600,8 +3600,8 @@ def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
     assert o.item() == 9.0 and four.metadata.num_warps == 4
     assert two is not four
 
-    key_two, _ = module.spec_key(bound, 0, 2, o, _twice)
-    key_four, _ = module.spec_key(bound, 0, 4, o, _twice)
+    key_two, _ = bound.__self__.spec_key(0, 2, o, _twice)
+    key_four, _ = bound.__self__.spec_key(0, 4, o, _twice)
     assert key_two != key_four
 
     # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
@@ -3690,17 +3690,15 @@ def test_alternating_objects_skip_the_interner(monkeypatch):
     act, cast = make_launcher(act_store), make_launcher(cast_store)
     act_module, cast_module = module_of(act), module_of(cast)
     o = torch.zeros(1, device="cuda")
-    neg, pos = (act_module.spec_key(act, 0, o, 2.0, v)[0] for v in ("neg", "pos"))
-    i32, f32 = (
-        cast_module.spec_key(cast, 0, o, 2.0, v)[0] for v in (tl.int32, tl.float32)
-    )
+    neg, pos = (act.__self__.spec_key(0, o, 2.0, v)[0] for v in ("neg", "pos"))
+    i32, f32 = (cast.__self__.spec_key(0, o, 2.0, v)[0] for v in (tl.int32, tl.float32))
     assert neg != pos and i32 != f32 and len(calls) == 4
     del calls[:]
     for _ in range(5):
-        assert act_module.spec_key(act, 0, o, 2.0, "neg")[0] == neg
-        assert act_module.spec_key(act, 0, o, 2.0, "pos")[0] == pos
-        assert cast_module.spec_key(cast, 0, o, 2.0, tl.int32)[0] == i32
-        assert cast_module.spec_key(cast, 0, o, 2.0, tl.float32)[0] == f32
+        assert act.__self__.spec_key(0, o, 2.0, "neg")[0] == neg
+        assert act.__self__.spec_key(0, o, 2.0, "pos")[0] == pos
+        assert cast.__self__.spec_key(0, o, 2.0, tl.int32)[0] == i32
+        assert cast.__self__.spec_key(0, o, 2.0, tl.float32)[0] == f32
     assert calls == []
     for act_value, want in (("neg", -2.0), ("pos", 2.0), ("neg", -2.0)):
         act(*_gpu_controls(), o, 2.0, act_value)
@@ -3720,15 +3718,15 @@ def test_equal_strs_share_an_id_in_c(monkeypatch):
     wide = "\u043d\u0435\u0433"  # a 2-byte-kind str
     wider = "\U0001f600x"  # a 4-byte-kind str
     known = ("neg", "pos", wide, wider)
-    keys = {v: module.spec_key(launch, 0, o, 2.0, v)[0] for v in known}
+    keys = {v: launch.__self__.spec_key(0, o, 2.0, v)[0] for v in known}
     del calls[:]
     for value in known:
         again = "".join(list(value))  # equal content, another object
         assert again is not value
-        assert module.spec_key(launch, 0, o, 2.0, again)[0] == keys[value]
+        assert launch.__self__.spec_key(0, o, 2.0, again)[0] == keys[value]
     assert calls == []
     for other in ("gen", "\u0433\u0435\u043d"):  # same length and kind as a known str
-        key = module.spec_key(launch, 0, o, 2.0, other)[0]
+        key = launch.__self__.spec_key(0, o, 2.0, other)[0]
         assert key not in keys.values()
     assert len(calls) == 2
 
@@ -3742,7 +3740,7 @@ def test_equal_hash_different_content_is_another_str(monkeypatch):
     launch = make_launcher(act_store)
     module = module_of(launch)
     o = torch.zeros(1, device="cuda")
-    neg = module.spec_key(launch, 0, o, 2.0, "neg")[0]
+    neg = launch.__self__.spec_key(0, o, 2.0, "neg")[0]
     forged = "".join(["g", "e", "n"])
     hash(forged)  # fill the cache, then overwrite it
     # PyASCIIObject: PyObject_HEAD, Py_ssize_t length, Py_hash_t hash (3.8-3.14,
@@ -3752,7 +3750,7 @@ def test_equal_hash_different_content_is_another_str(monkeypatch):
     )
     assert hash(forged) == hash("neg")
     del calls[:]
-    assert module.spec_key(launch, 0, o, 2.0, forged)[0] != neg
+    assert launch.__self__.spec_key(0, o, 2.0, forged)[0] != neg
     assert calls == ["gen"]
 
 
@@ -3766,21 +3764,21 @@ def test_fresh_dtype_objects_hit_by_name(monkeypatch):
     launch = make_launcher(act_store)
     module = module_of(launch)
     o = torch.zeros(1, device="cuda")
-    fp16 = module.spec_key(launch, 0, o, 2.0, tl.float16)[0]
-    fp32 = module.spec_key(launch, 0, o, 2.0, tl.float32)[0]
+    fp16 = launch.__self__.spec_key(0, o, 2.0, tl.float16)[0]
+    fp32 = launch.__self__.spec_key(0, o, 2.0, tl.float32)[0]
     del calls[:]
     refs = []
     for _ in range(5):
         for name, key in (("fp16", fp16), ("fp32", fp32)):
             fresh = tl.dtype(name)
             assert fresh is not tl.float16 and fresh is not tl.float32
-            assert module.spec_key(launch, 0, o, 2.0, fresh)[0] == key
+            assert launch.__self__.spec_key(0, o, 2.0, fresh)[0] == key
             refs.append(weakref.ref(fresh))
             del fresh
     assert calls == []
     gc.collect()
     assert sum(r() is not None for r in refs) == 1  # the memo's, nothing else
-    assert module.spec_key(launch, 0, o, 2.0, "fp16")[0] not in (fp16, fp32)
+    assert launch.__self__.spec_key(0, o, 2.0, "fp16")[0] not in (fp16, fp32)
     assert calls == ["fp16"]
 
 
@@ -3796,13 +3794,13 @@ def test_object_table_references_die_with_the_launcher(monkeypatch):
     o = torch.zeros(1, device="cuda")
     dt = tl.dtype("int32")
     assert dt is not tl.int32
-    key = module.spec_key(launch, 0, o, 2.0, dt)[0]
-    module.spec_key(launch, 0, o, 2.0, tl.float32)  # the memo moves on
+    key = launch.__self__.spec_key(0, o, 2.0, dt)[0]
+    launch.__self__.spec_key(0, o, 2.0, tl.float32)  # the memo moves on
     dt_ref, launch_ref = weakref.ref(dt), weakref.ref(launch)
     del dt
     gc.collect()
     assert dt_ref() is not None  # the table holds it
-    assert module.spec_key(launch, 0, o, 2.0, tl.int32)[0] == key
+    assert launch.__self__.spec_key(0, o, 2.0, tl.int32)[0] == key
     launcher._LOADED.clear()
     del launch, module
     gc.collect()
@@ -4032,7 +4030,7 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
     module = module_of(launch)
     seen = {}
     for value in values:
-        key, nparams = module.spec_key(launch, 0, value)
+        key, nparams = launch.__self__.spec_key(0, value)
         source = _compiler_input(scalar_kernel, params, (value,), backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
@@ -4065,7 +4063,7 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     module = module_of(launch)
     seen = {}
     for value in (None, 0, base, base[1:], large, large[1:]):
-        key, nparams = module.spec_key(launch, 0, value)
+        key, nparams = launch.__self__.spec_key(0, value)
         source = _compiler_input(pointer_kernel, params, (value,), backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
@@ -4231,7 +4229,7 @@ def test_runtime_compiler_input_invariant(
     for group_index, group in enumerate(groups):
         for value in group:
             source = compiler_input(value)
-            blob, slots = _launcher_module(native).spec_key(native, 0, value)
+            blob, slots = native.__self__.spec_key(0, value)
             assert slots == sum(ty != "constexpr" for _, ty in source.signature)
             assert native(*controls, value) is None
             assert saved.setdefault(blob, source) == source, (
@@ -4684,8 +4682,8 @@ options = dict(no_gpu=True, kernel_cache=KernelCache(sys.argv[2]),
                torch_access_mode=TorchAccessMode.INTERPRETER)
 one = make_launcher(module.one, **options)
 two = make_launcher(module.two, **options)
-assert len(module_of(one).spec_key(one, 0, 1)[0]) == 8
-assert len(module_of(two).spec_key(two, 0, 1, 2)[0]) == 16
+assert len(one.__self__.spec_key(0, 1)[0]) == 8
+assert len(two.__self__.spec_key(0, 1, 2)[0]) == 16
 for value in range(8):
     one(0, 0, (1,), value)
     two(0, 0, (1,), value, value + 7)
@@ -5275,7 +5273,7 @@ def test_every_mode_matches_triton_specialization(scale_by_mode):
     seen = {}
     for x in _read_corpus():
         args = (x, o, 1024, 2.0, 128)
-        key = module.spec_key(launcher, 0, *args)
+        key = launcher.__self__.spec_key(0, *args)
         spec = repr(triton_specialization(scale, args))
         assert seen.setdefault(key, spec) == spec, (
             f"key collides for {x.dtype} {x.shape}"
@@ -5293,7 +5291,7 @@ def test_modes_agree_on_every_read():
     o = torch.empty(4096, device="cuda")
     for x in _read_corpus():
         keys = {
-            m: mod.spec_key(k, 0, x, o, 1024, 2.0, 128)
+            m: k.__self__.spec_key(0, x, o, 1024, 2.0, 128)
             for m, (mod, k) in modules.items()
         }
         distinct = set(keys.values())
@@ -5445,7 +5443,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
         0x1234,
         0x42,
     ]
-    blob, np_ = module.spec_key(launch, 0, *args)
+    blob, np_ = launch.__self__.spec_key(0, *args)
 
     assert (len(blob), np_) == (key.nwords * 8, nparams)
     for param in key.params[:nparams]:
@@ -5465,7 +5463,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     for i in range(nparams):
         alt = list(args)
         alt[i] = 16
-        other, _ = module.spec_key(launch, 0, *alt)
+        other, _ = launch.__self__.spec_key(0, *alt)
         offset = key.params[i].annotation.key_fields[0].offset
         assert other[offset] == b_i32 + 1
         assert [b for j, b in enumerate(other) if j != offset] == [
@@ -5500,8 +5498,8 @@ def test_unannotated_key_decode_stays_direct(mode):
         assert "intj_decode_constexpr" not in pack
 
     args = (torch.empty(8), torch.empty(8), 8, 2.0, 16)
-    assert modules[0].spec_key(launchers[0], 0, *args) == modules[1].spec_key(
-        launchers[1], 0, *args
+    assert launchers[0].__self__.spec_key(0, *args) == launchers[1].__self__.spec_key(
+        0, *args
     )
 
 
@@ -5523,7 +5521,7 @@ def test_unsupported_dtype_is_refused_in_every_mode():
             torch.zeros(0, device="cuda", dtype=torch.complex64),
         ):
             with pytest.raises(RuntimeError, match="triton does not take"):
-                module.spec_key(launch, 0, x, o, 1024, 2.0, 128)
+                launch.__self__.spec_key(0, x, o, 1024, 2.0, 128)
 
 
 def test_device_above_255_is_refused(axpy_launcher):
@@ -5716,21 +5714,21 @@ def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
 
 
 def test_unconfigured_module_refuses_to_launch():
-    """`entry` is unreachable before set_torch_version; prove the guard exists."""
+    """`entry` is unreachable before _set_torch_version; prove the guard exists."""
     module = module_of(
         make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
     )
-    assert hasattr(module, "set_torch_version")
+    assert hasattr(module, "_set_torch_version")
     index = dtype_index_table()
     with pytest.raises(ValueError, match="needs a tensor layout"):
-        module.set_torch_version((2, 14), None, index)
+        module._set_torch_version((2, 14), None, index)
     layout = layout_for()
     assert layout is not None
     interpreter = module_of(
         make_launcher(scale, torch_access_mode=TorchAccessMode.INTERPRETER)
     )
     with pytest.raises(ValueError, match="takes no tensor layout"):
-        interpreter.set_torch_version((2, 14), layout.as_args(), index)
+        interpreter._set_torch_version((2, 14), layout.as_args(), index)
 
 
 def test_a_failed_set_torch_version_changes_nothing():
@@ -5749,8 +5747,8 @@ def test_a_failed_set_torch_version_changes_nothing():
 
     def keys():
         return {
-            d: module.spec_key(
-                launch, 0, torch.zeros(64, device="cuda", dtype=d), o, 64, 2.0, 128
+            d: launch.__self__.spec_key(
+                0, torch.zeros(64, device="cuda", dtype=d), o, 64, 2.0, 128
             )
             for d in (torch.float32, torch.float16)
         }
@@ -5768,7 +5766,7 @@ def test_a_failed_set_torch_version_changes_nothing():
         (good.as_args(), bytes([32]) + index[1:]),  # an index past five bits
     ):
         with pytest.raises(ValueError):
-            module.set_torch_version((2, 14), layout, table)
+            module._set_torch_version((2, 14), layout, table)
         # per case, not once at the end: each rejection has its own way of
         # committing early, and one masks the next
         assert keys() == before
@@ -5787,9 +5785,9 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
         module = module_of(make_launcher(scale, torch_access_mode=mode))
         args = layout.as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None
         with pytest.raises(TypeError, match="dtype_index"):
-            module.set_torch_version((2, 14), args)
+            module._set_torch_version((2, 14), args)
         with pytest.raises(ValueError, match="dtype index table"):
-            module.set_torch_version((2, 14), args, b"\xff" * (NDTYPES - 1))
+            module._set_torch_version((2, 14), args, b"\xff" * (NDTYPES - 1))
 
 
 def test_modes_agree_on_rejecting_a_storageless_tensor():
@@ -5806,7 +5804,7 @@ def test_modes_agree_on_rejecting_a_storageless_tensor():
         launch = make_launcher(scale, torch_access_mode=m)
         module = module_of(launch)
         with pytest.raises(RuntimeError):
-            module.spec_key(launch, 0, sparse, o, 1024, 2.0, 128)
+            launch.__self__.spec_key(0, sparse, o, 1024, 2.0, 128)
 
 
 def test_modes_agree_on_tensors_with_unusual_impls():
@@ -5828,7 +5826,7 @@ def test_modes_agree_on_tensors_with_unusual_impls():
 
     for label, t in cases.items():
         keys = {
-            m: mod.spec_key(k, 0, t, o, 1024, 2.0, 128)
+            m: k.__self__.spec_key(0, t, o, 1024, 2.0, 128)
             for m, (mod, k) in modules.items()
         }
         assert len(set(keys.values())) == 1, f"{label}: {keys}"
@@ -5839,7 +5837,7 @@ def test_modes_agree_on_tensors_with_unusual_impls():
         fake = fake_mode.from_tensor(torch.randn(1024, device="cuda"))
     for m, (mod, k) in modules.items():
         with pytest.raises(TypeError):  # a subclass: refused before any read
-            mod.spec_key(k, 0, fake, o, 1024, 2.0, 128)
+            k.__self__.spec_key(0, fake, o, 1024, 2.0, 128)
 
 
 def test_custom_sizes_policy_tensors_are_a_known_limitation():
@@ -5872,11 +5870,13 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
         launch = make_launcher(scale, torch_access_mode=m)
         module = module_of(launch)
         with pytest.raises(RuntimeError):
-            module.spec_key(launch, 0, mkl, o, 16, 2.0, 128)
+            launch.__self__.spec_key(0, mkl, o, 16, 2.0, 128)
 
 
-def test_bound_handles_share_one_header_layout(bound_kernel, device_kernel):
-    """Every bound object is one fixed header plus trailing arrays sized per module."""
+def test_every_launcher_shares_one_fixed_size_object(bound_kernel, device_kernel):
+    """Every launcher object is one fixed-size type; its state lives behind `state`."""
+    from intj.launcher import _stub
+
     pointer = Argument(
         type=tl.pointer_type(tl.float32), specialize=NEVER, bind_value=BindValue.POINTER
     )
@@ -5894,11 +5894,9 @@ def test_bound_handles_share_one_header_layout(bound_kernel, device_kernel):
     ).bind_device(0)
     assert two(0, 0, 1, 7) is None and none(0, 1, 7) is None
     t2, t0 = type(two.__self__), type(none.__self__)
-    assert t2 is t0  # one `_intj_lazy.Launcher` type for every launcher
-    assert t2.__basicsize__ == t0.__basicsize__
-    assert t2.__itemsize__ == t0.__itemsize__ == 1
-    # tail: 16 bytes per memo slot and 24 per bound slot, each at least one
-    assert sys.getsizeof(two.__self__) - sys.getsizeof(none.__self__) == 24
+    assert t2 is t0 and issubclass(t2, _stub().Launcher)
+    assert t2.__basicsize__ == _stub()._header_size()
+    assert t2.__itemsize__ == 0
 
 
 def test_sibling_launchers_compile_once(monkeypatch):
@@ -6198,7 +6196,7 @@ def check_dynamic_invariant():
                 for dt in (tl.float32, tl.float16):
                     for fn in (_twice, _thrice, triton.jit(_twice.fn)):
                         public = (o, x, 64, act, dt, fn, 64)
-                        key, _ = module.spec_key(launch, device, *dyn, *public)
+                        key, _ = launch.__self__.spec_key(device, *dyn, *public)
                         truth = (
                             _compiler_input(dyn_axpy, params, public, backend),
                             canonical,
@@ -6327,7 +6325,7 @@ def check_option_parameter_invariant():
     for warps, stages, block in itertools.product((2, 4), (1, 2), (64, 128)):
         public = (o, x, 64, warps, stages, block)
         options = {"num_warps": warps, "num_stages": stages}
-        key, _ = module.spec_key(launch, device, *public)
+        key, _ = launch.__self__.spec_key(device, *public)
         truth = (
             _compiler_input(option_axpy, params, public, backend),
             _canonical_options(

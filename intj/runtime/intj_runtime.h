@@ -300,7 +300,7 @@ typedef struct {
    * dtype.  Unlike itemsize, every access mode reads this: it is what the key
    * encodes, not how a pointer is computed. */
   uint8_t dtype_index[INTJ_NDTYPES];
-  int ready; /* set_torch_version has run */
+  int ready; /* _set_torch_version has run */
 } intj_torch_abi;
 
 #ifdef INTJ_TORCH_ACCESS_STATIC_COMPILE
@@ -799,7 +799,7 @@ intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
 #define INTJ_BOUND_SLOTS (INTJ_NBOUND ? INTJ_NBOUND : 1)
 #define INTJ_MEMO_SLOTS (INTJ_NMEMO ? INTJ_NMEMO : 1)
 
-typedef intj_bound_header intj_bound_launcher;
+typedef struct intj_launcher_state intj_bound_launcher;
 
 /* An object-valued slot's last object and its interned id. */
 typedef struct {
@@ -832,21 +832,35 @@ typedef struct {
   PyObject *dtype_type; /* the interner's `dtype_type`; NULL: none */
 } intj_objtab;
 
-/* The trailing arrays: memos, one entry per bound parameter, then the object
- * table. */
-typedef struct {
+/* One launcher's state, behind intj_launcher.state: `_init` allocates and
+ * fills it, ops->release frees it.  Hot fields first. */
+struct intj_launcher_state {
+  void *st;               /* the module's intj_state */
+  int64_t device_ordinal; /* bind_device only */
+  int32_t device_handle;  /* bind_device only */
+  int32_t cache_ready;
+  uint64_t cache[3]; /* opaque intj_cache storage, only ever accessed as one */
+  void *
+      fixed_kernel; /* intj_final *: a keyless fixed-device launcher's kernel */
+  /* Cold. */
+  /* callable(value) -> id or None: this launcher's intern table */
+  PyObject *intern;
+  /* this launcher's miss callback (the tuned callback if tuned) */
+  PyObject *compile_cb;
+  intj_rwlock lock; /* guards this launcher's cache, memos and intern writes */
+  PyObject *grid_py;
+  PyObject *grid_hidden;
   intj_memo memo[INTJ_MEMO_SLOTS];
   PyObject *owners[INTJ_BOUND_SLOTS];
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
   void *tensors[INTJ_BOUND_SLOTS]; /* at::Tensor * in STATIC_COMPILE */
-  intj_objtab objtab;              /* cold: last, so the hot offsets hold */
-} intj_bound_tail;
-/* launcher._tail_bytes computes the same size for _intj_lazy's allocation. */
-static_assert(sizeof(intj_bound_tail) ==
-                  32 + 16 * INTJ_MEMO_SLOTS + 24 * INTJ_BOUND_SLOTS,
-              "intj: bound tail layout");
-#define INTJ_TAIL(b)                                                           \
-  ((intj_bound_tail *)((char *)(b) + sizeof(intj_bound_header)))
+  intj_objtab objtab;
+};
+static_assert(offsetof(struct intj_launcher_state, fixed_kernel) +
+                      sizeof(void *) <=
+                  64,
+              "intj: hot fields share the block's first 64 bytes (a span, "
+              "not an aligned line)");
 
 static inline Py_hash_t intj_pointer_hash(PyObject *o) {
   return (Py_hash_t)((uintptr_t)o >> 4);
@@ -949,7 +963,7 @@ static inline void intj_object_remember(intj_bound_launcher *bound,
                                         intj_memo *memo, PyObject *o,
                                         uint64_t value, int same, uint64_t tag,
                                         Py_hash_t hash, PyObject *key) {
-  intj_objtab *t = &INTJ_TAIL(bound)->objtab;
+  intj_objtab *t = &bound->objtab;
   Py_INCREF(o);
   if (same)
     Py_INCREF(o);
@@ -973,7 +987,7 @@ static inline int intj_objtab_lookup(intj_bound_launcher *bound, uint64_t tag,
                                      Py_hash_t hash, PyObject *key,
                                      uint64_t *value) {
   INTJ_RDLOCK(&bound->lock);
-  intj_objent *e = intj_objtab_find(&INTJ_TAIL(bound)->objtab, tag, hash, key);
+  intj_objent *e = intj_objtab_find(&bound->objtab, tag, hash, key);
   if (e)
     *value = e->id;
   INTJ_RWUNLOCK(&bound->lock);
@@ -990,7 +1004,7 @@ static inline int intj_objtab_lookup(intj_bound_launcher *bound, uint64_t tag,
 static inline int intj_object_id_slow(intj_bound_launcher *bound,
                                       intj_memo *memo, PyObject *o,
                                       const char *pname, uint64_t *id) {
-  intj_objtab *t = &INTJ_TAIL(bound)->objtab;
+  intj_objtab *t = &bound->objtab;
   uint64_t value = 0;
   uint64_t tag = INTJ_OBJ_SAME; /* the content key's tag; SAME: none */
   PyObject *key = NULL;         /* owned: the str keyed by content */
@@ -1002,7 +1016,7 @@ static inline int intj_object_id_slow(intj_bound_launcher *bound,
     if (intj_objtab_lookup(bound, INTJ_OBJ_SAME, intj_pointer_hash(o), o,
                            &value))
       goto hit;
-    /* dtype_type: set by init_bound, dropped only by tp_clear */
+    /* dtype_type: set by _init, dropped only by release */
     if (t->dtype_type && PyObject_TypeCheck(o, (PyTypeObject *)t->dtype_type)) {
       key = PyObject_GetAttr(o, intj_str_name);
       if (!key)
@@ -1027,8 +1041,8 @@ static inline int intj_object_id_slow(intj_bound_launcher *bound,
     }
   }
   {
-    /* never NULL: init_bound sets it before publishing the launcher, and only
-     * tp_clear drops it, after the entry and spec_key stop reaching it */
+    /* never NULL: _init sets it before publishing the state block, and only
+     * release drops it, after the entry and spec_key stop reaching it */
     PyObject *r = PyObject_CallFunctionObjArgs(bound->intern, o, NULL);
     if (!r)
       goto fail;
@@ -1088,7 +1102,7 @@ static INTJ_ALWAYS_INLINE int intj_decode_value(PyObject *o, const char *pname,
   return intj_object_id(bound, memo, o, pname, &out->bits);
 }
 
-/* The header's cache storage, typed.  Never accessed any other way.  The
+/* The state block's cache storage, typed.  Never accessed any other way.  The
  * rendered module asserts that intj_cache fits, after defining it. */
 #define INTJ_BOUND_CACHE_OF(b) ((intj_cache *)(void *)(b)->cache)
 
@@ -1109,10 +1123,10 @@ static inline int intj_bind_tensor(intj_bound_launcher *bound, int index,
       PyErr_NoMemory();
       return -1;
     }
-    INTJ_TAIL(bound)->tensors[index] = tensor;
+    bound->tensors[index] = tensor;
   }
 #else
-  INTJ_TAIL(bound)->owners[index] = Py_NewRef(value);
+  bound->owners[index] = Py_NewRef(value);
 #endif
   return 0;
 }
@@ -1124,7 +1138,7 @@ intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
                          intj_decoded *out) {
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
   memset(out, 0, sizeof(*out));
-  at::Tensor *tensor = (at::Tensor *)INTJ_TAIL(bound)->tensors[index];
+  at::Tensor *tensor = (at::Tensor *)bound->tensors[index];
   if (!tensor) {
     out->kind = INTJ_VALUE_NONE;
     return 0;
@@ -1139,8 +1153,7 @@ intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
   return intj_finish_tensor(abi, dtype, pname, out);
 #else
   return intj_decode_argument(abi, tensor_type, param_type,
-                              INTJ_TAIL(bound)->owners[index], want_size, pname,
-                              out);
+                              bound->owners[index], want_size, pname, out);
 #endif
 }
 

@@ -126,9 +126,9 @@ def bench_readme(iters, batches):
     ):
         start = time.perf_counter_ns()
         keyed = make_launcher(noop, torch_access_mode=mode)
-        module = module_of(keyed)  # builds: make_launcher alone no longer does
+        module_of(keyed)  # builds: make_launcher alone no longer does
         build_s = (time.perf_counter_ns() - start) / 1e9
-        decode_ns = bench(module.spec_key, (keyed, 0, *args), iters, batches, sync)
+        decode_ns = bench(keyed.__self__.spec_key, (0, *args), iters, batches, sync)
         access_rows.append((mode.name.lower(), decode_ns, build_s))
 
     launcher = make_launcher(noop)
@@ -407,7 +407,7 @@ def bench_dynamic(iters, batches):
             fn, (device, stream, (1,), *dyn, *public), iters, batches, sync
         )
         key_ns = bench(
-            module_of(fn).spec_key, (fn, device, *dyn, *public), iters, batches, sync
+            fn.__self__.spec_key, (device, *dyn, *public), iters, batches, sync
         )
         print(f"{label:>19} {launch_ns:10.1f} {key_ns:10.1f}")
 

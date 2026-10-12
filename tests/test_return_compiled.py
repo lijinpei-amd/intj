@@ -68,9 +68,7 @@ def test_zero_grid_returns_kernel_without_dispatch_and_mode_changes_module():
     returning = make_launcher(store_value, return_compiled=True)
 
     assert module_of(default).__file__ != module_of(returning).__file__
-    assert module_of(default).spec_key(default, 0, x, 7) == module_of(
-        returning
-    ).spec_key(returning, 0, x, 7)
+    assert default.__self__.spec_key(0, x, 7) == returning.__self__.spec_key(0, x, 7)
     assert default(device, stream, (0,), x, 7) is None
     kernel = returning(device, stream, (0,), x, 7)
     assert kernel.asm["ttir"]

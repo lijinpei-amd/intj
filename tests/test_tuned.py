@@ -506,7 +506,7 @@ def test_two_level_chain():
         "one tuning run for N=8; strides only add level-1 keys"
     )
     module = module_of(launch)
-    keys, found = module.key_chain(launch, device, x, out, 8, 256)
+    keys, found = launch.__self__.key_chain(device, x, out, 8, 256)
     assert found and len(keys) == 2
 
 
@@ -563,7 +563,7 @@ def test_child_map_grows_past_four_slots(monkeypatch):
     # it must find every one of the 5 keys, including the 2 inserted before
     # the grow moved them.
     for stride, rem in cases:
-        keys, found = module.key_chain(launch, device, out, 8, stride)
+        keys, found = launch.__self__.key_chain(device, out, 8, stride)
         assert found, f"stride {stride} (REM={rem}) missing after the child map grew"
     # Still correct through fresh launches, and no record needed recompiling.
     for stride, rem in cases:
@@ -824,7 +824,7 @@ def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
         with live_knob_values(_split_dynamic(dynamic, dyn)[1]):
             for case in cases:
                 launch(device, stream, 1, *dyn, *case.values())
-                chain, found = module.key_chain(launch, device, *dyn, *case.values())
+                chain, found = launch.__self__.key_chain(device, *dyn, *case.values())
                 assert found
                 truth = _reference(make_kernel(), case, dict(zip(dynamic, dyn)))
                 assert seen.setdefault(chain, truth) == truth, (
@@ -1092,7 +1092,7 @@ def test_tuned_dynamic_knob_mismatch_raises_and_records_nothing(monkeypatch):
     with pytest.raises(ValueError, match="passed True but the current value is False"):
         launch(*controls(), True, x, out, 256)
     assert knobs.runtime.debug is False
-    assert not module_of(launch).key_chain(launch, controls()[0], True, x, out, 256)[1]
+    assert not launch.__self__.key_chain(controls()[0], True, x, out, 256)[1]
     off = launch(*controls(), False, x, out, 256)
     assert knobs.runtime.debug is False and not off.metadata.debug
 

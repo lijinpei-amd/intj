@@ -251,7 +251,7 @@ def built(request, stub, tmp_path_factory):
     launcher.override_compile(module, compile_cb)
     layout = layout_for().as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
     # every torch code its own 5-bit index; the real one comes from triton
-    module.set_torch_version(
+    module._set_torch_version(
         torch_version(), layout, bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     )
     return module, Stub(lib), compiles
@@ -348,7 +348,7 @@ def test_runtime_shim_rejects_rebased_cdata_overflow(built, launch):
     bad = (relative, *layout.as_args()[1:])
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(ValueError, match="16-bit"):
-        module.set_torch_version(torch_version(), bad, index)
+        module._set_torch_version(torch_version(), bad, index)
 
     launch(*args)
     assert stub.last(5)[3][0] == x.data_ptr()
@@ -359,7 +359,7 @@ def test_torch_abi_is_installed_once(built):
     layout = layout_for() if module.__name__ == "rt_runtime_shim" else None
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(RuntimeError, match="already installed"):
-        module.set_torch_version(
+        module._set_torch_version(
             torch_version(), layout.as_args() if layout else None, index
         )
 
@@ -374,7 +374,7 @@ def test_runtime_shim_rejects_offset_truncation(built, oversized_offset):
     oversized = (oversized_offset, *layout.as_args()[1:])
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(ValueError, match="16-bit"):
-        module.set_torch_version(torch_version(), oversized, index)
+        module._set_torch_version(torch_version(), oversized, index)
 
 
 def test_gil_stays_off_on_a_free_threaded_build(built):
@@ -442,7 +442,7 @@ def test_spec_key_buckets(built, launch):
     x = torch.zeros(64)
 
     def key(*args):
-        return module.spec_key(launch, 0, *args)[0]
+        return launch.__self__.spec_key(0, *args)[0]
 
     ints = [key(x, v, 0, 0.0, False, 64) for v in (17, 16, 2**31, 2**63, 1)]
     assert len(set(ints)) == len(ints)
@@ -491,12 +491,12 @@ import torch
 spec = importlib.util.spec_from_file_location({module.__name__!r}, {module.__file__!r})
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-module.set_torch_version({torch_version()!r}, {layout.as_args() if layout else None!r},
+module._set_torch_version({torch_version()!r}, {layout.as_args() if layout else None!r},
                          {bytes(c if c < 32 else 0xFF for c in range(NDTYPES))!r})
 spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
 lazy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lazy)
-launch = lazy.new_launcher({_TAIL!r}, b"", lambda header: module.init_bound(header, print, print))
+launch = lazy.new_launcher(lazy.Launcher, None, None, lambda header: module._init(header, print, print))
 assert not sys._is_gil_enabled()
 grid = [0, 1000, 1000]
 stop = threading.Event()
@@ -628,7 +628,6 @@ def stub_module(tmp_path_factory):
 
 
 _CALL = (0, 0, 1)  # device, stream, grid
-_TAIL = launcher._tail_bytes(sum(p.memo is not None for p in _PARAMS), 0)
 
 
 def _interner():
@@ -641,9 +640,10 @@ def launch(built, stub_module):
     """A built launcher over the fixture module: what `module.entry` used to be."""
     module, _, _ = built
     fn = stub_module.new_launcher(
-        _TAIL,
-        b"",
-        lambda header: module.init_bound(
+        stub_module.Launcher,
+        None,
+        None,
+        lambda header: module._init(
             header, launcher._launcher_compile(module), _interner()
         ),
     )
@@ -658,7 +658,7 @@ def _args():
 def test_stub_stays_out_of_sys_modules_and_matches_the_header(built, stub_module):
     module, _, _ = built
     assert "_intj_lazy" not in sys.modules
-    assert stub_module.header_size() == module.header_size()
+    assert stub_module._header_size() == module._header_size()
 
 
 def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
@@ -667,20 +667,18 @@ def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
 
     def build(header):
         builds.append(1)
-        return module.init_bound(
-            header, launcher._launcher_compile(module), _interner()
-        )
+        return module._init(header, launcher._launcher_compile(module), _interner())
 
-    launch = stub_module.new_launcher(_TAIL, b"launch(a, /)\n--\n\n", build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
     before = launch  # a reference taken before the build
     function = ctypes.pythonapi.PyCFunction_GetFunction
     function.argtypes, function.restype = [ctypes.py_object], ctypes.c_void_p
     shim = function(launch)
-    assert launch.__self__.__self__ is None and builds == []
+    assert launch.__self__._module is None and builds == []
     args = _args()
     assert launch(*args) is None
     assert builds == [1] and function(before) != shim
-    assert launch.__self__.__self__ is module and launch.__self__.build() is module
+    assert launch.__self__._module is module and launch.__self__.build() is module
     a, b, c, d, e, f, g, h, i = args
 
     def call():
@@ -710,11 +708,9 @@ def test_failed_build_raises_and_the_next_call_retries(built, stub_module):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("first build fails")
-        return module.init_bound(
-            header, launcher._launcher_compile(module), _interner()
-        )
+        return module._init(header, launcher._launcher_compile(module), _interner())
 
-    launch = stub_module.new_launcher(_TAIL, b"", build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
     with pytest.raises(RuntimeError, match="first build fails"):
         launch(*_args())
     assert launch(*_args()) is None and len(attempts) == 2
@@ -727,11 +723,9 @@ def test_concurrent_first_calls_build_once(built, stub_module):
     def build(header):
         builds.append(1)
         time.sleep(0.05)  # hold the build lock while the others arrive
-        return module.init_bound(
-            header, launcher._launcher_compile(module), _interner()
-        )
+        return module._init(header, launcher._launcher_compile(module), _interner())
 
-    launch = stub_module.new_launcher(_TAIL, b"", build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
     barrier, results, errors = threading.Barrier(8), [], []
 
     def worker():
@@ -758,17 +752,21 @@ def test_call_during_build_is_refused(built, stub_module):
             launch(*_args())
         except RuntimeError as error:
             seen.append(str(error))
-        return module.init_bound(
-            header, launcher._launcher_compile(module), _interner()
-        )
+        return module._init(header, launcher._launcher_compile(module), _interner())
 
-    launch = stub_module.new_launcher(_TAIL, b"", build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
     assert launch(*_args()) is None
     assert seen and "while it was being built" in seen[0]
 
 
-def test_unbuilt_and_built_launchers_are_collected(built, stub_module):
+@pytest.mark.parametrize("subclass", [False, True], ids=["base", "subclass"])
+def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass):
     module, _, _ = built
+    cls = (
+        type("Sub", (stub_module.Launcher,), {"__slots__": ()})
+        if subclass
+        else stub_module.Launcher
+    )
 
     class Owner:
         launch: Callable[..., object]
@@ -777,11 +775,10 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module):
         owner = Owner()
 
         def build(header, owner=owner):  # the builder holds its owner: a cycle
-            return module.init_bound(
-                header, launcher._launcher_compile(module), _interner()
-            )
+            return module._init(header, launcher._launcher_compile(module), _interner())
 
-        owner.launch = stub_module.new_launcher(_TAIL, b"", build)
+        # options and origin hold the owner too: cycles through every member
+        owner.launch = stub_module.new_launcher(cls, owner, owner, build)
         if call_first:
             owner.launch(*_args())
         ref = weakref.ref(owner)
@@ -802,9 +799,10 @@ def test_memo_referent_cycle_is_collected(built, stub_module):
 
     value = Value()
     value.launch = stub_module.new_launcher(
-        _TAIL,
-        b"",
-        lambda h: module.init_bound(
+        stub_module.Launcher,
+        None,
+        None,
+        lambda h: module._init(
             h, compile_cb, lambda v: 0 if type(v) is Value else None
         ),
     )
@@ -818,15 +816,16 @@ def test_memo_referent_cycle_is_collected(built, stub_module):
 def test_str_constexpr_keys_by_value(built, stub_module):
     module, _, _ = built
     launch = stub_module.new_launcher(
-        _TAIL,
-        b"",
-        lambda h: module.init_bound(h, launcher._launcher_compile(module), _interner()),
+        stub_module.Launcher,
+        None,
+        None,
+        lambda h: module._init(h, launcher._launcher_compile(module), _interner()),
     )
     launch(*_args())
     x = torch.zeros(4)
 
     def key(value):
-        return module.spec_key(launch, 0, x, 5, -7, 1.5, True, value)[0]
+        return launch.__self__.spec_key(0, x, 5, -7, 1.5, True, value)[0]
 
     assert key("act") == key("".join(["a", "c", "t"])) != key("other")
     assert key(0) != key("act")  # an int never shares an object's code
@@ -835,9 +834,10 @@ def test_str_constexpr_keys_by_value(built, stub_module):
 def test_memo_holds_its_object_until_replaced(built, stub_module):
     module, _, _ = built
     launch = stub_module.new_launcher(
-        _TAIL,
-        b"",
-        lambda h: module.init_bound(h, launcher._launcher_compile(module), _interner()),
+        stub_module.Launcher,
+        None,
+        None,
+        lambda h: module._init(h, launcher._launcher_compile(module), _interner()),
     )
     first, second = "".join(["o", "n", "e"]), "".join(["t", "w", "o"])
     launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, first)
@@ -848,3 +848,71 @@ def test_memo_holds_its_object_until_replaced(built, stub_module):
     assert sys.getrefcount(first) == held
     with pytest.raises(TypeError, match="unsupported argument 'BLOCK' of type list"):
         launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, [1])
+
+
+def test_launchers_come_only_from_new_launcher(stub_module):
+    with pytest.raises(TypeError, match="come from make_launcher"):
+        stub_module.Launcher()
+
+    class Sub(stub_module.Launcher):
+        __slots__ = ()
+
+    with pytest.raises(TypeError, match="come from make_launcher"):
+        Sub()
+    wide = type("Wide", (stub_module.Launcher,), {"__slots__": ("extra",)})
+    for cls in (object, int, wide):  # not a Launcher, or one more word
+        with pytest.raises(TypeError, match="new_launcher"):
+            stub_module.new_launcher(cls, None, None, print)
+    with pytest.raises(TypeError, match="new_launcher"):
+        stub_module.new_launcher(stub_module.Launcher, None, None, 7)
+    assert type(stub_module.new_launcher(Sub, None, None, print).__self__) is Sub
+
+
+def test_set_plan_publishes_options_and_signature_once(stub_module):
+    launch = stub_module.new_launcher(stub_module.Launcher, "delayed", "origin", print)
+    h = launch.__self__
+    assert (h.options, h._origin, h._plan, h._module) == (
+        "delayed",
+        "origin",
+        None,
+        None,
+    )
+    assert launch.__text_signature__ is None
+    h._set_plan("resolved", "plan", b"launch(a, /)\n--\n\n")
+    assert (h.options, h._plan) == ("resolved", "plan")
+    assert launch.__text_signature__ == "(a, /)"
+    h.check()  # a plan is set: nothing runs
+    with pytest.raises(RuntimeError, match="set once"):
+        h._set_plan("again", "plan", b"")
+    fresh = stub_module.new_launcher(stub_module.Launcher, None, None, print)
+    with pytest.raises(TypeError, match="_set_plan"):
+        fresh.__self__._set_plan(None, None, "not bytes")
+
+
+def test_options_reads_race_set_plan_safely(stub_module):
+    launchers = [
+        stub_module.new_launcher(stub_module.Launcher, "before", None, print)
+        for _ in range(200)
+    ]
+    seen, stop = set(), threading.Event()
+
+    def read():
+        while not stop.is_set():
+            for k in launchers:
+                seen.add(k.__self__.options)
+
+    readers = [threading.Thread(target=read) for _ in range(4)]
+    for t in readers:
+        t.start()
+    for k in launchers:
+        k.__self__._set_plan("after", None, b"")
+    stop.set()
+    for t in readers:
+        t.join()
+    assert seen <= {"before", "after"}
+    assert all(k.__self__.options == "after" for k in launchers)
+
+
+def test_key_chain_is_for_tuned_launchers_only(launch):
+    with pytest.raises(TypeError, match="tuned launchers only"):
+        launch.__self__.key_chain(0, torch.zeros(4), 5, -7, 1.5, True, 64)

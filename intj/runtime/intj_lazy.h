@@ -1,9 +1,7 @@
-/* The bound launcher's fixed header.  `_intj_lazy` (intj_lazy.c) allocates
- * it at its final size; a rendered module's init_bound fills it in place.
- * Both compile this one definition, so the static asserts below pin the same
- * layout on both sides.  Trailing arrays follow the header: their layout is
- * the rendered module's (`intj_bound_tail`, intj_runtime.h), their byte
- * count is ob_size. */
+/* A launcher's fixed-size object.  `_intj_lazy` allocates it at decoration;
+ * a rendered module's `_init` allocates the per-launcher state block behind
+ * `state` and installs `ops`.  Both compile this one definition;
+ * `_header_size` lets Python check they agree. */
 #pragma once
 
 #include <Python.h>
@@ -36,44 +34,42 @@ typedef char intj_rwlock;
 #define INTJ_RWUNLOCK(l) ((void)(l))
 #endif
 
-typedef struct intj_bound_header {
-  PyVarObject ob_base; /* PyObject_VAR_HEAD; ob_size: trailing array bytes */
-  /* Hot: a warmed launch reads these and nothing else in the header. */
-  /* the module's intj_state; NULL until built, and after clear */
-  void *state;
-  int64_t device_ordinal; /* bind_device only */
-  int32_t device_handle;  /* bind_device only */
-  int32_t cache_ready;
-  uint64_t cache[3]; /* opaque intj_cache storage, only ever accessed as one */
-  /* intj_final *: a keyless fixed-device launcher's kernel */
-  void *fixed_kernel;
-  /* Cold. */
-  PyMethodDef def;   /* the launcher PyCFunction's; ml_meth is swapped once */
-  PyObject *doc;     /* bytes behind def.ml_doc */
-  PyObject *builder; /* until built: callable(header) -> entry address */
-  PyObject *module;
-  /* callable(value) -> id or None: this launcher's intern table */
-  PyObject *intern;
-  /* this launcher's miss callback (the tuned callback if tuned) */
-  PyObject *compile_cb;
-  intj_rwlock lock; /* guards this launcher's cache, memos and intern writes */
-  PyObject *grid_py;
-  PyObject *grid_hidden;
-  PyThread_type_lock build_lock;
-  unsigned long build_thread; /* thread running the builder, else 0 */
-  /* the module's, once built */
-  int (*traverse)(PyObject *self, visitproc visit, void *arg);
-  int (*clear)(PyObject *self);
-} intj_bound_header;
+/* Free-threaded builds lock the object around its member reads and
+ * `_set_plan`; before 3.13 these are plain blocks. */
+#ifndef Py_BEGIN_CRITICAL_SECTION
+#define Py_BEGIN_CRITICAL_SECTION(op) {
+#define Py_END_CRITICAL_SECTION() }
+#endif
 
-static_assert(offsetof(intj_bound_header, state) == sizeof(PyVarObject),
-              "intj: state leads the hot fields");
-static_assert(offsetof(intj_bound_header, fixed_kernel) + sizeof(void *) <=
-                  sizeof(PyVarObject) + 64,
-              "intj: hot fields sit within 64 bytes after the object head "
-              "(a span, not an aligned line: GC objects are not 64-aligned)");
-static_assert(offsetof(intj_bound_header, def) >=
-                  offsetof(intj_bound_header, fixed_kernel) + sizeof(void *),
-              "intj: cold fields follow the hot ones");
-static_assert(sizeof(intj_bound_header) % 8 == 0,
-              "intj: trailing arrays start 8-byte aligned");
+/* What the rendered module does with its state block. */
+typedef struct intj_launcher_ops {
+  int (*traverse)(void *state, visitproc visit, void *arg);
+  /* drops the block's references, frees its cache and lock, then the block */
+  void (*release)(void *state);
+  PyObject *(*spec_key)(void *state, PyObject *const *args, Py_ssize_t nargs);
+  /* NULL unless tuned */
+  PyObject *(*key_chain)(void *state, PyObject *const *args, Py_ssize_t nargs);
+} intj_launcher_ops;
+
+typedef struct intj_launcher {
+  PyObject_HEAD
+  /* hot: the module's intj_launcher_state; NULL until built, and after clear */
+  void *state;
+  PyMethodDef def;   /* the launcher PyCFunction's; ml_meth is swapped once */
+  PyObject *options; /* MakeLauncherOption, or the Delayed until check() */
+  PyObject *origin;  /* _Origin, shared with every bind/unbind derivative */
+  PyObject *plan;    /* check()'s _Plan; NULL until checked */
+  PyObject *builder; /* until built: callable(launcher) -> entry address */
+  PyObject *module;
+  PyObject *doc; /* bytes behind def.ml_doc, once checked */
+  PyThread_type_lock build_lock;
+  unsigned long build_thread;   /* thread holding build_lock, else 0 */
+  const intj_launcher_ops *ops; /* the module's, once built */
+} intj_launcher;
+
+static_assert(offsetof(intj_launcher, state) == sizeof(PyObject),
+              "intj: state leads the object");
+static_assert(offsetof(intj_launcher, def) + sizeof(PyMethodDef) <=
+                  sizeof(PyObject) + 64,
+              "intj: the hot path's state and def sit within 64 bytes after "
+              "the object head");
