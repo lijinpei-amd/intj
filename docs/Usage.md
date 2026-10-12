@@ -14,34 +14,41 @@ launcher = make_launcher(
     kernel_cache=KernelCache.INTJ,
     no_gpu=False,          # host decode/cache path, without GPU work
     verify_annotation=False,
-    bind_device=False,
+    bind_device=None,      # a device ordinal: the launcher takes no device argument
+    bind_values=None,      # bound parameter name -> value
     grid_arg=None,         # keyword-only: 1, 2, or 3 separate grid dimensions
     grid_cpp=None,         # keyword-only: annotated def compiled into the extension
     grid_py=None,          # keyword-only: Python callback evaluated on each launch
     return_compiled=False, # keyword-only: return the cached Triton CompiledKernel
     assume_constant_globals=False, # keyword-only: accept kernels reading globals
+    delayed=None,          # keyword-only: () -> more of these keywords, run on first use
 )
 ```
 
-`make_launcher` returns a callable launcher when no value or device binding
-requires a factory; with bindings, `.bind()`/`.bind_device()` return it. Call it
-once, outside any hot loop.
+`make_launcher` always returns a launcher. Its `__self__` has `bind()`,
+`bind_device()`, `unbind()` and `unbind_device()`, which return new launchers,
+and `check()`. Call it once, outside any hot loop.
 
 ### Lazy build
 
-`make_launcher` returns a launcher at once, without touching the GPU. It
-validates arguments, resolves annotations, analyzes an autotune/heuristics
-chain, lowers `grid_cpp`, and provisions a non-default `kernel_cache`. The
-**first call** builds: it queries the GPU target, renders the C extension,
-compiles it with the host compiler (cached on disk under intj's module digest),
-loads it, fills the launcher, and swaps its entry. After that, every reference
-to the launcher, including ones taken before the build, calls the native entry
-directly. If the build raises, that call raises and the next call retries.
-Concurrent first calls build once.
+`make_launcher` returns a launcher at once and does no work: it records its
+keywords as a `MakeLauncherOption` (`launcher.__self__.options`), and an
+unknown keyword is the only error it raises. `launcher.__self__.check()` does
+the rest without touching the GPU: it runs `delayed`, validates arguments,
+resolves annotations, analyzes an autotune/heuristics chain, lowers
+`grid_cpp`, checks bound values, and provisions a non-default `kernel_cache`.
+It runs once; launchers derived by `bind()` and the like share its analysis.
+The **first call** checks if `check()` has not, then builds: it queries the GPU
+target, renders the C extension, compiles it with the host compiler (cached on
+disk under intj's module digest), loads it, fills the launcher's state, and
+swaps its entry. After that, every reference to the launcher, including ones
+taken before the build, calls the native entry directly. If the check or
+build raises, that call raises and the next call retries. Concurrent first
+calls build once.
 
 Decorating a module-level kernel is therefore safe at import on a machine
 without a GPU, and under `TRITON_INTERPRET=1` -- that refusal, like the others
-below, surfaces on the first call rather than at `make_launcher`, so it costs
+below, surfaces in `check()` or on the first call, never at `make_launcher`, so it costs
 nothing once the launcher is built (the swapped-in entry never reads the knob
 again). A few other checks need the target and surface on the first call
 too: an unknown `options=` name, an invalid compile option in an autotune
@@ -49,8 +56,10 @@ config, and the C-side checks on bound values (an out-of-range pointer, a
 failing `hipDeviceGet` / `cuDeviceGet`). Triton's `debug`, `instrumentation_mode` and
 `fpsan_homomorphic_casts` knobs are read then too, and fixed for the launcher.
 Every launcher is a builtin function whose `__self__` is an
-`_intj_lazy.Launcher`, whatever it binds; `intj.launcher.module_of(launcher)`
-builds if needed and returns the rendered module, for debugging.
+`intj.launcher.Launcher`, whatever it binds. Its `__text_signature__` is set by
+`check()`, so `inspect.signature(launcher)` needs a check or a call first.
+`intj.launcher.module_of(launcher)` builds if needed and returns the rendered
+module, for debugging.
 
 Called without `jit_func` (keyword arguments only), `make_launcher` is a
 decorator factory instead, so a kernel -- plain or stacked under
@@ -68,10 +77,28 @@ def k(x, o, n, BLOCK: tl.constexpr):
 This is equivalent to calling `make_launcher(k, grid_cpp=grid)` on the already
 autotuned/heuristic-wrapped `k`. A plain `@make_launcher` (no parens) keeps
 working exactly as before.
+
+`delayed` takes a function of no arguments returning more of these keywords,
+for values that need the GPU (a backend-dependent `num_warps`, say):
+
+```python
+@make_launcher(delayed=lambda: {"options": {"num_warps": pick_warps()}})
+@triton.jit
+def k(...): ...
+```
+
+It runs once per `make_launcher` call, on the first `check()` or call of any
+launcher derived from it, and its result is shared by all of them. Its keywords
+join the explicit ones and enter module identity the same way; a keyword
+passed both ways raises `UnsupportedKernel`, and a result that is not a
+mapping of `make_launcher` keywords raises `TypeError`. If it raises, the
+exception propagates and the next call runs it again. Calling a launcher from
+the same `make_launcher` call inside it raises `RuntimeError`; waiting there
+on another thread that calls one deadlocks.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
 values for binding. `verify_annotation=True` checks declared promises before
-cache lookup; the default trusts them. `bind_device=True` fixes a device on a
-bound handle. `no_gpu=True` renders and times host decoding and cache lookup
+cache lookup; the default trusts them. `bind_device=<ordinal>` fixes the
+device. `no_gpu=True` renders and times host decoding and cache lookup
 without querying a GPU target or driver, compiling a kernel, or launching one.
 It accepts only default compile options. The `torch_access_mode` and `kernel_cache`
 choices are described below.
@@ -79,7 +106,7 @@ choices are described below.
 `assume_constant_globals=True` accepts a kernel that reads global variables
 (`X = tl.constexpr(...)`, or a plain value a `constexpr_function` reads),
 which is refused by default. It is a caller promise: **those globals never
-change after the kernel is first hashed** (at `make_launcher`, the first time
+change after the kernel is first hashed** (at `check()`, the first time
 Triton computes its `cache_key`). Their values then become part of the
 module's identity, so two values never share a module, and a launch never
 reads them again -- no hit-path cost. Changing one afterwards is unsupported
@@ -148,7 +175,7 @@ Choose at most one grid option in `make_launcher`:
 | `stream` | raw stream handle, `int` (e.g. `torch.cuda.current_stream().cuda_stream`) |
 | `kernel_args` | public kernel parameters in declaration order; baked and bound values are omitted |
 
-All launch arguments are positional. With `bind_device=True`, omit `device` from
+All launch arguments are positional. With `bind_device=<ordinal>`, omit `device` from
 each call. Grid dimensions must be exact ints in `[0, 2**32)`; omitted dimensions
 are 1. By default the launcher returns `None`, and a zero-volume grid skips the
 launch. With `return_compiled=True`, it returns the cached Triton
@@ -192,7 +219,7 @@ check runs per launcher, before the module's compile cache: a sibling
 launcher's first call with an old value raises even when that cache already
 holds the kernel compiled under it.
 
-Refused at `make_launcher` with `UnsupportedKernel`: an unknown knob path, a
+Refused at `check()` with `UnsupportedKernel`: an unknown knob path, a
 repeated name, a name also given in `options=` (for knobs, the option the knob
 feeds, e.g. `debug`), `device`/`stream`/`device_type`/
 `warp_size`, a name an autotune config sets, and `no_gpu=True`. An unknown
@@ -227,7 +254,7 @@ launcher = make_launcher(kernel, grid_cpp=grid)
 launcher(device, stream, cap, out, n, BLOCK)
 ```
 
-The function is translated at `make_launcher` time and is never called by the
+The function is translated at `check()` time and is never called by the
 launcher. It can use integer/bool literals and names, simple local assignments,
 unary `+`/`-`, `+`, `-`, `*`, `//`, `triton.cdiv`, two-argument builtin `min`, and
 conditional expressions. It must end with a literal tuple/list of 1–3 integer
@@ -317,7 +344,7 @@ names or literals.
 Grids:
 
 - `grid_cpp` may read tuned values (such as `BLOCK`) but not a heuristic
-  result that is compiled to C (refused at `make_launcher`; use `grid_py`,
+  result that is compiled to C (refused at `check()`; use `grid_py`,
   which sees every value in `meta`). Its grid is computed after the lookup,
   and a zero-volume result skips the launch.
 - With the default grid or `grid_arg`, a zero-volume grid on a miss raises
@@ -331,7 +358,7 @@ name assigned twice (including two nested `@triton.autotune` layers, which
 Triton itself cannot run), a heuristic or autotune key reading a value an
 inner layer assigns, heuristics outside the subset above, and a tuned value
 read by C that is not an `int` or `bool` (autotune config values at
-`make_launcher`, heuristic results on the miss). Each bound launcher (every
+`check()`, heuristic results on the miss). Each bound launcher (every
 `bind()`/`bind_device()`) owns its own tuner caches and tunes again.
 Free-threaded Python builds are compile-untested.
 
@@ -394,7 +421,7 @@ argument. Its values convert as Triton's launcher converts them (`3` into a
 64 bits raises `OverflowError`; narrower integers truncate), and
 `verify_annotation` adds no type or range check on top. The two sources merge field by field:
 unspecified fields come from the other source, equal fields agree, and
-conflicting explicit fields raise at `make_launcher`. Triton's
+conflicting explicit fields raise at `check()`. Triton's
 `do_not_specialize` and `do_not_specialize_on_alignment` are merged into the
 corresponding `NEVER` facts; a conflicting explicit fact raises.
 
@@ -457,31 +484,33 @@ the Python wrapper while the native copy owns its `TensorImpl`. If that wrapper
 refers back to the bound handle, the resulting cycle can retain both until the
 tensor's back-reference is cleared (for example, `tensor.bound = None`).
 
-Binding annotations return a factory, not a callable launcher:
+A launcher with binding annotations takes its bound values from `bind()`,
+`bind_device()` or `bind_values=`; calling it with one missing raises
+`TypeError`:
 
 ```python
-factory = make_launcher(kernel, extra_annotation={
+launch = make_launcher(kernel, extra_annotation={
     "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
                   bind_value=BindValue.TENSOR),
 })
-bound = factory.bind(x=tensor)
+bound = launch.__self__.bind(x=tensor)
 bound(device, stream, grid, *remaining_public_args)
 
-fixed = make_launcher(kernel, bind_device=True, extra_annotation={
-    "x": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER,
-                  bind_value=BindValue.TENSOR),
-}).bind_device(device, x=tensor)
+fixed = launch.__self__.bind_device(device, x=tensor)
 fixed(stream, grid, *remaining_public_args)
 ```
 
-`bind()` and `bind_device()` take bound values by keyword; the latter takes one
-positional nonnegative int32 device ordinal. Baked and bound values disappear
+`bind()` and `bind_device()` take bound values by keyword, merged into the
+launcher's `bind_values`; the latter also takes one positional nonnegative
+int32 device ordinal (None is `unbind_device()`). `unbind()` drops every bound
+value and `unbind_device()` the device. Each returns a new, unbuilt launcher
+and validates nothing: a bad value raises from its `check()` or first call. Baked and bound values disappear
 from the native callable's signature, whose remaining arguments are positional
 only. Both methods return a `METH_FASTCALL` builtin, allowing CPython to specialize
 explicit positional calls. `inspect.signature(handle)` reads its generated
 `__text_signature__`. Each handle keeps its bound objects and extension alive
-through its private state at `handle.__self__` (an `_intj_lazy.Launcher`, as for
-every launcher); `module_of(handle)` returns the extension module.
+through its launcher object at `handle.__self__` (an `intj.launcher.Launcher`, as
+for every launcher); `module_of(handle)` returns the extension module.
 Kernel calls support Unicode parameter names, but CPython 3.12's builtin signature
 parser limits `inspect.signature(handle)` to ASCII parameter names.
 Every launcher and handle has its own kernel cache. A fixed-device handle with
@@ -496,7 +525,7 @@ categories, null handling, and address width remain checked. A false promise
 can select the wrong cached binary. `PointerRange(32)` means the entire
 underlying storage is at most 2**31 - 1 bytes, not just a tensor view. A raw pointer
 address cannot prove that range: even checked `BindValue.POINTER` warns once
-at factory creation and trusts the range promise.
+per `make_launcher` call, at the first `check()`, and trusts the range promise.
 
 ## Supported arguments
 
@@ -535,8 +564,8 @@ buffer-ops binary on a > 2 GiB tensor.
 
 ## Not supported
 
-Everything below is refused at `make_launcher` time, or on the first launch that
-hits it:
+Everything below is refused at `check()` (the first call runs it), or on the
+first launch that hits it:
 
 - Backends with no registered `intj.launcher.Backend`. `HipBackend` and
   `CudaBackend` ship; any triton backend whose driver exposes a
@@ -544,11 +573,10 @@ hits it:
   launch symbol, error-string convention, whether it specializes pointers on a 2 GiB
   range) and calling `register()`. Both shipped backends run the full GPU test
   suite: HIP on gfx942, CUDA on sm_89.
-- `TRITON_INTERPRET=1` -- refused on the first call, never at `make_launcher`,
-  so a module-level `@make_launcher` still imports under the interpreter (a
-  `@triton.jit` kernel decorated while it is on is an `InterpretedFunction`,
-  which intj cannot analyze either; decorating one also defers to the first
-  call). The refusal costs nothing after that call: it is not in the swapped-in
+- `TRITON_INTERPRET=1` -- refused by `check()` or the first call, never at
+  `make_launcher`, so a module-level `@make_launcher` still imports under the
+  interpreter (a `@triton.jit` kernel decorated while it is on is an
+  `InterpretedFunction`, which intj cannot analyze either). The refusal costs nothing after that call: it is not in the swapped-in
   entry, so turning the knob on later does not stop an already-built launcher.
 - Unsupported parameter annotations, `*args`/`**kwargs`, keyword-only parameters.
 - Tuple, `tl.constexpr` object and `TensorDescriptor` arguments, and `str` /
@@ -593,7 +621,7 @@ layout exists, else `INTERPRETER`. An explicit unavailable mode raises.
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
 `RUNTIME_SHIM` reads offsets from a table of verified torch versions
-(`intj/torch_intf/torch_abi.toml`), installed at load by `set_torch_version`.
+(`intj/torch_intf/torch_abi.toml`), installed at load by `_set_torch_version`.
 The recorded `cdata` starts after `PyObject_HEAD`; the generated module adds
 its compiled `sizeof(PyObject)` once and saves the absolute offset before any
 launch.
@@ -643,7 +671,7 @@ Most launches turn the spec key into a compiled kernel through a hash map.
 even under `RUNTIME_SHIM` or `INTERPRETER` access.
 
 Neither is vendored, and **nothing installed on the machine is searched for**:
-`make_launcher` downloads a pinned version, checks its sha256, and (for
+a launcher's `check()` downloads a pinned version, checks its sha256, and (for
 abseil) builds it into `$TRITON_HOME/.triton/intj/deps/`. What a module was
 built against is then a property of intj's cache rather than of the host. It
 happens once, on the path that was already going to invoke a compiler, and is
@@ -723,8 +751,8 @@ The invariant intj must not break is:
 
 A coarser key does not crash — it launches, say, a `tt.divisibility = 16` binary on an
 unaligned pointer. `tests/test_launcher.py::test_spec_key_is_never_coarser_than_triton`
-checks it directly through the module's `spec_key(launcher, device, *args)` debug entry
-point, and every
+checks it directly through the launcher's `k.__self__.spec_key(device, *args)` debug
+entry point, and every
 GPU cache miss builds a `CompilerInput` containing the final annotated
 `ASTSource` signature, tagged constexpr values, and attributes. The callback
 compares it with any input previously recorded for the same key and rejects a

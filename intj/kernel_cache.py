@@ -67,7 +67,7 @@ from . import _imports
 #: come back to the user as "the download failed, try again".
 INSTALL_ERRORS = (OSError, RuntimeError, tarfile.TarError, subprocess.SubprocessError)
 
-#: seconds; a stalled connection must not hang `make_launcher` forever
+#: seconds; a stalled connection must not hang `check()` forever
 _DOWNLOAD_TIMEOUT = 60
 
 #: written last, so a half-finished build tree never looks provisioned
@@ -274,7 +274,7 @@ def _unpack(source: Dependency, root: Path) -> None:
     with tempfile.TemporaryDirectory(dir=root.parent) as scratch:
         archive = Path(scratch) / "source.tar.gz"
         # timeout, because with none urlopen inherits socket's default of None:
-        # a blackholed port 443 would hang make_launcher forever
+        # a blackholed port 443 would hang check() forever
         with urllib.request.urlopen(source.url, timeout=_DOWNLOAD_TIMEOUT) as response:  # noqa: S310 - pinned https URL
             blob = response.read()
         digest = hashlib.sha256(blob).hexdigest()
@@ -348,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     for cache in wanted:
         if cache is KernelCache.INTJ:
             continue
-        # the same one line make_launcher would print, not a traceback: this
+        # the same one line check() would print, not a traceback: this
         # command is what that error tells the reader to run
         try:
             toolchain = install(cache, force=force)

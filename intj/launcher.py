@@ -1508,7 +1508,7 @@ def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
     That fills in defaults and normalizes the odd fields (`extern_libs`,
     `llvm_fn_attrs`, `warp_size`), so `{}` and `{"num_warps": 4}` reach the same
     rendered module instead of building it twice.  It also rejects what the
-    backend rejects, at `make_launcher` time rather than on the first launch.
+    backend rejects when the module is built, not on the first kernel compile.
 
     `parse_options` ignores keys it does not know, so unknown ones are caught
     here -- otherwise a typo would silently compile with the default.

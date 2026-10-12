@@ -80,8 +80,8 @@ free-threaded CPython 3.13t and 3.14t. This is a CPython-specific interface.
 
 1. `header_for()` looks up the interpreter's major/minor version in `_HEADERS`.
    Every supported entry currently selects `cpython_abi.h`. An unlisted
-   version returns `None`; `make_launcher` raises `UnsupportedKernel` before
-   building a module.
+   version returns `None`; a launcher's `check()` raises `UnsupportedKernel`
+   before building a module.
 2. `RenderKey` records the full `(major, minor, micro)` version, selected
    header, and `free_threaded` build flag. The flag comes from
    `sysconfig.get_config_var("Py_GIL_DISABLED")`, independently of whether the
@@ -119,12 +119,17 @@ first when adding a Python version.
 
 Generated modules declare `Py_MOD_GIL_NOT_USED` on Python 3.13+, so loading them
 does not require CPython to enable the GIL. `intj_rwlock` (in
-`runtime/intj_lazy.h`), owned by each launcher, is a pthread rwlock on
-free-threaded builds and a no-op otherwise. Launches take it shared
+`runtime/intj_lazy.h`), held in each launcher's state block that the module's
+`_init` allocates, is a pthread rwlock on free-threaded builds and a no-op
+otherwise. Launches take it shared
 (`INTJ_RDLOCK`) across their lookups and the GPU launch, because cache records
 live in the map and a put can move them; puts take it exclusive
 (`INTJ_WRLOCK`). It is never held while Python runs. The module's C state needs
-no lock: it is written once, before the module is reachable. A cache miss checks again under the write lock before
+no lock: it is written once, before the module is reachable. The launcher
+object's members (`options`, `_plan`, `_module`) are read under its critical
+section and `_set_plan` publishes them once; `_init` stores `state` last, and
+the shim then release-stores the entry. That order is untested on non-TSO hosts
+(aarch64). A cache miss checks again under the write lock before
 inserting its result because another thread may have filled the same key
 during compilation.
 

@@ -64,9 +64,11 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 
 `_intj_lazy` (`intj/lazy.py`, `runtime/intj_lazy.c`), the stub every launcher
 starts as, follows the same rule. Every launcher is a `PyCFunction` over a
-`PyMethodDef` embedded in its `_intj_lazy.Launcher`. The first call swaps its
-`ml_meth` from the build shim to the rendered entry, and GC reaches the module's
-state through the `traverse`/`clear` hooks that `init_bound` installs. All
+`PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
+`__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size). The first
+call swaps its `ml_meth` from the build shim to the rendered entry. The
+module's `_init` allocates the launcher's state block behind `state` and
+installs the `traverse`/`release` ops GC and dealloc reach it through. All
 mutable launch state (cache, lock, miss callback) is the launcher's; the
 module's C state is written once, at load.
 
@@ -89,9 +91,9 @@ one. `benchmarks/bench_launch.py --last-key` measures the full host launch path.
 A backend's library is downloaded at a pinned version and checksum into
 `$TRITON_HOME/.triton/intj/deps/`, never taken from the host: what a module was
 built against has to be a property of intj's cache, or the same digest means
-different binaries on two machines. `make_launcher` provisions on demand,
-once, after every GPU-free refusal it could have made instead (target-dependent
-ones wait for the first call), and announces it on stderr;
+different binaries on two machines. A launcher's `check()` provisions on
+demand, once, after every GPU-free refusal it could have made instead
+(target-dependent ones wait for the build), and announces it on stderr;
 `python -m intj.kernel_cache <name>` does the same thing ahead of time. A flock
 keeps it to one installer per machine, and a tree is only visible to
 `toolchain_for` once it is complete. Anything that reaches the network belongs
@@ -110,7 +112,8 @@ guards the rule.
 
 ## Refusals are loud and early
 
-Anything intj cannot do raises `UnsupportedKernel`, preferably in `make_launcher`,
+Anything intj cannot do raises `UnsupportedKernel`, preferably in `check()` (at
+the latest on the first call; `make_launcher` itself only records its keywords),
 otherwise on the first cache miss. Never fall back to `JITFunction` silently — a
 silent fallback turns a 0.3 us call into a 14 us one with no signal.
 

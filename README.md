@@ -56,8 +56,6 @@ proxy is what makes this install slow, not `uv`.
 ## Usage
 
 ```python
-import functools
-
 import torch
 import triton
 import triton.language as tl
@@ -83,23 +81,23 @@ touches the GPU, so a module-level `@make_launcher` imports on a machine with
 no visible device. On the first call at line `#2`, INTJ builds and loads the C
 extension and launches the kernel. Later calls use the native entry.
 
-`options` is evaluated at declaration, so an option that itself needs the GPU
-(selecting `num_warps` by backend, say) needs a factory that runs on first use:
+`options` is evaluated at declaration. An option that itself needs the GPU
+(selecting `num_warps` by backend, say) goes in `delayed`, a function that runs
+on first use:
 
 ```python
-@functools.cache
-def my_kernel():
-    backend = triton.runtime.driver.active.get_current_target().backend
-    return make_launcher(
-        _my_kernel, options={"num_warps": {"hip": 4, "cuda": 8}[backend]}
-    )
-
-my_kernel()(device, stream, (triton.cdiv(n, 128),), x, y, o, n, 128)
+@make_launcher(delayed=lambda: {
+    "options": {"num_warps": {"hip": 4, "cuda": 8}[
+        triton.runtime.driver.active.get_current_target().backend]},
+})
+@triton.jit
+def my_kernel(x, y, o, n, BLOCK: tl.constexpr):
+    ...
 ```
 
-Deferring `make_launcher`'s own arguments to the first call, so the decorator
-form works here too, is a planned option (`delayed=`) and is **not implemented**;
-see `TODO.md`.
+`delayed` runs once, on the launcher's first call (or
+`my_kernel.__self__.check()`), and its keywords join the ones passed to
+`make_launcher`; passing one keyword both ways raises.
 
 To compute the grid in the extension from launch values, use an annotated
 Python `def` with `grid_cpp`:

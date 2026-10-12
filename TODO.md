@@ -49,12 +49,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - Kernels reading globals: `assume_constant_globals=True` trusts them; still
   refused by default. Revalidating in C (`PyObject_RichCompareBool` per entry)
   would cover the default too.
-- **Deferred `make_launcher` arguments.** Add `delayed=lambda: {...}` to return
-  keyword arguments that are evaluated once on the first call, after the GPU
-  target is known. The README uses it to select `options["num_warps"]` by Triton
-  backend. Define how returned and explicit keywords combine, and include the
-  resolved values in module identity. This also covers aiter `mla_decode_ref`'s
-  GPU-dependent `kpack` without requiring a `functools.cache` factory.
 - Kernels needing global/profile scratch, `num_ctas > 1`, cooperative launches,
   `launch_pdl`.
 - **Gluon layout objects as constexpr arguments.** gfx1250 GEMM/MoE/batched-GEMM
