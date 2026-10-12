@@ -40,3 +40,11 @@ target as separate invocations.
 - A new check is a script plus a `build` line, then a workflow step calling it.
 - Anything that goes into an image is under `ci/dockerfiles/`: every file there
   feeds the tag hash.
+
+## Known gaps
+
+- `gpu.yml` and the rocm images are untested until a `[self-hosted, gfx942]`
+  runner is registered. CUDA has no images (no NVIDIA GPU to test on).
+- The self-hosted runner must provide `docker`, `ninja` and `python3`
+  (`gpu.yml` runs `image.py` and `ninja` directly on the host, outside a
+  container).

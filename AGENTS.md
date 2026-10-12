@@ -113,3 +113,10 @@ Mark anything untested as untested in the docs.
 PYTHONPATH=$PWD /tmp/gb2/bin/python -m pytest tests -q     # triton 3.8.0, torch 2.14+rocm7.2, gfx942
 PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py
 ```
+
+The same checks, as CI runs them, are `ninja -C ci` targets (`ci/AGENTS.md`):
+
+```
+PYTHON=<venv>/bin/python ninja -C ci            # lint, typecheck, test-cpu
+PYTHON=<venv>/bin/python ninja -C ci test-gpu
+```
