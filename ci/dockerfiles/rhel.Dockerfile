@@ -2,6 +2,7 @@
 # come from ci/image.py.  PY_ENSURE asks manylinux for one of its /opt/python builds.
 ARG BASE
 FROM ${BASE}
+LABEL org.opencontainers.image.source=https://github.com/lijinpei-amd/intj
 ARG PY_PKGS
 ARG PY_ENSURE
 ARG PY_BIN

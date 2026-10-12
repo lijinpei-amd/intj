@@ -40,6 +40,8 @@ target as separate invocations.
 - A new check is a script plus a `build` line, then a workflow step calling it.
 - Anything that goes into an image is under `ci/dockerfiles/`: every file there
   feeds the tag hash.
+- A published tag is never rebuilt; to refresh base images and unpinned
+  packages, change any file in `ci/dockerfiles/` (e.g. bump a comment).
 
 ## Known gaps
 

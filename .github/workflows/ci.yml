@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   matrix:
@@ -80,6 +80,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       INTJ_MODE: wheel
+    if: ${{ !cancelled() && needs.wheel.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

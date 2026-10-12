@@ -1,6 +1,7 @@
 # CI image for apt-based cells; build args come from ci/image.py.
 ARG BASE
 FROM ${BASE}
+LABEL org.opencontainers.image.source=https://github.com/lijinpei-amd/intj
 ARG PY_PKGS
 ARG PY_BIN
 ARG TORCH_INDEX

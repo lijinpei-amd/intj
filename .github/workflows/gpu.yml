@@ -85,3 +85,8 @@ jobs:
         with:
           name: bench-gpu-${{ matrix.cell.id }}
           path: ci/out/bench/
+      # This job runs as root in a container on the persistent self-hosted
+      # runner; without this, root-owned files left in $GITHUB_WORKSPACE make
+      # the next job's host checkout fail with EACCES.
+      - if: always()
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
