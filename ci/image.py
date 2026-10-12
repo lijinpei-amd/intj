@@ -7,6 +7,7 @@ The tag hashes every file under ci/dockerfiles/, the cell and the pins, so any
 change to what goes into an image publishes a new one.
 """
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -81,12 +82,14 @@ def build(cell, flavor):
     subprocess.run(command + [str(DOCKERFILES)], check=True)
 
 
+def published(name):
+    inspect = ["docker", "manifest", "inspect", name]
+    return subprocess.run(inspect, capture_output=True).returncode == 0
+
+
 def push(cell, flavor):
     name = tag(cell, flavor)
-    exists = subprocess.run(
-        ["docker", "manifest", "inspect", name], capture_output=True
-    )
-    if exists.returncode == 0:
+    if published(name):
         print("ci: %s already published" % name)
         return
     build(cell, flavor)
@@ -101,12 +104,27 @@ def matrix():
         "cpu": [{"id": c["id"], "image": tag(c, "cpu")} for c in cells],
         "rocm": [{"id": c["id"], "image": tag(c, "rocm")} for c in cells if c["gpu"]],
     }
+    # The cells the workflows' image jobs still have to build; an unreachable
+    # registry counts as unpublished, and push checks again after login.
+    with concurrent.futures.ThreadPoolExecutor(16) as pool:
+        for flavor in ("cpu", "rocm"):
+            entries = out[flavor]
+            found = pool.map(published, [e["image"] for e in entries])
+            out[flavor + "_unpublished"] = [
+                e for e, ok in zip(entries, found) if not ok
+            ]
     path = CI / "out" / "matrix.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=1) + "\n")
     print(
-        "ci: wrote %s (%d cpu, %d rocm cells)"
-        % (path, len(out["cpu"]), len(out["rocm"]))
+        "ci: wrote %s (%d cpu, %d rocm cells; %d, %d unpublished)"
+        % (
+            path,
+            len(out["cpu"]),
+            len(out["rocm"]),
+            len(out["cpu_unpublished"]),
+            len(out["rocm_unpublished"]),
+        )
     )
 
 

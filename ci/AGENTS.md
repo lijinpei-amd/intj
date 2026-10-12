@@ -25,7 +25,7 @@ Ninja has no command-line variables, so scripts read the environment:
 | `test-cpu` | GPU-free tests |
 | `test-gpu` | the full suite |
 | `bench-host`, `bench-gpu` | `bench_launch.py`, output in `ci/out/bench/` |
-| `matrix` | writes `ci/out/matrix.json` for the workflows |
+| `matrix` | writes `ci/out/matrix.json` for the workflows, with the cells not yet published |
 | `image`, `push-image` | build / build and push the `$CELL`/`$FLAVOR` image |
 | `check` (default) | `lint typecheck test-cpu` |
 
@@ -41,7 +41,8 @@ target as separate invocations.
 - Anything that goes into an image is under `ci/dockerfiles/`: every file there
   feeds the tag hash.
 - A published tag is never rebuilt; to refresh base images and unpinned
-  packages, change any file in `ci/dockerfiles/` (e.g. bump a comment).
+  packages, change any file in `ci/dockerfiles/` (e.g. bump a comment). The
+  workflows start an image job only for unpublished tags.
 
 ## Known gaps
 

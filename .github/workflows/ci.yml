@@ -21,23 +21,35 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       cells: ${{ steps.read.outputs.cells }}
+      unpublished: ${{ steps.read.outputs.unpublished }}
       primary: ${{ steps.read.outputs.primary }}
     steps:
       - uses: actions/checkout@v7
       - run: pipx install ninja
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - run: ninja -C ci matrix
       - id: read
         run: |
-          echo "cells=$(jq -c .cpu ci/out/matrix.json)" >> "$GITHUB_OUTPUT"
-          echo "primary=$(jq -r .primary ci/out/matrix.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "cells=$(jq -c .cpu ci/out/matrix.json)"
+            echo "unpublished=$(jq -c .cpu_unpublished ci/out/matrix.json)"
+            echo "primary=$(jq -r .primary ci/out/matrix.json)"
+          } >> "$GITHUB_OUTPUT"
 
   images:
     needs: matrix
+    # Only the cells whose tag is not in the registry yet; an empty matrix is an
+    # error, so the job is skipped instead.
+    if: ${{ needs.matrix.outputs.unpublished != '[]' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
+        cell: ${{ fromJSON(needs.matrix.outputs.unpublished) }}
     name: image ${{ matrix.cell.id }}
     steps:
       - uses: actions/checkout@v7

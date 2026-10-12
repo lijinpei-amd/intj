@@ -14,21 +14,34 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       cells: ${{ steps.read.outputs.cells }}
+      unpublished: ${{ steps.read.outputs.unpublished }}
     steps:
       - uses: actions/checkout@v7
       - run: pipx install ninja
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - run: ninja -C ci matrix
       - id: read
-        run: echo "cells=$(jq -c .rocm ci/out/matrix.json)" >> "$GITHUB_OUTPUT"
+        run: |
+          {
+            echo "cells=$(jq -c .rocm ci/out/matrix.json)"
+            echo "unpublished=$(jq -c .rocm_unpublished ci/out/matrix.json)"
+          } >> "$GITHUB_OUTPUT"
 
   images:
     needs: matrix
+    # Only the cells whose tag is not in the registry yet; an empty matrix is an
+    # error, so the job is skipped instead.
+    if: ${{ needs.matrix.outputs.unpublished != '[]' }}
     # rocm images are ~5 GB each: too large for hosted runners' disk.
     runs-on: [self-hosted, gfx942]
     strategy:
       fail-fast: false
       matrix:
-        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
+        cell: ${{ fromJSON(needs.matrix.outputs.unpublished) }}
     name: image ${{ matrix.cell.id }}
     steps:
       - uses: actions/checkout@v7
@@ -72,6 +85,9 @@ jobs:
       options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --security-opt seccomp=unconfined
     env:
       INTJ_MODE: wheel
+    # images is skipped when every image is published; a skipped need would
+    # otherwise skip this job too.
+    if: ${{ !cancelled() && needs.wheel.result == 'success' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
