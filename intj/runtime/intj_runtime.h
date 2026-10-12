@@ -19,6 +19,15 @@
 
 #include "intj_map.h"
 
+/* C++ modules build with -fvisibility=hidden, and before 3.9 PyMODINIT_FUNC
+ * does not mark the init function visible: the module would import as "does
+ * not define module export function". */
+#if defined(__cplusplus) && PY_VERSION_HEX < 0x03090000
+#undef PyMODINIT_FUNC
+#define PyMODINIT_FUNC                                                         \
+  extern "C" __attribute__((visibility("default"))) PyObject *
+#endif
+
 /* CPYTHON_ACCESS_MODE.STATIC_COMPILE selects its layout by PY_VERSION_HEX. */
 #ifndef INTJ_CPYTHON_STATIC_COMPILE_HEADER
 #error                                                                         \
