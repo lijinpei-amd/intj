@@ -781,12 +781,13 @@ def make_launcher(
         def k(...): ...
 
     Decoration only records a `MakeLauncherOption` (or, with `delayed`, how
-    to make one): no check, no GPU, no torch import.  Until one succeeds in
-    this process, a call also imports triton and loads `_intj_lazy`, the C
-    stub every launcher starts as; that and its own arguments are all it can
-    fail at (see Raises).  `k.__self__.check()` runs every other check now;
-    otherwise the first call does, then builds the module (see
-    docs/Usage.md, "Lazy build").
+    to make one): no kernel check, no GPU, no torch import.  Until one
+    succeeds in this process, a call also imports triton and loads
+    `_intj_lazy`, the C stub every launcher starts as, which can fail (see
+    Raises); only the Triton refusal is remembered, and any other failure
+    there is retried on the next call.  `k.__self__.check()` runs every
+    other check now; otherwise the first call does, then builds the module
+    (see docs/Usage.md, "Lazy build").
 
     The returned callable is a C function:
 
@@ -852,6 +853,8 @@ def make_launcher(
         UnsupportedKernel: Triton is missing or older than 3.7, checked once
             per process: every later call raises the same refusal.  Or the
             host compiler failed to build `_intj_lazy`.
+        ImportError: Importing an installed triton failed: a broken install,
+            such as a missing dependency or extension module.
         RuntimeError: Triton finds no host C compiler.
         OSError: The directory `_intj_lazy` is built in cannot be created.
     """

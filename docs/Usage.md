@@ -31,8 +31,8 @@ and `check()`. Call it once, outside any hot loop.
 
 ### Lazy build
 
-`make_launcher` returns a launcher at once and checks nothing about the kernel
-or its options: it records its keywords as a `MakeLauncherOption`
+`make_launcher` returns a launcher at once and does not analyze the kernel or
+its options: it records its keywords as a `MakeLauncherOption`
 (`launcher.__self__.options`, with dicts and lists copied). It raises
 `TypeError` for an unknown keyword, a None kernel or a `delayed` that is not
 callable. Until one call succeeds in the process, it also imports triton and
@@ -41,6 +41,8 @@ loads `_intj_lazy`, the C stub every launcher starts as, which can raise:
 - `UnsupportedKernel` when Triton is missing or older than 3.7. The check runs
   once per process: every later `make_launcher` raises the same refusal
   without searching for triton again.
+- whatever importing triton raises when the install is broken: an
+  `ImportError` for a missing dependency or extension module, for example.
 - `RuntimeError` when triton finds no host C compiler (`CC`, else `gcc` or
   `clang` on `PATH`), even with the stub already built.
 - `UnsupportedKernel` when that compiler fails to build the stub, built once
@@ -48,8 +50,8 @@ loads `_intj_lazy`, the C stub every launcher starts as, which can raise:
   `$TRITON_HOME/.triton/intj/lazy`; `OSError` when that directory cannot be
   created.
 
-The compiler and directory failures are not cached: the next `make_launcher`
-tries again.
+Only the Triton refusal is cached: after any other of these failures, the
+next `make_launcher` tries again.
 
 `launcher.__self__.check()` does the rest without touching the GPU: it runs
 `delayed`, validates arguments, resolves annotations, analyzes an
