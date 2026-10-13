@@ -19,6 +19,7 @@ import ctypes
 import dataclasses
 import dis
 import gc
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -105,10 +106,12 @@ def _test_compiler():
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(build, "compiler_path", _cc)
         build.cxx_toolchain.cache_clear()
+        build.cxx_lib_dirs.cache_clear()
         try:
             yield
         finally:
             build.cxx_toolchain.cache_clear()
+            build.cxx_lib_dirs.cache_clear()
 
 
 def _available(mode: TorchAccessMode) -> bool:
@@ -155,23 +158,10 @@ class Stub:
         return tuple(launch[:3]), launch[3], launch[4], params[:nparams]
 
 
-@pytest.fixture(scope="module", params=_MODES, ids=lambda m: m.value)
-def built(request, stub, tmp_path_factory):
-    """Builds the entry module for one access mode against the stub driver.
-
-    Returns:
-        The loaded module, a `Stub` over the driver, and the list of values the
-        compile callback was called with.
-    """
-    lib, lib_path = stub
-    mode = request.param
-    if not _available(mode):
-        pytest.fail(
-            f"INTJ_TEST_TORCH_MODES names {mode.value}, unavailable on torch "
-            f"{torch.__version__}"
-        )
+def _key(mode: TorchAccessMode, driver_path: str = "") -> RenderKey:
+    """Returns the key the `built` fixture renders and builds for `mode`."""
     static = mode is TorchAccessMode.STATIC_COMPILE
-    key = RenderKey(
+    return RenderKey(
         module_name=f"rt_{mode.value}",
         kernel_repr="test_runtime.kernel",
         params=_PARAMS,
@@ -182,7 +172,7 @@ def built(request, stub, tmp_path_factory):
         no_gpu=False,
         max_slots=5,
         spec_pointer_range=1,
-        driver_path=lib_path,
+        driver_path=driver_path,
         launch_symbol="stub_launch",
         device_symbol="",
         error_symbol="stub_error",
@@ -209,6 +199,24 @@ def built(request, stub, tmp_path_factory):
         intj_version=(0, 0),
         global_values=(),
     )
+
+
+@pytest.fixture(scope="module", params=_MODES, ids=lambda m: m.value)
+def built(request, stub, tmp_path_factory):
+    """Builds the entry module for one access mode against the stub driver.
+
+    Returns:
+        The loaded module, a `Stub` over the driver, and the list of values the
+        compile callback was called with.
+    """
+    lib, lib_path = stub
+    mode = request.param
+    if not _available(mode):
+        pytest.fail(
+            f"INTJ_TEST_TORCH_MODES names {mode.value}, unavailable on torch "
+            f"{torch.__version__}"
+        )
+    key = _key(mode, lib_path)
     with _test_compiler():
         flags = build.build_flags(key)
     out = tmp_path_factory.mktemp(mode.value)
@@ -331,6 +339,114 @@ def test_runtime_shim_probe_refuses_slot_before_header():
     from intj.torch_intf.abi_detect import probe_layout
 
     assert probe_layout(torch.Tensor.__basicsize__ + 1) is None
+
+
+@pytest.fixture
+def fresh_lib_dirs():
+    build.cxx_lib_dirs.cache_clear()
+    yield
+    build.cxx_lib_dirs.cache_clear()
+
+
+def test_cxx_lib_dirs_agree_with_cpp_extension(monkeypatch):
+    """Found without cpp_extension, the c++ mode's lib dirs are the ones it gives.
+
+    They decide the access mode and enter the digest as an rpath.
+    """
+    with _test_compiler():
+        toolchain = build.cxx_toolchain()  # imports cpp_extension
+        monkeypatch.delitem(sys.modules, "torch.utils.cpp_extension", raising=False)
+        found = build._lib_dirs_without_cpp_extension()
+    if toolchain is None:
+        assert found is None
+    elif found is not None:
+        assert found == tuple(toolchain[1])
+
+
+@pytest.mark.parametrize(
+    "lib, header, agree, setuptools, imported, certain",
+    [
+        (True, True, True, True, False, True),
+        (False, True, True, True, False, False),
+        (True, False, True, True, False, False),
+        (True, True, False, True, False, False),
+        (True, True, True, False, False, False),
+        (True, True, True, True, True, False),
+    ],
+    ids=["certain", "no-lib", "no-header", "roots-differ", "no-setuptools", "imported"],
+)
+def test_lib_dirs_without_cpp_extension_answer_only_when_certain(
+    tmp_path, monkeypatch, lib, header, agree, setuptools, imported, certain
+):
+    root = tmp_path / "torch"
+    if lib:
+        (root / "lib").mkdir(parents=True)
+    if header:
+        path = root / "include" / "torch/csrc/autograd/python_variable.h"
+        path.parent.mkdir(parents=True)
+        path.touch()
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name, *args):
+        if name == "setuptools":
+            return importlib.machinery.ModuleSpec(name, None) if setuptools else None
+        if name == "torch.utils.cpp_extension":
+            origin = str(root / "utils" / "cpp_extension.py")
+            return importlib.machinery.ModuleSpec(name, None, origin=origin)
+        return real_find_spec(name, *args)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(
+        "torch._utils_internal.get_file_path",
+        lambda *parts: str(root if agree else tmp_path / "elsewhere"),
+    )
+    if imported:
+        # any module: only its presence is read
+        monkeypatch.setitem(sys.modules, "torch.utils.cpp_extension", sys)
+    else:
+        monkeypatch.delitem(sys.modules, "torch.utils.cpp_extension", raising=False)
+    expected = (str(root / "lib"),) if certain else None
+    assert build._lib_dirs_without_cpp_extension() == expected
+
+
+def test_cxx_lib_dirs_ask_cpp_extension_when_unsure(monkeypatch, fresh_lib_dirs):
+    monkeypatch.setattr(build, "compiler_path", _cc)
+    monkeypatch.setattr(build, "_lib_dirs_without_cpp_extension", lambda: None)
+    for toolchain, expected in [((["/i"], ["/l"]), ("/l",)), (None, None)]:
+        monkeypatch.setattr(build, "cxx_toolchain", lambda t=toolchain: t)
+        build.cxx_lib_dirs.cache_clear()
+        assert build.cxx_lib_dirs() == expected
+
+
+def test_cxx_lib_dirs_need_a_cxx_compiler(monkeypatch, fresh_lib_dirs):
+    def no_compiler(language):
+        raise RuntimeError(f"Failed to find {language} compiler")
+
+    monkeypatch.setattr(build, "compiler_path", no_compiler)
+    monkeypatch.setattr(build, "_lib_dirs_without_cpp_extension", lambda: ("/l",))
+    assert build.cxx_lib_dirs() is None
+
+
+@pytest.mark.parametrize("toolchain", [None, (["/i"], ["/elsewhere"])])
+def test_build_refuses_where_cpp_extension_disagrees(monkeypatch, toolchain):
+    """The mode and digest were decided without cpp_extension: a build checks them."""
+    monkeypatch.setattr(build, "cxx_lib_dirs", lambda: ("/l",))
+    monkeypatch.setattr(build, "cxx_toolchain", lambda: toolchain)
+    with pytest.raises(launcher.UnsupportedKernel, match="cpp_extension disagrees"):
+        build.build_flags(_key(TorchAccessMode.STATIC_COMPILE))
+
+
+def test_build_flags_add_cpp_extension_includes_to_digest_flags(monkeypatch):
+    monkeypatch.setattr(build, "cxx_lib_dirs", lambda: ("/l",))
+    monkeypatch.setattr(build, "cxx_toolchain", lambda: (["/i"], ["/l"]))
+    key = _key(TorchAccessMode.STATIC_COMPILE)
+    flags, digest = build.build_flags(key), build.digest_flags(key)
+    assert flags["include_dirs"] == [*digest["include_dirs"], "/i"]
+    assert {k: v for k, v in flags.items() if k != "include_dirs"} == {
+        k: v for k, v in digest.items() if k != "include_dirs"
+    }
+    assert flags["library_dirs"] == ["/l"]
+    assert "-Wl,-rpath,/l" in flags["ccflags"]
 
 
 def test_runtime_shim_rejects_rebased_cdata_overflow(built, launch):

@@ -8,6 +8,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import sysconfig
 import tempfile
 import types
@@ -72,28 +73,87 @@ def compiler_identity(language: str = "c") -> tuple[str, ...]:
     return (str(cc), version)
 
 
+_TORCH_HEADER = "torch/csrc/autograd/python_variable.h"
+
+
 @functools.lru_cache(maxsize=1)
 def cxx_toolchain() -> tuple[list[str], list[str]] | None:
     """Returns (include dirs, library dirs) for the c++ mode, or None.
 
     Both come from the loaded torch rather than from `torch.__file__`, so a torch
-    that reorganises its tree, or one built out of tree, keeps working.
+    that reorganises its tree, or one built out of tree, keeps working.  Only a
+    build needs this; deciding the mode and keying the module need only
+    `cxx_lib_dirs`.
     """
     try:
         compiler_path("c++")
     except Exception:
         return None
     try:
-        # not cached with torch: importing it costs ~65 ms
+        # not cached with torch: importing it costs ~55 ms
         from torch.utils import cpp_extension
     except Exception:  # pragma: no cover - torch without the build helpers
         return None
     includes = [p for p in cpp_extension.include_paths() if os.path.isdir(p)]
     libs = [p for p in cpp_extension.library_paths() if os.path.isdir(p)]
-    header = "torch/csrc/autograd/python_variable.h"
-    if not libs or not any(os.path.exists(os.path.join(d, header)) for d in includes):
+    if not libs or not any(
+        os.path.exists(os.path.join(d, _TORCH_HEADER)) for d in includes
+    ):
         return None
     return (includes, libs)
+
+
+@functools.lru_cache(maxsize=1)
+def cxx_lib_dirs() -> tuple[str, ...] | None:
+    """Returns `cxx_toolchain()`'s library dirs, or None where it returns None.
+
+    The access mode, and the rpath the module's digest records, need only
+    these, so a first call whose `.so` is already on disk should not pay ~55 ms
+    for `torch.utils.cpp_extension`.  Where `_lib_dirs_without_cpp_extension`
+    is certain of the answer it is used; anywhere else this asks
+    `cxx_toolchain`.  `build_flags` checks the two agree before any build.
+    """
+    try:
+        compiler_path("c++")
+    except Exception:
+        return None
+    libs = _lib_dirs_without_cpp_extension()
+    if libs is not None:
+        return libs
+    toolchain = cxx_toolchain()
+    return None if toolchain is None else tuple(toolchain[1])
+
+
+def _lib_dirs_without_cpp_extension() -> tuple[str, ...] | None:
+    """Returns `cxx_toolchain()`'s library dirs where they are certain without it.
+
+    None means "ask cpp_extension", not "unavailable".  cpp_extension's torch
+    root is `dirname(dirname(its own file))` before 2.14 and
+    `torch._utils_internal.get_file_path("torch")` from 2.14 on; where the two
+    agree, that is its root on either.  On every torch from 2.2 to 2.14 its
+    first include dir is `<root>/include` and its only library dir
+    `<root>/lib`, so the header in the one and the existence of the other are
+    enough to say yes.
+    """
+    if "torch.utils.cpp_extension" in sys.modules:
+        return None  # already imported: asking it is free
+    if importlib.util.find_spec("setuptools") is None:
+        return None  # cpp_extension imports it: let that import fail
+    _imports.ensure_torch_imported()
+    spec = importlib.util.find_spec("torch.utils.cpp_extension")
+    # torch's own helper, the one cpp_extension calls from 2.14 on
+    utils_internal = getattr(_imports.torch, "_utils_internal", None)
+    get_file_path = getattr(utils_internal, "get_file_path", None)
+    if spec is None or spec.origin is None or get_file_path is None:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(spec.origin)))
+    if get_file_path("torch") != root:
+        return None
+    lib = os.path.join(root, "lib")
+    header = os.path.join(root, "include", _TORCH_HEADER)
+    if not os.path.isdir(lib) or not os.path.exists(header):
+        return None
+    return (lib,)
 
 
 def load(key: RenderKey, kernel_module: str) -> types.ModuleType:
@@ -196,6 +256,38 @@ def _runtime_header_flag() -> str:
 def build_flags(key: RenderKey) -> dict[str, Any]:
     """Returns the compiler arguments beyond intj's own include directory.
 
+    `digest_flags`, plus torch's include dirs for the c++ access mode: only a
+    build reads those, and finding them imports `torch.utils.cpp_extension`.
+
+    Raises:
+        UnsupportedKernel: `cxx_lib_dirs` decided the c++ mode, and so the
+            digest, without cpp_extension, and cpp_extension disagrees.
+    """
+    flags = digest_flags(key)
+    if key.torch_access_mode != TorchAccessMode.STATIC_COMPILE.value:
+        return flags
+    toolchain = cxx_toolchain()
+    if toolchain is None or tuple(toolchain[1]) != tuple(flags["library_dirs"]):
+        from ..launcher import UnsupportedKernel  # not at top: launcher imports this
+
+        found = (
+            toolchain[1]
+            if toolchain
+            else "nothing (it failed to import, or found no torch headers)"
+        )
+        raise UnsupportedKernel(
+            "intj: torch.utils.cpp_extension disagrees with the STATIC_COMPILE "
+            f"toolchain intj found without it: library dirs {flags['library_dirs']}, "
+            f"cpp_extension found {found}; report it, and pass "
+            "torch_access_mode=TorchAccessMode.RUNTIME_SHIM meanwhile"
+        )
+    flags["include_dirs"] += toolchain[0]
+    return flags
+
+
+def digest_flags(key: RenderKey) -> dict[str, Any]:
+    """Returns `build_flags` without torch's include dirs: what the digest records.
+
     The c++ access mode needs torch's headers, and `libc10` for the handful of
     error-path symbols `THPVariable_Unpack` pulls in.  Those are the reason it
     cannot be header-only -- torch loads libc10 `RTLD_LOCAL`, so an unlinked
@@ -237,10 +329,8 @@ def build_flags(key: RenderKey) -> dict[str, Any]:
     if not torch_static_compile:
         return flags
 
-    toolchain = cxx_toolchain()
-    assert toolchain is not None, "check() validated this"
-    includes, libs = toolchain
-    flags["include_dirs"] += includes
+    libs = cxx_lib_dirs()
+    assert libs is not None, "check() validated this"
     flags["library_dirs"] = list(libs)
     flags["libraries"] = ["c10"]
     flags["ccflags"] += [

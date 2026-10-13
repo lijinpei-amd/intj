@@ -46,10 +46,10 @@ from .kernel_cache import (
 from .options import OPTION_FIELDS, MakeLauncherKwargs, MakeLauncherOption
 from .python_intf import cpython_abi
 from .render.build import (
-    build_flags,
     compiler_identity,
     compiler_path,
-    cxx_toolchain,
+    cxx_lib_dirs,
+    digest_flags,
     load,
     runtime_headers,
 )
@@ -998,14 +998,14 @@ def _materialize_module(
         if canonical_options is not None
         else "host-defaults",
         triton=_triton_identity(),
-        # `build_flags` derives these from the fields above: filled in below
+        # `digest_flags` derives these from the fields above: filled in below
         compiler=(),
         build_flags=(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
         global_values=global_values,
     )
-    flags = build_flags(key)
+    flags = digest_flags(key)
     key = dataclasses.replace(
         key,
         compiler=compiler_identity(flags["language"]),
@@ -1332,14 +1332,14 @@ def _resolve_torch_access_mode(requested: TorchAccessMode | None) -> TorchAccess
     """
     if requested is TorchAccessMode.RUNTIME_SHIM and layout_for() is None:
         raise UnsupportedKernel(_unverified_torch_message())
-    if requested is TorchAccessMode.STATIC_COMPILE and not cxx_toolchain():
+    if requested is TorchAccessMode.STATIC_COMPILE and cxx_lib_dirs() is None:
         raise UnsupportedKernel(
             "intj: STATIC_COMPILE needs a C++ compiler and torch's headers; "
             "set $CXX or pass torch_access_mode=TorchAccessMode.RUNTIME_SHIM"
         )
     if requested is not None:
         return requested
-    if cxx_toolchain():
+    if cxx_lib_dirs() is not None:
         return TorchAccessMode.STATIC_COMPILE
     if layout_for() is not None:
         return TorchAccessMode.RUNTIME_SHIM

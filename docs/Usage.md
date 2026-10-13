@@ -637,6 +637,10 @@ AMD) the storage size. `make_launcher(..., torch_access_mode=...)` picks how, wi
 With `torch_access_mode=None` (the default), intj selects `STATIC_COMPILE` if a
 C++ compiler and torch's headers are present, else `RUNTIME_SHIM` if a verified
 layout exists, else `INTERPRETER`. An explicit unavailable mode raises.
+Deciding does not import `torch.utils.cpp_extension` (~55 ms) where intj can
+locate torch's headers and libraries itself (checked on torch 2.2 to 2.14, CPU
+and ROCm wheels; CUDA wheels untested): only a build imports it, and a build
+raises `UnsupportedKernel` if it disagrees.
 
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
