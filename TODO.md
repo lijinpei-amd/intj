@@ -40,13 +40,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
-- **A baked int cannot take Triton's specialization of its value.** On a
-  parameter with no inline type annotation, `Argument(value=0)` raises "has
-  AUTO specialization with a fixed value" under `AUTO` and under
-  `Assume(Aligned(16))` (equal-to-1 stays `AUTO`); only `NEVER` is accepted,
-  which drops the divisibility Triton gives 0 or any multiple of 16 (and the
-  constexpr it makes of 1), so the binary differs from Triton's. Resolve
-  `AUTO` from the baked value.
 - **`Assume` cannot turn a fact off.** Facts left out of `Assume` stay `AUTO`
   and are measured per call; only Triton's `do_not_specialize_on_alignment`
   and an inline type annotation turn single facts off, and "assume aligned,

@@ -487,6 +487,17 @@ receive a null `None` or integer 0; an untyped ordinary `None` follows Triton's
 constexpr behavior. Baked scalar `int`, `float`, `bool`, or `None` values must
 have one effective type, fit it, and cannot also be bound.
 
+A baked integer specializes as Triton specializes the same value passed: its
+`AUTO` facts resolve from the value when the launcher is built. 1 folds into a
+constexpr, and a multiple of 16 (0 and negatives included) gets 16-byte
+divisibility, unless an inline Triton type annotation, `do_not_specialize` or
+`do_not_specialize_on_alignment` turns that fact off, as it does for a passed
+value. For an untyped parameter, `Argument(value=0)` compiles `i32` with
+`tt.divisibility = 16`, `value=1` a constexpr 1, and `value=3` a plain `i32`.
+Explicit facts stay as given and must hold for the value; `NEVER` still
+compiles a plain runtime integer. A bound value is not known when the module
+is built, so a bound parameter's applicable facts must be `NEVER` or assumed.
+
 ### Bound values and fixed devices
 
 `Argument(bind_value=BindValue.TENSOR)` binds an exact `torch.Tensor` or

@@ -584,6 +584,21 @@ def _applicable(name: str | None, field: str) -> bool:
     return name.startswith("*") or (name.startswith(("i", "u")) and name != "u1")
 
 
+def _baked_modes(
+    value: object, ty: str | None, modes: Sequence[object]
+) -> tuple[object, ...]:
+    # As Triton specializes a passed int: 1 folds into a constexpr, and a
+    # multiple of 16 (0 and negatives too) is divisible by 16. What the
+    # decorator flags or a Triton type annotation turn off is NEVER already.
+    one, aligned, pointer_range = modes
+    if one == "auto" and _applicable(ty, "equal_to_one"):
+        one = "assume" if value == 1 else "never"
+    if aligned == "auto" and _applicable(ty, "aligned_16"):
+        divisible = one != "assume" and cast(int, value) % 16 == 0
+        aligned = "assume" if divisible else "never"
+    return (one, aligned, pointer_range)
+
+
 def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     annotation: CanonicalAnnotation,
 ) -> tuple[KeyField, ...]:
@@ -890,13 +905,23 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
                     raise ValueError(
                         f"intj: parameter {name!r} needs one effective type"
                     )
+            if baked is not UNSET:
+                assert types is not None
+                modes = _baked_modes(baked, types[0], modes)
+                assumed = tuple(
+                    (field, expected)
+                    for field, expected in _FACT_CLASSES.values()
+                    if modes[_FACT_NAMES.index(field)] == "assume"
+                )
+            elif bind_value is not None:
+                # a bound value is unknown until bind(), after the module is built
                 applicable = types if types is not None else ("i32", "*fp32")
                 if any(
                     mode == "auto" and any(_applicable(ty, field) for ty in applicable)
                     for field, mode in zip(_FACT_NAMES, modes)
                 ):
                     raise ValueError(
-                        f"intj: parameter {name!r} has AUTO specialization with a fixed value"
+                        f"intj: parameter {name!r} has AUTO specialization with a bound value"
                     )
         annotation = CanonicalAnnotation(
             kind,

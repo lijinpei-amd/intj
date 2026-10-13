@@ -3486,6 +3486,94 @@ def test_compiled_kernel_hash_matches_triton_launch(kernel):
 
 
 @triton.jit
+def parity_i64(
+    o,
+    x,
+    s: tl.int64,  # pyright: ignore[reportInvalidTypeForm]  # a triton dtype
+    f: float,
+    B: tl.constexpr,
+):
+    tl.store(o + s, tl.load(x) * f + B)
+
+
+@triton.jit
+def parity_u8(
+    o,
+    x,
+    s: tl.uint8,  # pyright: ignore[reportInvalidTypeForm]  # a triton dtype
+    f: float,
+    B: tl.constexpr,
+):
+    tl.store(o + s, tl.load(x) * f + B)
+
+
+# Values a baked `s` may take: each fits the kernel's type for `s`.
+BAKED_VALUES = {
+    "untyped": (0, 1, 3, 16, 32, -16, -1, 2**31, 2**32 + 16, 2**63, 2**64 - 1, True),
+    "typed": (0, 1, 3, 16, 32, -16, -1, 2**31 - 16),
+    "dns": (0, 1, 3, 16, 2**31),
+    "dnsa": (0, 1, 3, 16, 2**31),
+    "gluon": (0, 1, 3, 16),
+    "i64": (0, 1, 3, 16, 2**40, -(2**63)),
+    "u8": (0, 1, 3, 16, 255),
+}
+
+
+def _baked_annotations(jit_func, args):
+    # bake s = args[2]: AUTO, then the facts Triton gives it, assumed
+    value = args[2]
+    yield Argument(value=value)
+    yield Argument(value=value, specialize=Assume(*_triton_facts(jit_func, args)["s"]))
+
+
+@pytest.mark.parametrize("kernel", BAKED_VALUES)
+def test_baked_int_specializes_like_triton(kernel):
+    """A baked `s` compiles what Triton's launch passing it compiles.
+
+    Its AUTO facts resolve from the value at `check()`: 1 folds into a
+    constexpr unless typed or `do_not_specialize`, and a multiple of 16 is
+    divisible unless `do_not_specialize*` -- the hash matches too.
+    """
+    from triton.compiler import make_backend
+
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+
+    jit = {**PARITY_KERNELS, "i64": parity_i64, "u8": parity_u8}[kernel]
+    backend = make_backend(_current_target())
+    o, x = torch.zeros(64, device="cuda"), torch.ones(64, device="cuda")
+    for value in BAKED_VALUES[kernel]:
+        args = (o, x, value, 1.5, 4)
+        for annotation in _baked_annotations(jit, args):
+            params, _, _ = _render_params(
+                _resolve_annotations(jit, {"s": annotation}), DeviceBinding.NOT_FIXED
+            )
+            source = _compiler_input(
+                jit, params, (o, x, 1.5, 4), backend, baked_values={2: value}
+            )
+            check_same_ast_source(jit, source, args)
+
+
+@pytest.mark.parametrize("kernel", ["untyped", "typed", "dns", "dnsa"])
+def test_baked_int_launches_like_triton(kernel):
+    """A baked AUTO `s` launches Triton's binary for its value, hash and result."""
+    jit = PARITY_KERNELS[kernel]
+    x = torch.ones(64, device="cuda")
+    for value in (0, 1, 3):
+        expected = torch.zeros(64, device="cuda")
+        actual = torch.zeros_like(expected)
+        reference = jit[(1,)](expected, x, value, 1.5, 4)
+        launch = make_launcher(
+            jit, extra_annotation={"s": Argument(value=value)}, return_compiled=True
+        )
+        compiled = launch(*_gpu_controls(), actual, x, 1.5, 4)
+        torch.cuda.synchronize()
+        assert compiled.hash == reference.hash, value
+        torch.testing.assert_close(actual, expected)
+        assert actual[value] == 5.5
+
+
+@triton.jit
 def typed_f32(o, x: float):
     tl.store(o, x.to(tl.float64))  # pyright: ignore[reportAttributeAccessIssue]
 

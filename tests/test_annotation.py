@@ -540,6 +540,106 @@ def test_baked_values_resolve_exact_types_and_reject_bad_facts(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "params,decorator,specialize,value,expected",
+    [
+        # (types, equal_to_one, aligned_16), as Triton specializes the value
+        ("x", "", intj.AUTO, 0, (("i32",), "never", "assume")),
+        ("x", "", intj.AUTO, 1, (("i32",), "assume", "never")),
+        ("x", "", intj.AUTO, 3, (("i32",), "never", "never")),
+        ("x", "", intj.AUTO, 32, (("i32",), "never", "assume")),
+        ("x", "", intj.AUTO, -16, (("i32",), "never", "assume")),
+        ("x", "", intj.AUTO, -1, (("i32",), "never", "never")),
+        ("x", "", intj.AUTO, 2**32, (("i64",), "never", "assume")),
+        ("x", "", intj.AUTO, 2**32 + 1, (("i64",), "never", "never")),
+        ("x", "", intj.AUTO, -(2**63), (("i64",), "never", "assume")),
+        ("x", "", intj.AUTO, 2**63, (("u64",), "never", "assume")),
+        ("x", "", intj.AUTO, 2**64 - 1, (("u64",), "never", "never")),
+        ("x", "", intj.AUTO, True, (("u1",), "auto", "auto")),
+        ("x", "", intj.AUTO, 1.0, (("fp32",), "auto", "auto")),
+        ("x", "", intj.AUTO, None, ((None,), "auto", "auto")),
+        # a Triton type annotation keeps 1 a runtime integer
+        ("x: tl.int32", "", intj.AUTO, 1, (("i32",), "never", "never")),
+        ("x: tl.int32", "", intj.AUTO, 0, (("i32",), "never", "assume")),
+        ("x: tl.int64", "", intj.AUTO, 2**40, (("i64",), "never", "assume")),
+        ("x: tl.uint8", "", intj.AUTO, 255, (("u8",), "never", "never")),
+        ("x: tl.uint8", "", intj.AUTO, 16, (("u8",), "never", "assume")),
+        ("x: int", "", intj.AUTO, 16, (("i32",), "never", "assume")),
+        # so do the decorator flags (an explicit AUTO would conflict with them)
+        ("x", "do_not_specialize=['x']", None, 1, (("i32",), "never", "never")),
+        ("x", "do_not_specialize=['x']", None, 0, (("i32",), "never", "never")),
+        (
+            "x",
+            "do_not_specialize_on_alignment=['x']",
+            None,
+            1,
+            (("i32",), "assume", "never"),
+        ),
+        (
+            "x",
+            "do_not_specialize_on_alignment=['x']",
+            None,
+            0,
+            (("i32",), "never", "never"),
+        ),
+        # an explicit fact stays; the AUTO one left resolves
+        ("x", "", intj.Assume(intj.Aligned(16)), 0, (("i32",), "never", "assume")),
+        ("x", "", intj.Assume(intj.EqualTo(1)), 1, (("i32",), "assume", "never")),
+        ("x", "", intj.NEVER, 0, (("i32",), "never", "never")),
+    ],
+)
+def test_baked_ints_resolve_auto_facts_from_their_value(
+    tmp_path, params, decorator, specialize, value, expected
+):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
+    baked = intj.Argument(
+        value=value, specialize=UNSET if specialize is None else specialize
+    )
+    annotation = _resolve_annotations(kernel, {"x": baked})[0].annotation
+    types, equal_to_one, aligned_16 = expected
+    assert (annotation.types, annotation.equal_to_one, annotation.aligned_16) == (
+        types,
+        equal_to_one,
+        aligned_16,
+    )
+    assert annotation.facts == tuple(
+        (field, amount)
+        for field, amount, mode in (
+            ("equal_to_one", 1, equal_to_one),
+            ("aligned_16", 16, aligned_16),
+        )
+        if mode == "assume"
+    )
+
+
+@pytest.mark.parametrize(
+    "specialize,value,match",
+    [
+        (intj.Assume(intj.Aligned(16)), 1, "violates aligned_16"),
+        (intj.Assume(intj.EqualTo(1)), 16, "violates equal_to_one"),
+    ],
+)
+def test_baked_ints_refuse_facts_their_value_breaks(tmp_path, specialize, value, match):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, "x")
+    with pytest.raises(ValueError, match=match):
+        _resolve_annotations(
+            kernel, {"x": intj.Argument(value=value, specialize=specialize)}
+        )
+
+
+def test_bound_values_still_refuse_auto_specialization(tmp_path):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, "x")
+    tensor = intj.Argument(bind_value=intj.BindValue.TENSOR)
+    with pytest.raises(ValueError, match="AUTO specialization with a bound value"):
+        _resolve_annotations(kernel, {"x": tensor})
+
+
 def test_baked_constexpr_chooses_narrowest_matching_type(tmp_path):
     from intj.annotation import _resolve_annotations
 
