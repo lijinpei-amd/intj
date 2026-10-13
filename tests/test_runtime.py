@@ -20,6 +20,7 @@ import dataclasses
 import dis
 import gc
 import importlib.util
+import json
 import os
 import struct
 import subprocess
@@ -620,6 +621,84 @@ def test_load_stub_reports_a_compile_failure_as_unsupported(
     with pytest.raises(launcher.UnsupportedKernel, match="bad token") as excinfo:
         lazy.load_stub(root, _cc("c"))
     assert isinstance(excinfo.value.__cause__, subprocess.CalledProcessError)
+
+
+# Here rather than in test_launcher.py: needing neither triton nor a GPU, it
+# runs in ci's test-cpu and on interpreters triton has no wheel for.
+_NO_TRITON = '''
+class NoTriton:
+    """Fails every search for triton, and counts them."""
+
+    searches = 0
+
+    @classmethod
+    def find_spec(cls, name, path=None, target=None):
+        if name != "triton":
+            return None
+        cls.searches += 1
+        raise ModuleNotFoundError("No module named 'triton'", name="triton")
+
+
+sys.meta_path.insert(0, NoTriton)
+checks = lambda: NoTriton.searches
+'''
+
+_OLD_TRITON = """
+reads = 0
+
+
+def __getattr__(name):  # counts the version checks
+    global reads
+    if name != "__version__":
+        raise AttributeError(name)
+    reads += 1
+    return "3.5.0"
+"""
+
+
+@pytest.mark.parametrize("found", [None, "3.5.0"])
+def test_make_launcher_checks_triton_once(tmp_path, found):
+    """Without Triton >=3.7 every `make_launcher` call refuses; only the first looks.
+
+    Missing, triton is searched for once; old (a stub package), its
+    `__version__` is read once.
+    """
+    if found is None:
+        setup = _NO_TRITON
+    else:
+        (tmp_path / "triton").mkdir()
+        (tmp_path / "triton" / "__init__.py").write_text(_OLD_TRITON)
+        setup = "checks = lambda: sys.modules['triton'].reads"
+    probe = f"""
+import json, sys
+{setup}
+import intj
+from intj.launcher import UnsupportedKernel
+
+refusals = []
+for _ in range(2):
+    try:
+        intj.make_launcher(object())
+    except UnsupportedKernel as error:
+        refusals.append(str(error))
+print(json.dumps([refusals, checks()]))
+"""
+    package_root = os.path.dirname(os.path.dirname(launcher.__file__))
+    run = subprocess.run(
+        [sys.executable, "-c", probe],
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join([str(tmp_path), package_root]),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert run.returncode == 0, run.stderr
+    refusal = "intj: Triton >=3.7 is required; install `intj[launcher]`" + (
+        "" if found is None else f" (found {found})"
+    )
+    assert json.loads(run.stdout) == [[refusal, refusal], 1]
 
 
 @pytest.fixture(scope="module")

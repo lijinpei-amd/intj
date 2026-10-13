@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import dis
+import functools
 import gc
 import importlib.util
 import inspect
@@ -4825,9 +4826,19 @@ def test_launcher_requires_triton_extra(monkeypatch, version):
     setattr(installed, "__version__", version)
     monkeypatch.setitem(sys.modules, "triton", installed if version else None)
     monkeypatch.setattr("intj._imports.triton", None)  # forget the cached import
+    find = intj._imports._find_triton  # and the cached lookup, for this test only
+    monkeypatch.setattr(
+        intj._imports,
+        "_find_triton",
+        functools.lru_cache(maxsize=None)(find.__wrapped__),
+    )
 
-    with pytest.raises(UnsupportedKernel, match=r"Triton >=3\.7.*intj\[launcher\]"):
+    found = "" if version is None else f" (found {version})"
+    with pytest.raises(UnsupportedKernel) as excinfo:
         make_launcher(object()).__self__.check()
+    assert str(excinfo.value) == (
+        f"intj: Triton >=3.7 is required; install `intj[launcher]`{found}"
+    )
 
 
 def test_refuses_kernel_reading_globals():

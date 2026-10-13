@@ -9,6 +9,8 @@ knobs` copies the None.
 
 from __future__ import annotations
 
+import functools
+import types
 from typing import Any
 
 # triton and torch ship no type information, so every name here is `Any`.
@@ -40,7 +42,9 @@ def ensure_triton_imported() -> None:
     """Imports triton once and caches the names intj uses from it.
 
     Raises:
-        UnsupportedKernel: Triton is missing or older than 3.7.
+        UnsupportedKernel: Triton is missing or older than 3.7.  Found once
+            per process: later calls raise the same refusal without looking
+            again.
     """
     global triton, knobs, tl, driver, build, ASTSource, make_backend
     global JITFunction, MockTensor, TensorWrapper, Autotuner, Heuristics
@@ -48,14 +52,9 @@ def ensure_triton_imported() -> None:
     global native_specialize_impl, cdiv, is_compile_warmup
     if triton is not None:
         return
-    try:
-        import triton as found
-    except ModuleNotFoundError as e:
-        if e.name != "triton":
-            raise
-        raise _triton_required("") from e
-    if tuple(map(int, found.__version__.split(".")[:2])) < (3, 7):
-        raise _triton_required(f" (found {found.__version__})")
+    found = _find_triton()
+    if isinstance(found, str):
+        raise _triton_required(found)
     import triton.language as tl
     from triton import knobs
     from triton._C.libtriton import native_specialize_impl
@@ -73,6 +72,28 @@ def ensure_triton_imported() -> None:
         is_compile_warmup = None
     cdiv = found.cdiv
     triton = found  # last: once it is set, so is every name above
+
+
+@functools.lru_cache(maxsize=None)
+def _find_triton() -> types.ModuleType | str:
+    """Returns triton, or the `_triton_required` suffix saying why not.
+
+    Returning the refusal is what caches it: lru_cache caches no exception,
+    and until triton loads every `make_launcher` call gets here.
+    `make_launcher` calls it under `_STUB_LOCK`; another first caller racing
+    that may run it again, which imports nothing twice and returns the same
+    module or an equal message.
+    """
+    try:
+        import triton as found
+    except ModuleNotFoundError as e:
+        if e.name != "triton":
+            raise
+        return ""
+    version = found.__version__
+    if tuple(map(int, version.split(".")[:2])) < (3, 7):
+        return f" (found {version})"
+    return found
 
 
 def _triton_required(found: str) -> Exception:
