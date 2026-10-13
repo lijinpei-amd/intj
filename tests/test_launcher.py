@@ -5723,13 +5723,12 @@ def test_static_compile_on_disk_loads_without_asking_cpp_extension(
         assert module_of(launch).__file__ == module_of(built).__file__
 
 
-@pytest.mark.parametrize(
-    "mode", [None, TorchAccessMode.STATIC_COMPILE], ids=["auto", "static"]
-)
-def test_warm_first_call_does_not_import_cpp_extension(tmp_path, mode):
+def test_warm_first_call_does_not_import_cpp_extension(tmp_path):
     """A first call whose `.so` is on disk decides the mode and digest without it.
 
     Importing `torch.utils.cpp_extension` costs ~55 ms; only a build reads it.
+    The module is built here, so the one fresh process (`import torch` alone
+    can take seconds) only loads it, for an automatic and an explicit request.
     """
     import importlib.util
 
@@ -5737,10 +5736,15 @@ def test_warm_first_call_does_not_import_cpp_extension(tmp_path, mode):
 
     if cxx_toolchain() is None or importlib.util.find_spec("setuptools") is None:
         pytest.skip("no C++ compiler, torch headers or setuptools")
-    source = tmp_path / "warm_kernel.py"
-    source.write_text("import triton\n@triton.jit\ndef warm_kernel(x, n):\n    pass\n")
-    requested = "None" if mode is None else f"TorchAccessMode.{mode.name}"
-    script = f"""
+    kernel = _kernel_from_source(tmp_path, "warm_kernel", "x, n")
+    built = make_launcher(
+        kernel, no_gpu=True, torch_access_mode=TorchAccessMode.STATIC_COMPILE
+    )
+    built(0, 0, (1,), 0, 1)
+    path = module_of(built).__file__
+    assert path is not None
+    assert pathlib.Path(path).with_name("warm_kernel.cpp").exists()
+    script = """
 import importlib.util
 import sys
 from intj import TorchAccessMode, make_launcher
@@ -5749,30 +5753,21 @@ from intj.launcher import module_of
 spec = importlib.util.spec_from_file_location("warm_kernel", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-launch = make_launcher(module.warm_kernel, no_gpu=True, torch_access_mode={requested})
-launch(0, 0, (1,), 0, 1)
-print(module_of(launch).__file__)
+for mode in (None, TorchAccessMode.STATIC_COMPILE):
+    launch = make_launcher(module.warm_kernel, no_gpu=True, torch_access_mode=mode)
+    launch(0, 0, (1,), 0, 1)
+    print(module_of(launch).__file__)
 print("torch.utils.cpp_extension" in sys.modules)
 """
-
-    def first_call() -> list[str]:
-        run = subprocess.run(
-            [sys.executable, "-c", script, str(source)],
-            cwd=tmp_path,
-            env=_tested_intj_env(),
-            capture_output=True,
-            text=True,
-        )
-        assert run.returncode == 0, run.stderr
-        return run.stdout.split()
-
-    built, _ = first_call()  # puts the .so on disk
-    path, imported = first_call()
-    assert path == built
-    assert pathlib.Path(path).with_name("warm_kernel.cpp").exists(), (
-        "not STATIC_COMPILE"
+    run = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "warm_kernel.py")],
+        cwd=tmp_path,
+        env=_tested_intj_env(),
+        capture_output=True,
+        text=True,
     )
-    assert imported == "False"
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.split() == [path, path, "False"]
 
 
 def test_public_torch_access_modes():
