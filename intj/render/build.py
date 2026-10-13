@@ -105,13 +105,19 @@ def cxx_toolchain() -> tuple[list[str], list[str]] | None:
 
 @functools.lru_cache(maxsize=1)
 def cxx_lib_dirs() -> tuple[str, ...] | None:
-    """Returns `cxx_toolchain()`'s library dirs, or None where it returns None.
+    """Returns `cxx_toolchain()`'s library dirs, or None.
 
     The access mode, and the rpath the module's digest records, need only
     these, so a first call whose `.so` is already on disk should not pay ~55 ms
     for `torch.utils.cpp_extension`.  Where `_lib_dirs_without_cpp_extension`
     is certain of the answer it is used; anywhere else this asks
     `cxx_toolchain`.  `build_flags` checks the two agree before any build.
+
+    None exactly where `cxx_toolchain()` is None, but for one case: a
+    cpp_extension that is installed but fails to import (setuptools under
+    `SETUPTOOLS_USE_DISTUTILS=stdlib` on 3.12, a torch without `filelock`).
+    Never importing it, this says yes there; a build then raises
+    `CppExtensionUnavailable`, and the launcher chooses again.
     """
     try:
         compiler_path("c++")
@@ -189,8 +195,8 @@ def load(key: RenderKey, kernel_module: str) -> types.ModuleType:
 
 def build(so_path: Path, key: RenderKey) -> None:
     """Renders and compiles, then installs both artifacts next to each other."""
+    flags = build_flags(key)  # first: it may refuse
     src = render(key)
-    flags = build_flags(key)
     binary = _compile_so_bytes(src, key.module_name, flags)
     so_path.parent.mkdir(parents=True, exist_ok=True)
     # The source is kept next to the binary: it is what you read when a launch
@@ -260,6 +266,8 @@ def build_flags(key: RenderKey) -> dict[str, Any]:
     build reads those, and finding them imports `torch.utils.cpp_extension`.
 
     Raises:
+        CppExtensionUnavailable: `cxx_lib_dirs` decided the c++ mode without
+            cpp_extension, which fails to import or finds no torch headers.
         UnsupportedKernel: `cxx_lib_dirs` decided the c++ mode, and so the
             digest, without cpp_extension, and cpp_extension disagrees.
     """
@@ -267,22 +275,30 @@ def build_flags(key: RenderKey) -> dict[str, Any]:
     if key.torch_access_mode != TorchAccessMode.STATIC_COMPILE.value:
         return flags
     toolchain = cxx_toolchain()
-    if toolchain is None or tuple(toolchain[1]) != tuple(flags["library_dirs"]):
+    if toolchain is None:
+        raise CppExtensionUnavailable(
+            "intj: STATIC_COMPILE needs torch.utils.cpp_extension to build, and it "
+            "fails to import or finds no torch headers"
+        )
+    if tuple(toolchain[1]) != tuple(flags["library_dirs"]):
         from ..launcher import UnsupportedKernel  # not at top: launcher imports this
 
-        found = (
-            toolchain[1]
-            if toolchain
-            else "nothing (it failed to import, or found no torch headers)"
-        )
         raise UnsupportedKernel(
             "intj: torch.utils.cpp_extension disagrees with the STATIC_COMPILE "
             f"toolchain intj found without it: library dirs {flags['library_dirs']}, "
-            f"cpp_extension found {found}; report it, and pass "
+            f"cpp_extension found {toolchain[1]}; report it, and pass "
             "torch_access_mode=TorchAccessMode.RUNTIME_SHIM meanwhile"
         )
     flags["include_dirs"] += toolchain[0]
     return flags
+
+
+class CppExtensionUnavailable(Exception):
+    """A build needs `torch.utils.cpp_extension`, and it has no toolchain to give.
+
+    Only where `cxx_lib_dirs` said yes without importing it (see there); the
+    launcher catches this and chooses the mode as if `check()` had asked it.
+    """
 
 
 def digest_flags(key: RenderKey) -> dict[str, Any]:

@@ -110,7 +110,9 @@ in `_imports.py`. Three imports stay local, each commented: Gluon's runtime and
 from a triton built without it. `test_importing_intj_imports_neither_triton_nor_torch`
 guards the rule. Only a build imports `cpp_extension`: `cxx_lib_dirs` decides the
 access mode and the digest without it wherever it can be certain, and
-`test_warm_first_call_does_not_import_cpp_extension` guards that.
+`test_warm_first_call_does_not_import_cpp_extension` guards that. Where it then
+cannot import, the build raises `CppExtensionUnavailable` and the launcher
+chooses again from `cxx_toolchain`, as `check()` would have.
 
 ## Refusals are loud and early
 

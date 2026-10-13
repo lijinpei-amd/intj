@@ -427,13 +427,27 @@ def test_cxx_lib_dirs_need_a_cxx_compiler(monkeypatch, fresh_lib_dirs):
     assert build.cxx_lib_dirs() is None
 
 
-@pytest.mark.parametrize("toolchain", [None, (["/i"], ["/elsewhere"])])
-def test_build_refuses_where_cpp_extension_disagrees(monkeypatch, toolchain):
-    """The mode and digest were decided without cpp_extension: a build checks them."""
+@pytest.mark.parametrize(
+    "toolchain, error, match",
+    [
+        (None, build.CppExtensionUnavailable, "fails to import"),
+        ((["/i"], ["/elsewhere"]), launcher.UnsupportedKernel, "disagrees"),
+    ],
+    ids=["unavailable", "disagrees"],
+)
+def test_build_refuses_where_cpp_extension_disagrees(
+    monkeypatch, toolchain, error, match
+):
+    """The mode and digest were decided without cpp_extension: a build checks them.
+
+    Unavailable is the one case the launcher recovers from, by choosing again.
+    """
     monkeypatch.setattr(build, "cxx_lib_dirs", lambda: ("/l",))
     monkeypatch.setattr(build, "cxx_toolchain", lambda: toolchain)
-    with pytest.raises(launcher.UnsupportedKernel, match="cpp_extension disagrees"):
+    with pytest.raises(error, match=match) as raised:
         build.build_flags(_key(TorchAccessMode.STATIC_COMPILE))
+    if toolchain is not None:  # the launcher must not recover from this one
+        assert not isinstance(raised.value, build.CppExtensionUnavailable)
 
 
 def test_build_flags_add_cpp_extension_includes_to_digest_flags(monkeypatch):

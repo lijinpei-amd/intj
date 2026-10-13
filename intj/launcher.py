@@ -46,9 +46,11 @@ from .kernel_cache import (
 from .options import OPTION_FIELDS, MakeLauncherKwargs, MakeLauncherOption
 from .python_intf import cpython_abi
 from .render.build import (
+    CppExtensionUnavailable,
     compiler_identity,
     compiler_path,
     cxx_lib_dirs,
+    cxx_toolchain,
     digest_flags,
     load,
     runtime_headers,
@@ -162,6 +164,8 @@ class _Analysis:
     params: tuple[ResolvedParam, ...]
     options: tuple[tuple[str, Any], ...]
     torch_access_mode: TorchAccessMode
+    #: what `torch_access_mode` was resolved from: None selects
+    torch_access_request: TorchAccessMode | None
     kernel_cache: KernelCache
     verify_annotation: bool
     no_gpu: bool
@@ -450,6 +454,7 @@ def _analyze(option: MakeLauncherOption) -> _Analysis:
         resolved,
         tuple(options.items()),
         access,
+        torch_access_mode,
         kernel_cache,
         verify_annotation,
         no_gpu,
@@ -676,6 +681,7 @@ class Launcher:
             b.params,
             dict(a.options),
             a.torch_access_mode,
+            a.torch_access_request,
             a.kernel_cache,
             a.no_gpu,
             a.verify_annotation,
@@ -880,6 +886,7 @@ def _materialize_module(
     resolved: tuple[ResolvedParam, ...],
     options: Mapping[str, Any],
     access: TorchAccessMode,
+    requested_access: TorchAccessMode | None,
     kernel_cache: KernelCache,
     no_gpu: bool,
     verify_annotation: bool,
@@ -897,11 +904,14 @@ def _materialize_module(
     """Returns the loaded module for this kernel and configuration.
 
     Queries the target (unless `no_gpu`), and loads, building if needed, the
-    module for its `RenderKey`.
+    module for its `RenderKey`.  `requested_access` is what `access` was
+    resolved from, for choosing again where a build finds STATIC_COMPILE
+    unavailable after all.
 
     Raises:
-        UnsupportedKernel: The target's backend is not registered, or a
-            compile option name is unknown to it.
+        UnsupportedKernel: The target's backend is not registered, a
+            compile option name is unknown to it, or STATIC_COMPILE was
+            requested and the module needs a build cpp_extension cannot do.
     """
     if no_gpu:
         target = None
@@ -965,18 +975,13 @@ def _materialize_module(
         device_symbol=backend.device_symbol if backend is not None else "",
         error_symbol=backend.error_symbol if backend is not None else "",
         error_style=backend.error_style if backend is not None else "return",
-        torch_access_mode=access.value,
+        # `_for_access` fills in these and `compiler`, `build_flags`
+        torch_access_mode="",
+        torch_version=None,
+        cxx_abi=None,
         kernel_cache=kernel_cache.value,
         cache_include_dirs=cache_toolchain["include_dirs"],
         cache_archives=cache_toolchain["archives"],
-        # Only the c++ mode compiles anything torch-specific in, so only it has
-        # to be rebuilt when torch changes.  Leaving these None for the other
-        # two is what keeps their digest -- and so their cached `.so` -- stable
-        # across torch versions.
-        torch_version=torch_version()
-        if access is TorchAccessMode.STATIC_COMPILE
-        else None,
-        cxx_abi=_cxx_abi() if access is TorchAccessMode.STATIC_COMPILE else None,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=_verified_cpython_header(),
@@ -998,36 +1003,65 @@ def _materialize_module(
         if canonical_options is not None
         else "host-defaults",
         triton=_triton_identity(),
-        # `digest_flags` derives these from the fields above: filled in below
         compiler=(),
         build_flags=(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
         global_values=global_values,
     )
-    flags = digest_flags(key)
+    baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
+
+    def loaded(mode: TorchAccessMode) -> types.ModuleType:
+        # the c++ mode gets it too, not to read from but to check its own
+        # compiled-in offset against
+        layout = (
+            layout_for()
+            if mode in (TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE)
+            else None
+        )
+        return _loaded_module(
+            _for_access(key, mode),
+            jit_func,
+            params,
+            options,
+            layout,
+            baked_values,
+            knob_values,
+            dynamic,
+        )
+
+    try:
+        return loaded(access)
+    except CppExtensionUnavailable as error:
+        # `check()` chose STATIC_COMPILE without importing cpp_extension, and
+        # no `.so` was on disk: choose again, as `check()` used to, from
+        # cpp_extension itself.  An explicit request is refused.
+        try:
+            confirmed = _resolve_torch_access_mode(requested_access, confirmed=True)
+        except UnsupportedKernel as refusal:
+            raise refusal from error
+        return loaded(confirmed)
+
+
+def _for_access(key: RenderKey, access: TorchAccessMode) -> RenderKey:
+    """Returns `key` with the fields `access` decides filled in."""
+    static = access is TorchAccessMode.STATIC_COMPILE
     key = dataclasses.replace(
+        key,
+        torch_access_mode=access.value,
+        # Only the c++ mode compiles anything torch-specific in, so only it has
+        # to be rebuilt when torch changes.  Leaving these None for the other
+        # two is what keeps their digest -- and so their cached `.so` -- stable
+        # across torch versions.
+        torch_version=torch_version() if static else None,
+        cxx_abi=_cxx_abi() if static else None,
+    )
+    # `digest_flags` derives these from the fields above
+    flags = digest_flags(key)
+    return dataclasses.replace(
         key,
         compiler=compiler_identity(flags["language"]),
         build_flags=tuple(flags["ccflags"]),
-    )
-    # the c++ mode gets it too, not to read from but to check its own
-    # compiled-in offset against
-    layout = (
-        layout_for()
-        if access in (TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE)
-        else None
-    )
-    baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
-    return _loaded_module(
-        key,
-        jit_func,
-        params,
-        options,
-        layout,
-        baked_values,
-        knob_values,
-        dynamic,
     )
 
 
@@ -1323,23 +1357,34 @@ def _verified_cpython_header() -> str:
     return header
 
 
-def _resolve_torch_access_mode(requested: TorchAccessMode | None) -> TorchAccessMode:
+def _resolve_torch_access_mode(
+    requested: TorchAccessMode | None, *, confirmed: bool = False
+) -> TorchAccessMode:
     """Selects a concrete mode from an automatic or explicit request.
 
     Explicit modes are validated rather than silently downgraded: a caller who
     asked for `RUNTIME_SHIM` because they measured it wants to hear that it is
     unavailable, not to get `INTERPRETER` and wonder where the time went.
+
+    `check()` asks `cxx_lib_dirs`, which spares a first call whose `.so` is on
+    disk the cpp_extension import; `confirmed=True` asks `cxx_toolchain`, as a
+    build must (`_materialize_module`).  The two differ only where cpp_extension
+    is installed but cannot import.
     """
+
+    def cxx() -> bool:
+        return (cxx_toolchain() if confirmed else cxx_lib_dirs()) is not None
+
     if requested is TorchAccessMode.RUNTIME_SHIM and layout_for() is None:
         raise UnsupportedKernel(_unverified_torch_message())
-    if requested is TorchAccessMode.STATIC_COMPILE and cxx_lib_dirs() is None:
+    if requested is TorchAccessMode.STATIC_COMPILE and not cxx():
         raise UnsupportedKernel(
             "intj: STATIC_COMPILE needs a C++ compiler and torch's headers; "
             "set $CXX or pass torch_access_mode=TorchAccessMode.RUNTIME_SHIM"
         )
     if requested is not None:
         return requested
-    if cxx_lib_dirs() is not None:
+    if cxx():
         return TorchAccessMode.STATIC_COMPILE
     if layout_for() is not None:
         return TorchAccessMode.RUNTIME_SHIM

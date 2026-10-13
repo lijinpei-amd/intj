@@ -5638,12 +5638,89 @@ def test_default_resolves_and_explicit_modes_validate(monkeypatch):
     for m in ACCESS_MODES:
         assert resolve(m) is m
     assert resolve(None) is TorchAccessMode.STATIC_COMPILE
+    # `confirmed` asks cpp_extension itself, which here cannot import
+    monkeypatch.setattr(launcher_mod, "cxx_toolchain", lambda: None)
+    with pytest.raises(UnsupportedKernel, match="STATIC_COMPILE needs"):
+        resolve(TorchAccessMode.STATIC_COMPILE, confirmed=True)
+    assert resolve(None, confirmed=True) is TorchAccessMode.RUNTIME_SHIM
     monkeypatch.setattr(launcher_mod, "cxx_lib_dirs", lambda: None)
     with pytest.raises(UnsupportedKernel, match="STATIC_COMPILE needs"):
         resolve(TorchAccessMode.STATIC_COMPILE)
     assert resolve(None) is TorchAccessMode.RUNTIME_SHIM
     monkeypatch.setattr(launcher_mod, "layout_for", lambda: None)
     assert resolve(None) is TorchAccessMode.INTERPRETER
+
+
+@pytest.mark.parametrize(
+    "mode", [None, TorchAccessMode.STATIC_COMPILE], ids=["auto", "static"]
+)
+def test_static_compile_cpp_extension_cannot_build_chooses_again(
+    tmp_path, monkeypatch, mode
+):
+    """Where cpp_extension cannot import, a build chooses as `check()` used to.
+
+    `check()` picks STATIC_COMPILE without importing it (`cxx_lib_dirs`), so a
+    cpp_extension that is installed but fails to import (setuptools under
+    `SETUPTOOLS_USE_DISTUTILS=stdlib` on 3.12) says no only when a build asks:
+    the automatic choice moves on, an explicit request is refused.
+    """
+    from intj import launcher as launcher_mod
+    from intj.render import build
+
+    try:
+        build.compiler_path("c++")  # the c++ key reads its identity
+    except Exception:
+        pytest.skip("no C++ compiler")
+    missing = (str(tmp_path / "lib"),)  # no `.so` on disk has this rpath
+    for module in (launcher_mod, build):
+        monkeypatch.setattr(module, "cxx_lib_dirs", lambda: missing)
+        monkeypatch.setattr(module, "cxx_toolchain", lambda: None)
+    monkeypatch.setattr(launcher_mod, "_LOADED", {})
+    kernel = _kernel_from_source(tmp_path, "unconfirmed_kernel", "x, n")
+    launch = make_launcher(kernel, no_gpu=True, torch_access_mode=mode)
+    launch.__self__.check()
+    if mode is not None:
+        with pytest.raises(UnsupportedKernel, match="STATIC_COMPILE needs") as refused:
+            launch(0, 0, (1,), 0, 1)
+        assert isinstance(refused.value.__cause__, build.CppExtensionUnavailable)
+        assert not launcher_mod._LOADED
+        return
+    launch(0, 0, (1,), 0, 1)
+    (key,) = launcher_mod._LOADED
+    assert launcher_mod._LOADED[key] is module_of(launch)
+    expected = (
+        TorchAccessMode.RUNTIME_SHIM
+        if launcher_mod.layout_for() is not None
+        else TorchAccessMode.INTERPRETER
+    )
+    assert key.torch_access_mode == expected.value
+
+
+def test_static_compile_on_disk_loads_without_asking_cpp_extension(
+    tmp_path, monkeypatch
+):
+    """A c++ module already built loads even where cpp_extension now fails."""
+    from intj import launcher as launcher_mod
+    from intj.render import build
+
+    if launcher_mod.cxx_lib_dirs() is None:  # also caches the answer
+        pytest.skip("no C++ compiler or torch headers")
+    kernel = _kernel_from_source(tmp_path, "on_disk_kernel", "x, n")
+    built = make_launcher(
+        kernel, no_gpu=True, torch_access_mode=TorchAccessMode.STATIC_COMPILE
+    )
+    built(0, 0, (1,), 0, 1)
+
+    def unavailable():
+        raise AssertionError("asked cpp_extension for a module already on disk")
+
+    for module in (launcher_mod, build):
+        monkeypatch.setattr(module, "cxx_toolchain", unavailable)
+    monkeypatch.setattr(launcher_mod, "_LOADED", {})
+    for mode in (None, TorchAccessMode.STATIC_COMPILE):
+        launch = make_launcher(kernel, no_gpu=True, torch_access_mode=mode)
+        launch(0, 0, (1,), 0, 1)
+        assert module_of(launch).__file__ == module_of(built).__file__
 
 
 @pytest.mark.parametrize(

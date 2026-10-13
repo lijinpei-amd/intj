@@ -640,7 +640,11 @@ layout exists, else `INTERPRETER`. An explicit unavailable mode raises.
 Deciding does not import `torch.utils.cpp_extension` (~55 ms) where intj can
 locate torch's headers and libraries itself (checked on torch 2.2 to 2.14, CPU
 and ROCm wheels; CUDA wheels untested): only a build imports it, and a build
-raises `UnsupportedKernel` if it disagrees.
+raises `UnsupportedKernel` if it finds other library directories. A module
+already on disk loads without it. Where a build finds it cannot import (e.g.
+setuptools under `SETUPTOOLS_USE_DISTUTILS=stdlib` on Python 3.12), the default
+falls back as above, and an explicit `STATIC_COMPILE` is refused by that first
+call instead of by `check()`.
 
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
