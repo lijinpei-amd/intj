@@ -7,10 +7,13 @@ from migrating two trees onto intj `develop`, both on branch
 - `lijinpei-amd/triton`
 - `lijinpei-amd/aiter`
 
-Counts are sites in those trees as of 2026-09-29. Each tree's exception list
-(`intj_launch_exceptions.json` in triton, `docs/intj_launch_exceptions.md` in
-aiter) records every site with its reason. `TODO.md` tracks intj work in
-general; this file tracks what blocks migration.
+Triton counts are sites as of 2026-09-29; aiter counts are as of aiter
+`00df7c810` (2026-10-13), whose list has 11 Triton launches left:
+`num_ctas > 1` (3), Iris (3), `torch.compile` (3) and PDL (2). Each tree's
+exception list (`intj_launch_exceptions.json` in triton,
+`docs/intj_launch_exceptions.md` in aiter) records every site with its
+reason. `TODO.md` tracks intj work in general; this file tracks what blocks
+migration.
 
 ## Gaps that intj work can close
 
@@ -18,13 +21,13 @@ general; this file tracks what blocks migration.
 |---|---|---|
 | ~~**Class-valued globals**~~ | **Closed** in `3e06c17`. With `assume_constant_globals=True` a class global (`NamedTuple`, Gluon layout classes such as `AMDWMMALayout`) is keyed by `module.qualname`, and `make_launcher` emits one filterable `intj.ClassGlobalWarning` because replacing the class is not detected. Other values intj cannot canonicalize are still refused, with a message naming the global and its type (see `docs/Usage.md`). | none |
 | ~~**Dynamic option with the same name as a constexpr parameter**~~ | **Closed** in `8df1e41` (plain launchers, `compat.launch`) and `0be1991` (autotune/heuristics). A `tl.constexpr` parameter named like a compile option (`num_warps`, `num_stages`, `waves_per_eu`, ...) now also sets that option on every call, passed, baked or tuned; `dynamic_options` naming it is a no-op, and `options=` naming it is refused. Unlike Triton, a positional value sets the option too (see `docs/Usage.md`). | none |
-| **No way back from a launcher to its kernel** | A launcher is a `PyCFunction` and exposes no `JITFunction`. Callers that need it keep a separate named launcher. Uses include AOT compile by name, reference launches through Triton in tests, heuristics checks, calling the kernel as a device function, and reading its `debug` attribute (FlashKDA). A candidate fix is an `intj.jit_of(launcher)` read from the lazy-state object. | aiter: ~13 named launchers + FlashKDA |
+| ~~**No way back from a launcher to its kernel**~~ | **Closed** in `7cebe32` for launchers without `delayed=`: `launcher.__self__.options.jit_func` is the `JITFunction` (or tuner chain) it launches, so aiter's AOT compile tools and the tests that read `arg_names`, heuristics or source, or launch a Triton reference, read it from a decorated kernel's launcher. A `delayed=` launcher's `options` is an `intj.launcher.Delayed` with no `jit_func` until `check()` (see `TODO.md`). Of aiter's ~13 named launchers, 3 remain because the JIT function must keep its own name: `triton.tools.compile` loads `aiter/mla.py`'s kernel by attribute (2 launchers over it), and `rmsnorm`'s kernel is also called from another kernel. | none |
 | **`tl.constexpr` grid dimension** | A `tl.constexpr` value used as a grid dimension is rejected. | triton: a few |
 | **`compat.launch` has no `assume_constant_globals`** | Neither `compat.launch` nor `launch_or_interpret` can pass the option, so kernels behind the bridge that read globals stay refused. | triton: bridge sites that read globals |
-| **Tuple arguments and tuple constexprs** | `ARG_TUPLE` is not decoded or keyed (see `TODO.md`). aiter's Gluon kernels were rewritten to take scalars instead. | triton: ~41 entries; aiter: `attn_res` (`res`) |
+| **Tuple arguments and tuple constexprs** | `ARG_TUPLE` is not decoded or keyed (see `TODO.md`). aiter's Gluon kernels were rewritten to take scalars instead, and attn_res's sequence layout takes its residuals as 16 pointer parameters (`res0`..`res15`), one launcher per `L2` bucket; more than 16 are stacked into one tensor. | triton: ~41 entries |
 | **Gluon layout objects as constexprs** | intj cannot decode layout objects passed as arguments (see `TODO.md`). aiter's gfx1250 kernels were rewritten to build their layouts in-kernel. | triton: ~75 (+6 with tuples) |
 | **`TensorWrapper` arguments** | `make_launcher` refuses `TensorWrapper`. | triton: 14 bridge sites |
-| **`torch.compile`** | Kernels wrapped with `torch.library.wrap_triton`, or launched inside compiled graphs, must go through Triton (see `TODO.md`). | aiter: 2; triton: some |
+| **`torch.compile`** | Kernels wrapped with `torch.library.wrap_triton`, or launched inside compiled graphs, must go through Triton (see `TODO.md`). aiter's fav3_sage, compiled with `fullgraph=True`, launches its launchers' `jit_func` through Triton while Dynamo traces. | aiter: 3; triton: some |
 
 ## Gaps that intj refuses by design today
 
@@ -46,7 +49,9 @@ These sites stay on Triton because the site itself tests or needs Triton behavio
 - tests of Triton's cache, runtime, IR dumps, hooks and diagnostics (triton: ~80);
 - compile-warmup interception (triton: 20 bridge sites + 10);
 - tests that expect the bridge's own errors;
-- precompiled or AOT kernels that are not `JITFunction`s;
+- precompiled or AOT kernels that are not `JITFunction`s (none left in aiter: its
+  metadata-redirect test compiles through a `return_compiled=True` launcher,
+  and pa_mqa_logits' Triton < 3.4 loader was deleted);
 - code paths only reachable on Triton < 3.7.
 
 ## Untested

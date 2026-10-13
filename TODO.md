@@ -40,11 +40,27 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
+- **A baked int cannot take Triton's specialization of its value.** On a
+  parameter with no inline type annotation, `Argument(value=0)` raises "has
+  AUTO specialization with a fixed value" under `AUTO` and under
+  `Assume(Aligned(16))` (equal-to-1 stays `AUTO`); only `NEVER` is accepted,
+  which drops the divisibility Triton gives 0 or any multiple of 16 (and the
+  constexpr it makes of 1), so the binary differs from Triton's. Resolve
+  `AUTO` from the baked value.
+- **`Assume` cannot turn a fact off.** Facts left out of `Assume` stay `AUTO`
+  and are measured per call; only Triton's `do_not_specialize_on_alignment`
+  and an inline type annotation turn single facts off, and "assume aligned,
+  no pointer range" cannot be written. So a hand-written `ASTSource` attrs set
+  is not always reproducible: aiter's pa_mqa_logits launchers compile with
+  `tt.divisibility` and `tt.pointer_range` facts its attrs lacked, whenever
+  they hold. Needs a per-fact `NEVER`.
 - **Tuple / namedtuple arguments and tuple constexprs.** `ARG_TUPLE` recursion in the decoder and
-  the key; aiter `attn_res` (`res`) and ~41 Triton-test entries pass tuples.
+  the key; ~41 Triton-test entries pass tuples. aiter's last one, `attn_res`'s
+  `res`, became 16 pointer parameters, one launcher per `L2` bucket.
 - **`torch.compile` integration.** Kernels wrapped with `torch.library.wrap_triton` or launched
   inside `torch.compile` graphs still go through Triton (aiter rotary, Triton's constexpr-mutation
-  test); intj launchers are opaque to dynamo -- register them as custom ops or teach
+  test, and aiter's fav3_sage, which launches its launchers' `jit_func` while Dynamo traces);
+  intj launchers are opaque to dynamo -- register them as custom ops or teach
   `wrap_triton` to dispatch to an intj launcher.
 - Kernels reading globals: `assume_constant_globals=True` trusts them; still
   refused by default. Revalidating in C (`PyObject_RichCompareBool` per entry)
@@ -60,6 +76,12 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   `bench_time` and `configs_timings` after tuning, but not `cache` itself, so
   code inspecting `len(kernel.cache)` sees 0 even after a tuned launch; either
   mirror entries back per key or warm-start intj's own cache from it.
+- **A `delayed=` launcher has no `jit_func` before `check()`.** Its
+  `__self__.options` is an `intj.launcher.Delayed` until `check()` runs the
+  delayed function, which may query the GPU; code that only wants the kernel
+  back must check first or, like aiter's `launch_on_current_stream`, take only
+  launchers without `delayed=`. The kernel is known at `make_launcher`; expose
+  it on `Delayed`.
 - **Keyword arguments at launch.** Launchers are `METH_FASTCALL` (positional
   only); `METH_FASTCALL | METH_KEYWORDS` (vectorcall `kwnames`) would accept
   keywords with no cost for positional calls (`kwnames` `NULL`) -- needs a
