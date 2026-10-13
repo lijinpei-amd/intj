@@ -83,6 +83,18 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   common shapes ~1.5 ns (journal `2026-09-28_lazy-task5_0_8d95e66.md`); the
   upgrade path is a hot/cold section split (`__attribute__((hot/cold))` or
   `.text.hot`) so cold code cannot move the hit path.
+- **Launch calls with more than 30 positional arguments.** CPython 3.10+
+  compiles a call site with 31 or more positional arguments to `BUILD_LIST` /
+  `LIST_APPEND` + `CALL_FUNCTION_EX` instead of `CALL` (3.8 and 3.9 do not),
+  so the launcher loses `CALL_BUILTIN_FAST` and every call builds a list and a
+  tuple. Device, stream, grid dimensions and dynamic options all count. On
+  gfx942 a 27-parameter kernel went from 4123 ns at 30 positional arguments to
+  4514-4566 ns at 31-33; aiter's mla stage-2 launch gained +389-411 ns when
+  three dynamic options pushed it to 31. aiter's pa_decode_gluon kernels (54
+  parameters) pay this on every launch. The threshold is a property of the
+  caller's source, so intj cannot avoid it inside the entry; options are a
+  packed-argument call form, guidance to bake or `bind_values` arguments to stay
+  at or below 30, or both.
 - **Two-entry memo per object slot.** A slot remembers one object; a call site
   alternating two `str`/dtype/JIT objects in one slot pays an interner call
   per launch. Add a second entry if `--dynamic` or a real site shows it.
