@@ -97,7 +97,14 @@ def _cache_version() -> tuple[int, int]:
 
 @dataclasses.dataclass(frozen=True)
 class CompilerInput:
-    """The final annotated ASTSource identity, with its original Python constants."""
+    """The final annotated ASTSource identity, with its original Python constants.
+
+    `attrs` holds each parameter's facts; `bare` the parameters Triton's launch
+    lists in its attrs with no facts (`(i,): []`). Both enter
+    `ASTSource.hash()`, so the source hashes as Triton's own does, but an empty
+    entry never changes the binary: only `attrs` is compared. A Triton-typed
+    integer is listed for 3 and not for 1, under one intj key.
+    """
 
     signature: tuple[tuple[str, str], ...]
     constants: tuple[tuple[tuple[int, ...], tuple[object, ...]], ...]
@@ -105,9 +112,15 @@ class CompilerInput:
     values: tuple[tuple[tuple[int, ...], object], ...] = dataclasses.field(
         compare=False, hash=False, repr=False
     )
+    bare: tuple[tuple[int, ...], ...] = dataclasses.field(
+        default=(), compare=False, hash=False
+    )
 
     def ast_source(self, jit_func: JitFunction) -> Any:
-        """Returns the triton `ASTSource` (`GluonASTSource` for Gluon) to compile."""
+        """Returns the triton `ASTSource` (`GluonASTSource` for Gluon) to compile.
+
+        Its attrs list parameters in Triton's order, empty entries included.
+        """
         _imports.ensure_triton_imported()
         source_type = _imports.ASTSource
         if jit_func.is_gluon():
@@ -115,11 +128,15 @@ class CompilerInput:
             from triton.experimental.gluon._runtime import GluonASTSource
 
             source_type = GluonASTSource
+        entries = [
+            *((path, [list(attr) for attr in attrs]) for path, attrs in self.attrs),
+            *((path, []) for path in self.bare),
+        ]
         return source_type(
             jit_func,
             dict(self.signature),
             dict(self.values),
-            {path: [list(attr) for attr in attrs] for path, attrs in self.attrs},
+            dict(sorted(entries, key=lambda entry: entry[0])),
         )
 
 
@@ -2070,6 +2087,7 @@ def _compiler_input(
     constants: list[tuple[tuple[int, ...], tuple[object, ...]]] = []
     attrs: list[tuple[tuple[int, ...], tuple[tuple[str, int], ...]]] = []
     values: list[tuple[tuple[int, ...], object]] = []
+    bare: list[tuple[int, ...]] = []
     for param in params:
         annotation = param.annotation
         if annotation.bind_value is not None:
@@ -2152,16 +2170,36 @@ def _compiler_input(
                 )
         path = (param.index,)
         signature.append((param.name, ty))
+        parsed: tuple[tuple[str, int], ...] = ()
         if ty == "constexpr":
             constants.append((path, _canonical_value(value)))
             values.append((path, value))
-        if desc:
+        elif desc:
             parsed = tuple((name, amount) for name, amount in backend.parse_attr(desc))
-            if parsed:
-                attrs.append((path, parsed))
+        if parsed:
+            attrs.append((path, parsed))
+        elif ty == "constexpr" or _lists_attrs(
+            jit_func.params[param.index], annotation, ty, value
+        ):
+            bare.append(path)
     return CompilerInput(
-        tuple(signature), tuple(constants), tuple(attrs), tuple(values)
+        tuple(signature), tuple(constants), tuple(attrs), tuple(values), tuple(bare)
     )
+
+
+def _lists_attrs(
+    jit_param: Any, annotation: CanonicalAnnotation, ty: str, value: object
+) -> bool:
+    # Triton lists a runtime parameter whose specialize_impl key is a str: not
+    # under do_not_specialize, nor a bool or a float. A Triton-typed one keeps
+    # the key of its value, which is the int 1 for 1 and None for a bool or None.
+    if jit_param.do_not_specialize or not _applicable(ty, "aligned_16"):
+        return False
+    if annotation.triton_typed and annotation.bind_value is None:
+        return not (
+            value is None or type(value) is bool or type(value) is int and value == 1
+        )
+    return True
 
 
 def _checked_compile(

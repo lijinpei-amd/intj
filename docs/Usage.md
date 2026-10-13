@@ -787,6 +787,21 @@ compares it with any input previously recorded for the same key and rejects a
 mismatch. Compilation uses that source directly without the JIT function's
 warmup, binder, or device cache.
 
+That source is the one Triton's own `kernel[grid](...)` builds for the same
+arguments, down to its hash: Triton hashes `str(attrs)`, and lists an empty
+`(i,): []` entry for every constexpr and for every runtime integer or pointer
+it specializes, `do_not_specialize` ones excepted. intj lists the same
+entries, so a kernel launched through both compiles once and shares one
+Triton cache entry. This holds for annotations whose facts are the ones
+Triton derives (`NEVER` where it derives none, `Assume` of what it derives);
+other facts are a different binary and hash. One case shares a binary but
+not a hash: Triton lists no entry for a Triton-typed integer (`n: int`,
+`n: tl.int32`) equal to 1 or a bool, and an empty one for other values not
+divisible by 16. These compile alike, so intj keys them together, and the
+first to miss decides which of Triton's hashes the binary has.
+`tests/test_launcher.py::test_compiled_kernel_hash_matches_triton_launch`
+and `test_ast_source_hashes_as_triton_launch` check this.
+
 ## Launch benchmark
 
 ```bash

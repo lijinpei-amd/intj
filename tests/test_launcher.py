@@ -2597,6 +2597,23 @@ def launch(launcher, grid, *args):
     torch.cuda.synchronize()
 
 
+def triton_ast_source(jit_func, args):
+    # what Triton's own jit_func[grid](*args) compiles
+    _, _, _, backend, binder = jit_func.device_caches[torch.cuda.current_device()]
+    bound, specialization, options = binder(*args)
+    _, signature, constexprs, attrs = jit_func._pack_args(
+        backend, {}, bound, specialization, options
+    )
+    return jit_func.ASTSource(jit_func, signature, constexprs, attrs)
+
+
+def check_same_ast_source(jit_func, source, args):
+    ours, theirs = source.ast_source(jit_func), triton_ast_source(jit_func, args)
+    # str(attrs) is what the hash reads: order and empty entries count
+    assert str(ours.attrs) == str(theirs.attrs), args
+    assert ours.hash() == theirs.hash(), args
+
+
 def check_matches_triton(jit_func, launcher, grid, args, out_index):
     """Run the kernel through triton and through intj, compare the outputs."""
     reference = args[out_index]
@@ -3277,6 +3294,8 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
         assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
         # Triton treats tensor annotations as absent: same compiler input
         assert source == _compiler_input(axpy, plain_params, args, backend)
+        # and the source hashes as Triton's, so the two share its cache entry
+        check_same_ast_source(jit, source, args)
 
 
 @triton.jit
@@ -3330,8 +3349,140 @@ def test_python_annotated_params_compile_like_triton():
         assert dict(source.values) == {
             (i,): args[i] for i, (ty, _) in enumerate(spec) if ty == "constexpr"
         }, args
+        # `n` lists no attrs for 1 or a bool, and an empty one for 17
+        check_same_ast_source(python_annotated, source, args)
+        # ... under one key: an empty entry changes the hash, not the binary
         key, _ = launch.__self__.spec_key(0, *args)
         assert seen.setdefault(key, source) == source, args
+
+
+@triton.jit
+def parity_untyped(o, x, s, f, B: tl.constexpr):
+    tl.store(o + s, tl.load(x) * f + B)
+
+
+@triton.jit
+def parity_typed(
+    o,
+    x,
+    s: tl.int32,  # pyright: ignore[reportInvalidTypeForm]  # a triton dtype
+    f: float,
+    B: tl.constexpr,
+):
+    tl.store(o + s, tl.load(x) * f + B)
+
+
+@triton.jit(do_not_specialize=["x", "s"])
+def parity_dns(o, x, s, f, B: tl.constexpr):
+    tl.store(o + s, tl.load(x) * f + B)
+
+
+@triton.jit(do_not_specialize_on_alignment=["x", "s"])
+def parity_dnsa(o, x, s, f, B: tl.constexpr):
+    tl.store(o + s, tl.load(x) * f + B)
+
+
+@gluon.jit
+def parity_gluon(o, x, s, f, B: gl.constexpr):
+    gl.store(o + s, gl.load(x) * f + B)
+
+
+PARITY_KERNELS = {
+    "untyped": parity_untyped,
+    "typed": parity_typed,
+    "dns": parity_dns,
+    "dnsa": parity_dnsa,
+    "gluon": parity_gluon,
+}
+
+
+def _parity_calls():
+    o = torch.zeros(64, device="cuda")
+    x = torch.ones(64, device="cuda")
+    for s, x_view in itertools.product((0, 1, 3, 16), (x, x[1:])):
+        yield (o, x_view, s, 1.5, 4)
+
+
+def _triton_facts(jit_func, args):
+    spec = triton_specialization(jit_func, args)
+    facts = {}
+    for name in ("x", "s"):
+        ty, desc = spec[jit_func.arg_names.index(name)]
+        if ty == "constexpr":
+            facts[name] = (EqualTo(1),)  # an integer 1, folded
+        elif isinstance(desc, str):
+            by_char = {"D": Aligned(16), "S": PointerRange(32)}
+            facts[name] = tuple(by_char[char] for char in desc)
+        else:
+            facts[name] = ()
+    return facts
+
+
+def _parity_annotations(facts):
+    # AUTO, then the facts Triton gives x and s: assumed, or NEVER where none
+    yield None
+    yield {name: Argument(specialize=Assume(*held)) for name, held in facts.items()}
+    unspecialized = [name for name, held in facts.items() if not held]
+    if unspecialized:
+        yield {
+            "f": Argument(specialize=NEVER),
+            **{name: Argument(specialize=NEVER) for name in unspecialized},
+        }
+
+
+@pytest.mark.parametrize("kernel", PARITY_KERNELS)
+def test_ast_source_hashes_as_triton_launch(kernel):
+    """intj's ASTSource hashes as `kernel[grid](...)`'s for every annotation that
+    states Triton's facts.
+
+    Triton lists every constexpr and every specialized parameter in its attrs,
+    an empty entry included, and the hash reads `str(attrs)`.
+    """
+    from triton.compiler import make_backend
+
+    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.launcher import _compiler_input, _current_target, _render_params
+
+    jit = PARITY_KERNELS[kernel]
+    backend = make_backend(_current_target())
+    for args in _parity_calls():
+        for extra in _parity_annotations(_triton_facts(jit, args)):
+            params, _, _ = _render_params(
+                _resolve_annotations(jit, extra), DeviceBinding.NOT_FIXED
+            )
+            source = _compiler_input(jit, params, args, backend)
+            check_same_ast_source(jit, source, args)
+
+
+@pytest.mark.parametrize("kernel", PARITY_KERNELS)
+def test_compiled_kernel_hash_matches_triton_launch(kernel):
+    """A launcher compiles the kernel Triton's launch does, under its cache key.
+
+    So a process using both compiles each kernel once. A Triton-typed `s` of
+    1 and of 3 share an intj key (only an empty attrs entry tells them
+    apart), so the call that misses decides which of Triton's hashes it gets.
+    """
+    jit = PARITY_KERNELS[kernel]
+    plain = make_launcher(jit, return_compiled=True)
+    first = {}
+    for args in _parity_calls():
+        expected = jit[(1,)](*args)
+        compiled = plain(*_gpu_controls(), *args)
+        key, _ = plain.__self__.spec_key(torch.cuda.current_device(), *args)
+        if key in first:
+            assert compiled is first[key], args[2:]
+        else:
+            first[key] = compiled
+            assert compiled.hash == expected.hash, args[2:]
+    # one annotated launcher per kernel: the Assume of an aligned x and s = 16
+    args = next(a for a in _parity_calls() if a[2] == 16)
+    facts = _triton_facts(jit, args)
+    annotated = make_launcher(
+        jit,
+        extra_annotation={n: Argument(specialize=Assume(*f)) for n, f in facts.items()},
+        return_compiled=True,
+    )
+    assert annotated(*_gpu_controls(), *args).hash == jit[(1,)](*args).hash
 
 
 @triton.jit
