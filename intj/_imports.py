@@ -10,6 +10,7 @@ knobs` copies the None.
 from __future__ import annotations
 
 import functools
+import sys
 import types
 from typing import Any
 
@@ -26,7 +27,6 @@ MockTensor: Any = None
 TensorWrapper: Any = None
 Autotuner: Any = None
 Heuristics: Any = None
-InterpretedFunction: Any = None
 canonicalize_dtype: Any = None
 type_canonicalisation_dict: Any = None
 native_specialize_impl: Any = None
@@ -48,7 +48,7 @@ def ensure_triton_imported() -> None:
     """
     global triton, knobs, tl, driver, build, ASTSource, make_backend
     global JITFunction, MockTensor, TensorWrapper, Autotuner, Heuristics
-    global InterpretedFunction, canonicalize_dtype, type_canonicalisation_dict
+    global canonicalize_dtype, type_canonicalisation_dict
     global native_specialize_impl, cdiv, is_compile_warmup
     if triton is not None:
         return
@@ -65,7 +65,6 @@ def ensure_triton_imported() -> None:
     from triton.runtime import build
     from triton.runtime.autotuner import Autotuner, Heuristics
     from triton.runtime.driver import driver
-    from triton.runtime.interpreter import InterpretedFunction
     from triton.runtime.jit import JITFunction, MockTensor, TensorWrapper
 
     try:
@@ -99,6 +98,17 @@ def _find_triton() -> types.ModuleType | ModuleNotFoundError | str:
     if tuple(map(int, version.split(".")[:2])) < (3, 7):
         return version
     return found
+
+
+def interpreted_function() -> Any:
+    """Returns triton's `InterpretedFunction`, or None while nothing imported it.
+
+    Only `@triton.jit` under `TRITON_INTERPRET=1` makes one, and it imports the
+    class to do so; importing it here would cost every process's first
+    launcher ~4 ms.
+    """
+    module = sys.modules.get("triton.runtime.interpreter")
+    return getattr(module, "InterpretedFunction", None)
 
 
 def _triton_required(found: str) -> Exception:

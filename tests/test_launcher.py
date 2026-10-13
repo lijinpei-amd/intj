@@ -5723,12 +5723,14 @@ def test_static_compile_on_disk_loads_without_asking_cpp_extension(
         assert module_of(launch).__file__ == module_of(built).__file__
 
 
-def test_warm_first_call_does_not_import_cpp_extension(tmp_path):
-    """A first call whose `.so` is on disk decides the mode and digest without it.
+def test_warm_first_call_skips_unneeded_imports(tmp_path):
+    """A first call whose `.so` is on disk imports neither of two costly modules.
 
-    Importing `torch.utils.cpp_extension` costs ~55 ms; only a build reads it.
-    The module is built here, so the one fresh process (`import torch` alone
-    can take seconds) only loads it, for an automatic and an explicit request.
+    `torch.utils.cpp_extension` (~55 ms) only a build reads: the mode and the
+    digest are decided without it.  `triton.runtime.interpreter` (~4 ms) only
+    `@triton.jit` under `TRITON_INTERPRET=1` needs.  The module is built here,
+    so the one fresh process (`import torch` alone can take seconds) only loads
+    it, for an automatic and an explicit request.
     """
     import importlib.util
 
@@ -5758,6 +5760,7 @@ for mode in (None, TorchAccessMode.STATIC_COMPILE):
     launch(0, 0, (1,), 0, 1)
     print(module_of(launch).__file__)
 print("torch.utils.cpp_extension" in sys.modules)
+print("triton.runtime.interpreter" in sys.modules)
 """
     run = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path / "warm_kernel.py")],
@@ -5767,7 +5770,7 @@ print("torch.utils.cpp_extension" in sys.modules)
         text=True,
     )
     assert run.returncode == 0, run.stderr
-    assert run.stdout.split() == [path, path, "False"]
+    assert run.stdout.split() == [path, path, "False", "False"]
 
 
 def test_public_torch_access_modes():

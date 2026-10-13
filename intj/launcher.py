@@ -372,7 +372,8 @@ def _analyze(option: MakeLauncherOption) -> _Analysis:
     chain = kernel
     while type(kernel) in (_imports.Autotuner, _imports.Heuristics):
         kernel = kernel.fn
-    if isinstance(kernel, _imports.InterpretedFunction):
+    interpreted = _imports.interpreted_function()
+    if interpreted is not None and isinstance(kernel, interpreted):
         # `@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
         # not a JITFunction: it has none of the attributes the analysis below
         # needs.  Decoration never gets here, so a module-level `@make_launcher`
