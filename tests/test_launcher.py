@@ -4839,6 +4839,7 @@ def test_launcher_requires_triton_extra(monkeypatch, version):
     assert str(excinfo.value) == (
         f"intj: Triton >=3.7 is required; install `intj[launcher]`{found}"
     )
+    assert isinstance(excinfo.value.__cause__, ModuleNotFoundError) == (version is None)
 
 
 def test_refuses_kernel_reading_globals():

@@ -660,8 +660,9 @@ def __getattr__(name):  # counts the version checks
 def test_make_launcher_checks_triton_once(tmp_path, found):
     """Without Triton >=3.7 every `make_launcher` call refuses; only the first looks.
 
-    Missing, triton is searched for once; old (a stub package), its
-    `__version__` is read once.
+    Missing, triton is searched for once, and every refusal chains the
+    import's ModuleNotFoundError; old (a stub package), its `__version__` is
+    read once.
     """
     if found is None:
         setup = _NO_TRITON
@@ -680,7 +681,7 @@ for _ in range(2):
     try:
         intj.make_launcher(object())
     except UnsupportedKernel as error:
-        refusals.append(str(error))
+        refusals.append([str(error), type(error.__cause__).__name__])
 print(json.dumps([refusals, checks()]))
 """
     package_root = os.path.dirname(os.path.dirname(launcher.__file__))
@@ -695,9 +696,11 @@ print(json.dumps([refusals, checks()]))
         timeout=60,
     )
     assert run.returncode == 0, run.stderr
-    refusal = "intj: Triton >=3.7 is required; install `intj[launcher]`" + (
-        "" if found is None else f" (found {found})"
-    )
+    message = "intj: Triton >=3.7 is required; install `intj[launcher]`"
+    if found is None:
+        refusal = [message, "ModuleNotFoundError"]  # the cause, chained
+    else:
+        refusal = [f"{message} (found {found})", "NoneType"]
     assert json.loads(run.stdout) == [[refusal, refusal], 1]
 
 

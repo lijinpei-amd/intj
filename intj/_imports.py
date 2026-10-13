@@ -53,8 +53,10 @@ def ensure_triton_imported() -> None:
     if triton is not None:
         return
     found = _find_triton()
+    if isinstance(found, ModuleNotFoundError):
+        raise _triton_required("") from found
     if isinstance(found, str):
-        raise _triton_required(found)
+        raise _triton_required(f" (found {found})")
     import triton.language as tl
     from triton import knobs
     from triton._C.libtriton import native_specialize_impl
@@ -75,24 +77,27 @@ def ensure_triton_imported() -> None:
 
 
 @functools.lru_cache(maxsize=None)
-def _find_triton() -> types.ModuleType | str:
-    """Returns triton, or the `_triton_required` suffix saying why not.
+def _find_triton() -> types.ModuleType | ModuleNotFoundError | str:
+    """Returns triton, the error importing it, or its version if too old.
 
     Returning the refusal is what caches it: lru_cache caches no exception,
-    and until triton loads every `make_launcher` call gets here.
+    and until triton loads every `make_launcher` call gets here.  The error
+    is only ever a refusal's `__cause__`, never raised again, so its
+    traceback stays the original import's.
+
     `make_launcher` calls it under `_STUB_LOCK`; another first caller racing
-    that may run it again, which imports nothing twice and returns the same
-    module or an equal message.
+    that may run it again, which imports nothing twice and finds the same
+    module, version or missing triton.
     """
     try:
         import triton as found
     except ModuleNotFoundError as e:
         if e.name != "triton":
             raise
-        return ""
+        return e
     version = found.__version__
     if tuple(map(int, version.split(".")[:2])) < (3, 7):
-        return f" (found {version})"
+        return version
     return found
 
 
