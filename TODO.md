@@ -29,9 +29,13 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   *not* a performance item:
   measured identical codegen with and without, because intj has no non-trivial
   destructors and so no landing pads to elide.
-- **The triton half below 3.10.** `tests/run_python_matrix.sh` runs the rendered
-  module on 3.8 through 3.14t, but `triton>=3.8` ships no wheel below 3.10, so
-  `make_launcher` and the compile callback are only exercised from 3.10 up.
+- **The triton half below 3.10.** intj installs on Python 3.8+ (`torch>=2.2`),
+  but every triton it accepts (`triton>=3.7`; 3.5.0 through 3.8.0 alike) requires
+  `>=3.10,<3.15`. So `make_launcher` and the compile callback are only exercised
+  from 3.10 to 3.14t: the CI cells `manylinux_2_28-py3.8`, `manylinux_2_28-py3.9`
+  and `alma9-py3.9` are `"gpu": false`, build without triton, and run only
+  `tests/test_runtime.py` (as does `tests/run_python_matrix.sh` below 3.10).
+  The same bound leaves the 3.15/3.15t torch pins untested with triton.
 - **Develop a Torch and CPython interface spec.** Define the binary data each
   interface reads, supported versions and build variants, how those facts are
   verified, and when intj refuses an unsupported combination.
