@@ -70,9 +70,10 @@ def test_annotation_values_reject_unhashable_values(build):
     "fact",
     [intj.EqualTo(True), intj.Aligned(cast(Any, 16.0))],
 )
-def test_assume_fact_values_require_exact_int(fact):
+@pytest.mark.parametrize("specialization", [intj.Assume, intj.Exactly])
+def test_assume_fact_values_require_exact_int(fact, specialization):
     with pytest.raises(TypeError, match="Fact value must be an int"):
-        intj.Assume(fact)
+        specialization(fact)
 
 
 @pytest.mark.parametrize(
@@ -92,6 +93,13 @@ def test_assume_fact_values_require_exact_int(fact):
         (lambda: intj.Assume(intj.EqualTo(2)), ValueError, r"EqualTo\(1\)"),
         (lambda: intj.Assume(intj.Aligned(8)), ValueError, r"Aligned\(16\)"),
         (lambda: intj.Assume(intj.PointerRange(64)), ValueError, r"PointerRange\(32\)"),
+        (lambda: intj.Exactly(intj.EqualTo(2)), ValueError, r"EqualTo\(1\)"),
+        (lambda: intj.Exactly(intj.Aligned(8)), ValueError, r"Aligned\(16\)"),
+        (
+            lambda: intj.Exactly(cast(Any, intj.AUTO)),
+            TypeError,
+            "Exactly accepts exact built-in Fact",
+        ),
     ],
 )
 def test_annotation_constructor_errors(build, error, match):
@@ -508,10 +516,11 @@ def test_external_fact_subclass_is_rejected(tmp_path):
         pass
 
     kernel = kernel_with_params(tmp_path, "x")
-    forged = object.__new__(intj.Assume)
-    object.__setattr__(forged, "facts", (ExternalFact(),))
-    with pytest.raises(TypeError, match="Fact"):
-        _resolve_annotations(kernel, {"x": intj.Argument(specialize=forged)})
+    for specialization in (intj.Assume, intj.Exactly):
+        forged = object.__new__(specialization)
+        object.__setattr__(forged, "facts", (ExternalFact(),))
+        with pytest.raises(TypeError, match=f"{specialization.__name__} accepts"):
+            _resolve_annotations(kernel, {"x": intj.Argument(specialize=forged)})
 
 
 def test_baked_values_resolve_exact_types_and_reject_bad_facts(tmp_path):
@@ -638,6 +647,181 @@ def test_bound_values_still_refuse_auto_specialization(tmp_path):
     tensor = intj.Argument(bind_value=intj.BindValue.TENSOR)
     with pytest.raises(ValueError, match="AUTO specialization with a bound value"):
         _resolve_annotations(kernel, {"x": tensor})
+
+
+def _modes(annotation):
+    return (annotation.equal_to_one, annotation.aligned_16, annotation.pointer_range_32)
+
+
+@pytest.mark.parametrize(
+    "params,decorator,extra,modes",
+    [
+        # listed facts are assumed, every other one is NEVER
+        (
+            "x",
+            "",
+            intj.Argument(specialize=intj.Exactly(intj.PointerRange(32))),
+            ("never", "never", "assume"),
+        ),
+        (
+            "x",
+            "",
+            intj.Argument(type=tl.int32, specialize=intj.Exactly(intj.Aligned(16))),
+            ("never", "assume", "never"),
+        ),
+        (
+            "x: tl.int32",
+            "",
+            intj.Argument(specialize=intj.Exactly(intj.EqualTo(1))),
+            ("assume", "never", "never"),
+        ),
+        # it merges like NEVER and Assume: equal modes agree
+        (
+            "x: intj.Argument(specialize=intj.Exactly(intj.Aligned(16)))",
+            "",
+            intj.Argument(specialize=intj.Assume(intj.Aligned(16))),
+            ("never", "assume", "never"),
+        ),
+        (
+            "x",
+            "do_not_specialize_on_alignment=['x']",
+            intj.Argument(specialize=intj.Exactly(intj.PointerRange(32))),
+            ("never", "never", "assume"),
+        ),
+        (
+            "x",
+            "do_not_specialize=['x']",
+            intj.Argument(specialize=intj.Exactly()),
+            ("never", "never", "never"),
+        ),
+        # a baked value: the explicit spelling of what AUTO resolves to
+        (
+            "x",
+            "",
+            intj.Argument(value=0, specialize=intj.Exactly(intj.Aligned(16))),
+            ("never", "assume", "never"),
+        ),
+    ],
+)
+def test_exactly_assumes_its_facts_and_never_the_rest(
+    tmp_path, params, decorator, extra, modes
+):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
+    annotation = _resolve_annotations(kernel, {"x": extra})[0].annotation
+    assert _modes(annotation) == modes
+    assert annotation.facts == tuple(
+        (field, amount)
+        for field, amount, mode in zip(
+            ("equal_to_one", "aligned_16", "pointer_range_32"), (1, 16, 32), modes
+        )
+        if mode == "assume"
+    )
+
+
+@pytest.mark.parametrize(
+    "params,decorator,extra,field",
+    [
+        (
+            "x: intj.Argument(specialize=intj.Exactly(intj.Aligned(16)))",
+            "",
+            intj.Argument(specialize=intj.Assume(intj.PointerRange(32))),
+            "pointer_range_32",
+        ),
+        (
+            "x: intj.Argument(specialize=intj.Exactly(intj.Aligned(16)))",
+            "",
+            intj.Argument(specialize=intj.NEVER),
+            "aligned_16",
+        ),
+        (
+            "x: intj.Argument(specialize=intj.Exactly(intj.Aligned(16)))",
+            "",
+            intj.Argument(specialize=intj.Exactly(intj.PointerRange(32))),
+            "aligned_16",
+        ),
+        (
+            "x",
+            "do_not_specialize_on_alignment=['x']",
+            intj.Argument(specialize=intj.Exactly(intj.Aligned(16))),
+            "aligned_16",
+        ),
+        (
+            "x",
+            "do_not_specialize=['x']",
+            intj.Argument(specialize=intj.Exactly(intj.PointerRange(32))),
+            "pointer_range_32",
+        ),
+    ],
+)
+def test_exactly_conflicts_like_never_and_assume(
+    tmp_path, params, decorator, extra, field
+):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
+    with pytest.raises(ValueError, match=f"conflicting {field}"):
+        _resolve_annotations(kernel, {"x": extra})
+
+
+@pytest.mark.parametrize(
+    "params,decorator,extra",
+    [
+        ("x", "", {}),
+        ("x", "", {"type": tl.int32}),
+        ("x", "", {"type": tl.pointer_type(tl.float32)}),
+        ("x", "", {"type": tl.float32}),
+        ("x", "", {"value": 16}),
+        ("x: tl.int32", "", {}),
+        ("x", "do_not_specialize_on_alignment=['x']", {}),
+    ],
+)
+def test_exactly_without_facts_is_never(tmp_path, params, decorator, extra):
+    from intj.annotation import _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
+
+    def resolved(specialize):
+        return _resolve_annotations(
+            kernel, {"x": intj.Argument(specialize=specialize, **extra)}
+        )
+
+    assert resolved(intj.Exactly()) == resolved(intj.NEVER)
+
+
+@pytest.mark.parametrize(
+    "ty,exactly,assume",
+    [
+        (tl.int32, intj.Exactly(intj.Aligned(16)), intj.Assume(intj.Aligned(16))),
+        (
+            tl.pointer_type(tl.float32),
+            intj.Exactly(intj.PointerRange(32)),
+            intj.Assume(intj.PointerRange(32)),
+        ),
+    ],
+)
+def test_exactly_adds_no_key_bytes(tmp_path, ty, exactly, assume):
+    """With every fact fixed there is nothing to key, as for NEVER.
+
+    The `Assume` of the same facts measures the others, in one descriptor byte.
+    """
+    from intj.annotation import _key_fields, _resolve_annotations
+
+    kernel = kernel_with_params(tmp_path, "x")
+
+    def key_fields(specialize):
+        extra = {"x": intj.Argument(type=ty, specialize=specialize)}
+        return _key_fields(_resolve_annotations(kernel, extra)[0].annotation)
+
+    assert key_fields(exactly) == key_fields(intj.NEVER) == ()
+    assert [field.kind for field in key_fields(assume)] == ["descriptor"]
+
+
+def test_exactly_is_exported():
+    assert "Exactly" in intj.__all__
+    assert intj.Exactly(intj.Aligned(16)).facts == (intj.Aligned(16),)
+    assert intj.Exactly(intj.Aligned(16)) != intj.Assume(intj.Aligned(16))
 
 
 def test_baked_constexpr_chooses_narrowest_matching_type(tmp_path):

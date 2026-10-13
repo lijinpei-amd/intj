@@ -25,7 +25,7 @@ class Annotation:
 
 @dataclasses.dataclass(frozen=True)
 class Specialization:
-    """A specialization policy for an `Argument`: `AUTO`, `NEVER` or `Assume`."""
+    """A specialization policy for an `Argument`: `AUTO`, `NEVER`, `Assume` or `Exactly`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,7 +44,7 @@ NEVER = _Never()
 
 @dataclasses.dataclass(frozen=True)
 class Fact:
-    """A specialization fact a caller promises in `Assume`."""
+    """A specialization fact a caller promises in `Assume` or `Exactly`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +72,22 @@ class PointerRange(Fact):
     value: int
 
 
+def _checked_facts(facts: tuple[Fact, ...], owner: str) -> tuple[Fact, ...]:
+    allowed: dict[type[Fact], int] = {EqualTo: 1, Aligned: 16, PointerRange: 32}
+    for fact in facts:
+        expected = allowed.get(type(fact))
+        if expected is None:
+            raise TypeError(f"intj: {owner} accepts exact built-in Fact instances")
+        value = getattr(fact, "value")
+        if type(value) is not int:
+            raise TypeError("intj: Fact value must be an int")
+        if value != expected:
+            raise ValueError(
+                f"intj: only {type(fact).__name__}({expected}) is supported"
+            )
+    return facts
+
+
 @dataclasses.dataclass(frozen=True, init=False)
 class Assume(Specialization):
     """A specialization that fixes selected facts as caller promises.
@@ -93,23 +109,33 @@ class Assume(Specialization):
             ValueError: A fact value is not the one supported (`EqualTo(1)`,
                 `Aligned(16)`, `PointerRange(32)`).
         """
-        allowed: dict[type[Fact], int] = {
-            EqualTo: 1,
-            Aligned: 16,
-            PointerRange: 32,
-        }
-        for fact in facts:
-            expected = allowed.get(type(fact))
-            if expected is None:
-                raise TypeError("intj: Assume accepts exact built-in Fact instances")
-            value = getattr(fact, "value")
-            if type(value) is not int:
-                raise TypeError("intj: Fact value must be an int")
-            if value != expected:
-                raise ValueError(
-                    f"intj: only {type(fact).__name__}({expected}) is supported"
-                )
-        object.__setattr__(self, "facts", tuple(facts))
+        object.__setattr__(self, "facts", _checked_facts(facts, "Assume"))
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class Exactly(Specialization):
+    """A specialization that holds exactly the listed facts, as caller promises.
+
+    Listed facts are assumed, as in `Assume`; every other fact is `NEVER`. This
+    is what a hand-written `ASTSource` attrs entry states. `Exactly()` is
+    `NEVER`.
+
+    Attributes:
+        facts: The assumed facts, in the order given.
+    """
+
+    facts: tuple[Fact, ...]
+
+    def __init__(self, *facts: Fact) -> None:
+        """Builds the specialization from `facts`.
+
+        Raises:
+            TypeError: A fact is not an exact `EqualTo`, `Aligned` or
+                `PointerRange`, or its value is not an int.
+            ValueError: A fact value is not the one supported (`EqualTo(1)`,
+                `Aligned(16)`, `PointerRange(32)`).
+        """
+        object.__setattr__(self, "facts", _checked_facts(facts, "Exactly"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,7 +176,7 @@ class Argument(Annotation):
     Attributes:
         type: A dtype, pointer type, `None`, or a nonempty sequence of them as an
             allowlist; `AUTO` or `UNSET` retains Triton's inference.
-        specialize: `AUTO`, `NEVER` or `Assume(...)`.
+        specialize: `AUTO`, `NEVER`, `Assume(...)` or `Exactly(...)`.
         value: A value baked into the launcher, removing the parameter from
             the public call.
         bind_value: Binds the value later through `bind()`; exclusive with
@@ -171,7 +197,9 @@ class Argument(Annotation):
     def __post_init__(self) -> None:
         object.__setattr__(self, "type", _normalize_type_field(self.type))
         if not isinstance(cast(object, self.specialize), (Specialization, _Unset)):
-            raise TypeError("intj: specialize must be AUTO, NEVER, or Assume(...)")
+            raise TypeError(
+                "intj: specialize must be AUTO, NEVER, Assume(...) or Exactly(...)"
+            )
         if self.bind_value is not None and not isinstance(
             cast(object, self.bind_value), BindValue
         ):
@@ -470,13 +498,17 @@ def _specialization_modes(value: object) -> tuple[object, object, object]:
         return ("auto", "auto", "auto")
     if type(value) is _Never:
         return ("never", "never", "never")
-    if type(value) is not Assume:
+    if type(value) is not Assume and type(value) is not Exactly:
         raise ValueError("intj: unsupported specialization")
-    modes: list[object] = [UNSET, UNSET, UNSET]
+    # Exactly's unlisted facts are NEVER; Assume's stay unset, for AUTO
+    unlisted = "never" if type(value) is Exactly else UNSET
+    modes: list[object] = [unlisted, unlisted, unlisted]
     for fact in value.facts:
         detail = _FACT_CLASSES.get(type(fact))
         if detail is None:
-            raise TypeError("intj: Assume accepts exact built-in Fact instances")
+            raise TypeError(
+                f"intj: {type(value).__name__} accepts exact built-in Fact instances"
+            )
         field, expected = detail
         actual = getattr(fact, "value")
         if type(actual) is not int or actual != expected:

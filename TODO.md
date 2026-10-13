@@ -40,13 +40,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 - Parameter annotations (`extra_annotation`), including non-constexpr annotated
   parameters, which change arity (an annotated `== 1` int stays a kernel param).
-- **`Assume` cannot turn a fact off.** Facts left out of `Assume` stay `AUTO`
-  and are measured per call; only Triton's `do_not_specialize_on_alignment`
-  and an inline type annotation turn single facts off, and "assume aligned,
-  no pointer range" cannot be written. So a hand-written `ASTSource` attrs set
-  is not always reproducible: aiter's pa_mqa_logits launchers compile with
-  `tt.divisibility` and `tt.pointer_range` facts its attrs lacked, whenever
-  they hold. Needs a per-fact `NEVER`.
 - **Tuple / namedtuple arguments and tuple constexprs.** `ARG_TUPLE` recursion in the decoder and
   the key; ~41 Triton-test entries pass tuples. aiter's last one, `attn_res`'s
   `res`, became 16 pointer parameters, one launcher per `L2` bucket.

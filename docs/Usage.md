@@ -416,8 +416,8 @@ hook-sensitive launches on Triton.
 
 ## Argument annotations
 
-Import `Argument`, `Constexpr`, `AUTO`, `NEVER`, `Assume`, `EqualTo`, `Aligned`,
-`PointerRange`, `BindValue`, `INT_TYPES`, and `FLOAT_TYPES` from `intj`.
+Import `Argument`, `Constexpr`, `AUTO`, `NEVER`, `Assume`, `Exactly`, `EqualTo`,
+`Aligned`, `PointerRange`, `BindValue`, `INT_TYPES`, and `FLOAT_TYPES` from `intj`.
 `Annotation`, `Specialization`, and `Fact` are their public base classes.
 `Argument(type=..., specialize=..., value=..., bind_value=...)` describes an
 ordinary parameter. `Constexpr(type=..., power_of_two_or_zero=False,
@@ -463,9 +463,27 @@ kernel can test `is not None`); anything else raises `TypeError`. A plain
 16-byte alignment for integers and pointers, and AMD's <2 GiB pointer-storage
 range. `NEVER` omits those facts. `Assume(EqualTo(1), Aligned(16),
 PointerRange(32))` fixes selected facts; use only facts applicable to the
-parameter, and only the exact values shown. Omitted facts in `Assume` stay
-`AUTO`. The aligned and equal-to-one facts cannot both hold for one integer.
-An assumed fact is a caller promise unless `verify_annotation=True`.
+parameter, and only the exact values shown. `Exactly(...)` takes the same
+facts and turns every other one off: the parameter compiles with the listed
+facts and no others, which is what a hand-written `ASTSource` attrs entry
+states. Each fact is `AUTO` (measured per call and keyed), assumed, or
+`NEVER`:
+
+| `specialize` | listed facts | other facts |
+|---|---|---|
+| `AUTO` | | `AUTO` |
+| `NEVER` | | `NEVER` |
+| `Assume(F, ...)` | assumed | `AUTO` |
+| `Exactly(F, ...)` | assumed | `NEVER` |
+
+So `Exactly()` is `NEVER`, and on a pointer `Assume(PointerRange(32))` still
+compiles `tt.divisibility = 16` for an aligned tensor where
+`Exactly(PointerRange(32))` does not. Like `NEVER`, `Exactly` leaves no fact
+to key. Sources merge per fact, as above:
+`Exactly(Aligned(16))` agrees with `Assume(Aligned(16))` and conflicts with
+`NEVER`, `Assume(PointerRange(32))` or `do_not_specialize_on_alignment`. The
+aligned and equal-to-one facts cannot both hold for one integer. An assumed
+fact is a caller promise unless `verify_annotation=True`.
 
 Ordinary scalar types include `tl.int1` (canonical key name `u1`), signed and
 unsigned 8/16/32/64-bit integers, and `tl.float32`/`tl.float64`; pointers use
@@ -495,7 +513,8 @@ divisibility, unless an inline Triton type annotation, `do_not_specialize` or
 value. For an untyped parameter, `Argument(value=0)` compiles `i32` with
 `tt.divisibility = 16`, `value=1` a constexpr 1, and `value=3` a plain `i32`.
 Explicit facts stay as given and must hold for the value; `NEVER` still
-compiles a plain runtime integer. A bound value is not known when the module
+compiles a plain runtime integer, and `Exactly(Aligned(16))` spells out what
+`AUTO` resolves 0 to. A bound value is not known when the module
 is built, so a bound parameter's applicable facts must be `NEVER` or assumed.
 
 ### Bound values and fixed devices

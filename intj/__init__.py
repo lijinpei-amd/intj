@@ -6,8 +6,9 @@ Exports:
     KernelCache: the kernel cache backend selection.
     TorchAccessMode: how generated code reads torch tensors.
     ClassGlobalWarning: the warning for class-valued globals.
-    Annotation, Argument, Constexpr, Specialization, AUTO, NEVER, Assume, Fact,
-        EqualTo, Aligned, PointerRange, BindValue: per-argument annotations.
+    Annotation, Argument, Constexpr, Specialization, AUTO, NEVER, Assume,
+        Exactly, Fact, EqualTo, Aligned, PointerRange, BindValue: per-argument
+        annotations.
     INT_TYPES, FLOAT_TYPES: scalar type names, loaded lazily from `annotation`.
     __version__: the package version.
 """
@@ -27,6 +28,7 @@ from .annotation import (
     BindValue,
     Constexpr,
     EqualTo,
+    Exactly,
     Fact,
     PointerRange,
     Specialization,
@@ -66,6 +68,7 @@ __all__ = [
     "AUTO",
     "NEVER",
     "Assume",
+    "Exactly",
     "Fact",
     "EqualTo",
     "Aligned",

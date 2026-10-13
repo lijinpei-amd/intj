@@ -49,6 +49,7 @@ from intj import (
     BindValue,
     Constexpr,
     EqualTo,
+    Exactly,
     PointerRange,
 )
 from intj.annotation import CanonicalAnnotation
@@ -3419,9 +3420,14 @@ def _triton_facts(jit_func, args):
 
 
 def _parity_annotations(facts):
-    # AUTO, then the facts Triton gives x and s: assumed, or NEVER where none
+    # AUTO, then the facts Triton gives x and s: assumed, exactly, or NEVER
+    # where it gives none
     yield None
     yield {name: Argument(specialize=Assume(*held)) for name, held in facts.items()}
+    yield {
+        "f": Argument(specialize=Exactly()),
+        **{name: Argument(specialize=Exactly(*held)) for name, held in facts.items()},
+    }
     unspecialized = [name for name, held in facts.items() if not held]
     if unspecialized:
         yield {
@@ -3520,10 +3526,11 @@ BAKED_VALUES = {
 
 
 def _baked_annotations(jit_func, args):
-    # bake s = args[2]: AUTO, then the facts Triton gives it, assumed
-    value = args[2]
+    # bake s = args[2]: AUTO, then the facts Triton gives it, assumed or exactly
+    value, facts = args[2], _triton_facts(jit_func, args)["s"]
     yield Argument(value=value)
-    yield Argument(value=value, specialize=Assume(*_triton_facts(jit_func, args)["s"]))
+    yield Argument(value=value, specialize=Assume(*facts))
+    yield Argument(value=value, specialize=Exactly(*facts))
 
 
 @pytest.mark.parametrize("kernel", BAKED_VALUES)
@@ -3571,6 +3578,41 @@ def test_baked_int_launches_like_triton(kernel):
         assert compiled.hash == reference.hash, value
         torch.testing.assert_close(actual, expected)
         assert actual[value] == 5.5
+
+
+@triton.jit
+def store_one(p):
+    tl.store(p, 1)
+
+
+@needs_pointer_range
+def test_exactly_compiles_only_its_facts():
+    """`Exactly` states what a hand-written ASTSource attrs entry does.
+
+    `Assume(PointerRange(32))` still measures divisibility and finds it on an
+    aligned tensor; `Exactly(PointerRange(32))` compiles pointer_range alone,
+    for any tensor, under the hand-written source's hash.
+    """
+    from triton.compiler import ASTSource
+
+    x = torch.zeros(4, dtype=torch.int32, device="cuda")
+    extra = {"p": Argument(type=tl.pointer_type(tl.int32))}
+
+    def compiled(specialize, tensor):
+        annotation = {"p": dataclasses.replace(extra["p"], specialize=specialize)}
+        launch = make_launcher(
+            store_one, extra_annotation=annotation, return_compiled=True
+        )
+        return launch(*_gpu_controls(), tensor)
+
+    exact = ASTSource(store_one, {"p": "*i32"}, {}, {(0,): [["tt.pointer_range", 32]]})
+    for tensor in (x, x[1:]):
+        kernel = compiled(Exactly(PointerRange(32)), tensor)
+        assert kernel.src.attrs == exact.attrs
+        assert kernel.src.hash() == exact.hash()
+    assert compiled(Assume(PointerRange(32)), x).src.attrs == {
+        (0,): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+    }
 
 
 @triton.jit
@@ -4241,6 +4283,9 @@ def test_annotated_baked_arguments_compile_without_jit_state(monkeypatch):
         (Argument(type=tl.int32, specialize=NEVER), (1, 16, 17)),
         (Argument(type=tl.int32, specialize=Assume(Aligned(16))), (16, 32)),
         (Argument(type=tl.int32, specialize=Assume(EqualTo(1))), (1,)),
+        (Argument(type=tl.int32, specialize=Exactly(Aligned(16))), (16, 32)),
+        (Argument(specialize=Exactly(EqualTo(1))), (1, 1.0, None)),
+        (Argument(specialize=Exactly()), (None, False, True, 0, 1, 16, 17, 2**63)),
         (Constexpr(), (None, False, True, 0, 1, 0.0, -0.0, 1.0, 2**31, 2**63)),
         (Constexpr(type=(tl.int8, tl.int64)), (-128, 127, 128, 2**32)),
         (Constexpr(type=(tl.int8, tl.uint8)), (-128, 0, 127, 128, 255)),
@@ -4284,7 +4329,15 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
 
 
 @pytest.mark.parametrize(
-    "specialize", [AUTO, NEVER, Assume(Aligned(16), PointerRange(32))]
+    "specialize",
+    [
+        AUTO,
+        NEVER,
+        Assume(Aligned(16), PointerRange(32)),
+        Assume(PointerRange(32)),
+        Exactly(PointerRange(32)),
+        Exactly(Aligned(16)),
+    ],
 )
 def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     pointer_kernel, specialize
