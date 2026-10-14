@@ -35,7 +35,7 @@ typedef char intj_rwlock;
 #endif
 
 /* Free-threaded builds lock the object around its member reads and
- * `_set_plan`; before 3.13 these are plain blocks. */
+ * `_C_set_plan`; before 3.13 these are plain blocks. */
 #ifndef Py_BEGIN_CRITICAL_SECTION
 #define Py_BEGIN_CRITICAL_SECTION(op) {
 #define Py_END_CRITICAL_SECTION() }

@@ -264,7 +264,7 @@ def _launcher_module(launcher):
 
 
 def _launcher_over(module):
-    """A built, binding-free launcher of `module`, for its `spec_key`."""
+    """A built, binding-free launcher of `module`, for its `_C_spec_key`."""
     from intj.launcher import _Interner, _launcher_compile, _stub
 
     stub = _stub()
@@ -274,7 +274,7 @@ def _launcher_over(module):
         None,
         lambda h: module._init(h, _launcher_compile(module), _Interner()),
     )
-    module_of(launch)
+    launch.__self__._C_build()
     return launch
 
 
@@ -2402,8 +2402,8 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
             {},
         )
         ranged_launch = _launcher_over(ranged)
-        small_key = ranged_launch.__self__.spec_key(0, small)
-        large_key = ranged_launch.__self__.spec_key(0, large)
+        small_key = ranged_launch.__self__._C_spec_key(0, small)
+        large_key = ranged_launch.__self__._C_spec_key(0, large)
         if specialization is AUTO:
             assert small_key != large_key
             assert large_key == launch.__self__.spec_key(0, large)

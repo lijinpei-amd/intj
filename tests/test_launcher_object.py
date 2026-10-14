@@ -115,7 +115,7 @@ def test_bind_on_a_built_launcher_returns_an_unbuilt_one():
     base = make_launcher(store, **_HOST)
     assert base(0, 0, 1, 0, 4) is None
     child = base.__self__.bind_device(0)
-    assert child.__self__._module is None and child.__self__._plan is None
+    assert child.__self__._C_module is None and child.__self__._C_plan is None
     assert child(0, 1, 0, 4) is None and base(0, 0, 1, 0, 4) is None
 
 

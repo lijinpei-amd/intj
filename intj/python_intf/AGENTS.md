@@ -126,8 +126,8 @@ otherwise. Launches take it shared
 live in the map and a put can move them; puts take it exclusive
 (`INTJ_WRLOCK`). It is never held while Python runs. The module's C state needs
 no lock: it is written once, before the module is reachable. The launcher
-object's members (`options`, `_plan`, `_module`) are read under its critical
-section and `_set_plan` publishes them once; `_init` stores `state` last, and
+object's members (`_C_options`, `_C_plan`, `_C_module`) are read under its critical
+section and `_C_set_plan` publishes them once; `_init` stores `state` last, and
 the shim then release-stores the entry. That order is untested on non-TSO hosts
 (aarch64). A cache miss checks again under the write lock before
 inserting its result because another thread may have filled the same key

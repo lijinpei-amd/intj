@@ -573,7 +573,7 @@ def test_spec_key_buckets(built, launch):
     x = torch.zeros(64)
 
     def key(*args):
-        return launch.__self__.spec_key(0, *args)[0]
+        return launch.__self__._C_spec_key(0, *args)[0]
 
     ints = [key(x, v, 0, 0.0, False, 64) for v in (17, 16, 2**31, 2**63, 1)]
     assert len(set(ints)) == len(ints)
@@ -886,11 +886,11 @@ def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
     function = ctypes.pythonapi.PyCFunction_GetFunction
     function.argtypes, function.restype = [ctypes.py_object], ctypes.c_void_p
     shim = function(launch)
-    assert launch.__self__._module is None and builds == []
+    assert launch.__self__._C_module is None and builds == []
     args = _args()
     assert launch(*args) is None
     assert builds == [1] and function(before) != shim
-    assert launch.__self__._module is module and launch.__self__.build() is module
+    assert launch.__self__._C_module is module and launch.__self__._C_build() is module
     a, b, c, d, e, f, g, h, i = args
 
     def call():
@@ -1037,7 +1037,7 @@ def test_str_constexpr_keys_by_value(built, stub_module):
     x = torch.zeros(4)
 
     def key(value):
-        return launch.__self__.spec_key(0, x, 5, -7, 1.5, True, value)[0]
+        return launch.__self__._C_spec_key(0, x, 5, -7, 1.5, True, value)[0]
 
     assert key("act") == key("".join(["a", "c", "t"])) != key("other")
     assert key(0) != key("act")  # an int never shares an object's code
@@ -1083,22 +1083,22 @@ def test_launchers_come_only_from_new_launcher(stub_module):
 def test_set_plan_publishes_options_and_signature_once(stub_module):
     launch = stub_module.new_launcher(stub_module.Launcher, "delayed", "origin", print)
     h = launch.__self__
-    assert (h.options, h._origin, h._plan, h._module) == (
+    assert (h._C_options, h._C_origin, h._C_plan, h._C_module) == (
         "delayed",
         "origin",
         None,
         None,
     )
     assert launch.__text_signature__ is None
-    h._set_plan("resolved", "plan", b"launch(a, /)\n--\n\n")
-    assert (h.options, h._plan) == ("resolved", "plan")
+    h._C_set_plan("resolved", "plan", b"launch(a, /)\n--\n\n")
+    assert (h._C_options, h._C_plan) == ("resolved", "plan")
     assert launch.__text_signature__ == "(a, /)"
-    h.check()  # a plan is set: nothing runs
+    h._C_check()  # a plan is set: nothing runs
     with pytest.raises(RuntimeError, match="set once"):
-        h._set_plan("again", "plan", b"")
+        h._C_set_plan("again", "plan", b"")
     fresh = stub_module.new_launcher(stub_module.Launcher, None, None, print)
-    with pytest.raises(TypeError, match="_set_plan"):
-        fresh.__self__._set_plan(None, None, "not bytes")
+    with pytest.raises(TypeError, match="_C_set_plan"):
+        fresh.__self__._C_set_plan(None, None, "not bytes")
 
 
 def test_options_reads_race_set_plan_safely(stub_module):
@@ -1111,20 +1111,20 @@ def test_options_reads_race_set_plan_safely(stub_module):
     def read():
         while not stop.is_set():
             for k in launchers:
-                seen.add(k.__self__.options)
+                seen.add(k.__self__._C_options)
 
     readers = [threading.Thread(target=read) for _ in range(4)]
     for t in readers:
         t.start()
     for k in launchers:
-        k.__self__._set_plan("after", None, b"")
+        k.__self__._C_set_plan("after", None, b"")
     stop.set()
     for t in readers:
         t.join()
     assert seen <= {"before", "after"}
-    assert all(k.__self__.options == "after" for k in launchers)
+    assert all(k.__self__._C_options == "after" for k in launchers)
 
 
 def test_key_chain_is_for_tuned_launchers_only(launch):
     with pytest.raises(TypeError, match="tuned launchers only"):
-        launch.__self__.key_chain(0, torch.zeros(4), 5, -7, 1.5, True, 64)
+        launch.__self__._C_key_chain(0, torch.zeros(4), 5, -7, 1.5, True, 64)

@@ -181,13 +181,13 @@ static PyObject *intj_lazy_key_chain(PyObject *self, PyObject *const *args,
   return h->ops->key_chain(state, args, nargs);
 }
 
-/* _set_plan(options, plan, doc: bytes): check()'s result, published once. */
+/* _C_set_plan(options, plan, doc: bytes): check()'s result, published once. */
 static PyObject *intj_lazy_set_plan(PyObject *self, PyObject *const *args,
                                     Py_ssize_t nargs) {
   intj_launcher *h = (intj_launcher *)self;
   if (nargs != 3 || !PyBytes_CheckExact(args[2])) {
     PyErr_SetString(PyExc_TypeError,
-                    "intj: _set_plan(options, plan, doc: bytes)");
+                    "intj: _C_set_plan(options, plan, doc: bytes)");
     return NULL;
   }
   int set = 0;
@@ -279,29 +279,24 @@ static PyObject *intj_lazy_new(PyTypeObject *type, PyObject *args,
   return NULL;
 }
 
+/* `_C_` marks every attribute and method this type defines;
+ * intj.launcher.Launcher exposes the public ones as `options`, `check()`,
+ * `build()`, `spec_key()` and `key_chain()`. */
 static PyGetSetDef intj_lazy_getset[] = {
-    {(char *)"options", intj_lazy_member, NULL,
-     (char *)"The launcher's MakeLauncherOption; a Delayed until check() "
-             "resolves it.",
-     INTJ_MEMBER(options)},
-    {(char *)"_origin", intj_lazy_member, NULL, NULL, INTJ_MEMBER(origin)},
-    {(char *)"_plan", intj_lazy_member, NULL, NULL, INTJ_MEMBER(plan)},
-    {(char *)"_module", intj_lazy_member, NULL, NULL, INTJ_MEMBER(module)},
+    {(char *)"_C_options", intj_lazy_member, NULL, NULL, INTJ_MEMBER(options)},
+    {(char *)"_C_origin", intj_lazy_member, NULL, NULL, INTJ_MEMBER(origin)},
+    {(char *)"_C_plan", intj_lazy_member, NULL, NULL, INTJ_MEMBER(plan)},
+    {(char *)"_C_module", intj_lazy_member, NULL, NULL, INTJ_MEMBER(module)},
     {NULL, NULL, NULL, NULL, NULL}};
 
 static PyMethodDef intj_lazy_type_methods[] = {
-    {"check", intj_lazy_check, METH_NOARGS,
-     "Run every check make_launcher defers, once; the first call runs it too."},
-    {"build", intj_lazy_build_method, METH_NOARGS,
-     "Build now if the first call has not, and return the rendered module."},
-    {"spec_key", (PyCFunction)(void (*)(void))intj_lazy_spec_key, METH_FASTCALL,
-     "spec_key(device, *dynamic, *public_args) -> (key bytes, nparams); "
-     "builds first."},
-    {"key_chain", (PyCFunction)(void (*)(void))intj_lazy_key_chain,
-     METH_FASTCALL,
-     "key_chain(device, *dynamic, *public_args) -> ((key bytes, ...), found); "
-     "tuned launchers only, builds first."},
-    {"_set_plan", (PyCFunction)(void (*)(void))intj_lazy_set_plan,
+    {"_C_check", intj_lazy_check, METH_NOARGS, NULL},
+    {"_C_build", intj_lazy_build_method, METH_NOARGS, NULL},
+    {"_C_spec_key", (PyCFunction)(void (*)(void))intj_lazy_spec_key,
+     METH_FASTCALL, NULL},
+    {"_C_key_chain", (PyCFunction)(void (*)(void))intj_lazy_key_chain,
+     METH_FASTCALL, NULL},
+    {"_C_set_plan", (PyCFunction)(void (*)(void))intj_lazy_set_plan,
      METH_FASTCALL, NULL},
     {NULL, NULL, 0, NULL}};
 
@@ -355,7 +350,7 @@ static PyObject *new_launcher(PyObject *m, PyObject *const *args,
   h->def.ml_name = "launch";
   h->def.ml_meth = INTJ_SHIM;
   h->def.ml_flags = METH_FASTCALL;
-  h->def.ml_doc = NULL; /* `_set_plan` sets the signature */
+  h->def.ml_doc = NULL; /* `_C_set_plan` sets the signature */
   PyObject *launcher = PyCFunction_New(&h->def, (PyObject *)h);
   Py_DECREF(h);
   return launcher;

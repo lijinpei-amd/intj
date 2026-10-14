@@ -580,8 +580,8 @@ class Launcher:
     `k` is a C function whose entry is a build shim until its first call
     succeeds, then the rendered launch.  This object holds that entry, the
     options and, once built, the module's per-launcher state.  The C base
-    (`_intj_lazy.Launcher`) adds `options`, `check()`, `build()`,
-    `spec_key()` and `key_chain()`.
+    (`_intj_lazy.Launcher`) defines the `_C_*` attributes and methods this
+    class's public ones wrap.
     """
 
     __slots__ = ()
@@ -589,20 +589,47 @@ class Launcher:
     if TYPE_CHECKING:
 
         @property
-        def options(self) -> MakeLauncherOption | Delayed: ...
+        def _C_options(self) -> MakeLauncherOption | Delayed: ...
         @property
-        def _origin(self) -> _Origin: ...
+        def _C_origin(self) -> _Origin: ...
         @property
-        def _plan(self) -> _Plan | None: ...
+        def _C_plan(self) -> _Plan | None: ...
         @property
-        def _module(self) -> types.ModuleType | None: ...
-        def check(self) -> None: ...
-        def build(self) -> types.ModuleType: ...
-        def spec_key(self, *args: object) -> tuple[bytes, int]: ...
-        def key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]: ...
-        def _set_plan(
+        def _C_module(self) -> types.ModuleType | None: ...
+        def _C_check(self) -> None: ...
+        def _C_build(self) -> types.ModuleType: ...
+        def _C_spec_key(self, *args: object) -> tuple[bytes, int]: ...
+        def _C_key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]: ...
+        def _C_set_plan(
             self, options: MakeLauncherOption, plan: _Plan, doc: bytes
         ) -> None: ...
+
+    @property
+    def options(self) -> MakeLauncherOption | Delayed:
+        """The launcher's `MakeLauncherOption`; a `Delayed` until `check()` resolves it."""
+        return self._C_options
+
+    def check(self) -> None:
+        """Runs every check `make_launcher` defers, once; the first call runs it too."""
+        self._C_check()
+
+    def build(self) -> types.ModuleType:
+        """Builds now if the first call has not, and returns the rendered module."""
+        return self._C_build()
+
+    def spec_key(self, *args: object) -> tuple[bytes, int]:
+        """Returns `(key bytes, nparams)` for `(device, *dynamic, *public_args)`.
+
+        Builds first.
+        """
+        return self._C_spec_key(*args)
+
+    def key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]:
+        """Returns `((key bytes, ...), found)` for `(device, *dynamic, *public_args)`.
+
+        Tuned launchers only; builds first.
+        """
+        return self._C_key_chain(*args)
 
     def bind(self, /, **values: object) -> LaunchFunction:
         """Returns a new launcher with `values` merged into `bind_values`.
@@ -641,14 +668,14 @@ class Launcher:
     def _derive(
         self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]
     ) -> LaunchFunction:
-        options = self.options
+        options = self._C_options
         derived = options.then(edit) if isinstance(options, Delayed) else edit(options)
-        return _new_launcher(derived, self._origin)
+        return _new_launcher(derived, self._C_origin)
 
     def _resolved(self) -> tuple[MakeLauncherOption, _Analysis]:
-        options = self.options
+        options = self._C_options
         option = options() if isinstance(options, Delayed) else options
-        return option, self._origin.analysis.get(lambda: _analyze(option))
+        return option, self._C_origin.analysis.get(lambda: _analyze(option))
 
     def _prepare(self) -> None:
         # the C side runs it before the build lock: the work every launcher
@@ -656,12 +683,12 @@ class Launcher:
         self._resolved()
 
     def _check(self) -> None:
-        # check()'s body: the C method calls it under the build lock, as does _build
-        if self._plan is not None:
+        # check()'s body: _C_check calls it under the build lock, as does _build
+        if self._C_plan is not None:
             return
         option, analysis = self._resolved()
         binding = _bind(analysis, option)
-        self._set_plan(option, _Plan(analysis, binding), binding.doc)
+        self._C_set_plan(option, _Plan(analysis, binding), binding.doc)
 
     def _build(self) -> int:
         """Builds this launcher on its first call and returns the rendered entry.
@@ -678,7 +705,7 @@ class Launcher:
         it is turned on later.
         """
         self._check()
-        plan = self._plan
+        plan = self._C_plan
         assert plan is not None
         a, b = plan.analysis, plan.binding
         _imports.ensure_triton_imported()

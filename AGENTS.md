@@ -66,7 +66,10 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 starts as, follows the same rule. Every launcher is a `PyCFunction` over a
 `PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
 `__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size). The first
-call swaps its `ml_meth` from the build shim to the rendered entry. The
+call swaps its `ml_meth` from the build shim to the rendered entry. Every
+attribute and method the C type defines is `_C_*`; the Python subclass's own
+are `foo` if public, `_foo` if private, and a public one backed by C wraps its
+`_C_foo`. The
 module's `_init` allocates the launcher's state block behind `state` and
 installs the `traverse`/`release` ops GC and dealloc reach it through. All
 mutable launch state (cache, lock, miss callback) is the launcher's; the
