@@ -2505,6 +2505,46 @@ def test_annotation_module_identity(scalar_kernel):
     assert module_of(checked).__file__ != paths[0]
 
 
+def test_ndebug_reaches_the_whole_module_and_its_identity(scalar_kernel):
+    """`ndebug` decides NDEBUG ahead of every include, in a module of its own.
+
+    The default compiles out every `assert()`; `ndebug=False` keeps CPython's
+    live, which the binary shows as a reference to glibc's `__assert_fail`.
+    """
+    host = functools.partial(
+        make_launcher,
+        scalar_kernel,
+        no_gpu=True,
+        torch_access_mode=TorchAccessMode.INTERPRETER,  # C, so a .c source
+    )
+    release, debug = host(), host(ndebug=False)
+    paths = {
+        ndebug: pathlib.Path(str(module_of(launch).__file__))
+        for ndebug, launch in ((True, release), (False, debug))
+    }
+    assert paths[True].parent.parent.name != paths[False].parent.parent.name
+    for ndebug, path in paths.items():
+        head = path.with_name("scalar_kernel.c").read_text().split("#include", 1)[0]
+        assert ("#define NDEBUG" in head) == ndebug
+        assert ("#undef NDEBUG" in head) == (not ndebug)
+        assert (b"__assert_fail" in path.read_bytes()) == (not ndebug)
+    for launch in (release, debug):
+        assert launch(0, 0, 1, 7) is None
+        assert launch.__self__.spec_key(0, 7) == release.__self__.spec_key(0, 7)
+
+
+def test_ndebug_false_launches_on_the_gpu():
+    """A GPU module with CPython's assertions live still decodes and launches."""
+    debug = make_launcher(scale, ndebug=False)
+    assert pathlib.Path(str(module_of(debug).__file__)) != pathlib.Path(
+        str(module_of(make_launcher(scale)).__file__)
+    )
+    x = torch.randn(1024, device="cuda")
+    o = torch.empty(1024, device="cuda")
+    launch(debug, (8,), x, o, 1024, 3.0, 128)
+    torch.testing.assert_close(o, x * 3.0)
+
+
 @pytest.mark.parametrize(
     "mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.STATIC_COMPILE]
 )
@@ -2668,6 +2708,7 @@ def test_none_kernel_is_rejected_not_a_decorator_factory():
     [
         ({"no_gpu": 1}, "no_gpu must be a bool"),
         ({"assume_constant_globals": None}, "assume_constant_globals must be a bool"),
+        ({"ndebug": 0}, "ndebug must be a bool"),
         ({"options": [("num_warps", 4)]}, "options must be None or a mapping"),
         ({"extra_annotation": {0: int}}, "extra_annotation must be None or a mapping"),
         ({"kernel_cache": "intj"}, "kernel_cache must be a KernelCache"),

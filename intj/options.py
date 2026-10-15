@@ -36,6 +36,7 @@ class MakeLauncherOption:
     grid_py: Callable[[dict[str, object]], object] | None = None
     return_compiled: bool = False
     assume_constant_globals: bool = False
+    ndebug: bool = True
 
     def __post_init__(self) -> None:
         # a snapshot: check() reads these later; anything else stays as given
@@ -68,6 +69,7 @@ class MakeLauncherKwargs(TypedDict, total=False):
     grid_py: Callable[[dict[str, object]], object] | None
     return_compiled: bool
     assume_constant_globals: bool
+    ndebug: bool
 
 
 #: the keywords `make_launcher` (and `delayed`) may set

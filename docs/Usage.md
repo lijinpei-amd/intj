@@ -21,6 +21,7 @@ launcher = make_launcher(
     grid_py=None,          # keyword-only: Python callback evaluated on each launch
     return_compiled=False, # keyword-only: return the cached Triton CompiledKernel
     assume_constant_globals=False, # keyword-only: accept kernels reading globals
+    ndebug=True,           # keyword-only: compile the module with NDEBUG (asserts off)
     delayed=None,          # keyword-only: () -> more of these keywords, run on first use
 )
 ```
@@ -122,6 +123,12 @@ device. `no_gpu=True` renders and times host decoding and cache lookup
 without querying a GPU target or driver, compiling a kernel, or launching one.
 It accepts only default compile options. The `torch_access_mode` and `kernel_cache`
 choices are described below.
+
+`ndebug=True`, the default, defines `NDEBUG` at the top of the rendered source,
+so `assert()` in CPython's headers and intj's runtime is compiled out: the
+module checks its inputs explicitly. `ndebug=False` undefines it, so
+those assertions abort the process if a launch breaks one; it is a debugging
+aid, and builds a separate module.
 
 `assume_constant_globals=True` accepts a kernel that reads global variables
 (`X = tl.constexpr(...)`, or a plain value a `constexpr_function` reads),

@@ -192,6 +192,7 @@ class _Analysis:
     return_compiled: bool = False
     tuned: _Tuned | None = None
     grid_fn: object | None = None
+    ndebug: bool = True
     dynamic: tuple[str, ...] = ()
     global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
     #: `dynamic_options` naming a tl.constexpr parameter: no slot, and only
@@ -324,12 +325,14 @@ def _analyze(option: MakeLauncherOption) -> _Analysis:
     grid_py = option.grid_py
     return_compiled = option.return_compiled
     assume_constant_globals = option.assume_constant_globals
+    ndebug = option.ndebug
     # Cheap checks on every argument first: no imports, no GPU, no build.
     flags: dict[str, object] = {
         "no_gpu": no_gpu,
         "verify_annotation": verify_annotation,
         "return_compiled": return_compiled,
         "assume_constant_globals": assume_constant_globals,
+        "ndebug": ndebug,
     }
     for name, flag in flags.items():
         if type(flag) is not bool:
@@ -482,6 +485,7 @@ def _analyze(option: MakeLauncherOption) -> _Analysis:
         return_compiled,
         tuned,
         grid_cpp,
+        ndebug=ndebug,
         dynamic=dynamic,
         global_values=global_values,
         declared_parameters=tuple(n for n in declared if n in kernel.arg_names),
@@ -740,6 +744,7 @@ class Launcher:
             dynamic=a.dynamic,
             global_values=a.global_values,
             declared_parameters=a.declared_parameters,
+            ndebug=a.ndebug,
         )
         if a.tuned is None:
             callback: Callable[..., Any] = _launcher_compile(module)
@@ -892,6 +897,9 @@ def make_launcher(
             their values when triton first hashed the kernel become part of
             the module identity, and are never checked again. Changing one
             afterwards is unsupported and not detected.
+        ndebug: Compile the module with `NDEBUG` defined, so `assert()` in
+            CPython's headers and intj's runtime is compiled out. False keeps
+            them live, for debugging; it builds a separate module.
 
     Returns:
         The launcher, a C function whose `__self__` is its `Launcher`
@@ -945,6 +953,7 @@ def _materialize_module(
     dynamic: tuple[str, ...] = (),
     global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = (),
     declared_parameters: tuple[str, ...] = (),
+    ndebug: bool = True,
 ) -> types.ModuleType:
     """Returns the loaded module for this kernel and configuration.
 
@@ -1036,6 +1045,7 @@ def _materialize_module(
         grid_cpp_source=grid_cpp.source if grid_cpp else "",
         grid_extra=grid_cpp.extras if grid_cpp else (),
         return_compiled=return_compiled,
+        ndebug=ndebug,
         tuning=tuning,
         dynamic=slots,
         template=ENTRY_TEMPLATE.read_bytes().hex(),

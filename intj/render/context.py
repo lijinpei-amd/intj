@@ -196,6 +196,7 @@ class RenderContext:
     grid_py_mode: bool
     grid_cpp_source: str
     return_compiled: bool
+    ndebug: bool
     tuning: TuningRender | None
 
     # Derived.
@@ -323,6 +324,7 @@ class RenderContext:
             grid_py_mode=key.grid_py_mode,
             grid_cpp_source=key.grid_cpp_source,
             return_compiled=key.return_compiled,
+            ndebug=key.ndebug,
             tuning=tuning,
             params=params,
             bound_params=tuple(v for v in params if v.bound_slot is not None),

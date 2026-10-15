@@ -118,6 +118,7 @@ class RenderKey:
     grid_cpp_source: str = ""
     grid_extra: tuple[str, ...] = ()
     return_compiled: bool = False
+    ndebug: bool = True  # NDEBUG for the whole translation unit
     tuning: TuningRender | None = None
     #: `dynamic_options`, in call order: they shape the call and the key
     dynamic: tuple[DynamicSlot, ...] = ()
