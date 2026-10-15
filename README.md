@@ -6,7 +6,7 @@ INTJ (INcompatible Triton Jit) is a host side python launcher for triton kernel,
 - Lookup compiled kernel using the cache key. If missing, compile it.
 - Launch the compiled kernel.
 
-INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunction` has a launch overhead of ~10us, while INTJ has a launch overhead of ~0.3us (overhead defined as the time excluding cuLaunchKernel/hipLaunchKernel, which itself takes ~3us).
+INTJ aims at reducing host launch overhead, from our benchmark, triton `JitFunction` has a launch overhead of ~10us, while INTJ has a launch overhead of ~0.1us (overhead defined as the time excluding cuLaunchKernel/hipLaunchKernel, which itself takes ~3us).
 
 This is an early version with limited argument types and grid expressions. Unsupported cases are refused; see `docs/Usage.md`. AMD is tested on gfx942 and NVIDIA on sm_89 (Ada); both run the full GPU test suite.
 
@@ -160,16 +160,17 @@ Perhaps some of the feature may not contribute much to the overhead, but, I don'
 ## Benchmark results
 
 `taskset -c 0 python benchmarks/bench_launch.py --readme --iters 20000 --batches 7`,
-5-argument kernel, MI308X (gfx942), triton 3.8.0, torch 2.14+rocm7.2. The
-numbers below are the median of five fresh-cache runs; each run reports the
-median of seven 20k-call batches. Each process used a separate empty
-`TRITON_HOME` for the cold-build column.
+5-argument kernel, MI308X (gfx942), CPython 3.12, triton 3.8.0,
+torch 2.14.0.dev20260804+rocm7.1, intj `c8b86c9`. The numbers below are the
+median of five fresh-cache runs; each run reports the median of seven 20k-call
+batches. Each process used a separate empty `TRITON_HOME` for the cold-build
+column.
 
 | | triton `JitFunction` | INTJ |
 |---|---|---|
-| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.0 us) | 17.42 us | 3.20 us |
-| `grid=(0,)`, i.e. no driver call | 13.47 us | 0.15 us |
-| argument decoding + spec key only | — | 0.12 us |
+| `grid=(1,)`, i.e. including `hipModuleLaunchKernel` (~3.0 us) | 16.58 us | 3.11 us |
+| `grid=(0,)`, i.e. no driver call | 12.83 us | 0.03 us |
+| argument decoding + spec key only | — | 0.09 us |
 
 The same command on an RTX 4080 SUPER (sm_89), triton 3.8.0, torch 2.14.1+cu130,
 CPython 3.12, same methodology:
@@ -186,16 +187,16 @@ differ mainly because `cuLaunchKernel` is cheaper here than
 cheaper on a desktop CPU.
 
 Argument decoding depends on how the module reads a tensor (`torch_access_mode`), for a
-kernel with three tensor arguments. These access-mode measurements came from a
-separate 20k-iteration MI300X run:
+kernel with three tensor arguments. On the MI308X, median of the same five
+fresh-cache runs:
 
 | `TorchAccessMode` | decode + spec key | first build |
 |---|---|---|
-| `RUNTIME_SHIM` — torch's structs, at recorded offsets selected at load | 89 ns | 0.6 s |
-| `STATIC_COMPILE` — compiled against torch's headers | 90 ns | 1.9 s |
-| `INTERPRETER` — pointer and storage size through the interpreter | 300 ns | 0.6 s |
+| `RUNTIME_SHIM` — torch's structs, at recorded offsets selected at load | 93 ns | 1.3 s |
+| `STATIC_COMPILE` — compiled against torch's headers | 94 ns | 2.3 s |
+| `INTERPRETER` — pointer and storage size through the interpreter | 888 ns | 0.8 s |
 
-and on the RTX 4080 SUPER, median of the same five fresh-cache runs:
+and on the RTX 4080 SUPER, median of its five fresh-cache runs:
 
 | `TorchAccessMode` | decode + spec key | first build |
 |---|---|---|
@@ -216,10 +217,12 @@ each other; `STATIC_COMPILE` has the compiler supply the field offsets that
 that and is the only mode whose `.so` must be rebuilt when torch is upgraded.
 
 The zero-volume row flatters INTJ a little: it returns before decoding arguments,
-which is the third row's 0.12 us. Host overhead is therefore ~0.3 us against
-~14 us.
+which is the third row's 0.09 us. Host overhead is therefore ~0.1 us against
+~13 us.
 
-The sm_89 numbers and their raw per-run samples are in the
+The MI308X numbers and their raw per-run samples are in the
+[2026-10-15 README journal](benchmarks/journals/2026-10-15_readme_0_c8b86c9.md),
+the sm_89 ones in the
 [2026-10-12 CUDA port journal](benchmarks/journals/2026-10-12_cuda-port_0_9682f5c.md).
 
 Run `python benchmarks/bench_launch.py --sweep --iters 100000 --batches 9` for
