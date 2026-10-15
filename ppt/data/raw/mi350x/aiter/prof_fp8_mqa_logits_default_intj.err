@@ -1,0 +1,10 @@
+W1015 11:58:45.785851 3808190 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000291 sec
+W1015 11:58:45.788211 3808190 simple_timer.cpp:55] [rocprofv3] '/raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python /raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/scripts/bench_aiter_ops.py --op fp8_mqa_logits --side intj --profile 50' ::     0.000000 sec
+[1;91mE-001h rocSHMEM[0m Could not open libnuma. Returning	[90mNUMAWrapper@src/gda/numa_wrapper.cpp:48[0m
+[aiter] Triton ops only: CK and HIP ops (and their JIT build) are skipped.
+W1015 11:58:47.364242 3808190 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+W1015 11:58:49.543189 3808190 simple_timer.cpp:55] [rocprofv3] '/raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python /raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/scripts/bench_aiter_ops.py --op fp8_mqa_logits --side intj --profile 50' ::     3.754976 sec
+E1015 11:58:49.561410 3808190 output_stream.cpp:111] Opened result file: /raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/out/mi350-2026-10-15/aiter/prof_fp8_mqa_logits_default_intj/trace_kernel_trace.csv
+E1015 11:58:49.578235 3808190 output_stream.cpp:111] Opened result file: /raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/out/mi350-2026-10-15/aiter/prof_fp8_mqa_logits_default_intj/trace_agent_info.csv
+W1015 11:58:49.579823 3808190 simple_timer.cpp:55] [rocprofv3] output generation ::     0.024566 sec
+W1015 11:58:49.581633 3808190 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.026391 sec

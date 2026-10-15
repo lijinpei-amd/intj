@@ -1,0 +1,10 @@
+default torch_access_mode=static_compile
+mode=readme; 1000 calls × 9 batches; median
+        path   triton us    intj us   speedup
+   grid=(1,)       10.85       3.24      3.3x
+   grid=(0,)        8.13       0.02    468.4x
+
+torch_access_mode   decode ns    build s
+     runtime_shim n/a UnsupportedKernel: intj: no verified tensor layout for torch 2.15.0.dev20260816+rocm7.14 (have 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.1
+   static_compile        55.3       0.01
+      interpreter       471.5       0.00

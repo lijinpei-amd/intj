@@ -1,0 +1,37 @@
+op,route,shape,gpu_kernel_us,triton_jit_host_us,triton_jit_eager_us,fastlaunch_host_us,fastlaunch_eager_us,intj_host_us,intj_eager_us,regime,host_speedup_vs_upstream,eager_speedup_vs_upstream
+flash_kda,default,1x64x12,18.5,96.1,96.3,49.66,50.33,26.7,26.7,upstream host-bound,1.86,1.88
+flash_kda,default,1x128x12,21.65,96.57,96.72,51.6,51.3,26.83,26.91,upstream host-bound,1.92,1.91
+flash_kda,default,1x256x12,29.22,97.04,97.64,51.85,51.87,26.92,28.94,upstream host-bound,1.93,1.79
+flash_kda,default,1x512x12,40.79,96.97,97.64,51.12,51.86,27.03,41.26,upstream host-bound,1.89,1.26
+flash_kda,default,1x1024x12,70.07,97.5,98.56,51.8,70.75,26.84,70.68,gpu-bound,1.93,
+flash_kda,default,1x2048x12,108.84,163.39,166.18,89.14,110.75,40.66,stall,gpu-bound,2.19,
+flash_kda,default,1x4096x12,168.94,164.6,174.59,89.97,171.3,41.1,stall,gpu-bound,2.19,
+flash_kda,default,1x8192x12,293.66,163.91,300.24,89.88,stall,40.77,stall,gpu-bound,2.2,
+flash_kda,default,1x16384x12,548.13,165.17,548.46,90.57,549.0,40.47,662.01,gpu-bound,2.24,
+flash_kda,triton,1x64x12,20.83,92.34,92.54,48.35,49.13,26.45,26.6,upstream host-bound,1.83,1.85
+flash_kda,triton,1x128x12,24.02,93.54,94.19,49.62,50.08,26.64,26.77,upstream host-bound,1.86,1.87
+flash_kda,triton,1x256x12,31.64,94.24,94.4,50.09,50.39,26.28,31.98,upstream host-bound,1.91,1.58
+flash_kda,triton,1x512x12,44.14,93.94,94.66,50.11,50.58,26.68,45.13,upstream host-bound,1.88,1.12
+flash_kda,triton,1x1024x12,76.53,94.46,95.57,50.29,76.31,26.3,76.8,gpu-bound,1.91,
+flash_kda,triton,1x2048x12,145.01,197.77,stall,102.07,stall,43.72,stall,gpu-bound,2.33,
+flash_kda,triton,1x4096x12,237.13,199.47,stall,103.2,240.8,43.67,stall,gpu-bound,2.36,
+flash_kda,triton,1x8192x12,424.4,199.35,430.26,102.69,430.51,44.01,stall,gpu-bound,2.33,
+flash_kda,triton,1x16384x12,787.85,199.22,792.91,103.66,792.22,43.74,897.07,gpu-bound,2.37,
+kda_decode,default,1x12,13.04,31.78,32.61,,,6.9,12.56,upstream host-bound,4.61,2.6
+kda_decode,default,4x12,12.93,31.82,32.89,,,7.05,12.74,upstream host-bound,4.52,2.58
+kda_decode,default,8x12,13.45,31.76,32.79,,,7.02,13.07,upstream host-bound,4.52,2.51
+kda_decode,default,16x12,14.61,31.69,33.13,,,6.98,14.0,upstream host-bound,4.54,2.37
+kda_decode,default,32x12,25.81,31.85,33.4,,,7.1,25.29,upstream host-bound,4.48,1.32
+kda_decode,default,64x12,46.06,31.81,46.57,,,7.01,45.66,gpu-bound,4.54,
+kda_decode,default,128x12,82.53,31.88,83.74,,,7.05,82.58,gpu-bound,4.52,
+kda_decode,default,256x12,152.23,31.89,157.46,,,6.99,156.92,gpu-bound,4.56,
+fp8_mqa_logits,default,1x8192x64,55.73,34.85,54.56,,,14.71,53.84,gpu-bound,2.37,
+fp8_mqa_logits,default,16x8192x64,56.77,35.08,55.29,,,14.57,54.5,gpu-bound,2.41,
+fp8_mqa_logits,default,64x8192x64,58.04,35.04,56.13,,,14.67,55.38,gpu-bound,2.39,
+fp8_mqa_logits,default,128x128x64,5.93,35.49,35.74,,,15.15,15.19,upstream host-bound,2.34,2.35
+fp8_mqa_logits,default,256x256x64,9.2,35.51,35.5,,,14.89,14.86,upstream host-bound,2.39,2.39
+fp8_mqa_logits,default,512x512x64,12.12,35.33,35.37,,,14.76,14.94,upstream host-bound,2.39,2.37
+fp8_mqa_logits,default,1024x1024x64,16.72,35.41,35.61,,,14.89,15.1,upstream host-bound,2.38,2.36
+fp8_mqa_logits,default,2048x2048x64,35.53,35.44,37.85,,,14.84,38.16,gpu-bound,2.39,
+fp8_mqa_logits,default,4096x4096x64,131.4,35.11,127.03,,,14.65,127.11,gpu-bound,2.4,
+fp8_mqa_logits,default,8192x8192x64,404.27,36.09,427.19,,,15.33,423.42,gpu-bound,2.35,

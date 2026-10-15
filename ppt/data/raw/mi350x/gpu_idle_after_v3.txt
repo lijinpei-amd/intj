@@ -1,0 +1,14 @@
+gpu0 vram_MB=284 busy=3
+gpu1 vram_MB=284 busy=3
+gpu2 vram_MB=1251 busy=2
+gpu3 vram_MB=284 busy=2
+gpu4 vram_MB=284 busy=3
+gpu5 vram_MB=284 busy=3
+gpu6 vram_MB=284 busy=2
+gpu7 vram_MB=284 busy=2
+PSR %CPU     ELAPSED COMMAND
+262  2.5       09:51 MainThread
+194  1.8    01:50:53 claude
+ 63  1.2       07:58 MainThread
+180  1.0       09:50 MainThread
+166  0.8       09:54 MainThread

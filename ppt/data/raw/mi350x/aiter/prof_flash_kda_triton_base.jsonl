@@ -1,0 +1,10 @@
+{"header": true, "op": "flash_kda", "side": "base", "tag": "", "aiter": "/raid/jinpli/workspace/home01/jinpli/development/workspace/intj-aiter/trees/aiter-base-874d253dd3/aiter/__init__.py", "intj": null, "gpu": "AMD Instinct MI350X", "arch": "gfx950:sramecc+:xnack-", "hip_visible_devices": "2", "cpu_affinity": [100], "python": "3.14.4", "torch": "2.15.0.dev20260816+rocm7.14", "triton": "3.8.0", "env": {"AITER_FDA_USE_GLUON": "0", "AITER_TRITON_ONLY": "1", "AITER_USE_SYSTEM_TRITON": "1", "TRITON_HOME": "/raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/triton_home_aiter_base"}, "started": "2026-10-15T11:58:34+0800"}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 64, 12], "sha1": "59cc9d64322cd14475b8d009a0af4b76bc00ae88", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 128, 12], "sha1": "43a20047ce42fb94abeb30da8131debfe173e344", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 256, 12], "sha1": "d47408f350d26488dcfc099e439ba7dbbebd45ba", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 512, 12], "sha1": "88864c071b0bc32650184fcddb74bb67a649ec37", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 1024, 12], "sha1": "3942c5427ea0ffbfdc544728e3dd027671e95499", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 2048, 12], "sha1": "652843124cf611d1944c38faf1a852f124755b01", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 4096, 12], "sha1": "40bf267accd515f605e85063ffa08a21177b66bb", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 8192, 12], "sha1": "8520743c4e7559a3a1f9b37163ce47466705e93c", "profile_calls": 50}
+{"op": "flash_kda", "side": "base", "variant": "default", "shape": [1, 16384, 12], "sha1": "3710abd8f1e19f585f56b0810db440d5d8a00076", "profile_calls": 50}

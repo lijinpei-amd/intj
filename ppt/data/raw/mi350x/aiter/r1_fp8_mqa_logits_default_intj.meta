@@ -1,0 +1,3 @@
+started=2026-10-15T12:08:10+08:00
+command=/raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/scripts/run_aiter.sh intj fp8_mqa_logits --tag r1
+exit_status=0 ended=2026-10-15T12:08:21+08:00

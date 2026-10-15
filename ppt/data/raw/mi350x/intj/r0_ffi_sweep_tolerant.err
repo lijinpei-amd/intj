@@ -1,0 +1,2 @@
+[1;91mE-001h rocSHMEM[0m Could not open libnuma. Returning	[90mNUMAWrapper@src/gda/numa_wrapper.cpp:48[0m
+skipping runtime_shim: intj: no verified tensor layout for torch 2.15.0.dev20260816+rocm7.14 (have 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10

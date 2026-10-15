@@ -1,0 +1,14 @@
+gpu0 vram_MB=284 busy=0
+gpu1 vram_MB=284 busy=0
+gpu2 vram_MB=284 busy=0
+gpu3 vram_MB=284 busy=0
+gpu4 vram_MB=284 busy=0
+gpu5 vram_MB=284 busy=0
+gpu6 vram_MB=284 busy=0
+gpu7 vram_MB=5204 busy=1
+PSR %CPU     ELAPSED COMMAND
+129 1972       00:06 python
+311 14.2       00:00 zsh
+128  5.2       31:10 python
+231  2.0    01:31:58 claude
+174  0.2  1-15:43:06 wezterm-mux-ser

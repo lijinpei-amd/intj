@@ -1,0 +1,10 @@
+machine,torch_access_mode,decode_spec_key_ns,is_default,rounds,source
+MI308X (gfx942),runtime_shim,91.5,False,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI308X (gfx942),static_compile,94.1,True,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI308X (gfx942),interpreter,923.4,False,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI350X (gfx950),runtime_shim,n/a,False,0,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI350X (gfx950),static_compile,55.3,True,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI350X (gfx950),interpreter,471.5,False,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+RTX 4080 SUPER (sm_89),runtime_shim,91.5,False,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+RTX 4080 SUPER (sm_89),static_compile,84.6,True,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+RTX 4080 SUPER (sm_89),interpreter,352.7,False,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"

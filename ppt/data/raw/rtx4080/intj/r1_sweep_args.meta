@@ -1,0 +1,4 @@
+started=2026-10-15T13:00:47+08:00
+cwd=/home/lijinpei/intj-ppt/src
+command=taskset -c 0 /home/lijinpei/development/intj/.venv/bin/python /home/lijinpei/intj-ppt/scripts/bench_sweeps.py args --tag r1
+exit_status=0 ended=2026-10-15T13:00:54+08:00

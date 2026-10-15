@@ -1,0 +1,26 @@
+MI350X eager-loop stalls: evidence (2026-10-15)
+
+1. Host-timed loops (wall clock around N calls + synchronize), first pass,
+   64 calls: GPU-bound loop totals land on multiples of 4 ms per 32 calls
+   (per-call 249.6, 374.5, 616.9, 749.9 us = 8, 12, ~20, 24 ms / 32), on
+   both sides. A blocking synchronize wakes on a 4 ms tick.
+
+2. Event-timed loops (aiter/ r*_*.jsonl, eager_us), 32 calls, 41 loops:
+   FlashKDA intj T=2048/4096/8192 read 249 / 374 / 505 us/call in all three
+   rounds (12:04-12:09), kernels 109 / 169 / 294 us. Rerunning the same
+   command at 12:18 read:
+     T=2048 eager 109.06, T=4096 168.98, T=8192 618.21, T=16384 554.94
+   and a standalone probe (200 warm-up calls, then 41 x 32-call loops):
+     base T=2048 event 109.0 (enqueue 86.7 us/call)
+     intj T=2048 event 109.3 (enqueue 41.5 us/call)
+   So the slow state is intermittent, hits GPU-bound shapes whose host runs
+   far ahead (deep queue), and is not a property of either launch path: the
+   kernels are identical (rocprofv3, same names and durations) and outputs
+   are bitwise equal.
+
+3. Deeper loops (>= 64 calls of the 5-kernel FlashKDA, 512 calls in a probe)
+   double the per-call host time on both sides; isolated loops stall ~8 ms.
+
+aggregate.py therefore flags eager_us > 1.25 x max(host_us, gpu_kernel_us)
+as driver_stall, and aiter_summary.csv reports an eager speedup only where
+upstream is host-bound.

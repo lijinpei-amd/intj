@@ -1,0 +1,4 @@
+started=2026-10-15T11:42:40+08:00
+cwd=/mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/ppt
+command=taskset -c 80 /mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/venv/bin/python /mnt/nvme2/jinpli/workspace/home/jinpli/development/workspace/intj/ppt/ppt/scripts/bench_sweeps.py args --tag r1
+exit_status=0 ended=2026-10-15T11:43:01+08:00

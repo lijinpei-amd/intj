@@ -1,0 +1,9 @@
+{"header": true, "op": "kda_decode", "side": "base", "tag": "", "aiter": "/raid/jinpli/workspace/home01/jinpli/development/workspace/intj-aiter/trees/aiter-base-874d253dd3/aiter/__init__.py", "intj": null, "gpu": "AMD Instinct MI350X", "arch": "gfx950:sramecc+:xnack-", "hip_visible_devices": "2", "cpu_affinity": [100], "python": "3.14.4", "torch": "2.15.0.dev20260816+rocm7.14", "triton": "3.8.0", "env": {"AITER_TRITON_ONLY": "1", "AITER_USE_SYSTEM_TRITON": "1", "TRITON_HOME": "/raid/jinpli/workspace/home01/jinpli/development/workspace/intj-ppt/triton_home_aiter_base"}, "started": "2026-10-15T11:58:20+0800"}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [1, 12], "sha1": "6274a510f22fbe3d9eeace6b81a5e5707497e2ab", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [4, 12], "sha1": "3e8fb7c2753807ce8d86dd1135b74d633daa27ec", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [8, 12], "sha1": "ef66d362fae3dce9a094c61aacf6f7d81cc0bf81", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [16, 12], "sha1": "19811ac3cdaa79f52c46ab77b94b2432e111b8bc", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [32, 12], "sha1": "f397d04450daba1cd77f2829d5f38593175b9935", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [64, 12], "sha1": "4bd97e034f5b4e53b56259186630825278f5a4e0", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [128, 12], "sha1": "3002dcc49b22e858a1c0bd0f6bd7d497f6d4a5bb", "profile_calls": 50}
+{"op": "kda_decode", "side": "base", "variant": "default", "shape": [256, 12], "sha1": "b7f7f72482f5a77080a02c34ca1b98bbbbeab703", "profile_calls": 50}

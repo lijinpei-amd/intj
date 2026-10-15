@@ -1,0 +1,10 @@
+default torch_access_mode=static_compile
+mode=readme; 1000 calls × 9 batches; median
+        path   triton us    intj us   speedup
+   grid=(1,)       17.42       4.17      4.2x
+   grid=(0,)       12.94       0.03    478.2x
+
+torch_access_mode   decode ns    build s
+     runtime_shim        92.3       1.34
+   static_compile        94.1       2.13
+      interpreter       923.4       0.82

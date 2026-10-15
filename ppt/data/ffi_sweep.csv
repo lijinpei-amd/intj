@@ -1,0 +1,99 @@
+machine,n_args,case,us_per_call,lo,hi,rounds
+MI308X (gfx942),0,FFI empty kernel,1.721,1.7078,1.7562,3
+MI308X (gfx942),0,FFI packed nop,0.1154,0.114,0.1168,3
+MI308X (gfx942),0,FFI typed nop,0.1212,0.1202,0.1213,3
+MI308X (gfx942),0,INTJ runtime_shim kernel,2.7772,2.7655,2.7817,3
+MI308X (gfx942),0,INTJ static_compile kernel,2.8367,2.8273,2.8918,3
+MI308X (gfx942),3,FFI empty kernel,3.3605,3.3428,3.381,3
+MI308X (gfx942),3,FFI packed nop,0.1442,0.1438,0.1501,3
+MI308X (gfx942),3,FFI typed nop,0.1507,0.1488,0.1527,3
+MI308X (gfx942),3,INTJ runtime_shim kernel,2.9834,2.9716,2.9889,3
+MI308X (gfx942),3,INTJ static_compile kernel,3.0202,3.0202,3.0399,3
+MI308X (gfx942),5,FFI empty kernel,3.3823,3.3755,3.3976,3
+MI308X (gfx942),5,FFI packed nop,0.1719,0.1715,0.173,3
+MI308X (gfx942),5,FFI typed nop,0.179,0.1784,0.1793,3
+MI308X (gfx942),5,INTJ runtime_shim kernel,3.0275,3.0255,3.0332,3
+MI308X (gfx942),5,INTJ static_compile kernel,3.0442,3.0319,3.0529,3
+MI308X (gfx942),8,FFI empty kernel,3.4675,3.4563,3.4727,3
+MI308X (gfx942),8,FFI packed nop,0.2058,0.2047,0.2088,3
+MI308X (gfx942),8,FFI typed nop,0.2113,0.21,0.2164,3
+MI308X (gfx942),8,INTJ runtime_shim kernel,3.0435,3.0292,3.05,3
+MI308X (gfx942),8,INTJ static_compile kernel,3.0774,3.0471,3.0847,3
+MI308X (gfx942),16,FFI empty kernel,3.732,3.7027,3.7368,3
+MI308X (gfx942),16,FFI packed nop,0.3047,0.3037,0.3052,3
+MI308X (gfx942),16,FFI typed nop,0.3123,0.311,0.3154,3
+MI308X (gfx942),16,INTJ runtime_shim kernel,3.4146,3.4069,3.4219,3
+MI308X (gfx942),16,INTJ static_compile kernel,3.4569,3.4421,3.4679,3
+MI308X (gfx942),32,FFI empty kernel,4.2427,4.2366,4.3216,3
+MI308X (gfx942),32,FFI packed nop,0.4824,0.4812,0.4963,3
+MI308X (gfx942),32,FFI typed nop,0.4977,0.4947,0.5106,3
+MI308X (gfx942),32,INTJ runtime_shim kernel,3.7251,3.6628,3.7323,3
+MI308X (gfx942),32,INTJ static_compile kernel,3.8119,3.8064,3.8126,3
+MI308X (gfx942),64,FFI empty kernel,5.3828,5.3823,5.3915,3
+MI308X (gfx942),64,FFI packed nop,0.84,0.8367,0.8719,3
+MI308X (gfx942),64,FFI typed nop,0.8777,0.8736,0.8959,3
+MI308X (gfx942),64,INTJ runtime_shim kernel,4.8683,4.8501,4.8789,3
+MI308X (gfx942),64,INTJ static_compile kernel,4.933,4.9185,4.9657,3
+MI350X (gfx950),0,FFI empty kernel,1.1366,0.8393,1.1411,3
+MI350X (gfx950),0,FFI packed nop,0.0669,0.066,0.0677,3
+MI350X (gfx950),0,FFI typed nop,0.0688,0.0679,0.0701,3
+MI350X (gfx950),0,INTJ static_compile kernel,2.548,2.2126,2.5503,3
+MI350X (gfx950),3,FFI empty kernel,2.7409,2.4348,2.7658,3
+MI350X (gfx950),3,FFI packed nop,0.0874,0.0863,0.0886,3
+MI350X (gfx950),3,FFI typed nop,0.0908,0.0889,0.091,3
+MI350X (gfx950),3,INTJ static_compile kernel,2.5318,2.2409,2.5927,3
+MI350X (gfx950),5,FFI empty kernel,2.7936,2.5221,2.8564,3
+MI350X (gfx950),5,FFI packed nop,0.1029,0.1028,0.1043,3
+MI350X (gfx950),5,FFI typed nop,0.1062,0.1053,0.1069,3
+MI350X (gfx950),5,INTJ static_compile kernel,2.5334,2.2597,2.5356,3
+MI350X (gfx950),8,FFI empty kernel,2.7379,2.5118,2.8109,3
+MI350X (gfx950),8,FFI packed nop,0.124,0.1233,0.1259,3
+MI350X (gfx950),8,FFI typed nop,0.1275,0.1266,0.1287,3
+MI350X (gfx950),8,INTJ static_compile kernel,2.6417,2.2732,2.7305,3
+MI350X (gfx950),16,FFI empty kernel,3.0348,2.6332,3.265,3
+MI350X (gfx950),16,FFI packed nop,0.1924,0.1913,0.1925,3
+MI350X (gfx950),16,FFI typed nop,0.1971,0.1968,0.1988,3
+MI350X (gfx950),16,INTJ static_compile kernel,2.7899,2.3428,2.8086,3
+MI350X (gfx950),32,FFI empty kernel,3.2732,2.8697,3.4958,3
+MI350X (gfx950),32,FFI packed nop,0.2992,0.2976,0.3059,3
+MI350X (gfx950),32,FFI typed nop,0.3115,0.3112,0.3138,3
+MI350X (gfx950),32,INTJ static_compile kernel,2.8637,2.4466,3.2021,3
+MI350X (gfx950),64,FFI empty kernel,3.6975,3.2466,3.7355,3
+MI350X (gfx950),64,FFI packed nop,0.5298,0.5268,0.5429,3
+MI350X (gfx950),64,FFI typed nop,0.5496,0.549,0.5614,3
+MI350X (gfx950),64,INTJ static_compile kernel,3.4795,2.8188,3.634,3
+RTX 4080 SUPER (sm_89),0,FFI empty kernel,1.4779,1.4709,1.4911,3
+RTX 4080 SUPER (sm_89),0,FFI packed nop,0.0808,0.0797,0.0821,3
+RTX 4080 SUPER (sm_89),0,FFI typed nop,0.0835,0.0824,0.0835,3
+RTX 4080 SUPER (sm_89),0,INTJ runtime_shim kernel,1.2756,1.2742,1.2805,3
+RTX 4080 SUPER (sm_89),0,INTJ static_compile kernel,1.2742,1.2719,1.2769,3
+RTX 4080 SUPER (sm_89),3,FFI empty kernel,1.5108,1.5021,1.5163,3
+RTX 4080 SUPER (sm_89),3,FFI packed nop,0.1039,0.1023,0.1043,3
+RTX 4080 SUPER (sm_89),3,FFI typed nop,0.1102,0.1083,0.1133,3
+RTX 4080 SUPER (sm_89),3,INTJ runtime_shim kernel,1.3006,1.2985,1.3012,3
+RTX 4080 SUPER (sm_89),3,INTJ static_compile kernel,1.3026,1.2999,1.3047,3
+RTX 4080 SUPER (sm_89),5,FFI empty kernel,1.5343,1.527,1.5355,3
+RTX 4080 SUPER (sm_89),5,FFI packed nop,0.1228,0.1227,0.1238,3
+RTX 4080 SUPER (sm_89),5,FFI typed nop,0.1362,0.1346,0.1365,3
+RTX 4080 SUPER (sm_89),5,INTJ runtime_shim kernel,1.3051,1.3049,1.3051,3
+RTX 4080 SUPER (sm_89),5,INTJ static_compile kernel,1.304,1.3038,1.3061,3
+RTX 4080 SUPER (sm_89),8,FFI empty kernel,1.5667,1.5643,1.5709,3
+RTX 4080 SUPER (sm_89),8,FFI packed nop,0.1429,0.1421,0.1448,3
+RTX 4080 SUPER (sm_89),8,FFI typed nop,0.1617,0.1583,0.1637,3
+RTX 4080 SUPER (sm_89),8,INTJ runtime_shim kernel,1.3051,1.3047,1.3059,3
+RTX 4080 SUPER (sm_89),8,INTJ static_compile kernel,1.3064,1.3055,1.3075,3
+RTX 4080 SUPER (sm_89),16,FFI empty kernel,1.6634,1.6574,1.7064,3
+RTX 4080 SUPER (sm_89),16,FFI packed nop,0.2089,0.2057,0.2105,3
+RTX 4080 SUPER (sm_89),16,FFI typed nop,0.2281,0.2272,0.2289,3
+RTX 4080 SUPER (sm_89),16,INTJ runtime_shim kernel,1.3338,1.3224,1.3356,3
+RTX 4080 SUPER (sm_89),16,INTJ static_compile kernel,1.3247,1.3224,1.3282,3
+RTX 4080 SUPER (sm_89),32,FFI empty kernel,1.9445,1.9439,1.9456,3
+RTX 4080 SUPER (sm_89),32,FFI packed nop,0.3356,0.3335,0.3369,3
+RTX 4080 SUPER (sm_89),32,FFI typed nop,0.3747,0.3738,0.3757,3
+RTX 4080 SUPER (sm_89),32,INTJ runtime_shim kernel,1.4791,1.4766,1.4863,3
+RTX 4080 SUPER (sm_89),32,INTJ static_compile kernel,1.4802,1.479,1.4827,3
+RTX 4080 SUPER (sm_89),64,FFI empty kernel,2.3569,2.3472,2.3636,3
+RTX 4080 SUPER (sm_89),64,FFI packed nop,0.5851,0.5659,0.5949,3
+RTX 4080 SUPER (sm_89),64,FFI typed nop,0.663,0.6439,0.6632,3
+RTX 4080 SUPER (sm_89),64,INTJ runtime_shim kernel,1.6425,1.6319,1.6843,3
+RTX 4080 SUPER (sm_89),64,INTJ static_compile kernel,1.6284,1.625,1.6699,3

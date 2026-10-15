@@ -1,0 +1,193 @@
+machine,n_args,arg_kind,path,us_per_call,lo,hi,rounds
+MI308X (gfx942),0,int,intj_host,0.022,0.022,0.022,3
+MI308X (gfx942),0,int,intj_launch,3.267,3.238,3.426,3
+MI308X (gfx942),0,int,triton_host,4.95,4.914,4.979,3
+MI308X (gfx942),0,int,triton_launch,8.635,8.576,8.695,3
+MI308X (gfx942),1,int,intj_host,0.025,0.025,0.025,3
+MI308X (gfx942),1,int,intj_launch,3.209,3.113,3.437,3
+MI308X (gfx942),1,int,triton_host,5.438,5.422,5.489,3
+MI308X (gfx942),1,int,triton_launch,9.166,9.133,9.276,3
+MI308X (gfx942),2,int,intj_host,0.027,0.027,0.027,3
+MI308X (gfx942),2,int,intj_launch,3.151,3.148,3.403,3
+MI308X (gfx942),2,int,triton_host,5.652,5.589,5.735,3
+MI308X (gfx942),2,int,triton_launch,9.208,9.185,9.534,3
+MI308X (gfx942),4,int,intj_host,0.032,0.032,0.032,3
+MI308X (gfx942),4,int,intj_launch,3.176,3.163,3.414,3
+MI308X (gfx942),4,int,triton_host,6.14,6.107,6.151,3
+MI308X (gfx942),4,int,triton_launch,9.707,9.569,10.098,3
+MI308X (gfx942),8,int,intj_host,0.042,0.042,0.043,3
+MI308X (gfx942),8,int,intj_launch,3.238,3.178,3.457,3
+MI308X (gfx942),8,int,triton_host,7.086,7.081,7.111,3
+MI308X (gfx942),8,int,triton_launch,10.675,10.523,11.071,3
+MI308X (gfx942),16,int,intj_host,0.063,0.063,0.063,3
+MI308X (gfx942),16,int,intj_launch,3.251,3.244,3.543,3
+MI308X (gfx942),16,int,triton_host,8.928,8.803,8.956,3
+MI308X (gfx942),16,int,triton_launch,12.499,12.374,12.888,3
+MI308X (gfx942),32,int,intj_host,0.102,0.102,0.102,3
+MI308X (gfx942),32,int,intj_launch,3.558,3.407,3.721,3
+MI308X (gfx942),32,int,triton_host,12.963,12.802,12.992,3
+MI308X (gfx942),32,int,triton_launch,16.468,16.406,16.895,3
+MI308X (gfx942),64,int,intj_host,0.204,0.204,0.205,3
+MI308X (gfx942),64,int,intj_launch,3.889,3.572,3.953,3
+MI308X (gfx942),64,int,triton_host,20.521,20.432,20.555,3
+MI308X (gfx942),64,int,triton_launch,24.258,24.081,24.729,3
+MI308X (gfx942),0,tensor,intj_host,0.022,0.022,0.022,3
+MI308X (gfx942),0,tensor,intj_launch,3.191,3.145,3.433,3
+MI308X (gfx942),0,tensor,triton_host,4.928,4.914,4.999,3
+MI308X (gfx942),0,tensor,triton_launch,8.723,8.559,8.845,3
+MI308X (gfx942),1,tensor,intj_host,0.025,0.025,0.025,3
+MI308X (gfx942),1,tensor,intj_launch,3.214,3.207,3.445,3
+MI308X (gfx942),1,tensor,triton_host,8.057,7.756,8.067,3
+MI308X (gfx942),1,tensor,triton_launch,11.574,11.415,11.68,3
+MI308X (gfx942),2,tensor,intj_host,0.028,0.028,0.029,3
+MI308X (gfx942),2,tensor,intj_launch,3.377,3.286,3.486,3
+MI308X (gfx942),2,tensor,triton_host,9.986,9.957,9.986,3
+MI308X (gfx942),2,tensor,triton_launch,13.7,13.464,13.875,3
+MI308X (gfx942),4,tensor,intj_host,0.031,0.031,0.031,3
+MI308X (gfx942),4,tensor,intj_launch,3.362,3.327,3.607,3
+MI308X (gfx942),4,tensor,triton_host,13.783,13.66,13.955,3
+MI308X (gfx942),4,tensor,triton_launch,17.476,17.317,17.907,3
+MI308X (gfx942),8,tensor,intj_host,0.041,0.041,0.041,3
+MI308X (gfx942),8,tensor,intj_launch,3.648,3.597,3.824,3
+MI308X (gfx942),8,tensor,triton_host,21.932,21.903,21.983,3
+MI308X (gfx942),8,tensor,triton_launch,25.75,25.607,25.862,3
+MI308X (gfx942),16,tensor,intj_host,0.06,0.06,0.061,3
+MI308X (gfx942),16,tensor,intj_launch,4.134,4.124,4.255,3
+MI308X (gfx942),16,tensor,triton_host,37.302,36.884,37.418,3
+MI308X (gfx942),16,tensor,triton_launch,41.81,41.358,41.878,3
+MI308X (gfx942),32,tensor,intj_host,0.1,0.099,0.163,3
+MI308X (gfx942),32,tensor,intj_launch,5.131,5.051,5.222,3
+MI308X (gfx942),32,tensor,triton_host,69.053,68.24,69.906,3
+MI308X (gfx942),32,tensor,triton_launch,73.89,73.051,75.492,3
+MI308X (gfx942),64,tensor,intj_host,0.298,0.295,0.298,3
+MI308X (gfx942),64,tensor,intj_launch,7.314,7.314,7.346,3
+MI308X (gfx942),64,tensor,triton_host,129.234,129.07,130.29,3
+MI308X (gfx942),64,tensor,triton_launch,135.969,135.243,136.73,3
+MI350X (gfx950),0,int,intj_host,0.014,0.014,0.014,3
+MI350X (gfx950),0,int,intj_launch,3.173,3.16,3.335,3
+MI350X (gfx950),0,int,triton_host,3.436,3.43,3.46,3
+MI350X (gfx950),0,int,triton_launch,6.51,6.467,6.602,3
+MI350X (gfx950),1,int,intj_host,0.016,0.016,0.017,3
+MI350X (gfx950),1,int,intj_launch,3.107,2.982,3.179,3
+MI350X (gfx950),1,int,triton_host,3.735,3.735,3.75,3
+MI350X (gfx950),1,int,triton_launch,6.927,6.851,6.936,3
+MI350X (gfx950),2,int,intj_host,0.017,0.017,0.018,3
+MI350X (gfx950),2,int,intj_launch,3.327,3.014,3.339,3
+MI350X (gfx950),2,int,triton_host,3.92,3.86,3.922,3
+MI350X (gfx950),2,int,triton_launch,7.03,7.013,7.229,3
+MI350X (gfx950),4,int,intj_host,0.021,0.021,0.021,3
+MI350X (gfx950),4,int,intj_launch,3.159,3.077,3.287,3
+MI350X (gfx950),4,int,triton_host,4.173,4.162,4.244,3
+MI350X (gfx950),4,int,triton_launch,7.466,7.325,7.475,3
+MI350X (gfx950),8,int,intj_host,0.028,0.028,0.028,3
+MI350X (gfx950),8,int,intj_launch,3.459,3.222,3.481,3
+MI350X (gfx950),8,int,triton_host,4.776,4.762,4.796,3
+MI350X (gfx950),8,int,triton_launch,7.839,7.818,8.203,3
+MI350X (gfx950),16,int,intj_host,0.043,0.043,0.043,3
+MI350X (gfx950),16,int,intj_launch,3.218,3.19,3.316,3
+MI350X (gfx950),16,int,triton_host,5.838,5.749,5.878,3
+MI350X (gfx950),16,int,triton_launch,9.17,8.863,9.194,3
+MI350X (gfx950),32,int,intj_host,0.071,0.071,0.072,3
+MI350X (gfx950),32,int,intj_launch,3.703,3.573,3.733,3
+MI350X (gfx950),32,int,triton_host,8.139,8.055,8.166,3
+MI350X (gfx950),32,int,triton_launch,11.316,11.248,11.492,3
+MI350X (gfx950),64,int,intj_host,0.135,0.134,0.139,3
+MI350X (gfx950),64,int,intj_launch,3.782,2.817,3.942,3
+MI350X (gfx950),64,int,triton_host,12.222,12.162,12.302,3
+MI350X (gfx950),64,int,triton_launch,15.607,14.901,15.811,3
+MI350X (gfx950),0,tensor,intj_host,0.014,0.014,0.014,3
+MI350X (gfx950),0,tensor,intj_launch,3.176,3.068,3.23,3
+MI350X (gfx950),0,tensor,triton_host,3.47,3.451,3.525,3
+MI350X (gfx950),0,tensor,triton_launch,6.637,6.56,6.723,3
+MI350X (gfx950),1,tensor,intj_host,0.016,0.016,0.017,3
+MI350X (gfx950),1,tensor,intj_launch,3.055,2.972,3.13,3
+MI350X (gfx950),1,tensor,triton_host,5.205,5.159,5.227,3
+MI350X (gfx950),1,tensor,triton_launch,8.21,8.138,8.392,3
+MI350X (gfx950),2,tensor,intj_host,0.017,0.017,0.018,3
+MI350X (gfx950),2,tensor,intj_launch,3.194,3.156,3.204,3
+MI350X (gfx950),2,tensor,triton_host,6.478,6.431,6.601,3
+MI350X (gfx950),2,tensor,triton_launch,9.552,9.509,9.84,3
+MI350X (gfx950),4,tensor,intj_host,0.021,0.021,0.021,3
+MI350X (gfx950),4,tensor,intj_launch,3.134,3.016,3.245,3
+MI350X (gfx950),4,tensor,triton_host,9.034,9.026,9.079,3
+MI350X (gfx950),4,tensor,triton_launch,12.14,12.134,12.226,3
+MI350X (gfx950),8,tensor,intj_host,0.028,0.027,0.028,3
+MI350X (gfx950),8,tensor,intj_launch,3.417,3.177,3.462,3
+MI350X (gfx950),8,tensor,triton_host,14.287,14.169,14.448,3
+MI350X (gfx950),8,tensor,triton_launch,17.449,17.194,17.591,3
+MI350X (gfx950),16,tensor,intj_host,0.041,0.041,0.042,3
+MI350X (gfx950),16,tensor,intj_launch,3.79,3.652,3.807,3
+MI350X (gfx950),16,tensor,triton_host,24.619,24.244,24.919,3
+MI350X (gfx950),16,tensor,triton_launch,27.726,27.226,28.111,3
+MI350X (gfx950),32,tensor,intj_host,0.071,0.07,0.071,3
+MI350X (gfx950),32,tensor,intj_launch,3.557,2.662,3.757,3
+MI350X (gfx950),32,tensor,triton_host,45.622,45.487,46.116,3
+MI350X (gfx950),32,tensor,triton_launch,48.68,48.051,49.589,3
+MI350X (gfx950),64,tensor,intj_host,0.13,0.129,0.132,3
+MI350X (gfx950),64,tensor,intj_launch,4.126,2.942,4.341,3
+MI350X (gfx950),64,tensor,triton_host,87.503,85.692,87.636,3
+MI350X (gfx950),64,tensor,triton_launch,90.179,89.999,91.694,3
+RTX 4080 SUPER (sm_89),0,int,intj_host,0.018,0.018,0.019,3
+RTX 4080 SUPER (sm_89),0,int,intj_launch,1.262,1.252,1.272,3
+RTX 4080 SUPER (sm_89),0,int,triton_host,4.136,4.03,4.149,3
+RTX 4080 SUPER (sm_89),0,int,triton_launch,5.9,5.848,5.919,3
+RTX 4080 SUPER (sm_89),1,int,intj_host,0.018,0.018,0.019,3
+RTX 4080 SUPER (sm_89),1,int,intj_launch,1.255,1.25,1.27,3
+RTX 4080 SUPER (sm_89),1,int,triton_host,4.524,4.465,4.592,3
+RTX 4080 SUPER (sm_89),1,int,triton_launch,5.952,5.866,6.046,3
+RTX 4080 SUPER (sm_89),2,int,intj_host,0.02,0.019,0.02,3
+RTX 4080 SUPER (sm_89),2,int,intj_launch,1.255,1.249,1.276,3
+RTX 4080 SUPER (sm_89),2,int,triton_host,4.658,4.657,4.701,3
+RTX 4080 SUPER (sm_89),2,int,triton_launch,6.121,6.003,6.149,3
+RTX 4080 SUPER (sm_89),4,int,intj_host,0.024,0.023,0.025,3
+RTX 4080 SUPER (sm_89),4,int,intj_launch,1.299,1.286,1.3,3
+RTX 4080 SUPER (sm_89),4,int,triton_host,4.92,4.901,4.987,3
+RTX 4080 SUPER (sm_89),4,int,triton_launch,6.446,6.363,6.498,3
+RTX 4080 SUPER (sm_89),8,int,intj_host,0.031,0.031,0.031,3
+RTX 4080 SUPER (sm_89),8,int,intj_launch,1.31,1.288,1.311,3
+RTX 4080 SUPER (sm_89),8,int,triton_host,5.548,5.479,5.576,3
+RTX 4080 SUPER (sm_89),8,int,triton_launch,7.023,6.854,7.06,3
+RTX 4080 SUPER (sm_89),16,int,intj_host,0.046,0.046,0.046,3
+RTX 4080 SUPER (sm_89),16,int,intj_launch,1.332,1.325,1.334,3
+RTX 4080 SUPER (sm_89),16,int,triton_host,6.714,6.663,6.724,3
+RTX 4080 SUPER (sm_89),16,int,triton_launch,8.163,8.073,8.191,3
+RTX 4080 SUPER (sm_89),32,int,intj_host,0.076,0.076,0.077,3
+RTX 4080 SUPER (sm_89),32,int,intj_launch,1.478,1.468,1.483,3
+RTX 4080 SUPER (sm_89),32,int,triton_host,9.372,9.324,9.408,3
+RTX 4080 SUPER (sm_89),32,int,triton_launch,10.858,10.856,10.872,3
+RTX 4080 SUPER (sm_89),64,int,intj_host,0.132,0.132,0.143,3
+RTX 4080 SUPER (sm_89),64,int,intj_launch,1.612,1.605,1.614,3
+RTX 4080 SUPER (sm_89),64,int,triton_host,14.611,14.53,14.675,3
+RTX 4080 SUPER (sm_89),64,int,triton_launch,16.13,16.08,16.171,3
+RTX 4080 SUPER (sm_89),0,tensor,intj_host,0.018,0.017,0.019,3
+RTX 4080 SUPER (sm_89),0,tensor,intj_launch,1.254,1.246,1.272,3
+RTX 4080 SUPER (sm_89),0,tensor,triton_host,4.142,4.105,4.18,3
+RTX 4080 SUPER (sm_89),0,tensor,triton_launch,5.582,5.508,5.64,3
+RTX 4080 SUPER (sm_89),1,tensor,intj_host,0.019,0.018,0.019,3
+RTX 4080 SUPER (sm_89),1,tensor,intj_launch,1.256,1.25,1.271,3
+RTX 4080 SUPER (sm_89),1,tensor,triton_host,4.902,4.844,4.937,3
+RTX 4080 SUPER (sm_89),1,tensor,triton_launch,6.347,6.256,6.389,3
+RTX 4080 SUPER (sm_89),2,tensor,intj_host,0.02,0.019,0.021,3
+RTX 4080 SUPER (sm_89),2,tensor,intj_launch,1.255,1.249,1.289,3
+RTX 4080 SUPER (sm_89),2,tensor,triton_host,5.233,5.209,5.262,3
+RTX 4080 SUPER (sm_89),2,tensor,triton_launch,6.691,6.612,6.709,3
+RTX 4080 SUPER (sm_89),4,tensor,intj_host,0.022,0.022,0.023,3
+RTX 4080 SUPER (sm_89),4,tensor,intj_launch,1.294,1.287,1.294,3
+RTX 4080 SUPER (sm_89),4,tensor,triton_host,5.97,5.955,6.025,3
+RTX 4080 SUPER (sm_89),4,tensor,triton_launch,7.45,7.434,7.494,3
+RTX 4080 SUPER (sm_89),8,tensor,intj_host,0.029,0.029,0.029,3
+RTX 4080 SUPER (sm_89),8,tensor,intj_launch,1.308,1.284,1.322,3
+RTX 4080 SUPER (sm_89),8,tensor,triton_host,7.355,7.282,7.426,3
+RTX 4080 SUPER (sm_89),8,tensor,triton_launch,8.834,8.711,8.966,3
+RTX 4080 SUPER (sm_89),16,tensor,intj_host,0.042,0.042,0.043,3
+RTX 4080 SUPER (sm_89),16,tensor,intj_launch,1.327,1.323,1.332,3
+RTX 4080 SUPER (sm_89),16,tensor,triton_host,10.125,10.012,10.129,3
+RTX 4080 SUPER (sm_89),16,tensor,triton_launch,11.712,11.453,11.713,3
+RTX 4080 SUPER (sm_89),32,tensor,intj_host,0.071,0.071,0.071,3
+RTX 4080 SUPER (sm_89),32,tensor,intj_launch,1.455,1.436,1.466,3
+RTX 4080 SUPER (sm_89),32,tensor,triton_host,16.201,16.099,16.233,3
+RTX 4080 SUPER (sm_89),32,tensor,triton_launch,17.591,17.537,17.7,3
+RTX 4080 SUPER (sm_89),64,tensor,intj_host,0.123,0.123,0.124,3
+RTX 4080 SUPER (sm_89),64,tensor,intj_launch,1.6,1.587,1.609,3
+RTX 4080 SUPER (sm_89),64,tensor,triton_host,27.692,27.599,27.932,3
+RTX 4080 SUPER (sm_89),64,tensor,triton_launch,29.248,29.092,29.361,3

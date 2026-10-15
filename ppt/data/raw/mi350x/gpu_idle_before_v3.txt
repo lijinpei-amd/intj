@@ -1,0 +1,14 @@
+gpu0 vram_MB=283 busy=0
+gpu1 vram_MB=283 busy=0
+gpu2 vram_MB=283 busy=0
+gpu3 vram_MB=283 busy=0
+gpu4 vram_MB=283 busy=0
+gpu5 vram_MB=283 busy=0
+gpu6 vram_MB=283 busy=0
+gpu7 vram_MB=284 busy=0
+PSR %CPU     ELAPSED COMMAND
+ 19 12.3       00:00 zsh
+262  7.1       03:23 MainThread
+ 62  5.7       01:29 MainThread
+180  3.0       03:21 MainThread
+176  2.3       03:25 MainThread

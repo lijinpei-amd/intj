@@ -1,0 +1,7 @@
+machine,grid,triton_us,intj_us,speedup,rounds,source
+MI308X (gfx942),"grid=(1,)",16.56,3.45,4.8,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI308X (gfx942),"grid=(0,)",12.9,0.03,430.0,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI350X (gfx950),"grid=(1,)",10.96,3.14,3.5,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+MI350X (gfx950),"grid=(0,)",8.17,0.02,408.5,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+RTX 4080 SUPER (sm_89),"grid=(1,)",8.1,1.31,6.2,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
+RTX 4080 SUPER (sm_89),"grid=(0,)",6.11,0.02,305.5,3,"measured 2026-10-15, 1000 calls x 9 batches, 3 processes"
