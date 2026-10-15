@@ -1,0 +1,5 @@
+binary_sha256=267568438622d3c8a2367a93b74a4e25059fc3ff52414ea7adce0c439d0fd779 kind=cubin kernel=empty_kernel_1 threads=128 shared=0 callback_count=1
+iters=1000 batches=9 unit=us/call (host enqueue, no timed sync)
+TVM FFI same binary       median=1.5067 samples=[1.531731, 1.501845, 1.503227, 1.50988, 1.508527, 1.5048, 1.506703, 1.507886, 1.498178]
+Triton same binary        median=6.4506 samples=[6.498442, 6.464219, 6.451716, 6.450553, 6.460542, 6.430396, 6.414998, 6.3998, 6.412162]
+INTJ same binary          median=1.3058 samples=[1.303485, 1.308595, 1.30579, 1.3060699999999998, 1.3046179999999998, 1.306071, 1.303496, 1.303555, 1.309978]

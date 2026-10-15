@@ -1,0 +1,14 @@
+{"header": true, "python": "3.12.3", "torch": "2.14.0.dev20260804+rocm7.1", "triton": "3.8.0", "hip": true, "number": 200000, "repeat": 9, "gpu": "AMD Instinct MI308X"}
+{"group": "launch_syntax", "case": "triton.cdiv", "stmt": "triton.cdiv(n, block)", "ns": 990.79, "lo": 989.8, "hi": 992.42}
+{"group": "launch_syntax", "case": "plain def cdiv", "stmt": "cdiv(n, block)", "ns": 52.64, "lo": 52.18, "hi": 53.67}
+{"group": "launch_syntax", "case": "inline (n + b - 1) // b", "stmt": "(n + block - 1) // block", "ns": 35.18, "lo": 34.91, "hi": 35.42}
+{"group": "launch_syntax", "case": "intj, grid passed in", "stmt": "l_tuple(dev, stream, g, x, y, o, n, a, block)", "ns": 45.26, "lo": 45.03, "hi": 46.6}
+{"group": "launch_syntax", "case": "intj, grid_cpp in C", "stmt": "l_cpp(dev, stream, x, y, o, n, a, block)", "ns": 48.45, "lo": 48.03, "hi": 48.64}
+{"group": "launch_syntax", "case": "kernel[grid]", "stmt": "k[g]", "ns": 125.82, "lo": 123.78, "hi": 133.01}
+{"group": "launch_syntax", "case": "kernel[grid](...), run stubbed", "stmt": "k[g](x, y, o, n, a, BLOCK=block)", "ns": 544.19, "lo": 543.42, "hi": 544.95}
+{"group": "launch_syntax", "case": "kernel.run(...) directly, stubbed", "stmt": "k.run(x, y, o, n, a, BLOCK=block, grid=g, warmup=False)", "ns": 127.2, "lo": 127.05, "hi": 128.13}
+{"group": "ptr_range", "case": "triton is_within_2gb(tensor)", "stmt": "HIPBackend.is_within_2gb(t)", "ns": 452.6, "lo": 452.04, "hi": 454.45}
+{"group": "ptr_range", "case": "triton get_tensor_specialization(tensor)", "stmt": "HIPBackend.get_tensor_specialization(t, align=True)", "ns": 1255.48, "lo": 1254.1, "hi": 1257.88}
+{"group": "ptr_range", "case": "  hasattr(tensor, 'ptr_range')", "stmt": "hasattr(t, 'ptr_range')", "ns": 19.13, "lo": 18.92, "hi": 19.55}
+{"group": "ptr_range", "case": "  tensor.untyped_storage().size()", "stmt": "t.untyped_storage().size()", "ns": 143.49, "lo": 141.56, "hi": 144.77}
+{"group": "ptr_range", "case": "  import torch", "stmt": "import torch", "ns": 58.04, "lo": 56.77, "hi": 60.39}

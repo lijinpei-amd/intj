@@ -1,0 +1,2 @@
+g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+ 19:25:07 up 37 days, 19:55,  0 users,  load average: 0.73, 1.08, 2.01

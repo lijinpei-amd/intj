@@ -1,0 +1,10 @@
+machine,case,us_per_call,lo,hi,rounds
+MI308X (gfx942),INTJ same binary,3.0098,2.9684,3.1435,3
+MI308X (gfx942),TVM FFI same binary,3.2229,3.1644,3.3662,3
+MI308X (gfx942),Triton same binary,11.2307,11.1626,11.5965,3
+MI350X (gfx950),INTJ same binary,2.7701,2.2285,2.938,3
+MI350X (gfx950),TVM FFI same binary,2.8353,2.333,2.9405,3
+MI350X (gfx950),Triton same binary,7.722,7.518,7.801,3
+RTX 4080 SUPER (sm_89),INTJ same binary,1.3058,1.3051,1.306,3
+RTX 4080 SUPER (sm_89),TVM FFI same binary,1.4996,1.497,1.5067,3
+RTX 4080 SUPER (sm_89),Triton same binary,6.4557,6.4506,6.5988,3

@@ -1,0 +1,9 @@
+{"header": true, "python": "3.12.15", "torch": "2.14.1+cu130", "triton": "3.8.0", "hip": false, "number": 200000, "repeat": 9, "gpu": "NVIDIA GeForce RTX 4080 SUPER"}
+{"group": "launch_syntax", "case": "triton.cdiv", "stmt": "triton.cdiv(n, block)", "ns": 809.28, "lo": 808.06, "hi": 822.26}
+{"group": "launch_syntax", "case": "plain def cdiv", "stmt": "cdiv(n, block)", "ns": 50.32, "lo": 50.08, "hi": 51.0}
+{"group": "launch_syntax", "case": "inline (n + b - 1) // b", "stmt": "(n + block - 1) // block", "ns": 32.33, "lo": 32.02, "hi": 33.18}
+{"group": "launch_syntax", "case": "intj, grid passed in", "stmt": "l_tuple(dev, stream, g, x, y, o, n, a, block)", "ns": 33.86, "lo": 33.12, "hi": 34.2}
+{"group": "launch_syntax", "case": "intj, grid_cpp in C", "stmt": "l_cpp(dev, stream, x, y, o, n, a, block)", "ns": 33.68, "lo": 33.13, "hi": 34.59}
+{"group": "launch_syntax", "case": "kernel[grid]", "stmt": "k[g]", "ns": 119.27, "lo": 119.01, "hi": 119.67}
+{"group": "launch_syntax", "case": "kernel[grid](...), run stubbed", "stmt": "k[g](x, y, o, n, a, BLOCK=block)", "ns": 448.53, "lo": 444.7, "hi": 451.93}
+{"group": "launch_syntax", "case": "kernel.run(...) directly, stubbed", "stmt": "k.run(x, y, o, n, a, BLOCK=block, grid=g, warmup=False)", "ns": 111.06, "lo": 109.99, "hi": 111.42}

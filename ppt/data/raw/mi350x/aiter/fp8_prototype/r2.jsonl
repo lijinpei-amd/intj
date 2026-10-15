@@ -1,0 +1,7 @@
+{"shape": [128, 128, 64], "bitwise_equal": true, "intj_host_us": 14.962, "intj_eager_us": 14.589, "prototype_host_us": 11.418, "prototype_eager_us": 11.035}
+{"shape": [256, 256, 64], "bitwise_equal": true, "prototype_host_us": 10.127, "prototype_eager_us": 10.215, "intj_host_us": 14.921, "intj_eager_us": 14.841}
+{"shape": [512, 512, 64], "bitwise_equal": true, "intj_host_us": 14.697, "intj_eager_us": 14.744, "prototype_host_us": 9.995, "prototype_eager_us": 10.221}
+{"shape": [1024, 1024, 64], "bitwise_equal": true, "prototype_host_us": 9.813, "prototype_eager_us": 14.921, "intj_host_us": 14.832, "intj_eager_us": 15.089}
+{"shape": [2048, 2048, 64], "bitwise_equal": true, "intj_host_us": 14.752, "intj_eager_us": 35.624, "prototype_host_us": 9.859, "prototype_eager_us": 36.961}
+{"shape": [4096, 4096, 64], "bitwise_equal": true, "prototype_host_us": 9.82, "prototype_eager_us": 121.43, "intj_host_us": 14.632, "intj_eager_us": 121.878}
+{"shape": [8192, 8192, 64], "bitwise_equal": true, "intj_host_us": 15.335, "intj_eager_us": 391.475, "prototype_host_us": 9.873, "prototype_eager_us": 393.468}

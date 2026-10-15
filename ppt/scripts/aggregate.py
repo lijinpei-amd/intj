@@ -191,13 +191,16 @@ def ffi():
         ("ffi_compare", "r*_ffi_compare.out"),
         ("ffi_sweep", "r*_ffi_sweep*.out"),
         ("hip_module_same_hsaco", "r*_hip_module.out"),
+        ("same_binary_1arg", "r*_same_binary_1arg.out"),
     ):
         acc = defaultdict(list)
         for m in MACHINES:
             for f in rounds(m, glob):
                 for line in f.read_text().splitlines():
                     g = pat.match(line)
-                    if g and not line.startswith(("iters=", "counts=", "hsaco_sha256")):
+                    if g and not line.startswith(
+                        ("iters=", "counts=", "hsaco_sha256", "binary_sha256")
+                    ):
                         acc[m, int(g[1]) if g[1] else "", g[2].strip()].append(
                             float(g[3])
                         )
@@ -361,9 +364,191 @@ def aiter():
         write("aiter_errors.csv", ["file", "shape", "error"], errors)
 
 
+JOURNAL = (
+    DATA.parent.parent
+    / "benchmarks"
+    / "journals"
+    / "2026-10-14_full-suite_0_bc8caf7.md"
+)
+
+
+def ffi_dispatch():
+    """bench_unordered_map_lookup.cpp (ns per argument) and bench_ffi_dispatch.py (ns per call)."""
+    acc = defaultdict(list)
+    meta = {}
+    order = []
+    for m in MACHINES:
+        for f in rounds(m, "r*_umap.out"):
+            for line in f.read_text().splitlines():
+                d = json.loads(line)
+                key = (m, "unordered_map", d["case"])
+                order.append(key) if key not in acc else None
+                acc[key].append(d["ns_per_arg"])
+                meta[key] = (d["entries"], "ns_per_arg")
+        for f in rounds(m, "r*_ffi_dispatch.out"):
+            for line in f.read_text().splitlines():
+                d = json.loads(line)
+                if "case" not in d:
+                    continue
+                key = (m, "tvm_ffi_nop", f"{d['load']}: {d['case']}")
+                order.append(key) if key not in acc else None
+                acc[key].append(d["ns"])
+                meta[key] = (d["map_entries"], "ns_per_call")
+    rows = []
+    for key in order:
+        med, lo, hi = spread(acc[key])
+        entries, unit = meta[key]
+        rows.append(
+            [
+                MACHINES[key[0]],
+                key[1],
+                key[2],
+                entries,
+                unit,
+                fmt(med, 2),
+                fmt(lo, 2),
+                fmt(hi, 2),
+                len(acc[key]),
+            ]
+        )
+    write(
+        "ffi_dispatch.csv",
+        [
+            "machine",
+            "bench",
+            "case",
+            "map_entries",
+            "unit",
+            "value",
+            "lo",
+            "hi",
+            "rounds",
+        ],
+        rows,
+    )
+
+
+def kernel_cache_map():
+    """The map-only benchmark (tests/bench_kernel_cache.cpp) from the 2026-10-14 full-suite journal,
+    MI308X host (Xeon 8480C); `new=` is that run, the median of its 3 rounds."""
+    pat = re.compile(
+        r"^kernel_cache\s+(\d)-word key\s+(\S+)\s+(\S+)\s+baseline=\S+ new=([\d.]+)"
+    )
+    rows = []
+    for line in JOURNAL.read_text().splitlines():
+        g = pat.match(line)
+        if g:
+            case = g[2]
+            op, _, entries = case.partition("/")
+            rows.append([int(g[1]), op, entries, g[3], float(g[4])])
+    rows.sort(key=lambda r: (r[0], r[1], int(r[2]) if r[2] else 0, r[3]))
+    write("kernel_cache_map.csv", ["key_words", "op", "entries", "backend", "ns"], rows)
+
+
+def incompatible():
+    """bench_incompatible.py: host ns per call of the Triton conveniences intj drops."""
+    acc = defaultdict(list)
+    order = []
+    for m in MACHINES:
+        for f in rounds(m, "r*_incompatible.out"):
+            for line in f.read_text().splitlines():
+                d = json.loads(line)
+                if "case" in d:
+                    key = (m, d["group"], d["case"].strip())
+                    if key not in acc:
+                        order.append(key)
+                    acc[key].append(d["ns"])
+    rows = []
+    for m, group, case in order:
+        med, lo, hi = spread(acc[m, group, case])
+        rows.append(
+            [
+                MACHINES[m],
+                group,
+                case,
+                fmt(med, 1),
+                fmt(lo, 1),
+                fmt(hi, 1),
+                len(acc[m, group, case]),
+            ]
+        )
+    write(
+        "incompatible_micro.csv",
+        ["machine", "group", "case", "ns_per_call", "lo", "hi", "rounds"],
+        rows,
+    )
+
+
+def fp8_wrapper():
+    """fp8_mqa_logits on the MI350: the intj op vs the leaner-wrapper prototype, and the
+    host-time breakdown of the op's wrapper (raw/mi350x/aiter/fp8_prototype, fp8_breakdown)."""
+    base = RAW / "mi350x" / "aiter"
+    acc = defaultdict(list)
+    for f in sorted((base / "fp8_prototype").glob("r*.jsonl")):
+        for line in f.read_text().splitlines():
+            d = json.loads(line)
+            acc[d["shape"][0]].append(d)
+    rows = []
+    for n, ds in sorted(acc.items()):
+        row = [n, n, 64]
+        for k in (
+            "intj_host_us",
+            "intj_eager_us",
+            "prototype_host_us",
+            "prototype_eager_us",
+        ):
+            med, lo, hi = spread([d[k] for d in ds])
+            row += [fmt(med), fmt(lo), fmt(hi)]
+        rows.append(row + [all(d["bitwise_equal"] for d in ds), len(ds)])
+    cols = []
+    for k in (
+        "intj_host_us",
+        "intj_eager_us",
+        "prototype_host_us",
+        "prototype_eager_us",
+    ):
+        cols += [k, k.replace("_us", "_lo"), k.replace("_us", "_hi")]
+    write(
+        "aiter_fp8_mqa_logits_prototype.csv",
+        ["seq_q", "seq_kv", "H"] + cols + ["output_bitwise_equal", "rounds"],
+        rows,
+    )
+
+    acc = defaultdict(list)
+    for f in sorted((base / "fp8_breakdown").glob("r*_*.jsonl")):
+        for line in f.read_text().splitlines():
+            d = json.loads(line)
+            if "sections_us" not in d:
+                continue
+            for step, v in d["sections_us"].items():
+                acc[d["side"], step, d["shape"][0]].append(v)
+            acc[d["side"], "op (uninstrumented)", d["shape"][0]].append(
+                d["host_us_real"]
+            )
+    for f in sorted((base / "fp8_breakdown").glob("extra_*.jsonl")):
+        for line in f.read_text().splitlines():
+            d = json.loads(line)
+            acc[d["side"], "free previous logits", d["shape"][0]].append(
+                d["free_logits_us"]
+            )
+    rows = []
+    for (side, step, n), vals in sorted(acc.items()):
+        med, lo, hi = spread(vals)
+        rows.append([side, step, n, fmt(med), fmt(lo), fmt(hi), len(vals)])
+    write(
+        "aiter_fp8_mqa_logits_breakdown.csv",
+        ["side", "step", "seq_q_eq_kv", "host_us", "lo", "hi", "rounds"],
+        rows,
+    )
+
+
 if __name__ == "__main__":
     headline()
     for kind in ("args", "constexpr", "cache"):
         sweep(kind)
     ffi()
     aiter()
+    fp8_wrapper()
+    incompatible()
+    kernel_cache_map()
+    ffi_dispatch()

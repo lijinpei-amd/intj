@@ -1,0 +1,5 @@
+{"case": "unordered_map find, light", "entries": 6, "buckets": 37, "ns_per_arg": 1.480, "lo": 1.458, "hi": 1.488}
+{"case": "unordered_map find, light, spread keys", "entries": 6, "buckets": 37, "ns_per_arg": 1.389, "lo": 1.387, "hi": 1.389}
+{"case": "unordered_map find, heavy", "entries": 1030, "buckets": 1493, "ns_per_arg": 1.358, "lo": 1.356, "hi": 1.360}
+{"case": "unordered_map find, heavy, spread keys", "entries": 1030, "buckets": 1493, "ns_per_arg": 1.502, "lo": 1.495, "hi": 1.571}
+{"case": "direct type compare", "entries": 0, "buckets": 0, "ns_per_arg": 0.458, "lo": 0.440, "hi": 0.491}

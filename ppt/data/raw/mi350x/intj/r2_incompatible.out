@@ -1,0 +1,14 @@
+{"header": true, "python": "3.14.4", "torch": "2.15.0.dev20260816+rocm7.14", "triton": "3.8.0", "hip": true, "number": 200000, "repeat": 9, "gpu": "AMD Instinct MI350X"}
+{"group": "launch_syntax", "case": "triton.cdiv", "stmt": "triton.cdiv(n, block)", "ns": 599.3, "lo": 598.12, "hi": 600.43}
+{"group": "launch_syntax", "case": "plain def cdiv", "stmt": "cdiv(n, block)", "ns": 31.99, "lo": 31.84, "hi": 32.29}
+{"group": "launch_syntax", "case": "inline (n + b - 1) // b", "stmt": "(n + block - 1) // block", "ns": 19.52, "lo": 19.4, "hi": 19.68}
+{"group": "launch_syntax", "case": "intj, grid passed in", "stmt": "l_tuple(dev, stream, g, x, y, o, n, a, block)", "ns": 35.39, "lo": 35.28, "hi": 35.62}
+{"group": "launch_syntax", "case": "intj, grid_cpp in C", "stmt": "l_cpp(dev, stream, x, y, o, n, a, block)", "ns": 35.63, "lo": 35.39, "hi": 35.76}
+{"group": "launch_syntax", "case": "kernel[grid]", "stmt": "k[g]", "ns": 80.61, "lo": 80.45, "hi": 81.05}
+{"group": "launch_syntax", "case": "kernel[grid](...), run stubbed", "stmt": "k[g](x, y, o, n, a, BLOCK=block)", "ns": 321.93, "lo": 321.41, "hi": 322.75}
+{"group": "launch_syntax", "case": "kernel.run(...) directly, stubbed", "stmt": "k.run(x, y, o, n, a, BLOCK=block, grid=g, warmup=False)", "ns": 84.59, "lo": 84.44, "hi": 84.77}
+{"group": "ptr_range", "case": "triton is_within_2gb(tensor)", "stmt": "HIPBackend.is_within_2gb(t)", "ns": 260.07, "lo": 259.86, "hi": 261.0}
+{"group": "ptr_range", "case": "triton get_tensor_specialization(tensor)", "stmt": "HIPBackend.get_tensor_specialization(t, align=True)", "ns": 856.65, "lo": 856.1, "hi": 857.08}
+{"group": "ptr_range", "case": "  hasattr(tensor, 'ptr_range')", "stmt": "hasattr(t, 'ptr_range')", "ns": 13.37, "lo": 13.01, "hi": 13.87}
+{"group": "ptr_range", "case": "  tensor.untyped_storage().size()", "stmt": "t.untyped_storage().size()", "ns": 73.61, "lo": 73.5, "hi": 73.62}
+{"group": "ptr_range", "case": "  import torch", "stmt": "import torch", "ns": 42.44, "lo": 42.38, "hi": 42.48}

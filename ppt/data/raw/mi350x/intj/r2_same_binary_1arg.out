@@ -1,0 +1,5 @@
+binary_sha256=9a5f64502226f107185af70f5715713c34d0e06b80721b8f41d31ce667cb2f9a kind=hsaco kernel=empty_kernel_1 threads=256 shared=0 callback_count=1
+iters=1000 batches=9 unit=us/call (host enqueue, no timed sync)
+TVM FFI same binary       median=2.8353 samples=[2.423393, 2.75062, 2.844, 2.757901, 2.863659, 2.860539, 2.8090100000000002, 2.835279, 2.86594]
+Triton same binary        median=7.7220 samples=[7.798174, 7.750324, 7.726014, 7.713415, 7.709444, 7.728345, 7.691185000000001, 7.721965, 7.690595]
+INTJ same binary          median=2.7701 samples=[2.7700500000000003, 2.7985, 2.76843, 2.80354, 2.733901, 2.79706, 2.708201, 2.870939, 2.700081]

@@ -12,8 +12,11 @@ are the smallest and largest process median.
 | Varying argument number | `sweep_args_wide.csv` (long form: `sweep_args.csv`) |
 | Varying constexpr-argument number | `sweep_constexpr_wide.csv` (`sweep_constexpr.csv`) |
 | Varying cached-kernel number | `sweep_cache_wide.csv` (`sweep_cache.csv`) |
-| Comparing with TVM FFI | `hip_module_same_hsaco.csv`, `ffi_compare.csv`, `ffi_sweep.csv` |
-| AITER KDA / fp8_mqa_logits | `aiter_summary.csv`; per-op detail `aiter_flash_kda.csv`, `aiter_kda_decode.csv`, `aiter_fp8_mqa_logits.csv` |
+| Incompatible: launch syntax, ptr_range | `incompatible_micro.csv` (per-tensor slopes from `sweep_args_wide.csv`) |
+| Micro optimization (map) | `kernel_cache_map.csv`: `tests/bench_kernel_cache.cpp` rows of `benchmarks/journals/2026-10-14_full-suite_0_bc8caf7.md` (MI308X host, Xeon 8480C), intj / tsl::robin_map / absl::flat_hash_map, 1/2/5-word keys, hit/miss at 1/8/64/512 entries |
+| TVM FFI per-argument lookup | `ffi_dispatch.csv`: `scripts/bench_unordered_map_lookup.cpp` (isolated `std::unordered_map<PyTypeObject*, setter>::find`, ns per argument, light 6 / heavy 1,030 entries, vs a direct type compare; each machine's g++ -O2) and `scripts/bench_ffi_dispatch.py` (TVM FFI `testing.nop`, ns per call, map light 2 / heavy 1,026 types), via `run_ffi_dispatch.sh`, 3 processes per machine, 2026-10-15 19:25 |
+| Comparing with TVM FFI | `same_binary_1arg.csv` (all three machines), `hip_module_same_hsaco.csv`, `ffi_compare.csv`, `ffi_sweep.csv` |
+| AITER KDA / fp8_mqa_logits | `aiter_summary.csv`; per-op detail `aiter_flash_kda.csv`, `aiter_kda_decode.csv`, `aiter_fp8_mqa_logits.csv`; fp8_mqa_logits wrapper `aiter_fp8_mqa_logits_breakdown.csv`, `aiter_fp8_mqa_logits_prototype.csv` |
 
 ## Key numbers
 
@@ -25,6 +28,7 @@ are the smallest and largest process median.
 | host only, 0 → 64 tensor args, intj | 0.022 → 0.298 us | 0.014 → 0.130 us | 0.018 → 0.123 us |
 | host only, 1 → 1024 cached kernels, intj | 0.035 → 0.046 us | 0.022 → 0.030 us | 0.024 → 0.027 us |
 | same HSACO: Triton / TVM FFI / intj | 15.69 / 3.34 / 3.12 us | 10.77 / 3.05 / 3.00 us | n/a (ROCm-only bench) |
+| same binary, 1 tensor arg: Triton / TVM FFI / intj | 11.23 / 3.22 / 3.01 us | 7.72 / 2.84 / 2.77 us | 6.46 / 1.50 / 1.31 us (cubin) |
 | empty kernel, 3 tensors: TVM FFI / intj | 3.94 / 3.43 us | 2.89 / 2.98 us | 1.51 / 1.30 us |
 
 AITER on MI350X, upstream → intj, outputs bitwise equal on every shape:
@@ -82,6 +86,41 @@ AITER (`bench_aiter_ops.py`), per shape after warm-up:
   launch cache (its `base_triton_jit` rows bypass it). FlashKDA `route=triton` sets
   `AITER_FDA_USE_GLUON=0`.
 
+## Incompatible micro-benchmarks (2026-10-15 18:01, all three machines)
+
+`incompatible_micro.csv` (`raw/<machine>/intj/r*_incompatible.*`, `scripts/bench_incompatible.py`
+via `run_incompatible.sh`, intj `05e25a9`, same pinning as the rest): host ns per call, each
+statement inline in a `timeit` loop (200k calls x 9 samples, minus the loop around `pass`),
+median of 3 processes.
+
+- launch syntax: `triton.cdiv(n, 128)` 989 / 602 / 809 ns (MI308X / MI350X / RTX 4080 SUPER)
+  against 52 / 32 / 52 for the same arithmetic in a plain `def` (Triton's is a
+  `ConstexprFunction` that imports per call); intj's `grid_cpp` adds 0–3 ns over passing the
+  grid in; the `kernel[grid](...)` layer costs 420 / 240 / 322 ns over calling `run` directly
+  (`run` stubbed on a fresh `JITFunction`).
+- ptr_range (ROCm only): `HIPBackend.get_tensor_specialization(t)`, which Triton's native
+  specializer calls per tensor argument per launch, 1256 / 857 ns; `is_within_2gb` 449 / 260.
+  The MI350X host had a load average of ~8 during its run.
+
+## fp8_mqa_logits wrapper (MI350X, 2026-10-15 17:15–17:40)
+
+Why intj's fp8_mqa_logits call costs ~15 us host when its kernels take 6–17 us:
+the time is AITER's Python wrapper, not the launch.
+
+- `aiter_fp8_mqa_logits_breakdown.csv` (`raw/mi350x/aiter/fp8_breakdown/`,
+  `scripts/bench_fp8_mqa_breakdown.py` via `fp8_breakdown_drive.sh`): host us per call per
+  section of an instrumented copy of the wrapper (checked bitwise-equal to the op), both
+  trees, q = kv 128–1024, 3 processes. intj, medians: -inf fill (`torch.full`) 4.7–5.0,
+  gfx950 config (`triton.cdiv` runs an import per call) 3.2, launch 3.4–3.6 (driver ~2.7),
+  slice 0.9–1.2, freeing the previous output 0.5–0.8 (one process,
+  `bench_fp8_mqa_breakdown_extra.py`), stream lookup 0.4, checks/strides/dict ~1.0.
+  The timer adds ~40 ns per section.
+- `aiter_fp8_mqa_logits_prototype.csv` (`raw/mi350x/aiter/fp8_prototype/`,
+  `scripts/bench_fp8_mqa_prototype.py`): the intj op vs the same wrapper with the config
+  cached per shape and the slice skipped when 256-aligned (`make_proto`), host_us and
+  eager_us as `bench_aiter_ops.py`, outputs bitwise equal on all 7 shapes. Prototype eager
+  10.0–11.0 us at q = kv <= 512, intj 14.6–15.0. Not run: the kernel writing -inf itself.
+
 ## Caveats
 
 - **gfx950 launch jitter.** `hipModuleLaunchKernel` on the MI350 flips between ~2.3 and
@@ -92,6 +131,11 @@ AITER (`bench_aiter_ops.py`), per shape after warm-up:
   `eager_flag=driver_stall`; their kernel times are identical on both sides. Evidence in
   `raw/mi350x/aiter_eager_stall_notes.txt`. Two earlier AITER passes on the MI350 with
   host-timed loops hit this harder and were discarded; only the event-timed pass is in `raw/`.
+- **Same binary, 1 argument** (`same_binary_1arg.csv`, `scripts/bench_same_binary.py`, collected
+  16:54–16:56 the same day, intj `05e25a9`): one Triton binary of a one-tensor empty kernel,
+  launched by TVM FFI, Triton and intj. TVM FFI loads it with `hipModuleLoadData` on ROCm and
+  with its own cubin launcher (`TVM_FFI_EMBED_CUBIN`) on CUDA. On the MI350 round 1 caught the
+  low `hipModuleLaunchKernel` state (2.2–2.3 us for both FFI and intj; rounds 0 and 2 at 2.8–2.9).
 - **FFI.** In `ffi_compare.csv` and `ffi_sweep.csv`, FFI and intj launch different
   binaries, and FFI gets preconverted `TensorView`s. `hip_module_same_hsaco.csv` is the
   same-kernel comparison. At 0 arguments FFI's empty kernel takes a different stream
@@ -113,5 +157,9 @@ scripts/mi350_rerun.sh out/mi350                 # tolerant FFI sweep (+ AITER p
 scripts/mi350_aiter_v3.sh out/mi350              # event-timed AITER pass (the one kept)
 # on the NVIDIA box, from ~/intj-ppt/src after `. ../env.sh`:
 setsid nohup bash ../scripts/nvidia_all.sh ~/intj-ppt/out/rtx4080 &
+bash ppt/scripts/run_same_binary.sh <out>        # each machine, from an intj root with its env
+bash ppt/scripts/run_incompatible.sh <out>       # each machine: Incompatible micro-benchmarks
+bash scripts/fp8_breakdown_drive.sh <out>        # MI350: fp8_mqa_logits wrapper breakdown
+for r in 0 1 2; do SCRIPT=$W/scripts/bench_fp8_mqa_prototype.py bash scripts/fp8_breakdown_run.sh intj > <out>/r$r.jsonl; done
 python3 ppt/scripts/aggregate.py                 # after copying outputs into raw/<machine>/
 ```

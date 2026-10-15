@@ -1,0 +1,2 @@
+g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+ 19:25:02 up 7 days,  4:57,  0 user,  load average: 1.38, 1.83, 1.37

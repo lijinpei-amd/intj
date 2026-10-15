@@ -1,0 +1,40 @@
+machine,bench,case,map_entries,unit,value,lo,hi,rounds
+MI308X (gfx942),unordered_map,"unordered_map find, light",6,ns_per_arg,3.46,3.46,3.46,3
+MI308X (gfx942),unordered_map,"unordered_map find, light, spread keys",6,ns_per_arg,4.33,4.3,4.41,3
+MI308X (gfx942),unordered_map,"unordered_map find, heavy",1030,ns_per_arg,3.46,3.46,3.46,3
+MI308X (gfx942),unordered_map,"unordered_map find, heavy, spread keys",1030,ns_per_arg,4.34,4.32,4.34,3
+MI308X (gfx942),unordered_map,direct type compare,0,ns_per_arg,1.17,1.15,1.17,3
+MI308X (gfx942),tvm_ffi_nop,light: 0 args,2,ns_per_call,102.43,101.9,102.99,3
+MI308X (gfx942),tvm_ffi_nop,light: 1 int,2,ns_per_call,133.52,133.4,133.77,3
+MI308X (gfx942),tvm_ffi_nop,light: 4 ints,2,ns_per_call,190.56,190.08,190.6,3
+MI308X (gfx942),tvm_ffi_nop,light: 4 CPU tensors,2,ns_per_call,540.84,540.55,541.09,3
+MI308X (gfx942),tvm_ffi_nop,heavy: 0 args,1026,ns_per_call,101.93,101.91,102.38,3
+MI308X (gfx942),tvm_ffi_nop,heavy: 1 int,1026,ns_per_call,133.93,133.32,139.77,3
+MI308X (gfx942),tvm_ffi_nop,heavy: 4 ints,1026,ns_per_call,190.37,190.32,198.99,3
+MI308X (gfx942),tvm_ffi_nop,heavy: 4 CPU tensors,1026,ns_per_call,540.83,539.48,540.94,3
+MI350X (gfx950),unordered_map,"unordered_map find, light",6,ns_per_arg,2.52,2.5,2.52,3
+MI350X (gfx950),unordered_map,"unordered_map find, light, spread keys",6,ns_per_arg,2.51,2.51,2.52,3
+MI350X (gfx950),unordered_map,"unordered_map find, heavy",1030,ns_per_arg,1.86,1.86,1.87,3
+MI350X (gfx950),unordered_map,"unordered_map find, heavy, spread keys",1030,ns_per_arg,2.44,2.42,2.45,3
+MI350X (gfx950),unordered_map,direct type compare,0,ns_per_arg,0.53,0.53,0.54,3
+MI350X (gfx950),tvm_ffi_nop,light: 0 args,2,ns_per_call,61.64,61.34,61.8,3
+MI350X (gfx950),tvm_ffi_nop,light: 1 int,2,ns_per_call,79.17,78.71,81.67,3
+MI350X (gfx950),tvm_ffi_nop,light: 4 ints,2,ns_per_call,115.96,115.8,115.98,3
+MI350X (gfx950),tvm_ffi_nop,light: 4 CPU tensors,2,ns_per_call,331.71,330.0,337.32,3
+MI350X (gfx950),tvm_ffi_nop,heavy: 0 args,1026,ns_per_call,61.92,61.87,61.99,3
+MI350X (gfx950),tvm_ffi_nop,heavy: 1 int,1026,ns_per_call,78.87,78.19,80.33,3
+MI350X (gfx950),tvm_ffi_nop,heavy: 4 ints,1026,ns_per_call,116.28,115.76,116.41,3
+MI350X (gfx950),tvm_ffi_nop,heavy: 4 CPU tensors,1026,ns_per_call,344.06,337.45,348.71,3
+RTX 4080 SUPER (sm_89),unordered_map,"unordered_map find, light",6,ns_per_arg,1.36,1.36,1.48,3
+RTX 4080 SUPER (sm_89),unordered_map,"unordered_map find, light, spread keys",6,ns_per_arg,1.4,1.39,1.4,3
+RTX 4080 SUPER (sm_89),unordered_map,"unordered_map find, heavy",1030,ns_per_arg,1.36,1.36,1.37,3
+RTX 4080 SUPER (sm_89),unordered_map,"unordered_map find, heavy, spread keys",1030,ns_per_arg,1.5,1.5,1.52,3
+RTX 4080 SUPER (sm_89),unordered_map,direct type compare,0,ns_per_arg,0.46,0.45,0.46,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,light: 0 args,2,ns_per_call,68.54,67.52,69.0,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,light: 1 int,2,ns_per_call,89.67,87.91,91.07,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,light: 4 ints,2,ns_per_call,122.31,121.5,125.02,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,light: 4 CPU tensors,2,ns_per_call,326.71,307.78,340.0,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,heavy: 0 args,1026,ns_per_call,64.74,64.0,65.16,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,heavy: 1 int,1026,ns_per_call,89.74,88.11,91.7,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,heavy: 4 ints,1026,ns_per_call,122.69,122.35,127.52,3
+RTX 4080 SUPER (sm_89),tvm_ffi_nop,heavy: 4 CPU tensors,1026,ns_per_call,301.72,299.42,304.19,3

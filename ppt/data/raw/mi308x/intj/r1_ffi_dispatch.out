@@ -1,0 +1,9 @@
+{"header": true, "python": "3.12.3", "tvm_ffi": "0.1.14.post1", "torch": "2.14.0.dev20260804+rocm7.1", "number": 200000, "repeat": 9}
+{"load": "light", "map_entries": 2, "case": "0 args", "stmt": "nop()", "ns": 102.99, "lo": 102.16, "hi": 103.76}
+{"load": "light", "map_entries": 2, "case": "1 int", "stmt": "nop(i)", "ns": 133.4, "lo": 132.92, "hi": 134.31}
+{"load": "light", "map_entries": 2, "case": "4 ints", "stmt": "nop(i, i, i, i)", "ns": 190.56, "lo": 189.82, "hi": 191.53}
+{"load": "light", "map_entries": 2, "case": "4 CPU tensors", "stmt": "nop(t, t, t, t)", "ns": 540.55, "lo": 540.01, "hi": 541.55}
+{"load": "heavy", "map_entries": 1026, "case": "0 args", "stmt": "nop()", "ns": 101.93, "lo": 101.55, "hi": 103.84}
+{"load": "heavy", "map_entries": 1026, "case": "1 int", "stmt": "nop(i)", "ns": 133.93, "lo": 132.79, "hi": 134.63}
+{"load": "heavy", "map_entries": 1026, "case": "4 ints", "stmt": "nop(i, i, i, i)", "ns": 190.32, "lo": 189.75, "hi": 191.63}
+{"load": "heavy", "map_entries": 1026, "case": "4 CPU tensors", "stmt": "nop(t, t, t, t)", "ns": 539.48, "lo": 539.18, "hi": 540.57}
