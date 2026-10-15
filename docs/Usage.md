@@ -667,9 +667,13 @@ AMD) the storage size. `make_launcher(..., torch_access_mode=...)` picks how, wi
 
 | | how it reads | decode + key, 3 tensors | first build | rebuilt when torch changes |
 |---|---|---|---|---|
-| `RUNTIME_SHIM` | `TensorImpl`/`StorageImpl` at recorded offsets selected for the running torch | 89 ns | 0.6 s | no |
-| `STATIC_COMPILE` | the same fields, offsets supplied by the compiler | 90 ns | 1.9 s | yes |
-| `INTERPRETER` | `data_ptr()` / `untyped_storage().nbytes()` through the interpreter | 300 ns | 0.6 s | no |
+| `RUNTIME_SHIM` | `TensorImpl`/`StorageImpl` at recorded offsets selected for the running torch | 93 ns | 1.3 s | no |
+| `STATIC_COMPILE` | the same fields, offsets supplied by the compiler | 94 ns | 2.3 s | yes |
+| `INTERPRETER` | `data_ptr()` / `untyped_storage().nbytes()` through the interpreter | 888 ns | 0.8 s | no |
+
+Times are MI308X (gfx942) medians from the
+[2026-10-15 README journal](../benchmarks/journals/2026-10-15_readme_0_c8b86c9.md);
+the README also lists the RTX 4080 SUPER's.
 
 With `torch_access_mode=None` (the default), intj selects `STATIC_COMPILE` if a
 C++ compiler and torch's headers are present, else `RUNTIME_SHIM` if a verified
