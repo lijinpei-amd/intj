@@ -190,7 +190,8 @@ def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
     Each thread holds its own launcher's build lock and would wait on the
     other's: neither may wait.
     """
-    both_building, seen, errors = threading.Barrier(2, timeout=10), [], []
+    both_building = threading.Barrier(2, timeout=10)
+    both_checked, seen, errors = threading.Barrier(2, timeout=10), [], []
     mine = threading.local()
 
     def delayed():
@@ -199,6 +200,7 @@ def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
             mine.other.__self__.check()
         except RuntimeError as error:
             seen.append(str(error))
+        both_checked.wait()  # neither build ends, and frees its lock, before both checks ran
         return _HOST
 
     k1 = make_launcher(store, delayed=delayed)

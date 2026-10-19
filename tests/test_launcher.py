@@ -2604,6 +2604,18 @@ def test_no_gpu_rejects_real_backend_options(monkeypatch):
         make_launcher(scale, no_gpu=True, options={"num_warps": 8}).__self__.check()
 
 
+def test_binding_refusals_come_before_provisioning(monkeypatch):
+    import intj.launcher as launcher
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("provisioning was reached before a GPU-free refusal")
+
+    monkeypatch.setattr(launcher, "_provision", forbidden)
+    k = make_launcher(scale, bind_device=-1)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(TypeError, match="device ordinal"):
+        k.__self__.check()
+
+
 def test_no_gpu_does_not_read_gpu_compilation_knobs(scalar_kernel, monkeypatch):
     from triton import knobs
 

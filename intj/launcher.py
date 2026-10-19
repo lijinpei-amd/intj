@@ -402,8 +402,6 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
                     "cannot be verified from an address and will be trusted",
                     RuntimeWarning,
                 )
-    # GPU-free but may reach the network: here, never on a build
-    _provision(kernel_cache)
     classes = sorted(
         {".".join(c[1:]) for _, _, v in global_values for c in _class_globals(v)}
     )
@@ -417,6 +415,8 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     device_binding, params, args, hidden, doc = _check_binding(
         option, resolved, dynamic=dynamic, grid_code=compiled_grid
     )
+    # GPU-free but may reach the network: after every refusal above, never on a build
+    _provision(kernel_cache)
     return _BuildOptions(
         jit_func=kernel,
         tuned=tuned,
@@ -704,12 +704,16 @@ class Launcher:
         """Calls `delayed` now and applies its keywords in place; `resolve_delayed` copies instead.
 
         Does nothing when there is no `delayed`, built or not.
-
-        Raises:
-            RuntimeError: The launcher is built.
         """
-        if self._C_options.delayed is not None:
+        if self._C_options.delayed is None:
+            return
+        try:
             self._C_edit_options(_resolved)
+        except RuntimeError:
+            # another thread built it after the check above: a built launcher
+            # holds resolved options, so there is nothing left to resolve
+            if self._C_options.delayed is not None:
+                raise
 
     def resolve_delayed(self) -> LaunchFunction:
         """Returns a new launcher with `delayed` called now and its keywords applied."""

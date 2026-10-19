@@ -302,6 +302,38 @@ def test_resolve_and_chain_delayed():
     assert _option(k.__self__.replace_delayed(None)).delayed is None
 
 
+def test_resolve_delayed_is_a_no_op_when_built_between_its_check_and_its_edit(
+    monkeypatch,
+):
+    k = make_launcher(store, delayed=_first, **_HOST)
+    stale = _option(k)
+    assert stale.delayed is not None
+    k.__self__.build()  # the other thread's build, landing after the check below
+    cls = type(k.__self__)  # the process's `Launcher` over `_intj_lazy.Launcher`
+    real = cls._C_options  # the C member's descriptor
+    reads = []
+
+    def options(self):
+        reads.append(None)
+        return stale if len(reads) == 1 else real.__get__(self, cls)
+
+    monkeypatch.setattr(cls, "_C_options", property(options))
+    k.__self__._resolve_delayed()  # sees `delayed`, then the edit finds it built
+    assert len(reads) == 2
+    monkeypatch.undo()
+    assert _option(k).delayed is None
+
+
+def test_resolve_delayed_still_raises_when_delayed_does_while_unbuilt():
+    def delayed():
+        raise RuntimeError("from delayed")
+
+    k = make_launcher(store, delayed=delayed, **_HOST)
+    with pytest.raises(RuntimeError, match="from delayed"):
+        k.__self__._resolve_delayed()
+    assert _option(k).delayed is delayed
+
+
 def test_delayed_editors_refuse_non_callables():
     k = make_launcher(store, **_HOST)
     with pytest.raises(TypeError, match="callable"):
