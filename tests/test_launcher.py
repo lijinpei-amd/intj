@@ -1422,10 +1422,11 @@ def test_binding_checked_source_checks_only_where_values_change(
                 if cache_owner == "module"
                 else factory.__self__.bind_device(0, x=None, p=0)
             )
-            bound.__self__.check()  # where the ignored warning fires
+            bound.__self__.check()  # the check and the build both warn
+            module = module_of(bound)
         suffix = ".cpp" if mode is TorchAccessMode.STATIC_COMPILE else ".c"
         source = (
-            pathlib.Path(str(module_of(bound).__file__))
+            pathlib.Path(str(module.__file__))
             .with_name(f"bound_kernel{suffix}")
             .read_text()
         )
@@ -5469,8 +5470,9 @@ def test_different_class_globals_never_share_a_module(tmp_path):
         warnings.simplefilter("ignore", intj.ClassGlobalWarning)
         launches = [make_launcher(k, assume_constant_globals=True) for k in kernels]
         for launch in launches:
-            launch.__self__.check()  # where the ignored warning fires
-    assert module_of(launches[0]) is not module_of(launches[1])
+            launch.__self__.check()  # the check and the build both warn
+        modules = [module_of(launch) for launch in launches]
+    assert modules[0] is not modules[1]
 
 
 _BlockedLayout = gl.BlockedLayout  # a class global, like Triton's layout imports
@@ -5495,7 +5497,8 @@ def test_gluon_layout_class_global_launches():
         launch = make_launcher(gluon_class_global, assume_constant_globals=True)
         launch.__self__.check()
     o = torch.full((256,), -1, device="cuda", dtype=torch.int32)
-    launch(0, 0, 1, o, 256, warp)
+    with pytest.warns(intj.ClassGlobalWarning, match="BlockedLayout"):
+        launch(0, 0, 1, o, 256, warp)  # the build checks again
     torch.testing.assert_close(o, torch.arange(256, device="cuda", dtype=torch.int32))
 
 
