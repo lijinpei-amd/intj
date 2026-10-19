@@ -1,4 +1,4 @@
-"""`MakeLauncherOption`: every `make_launcher` keyword but `delayed`, as one value."""
+"""`MakeLauncherOption`: every `make_launcher` keyword, as one value."""
 
 from __future__ import annotations
 
@@ -12,13 +12,16 @@ from .torch_intf.torch_abi import TorchAccessMode
 
 @dataclasses.dataclass(frozen=True)
 class MakeLauncherOption:
-    """Every `make_launcher` keyword except `delayed`, stored as given.
+    """Every `make_launcher` keyword, stored as given.
 
     Nothing is validated here: `k.__self__.check()`, at the latest the first
     call, checks the values with the errors `make_launcher` used to raise.
     Mappings and the `dynamic_options` sequence are copied, so a caller
     changing its dict or list afterwards does not change the launcher.
     `k.__self__.options` is a launcher's; `dataclasses.replace` makes variants.
+
+    `delayed`, if set, is called at the first `check()` or call; its keywords
+    replace these.  Once a launcher is built its `options` has `delayed=None`.
     """
 
     jit_func: Any
@@ -37,6 +40,7 @@ class MakeLauncherOption:
     return_compiled: bool = False
     assume_constant_globals: bool = False
     ndebug: bool = True
+    delayed: Callable[[], Mapping[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         # a snapshot: check() reads these later; anything else stays as given
@@ -53,7 +57,7 @@ class MakeLauncherOption:
 
 
 class MakeLauncherKwargs(TypedDict, total=False):
-    """`make_launcher`'s keywords: `MakeLauncherOption`'s fields but `jit_func`."""
+    """`make_launcher`'s `**kwargs`: `MakeLauncherOption`'s fields but `jit_func` and `delayed`."""
 
     dynamic_options: Sequence[str]
     extra_annotation: Mapping[str, object] | None
@@ -72,7 +76,7 @@ class MakeLauncherKwargs(TypedDict, total=False):
     ndebug: bool
 
 
-#: the keywords `make_launcher` (and `delayed`) may set
+#: the keywords `make_launcher` passes through `**kwargs` and `delayed` may return
 OPTION_FIELDS: frozenset[str] = frozenset(
     f.name for f in dataclasses.fields(MakeLauncherOption)
-) - {"jit_func"}
+) - {"jit_func", "delayed"}

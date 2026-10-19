@@ -2,7 +2,7 @@
 
 Exports:
     make_launcher: builds a launcher for a kernel.
-    MakeLauncherOption: every make_launcher keyword but delayed, as one value.
+    MakeLauncherOption: every make_launcher keyword, as one value.
     KernelCache: the kernel cache backend selection.
     TorchAccessMode: how generated code reads torch tensors.
     ClassGlobalWarning: the warning for class-valued globals.

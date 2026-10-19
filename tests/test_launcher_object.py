@@ -186,3 +186,14 @@ assert len(loads) == 1, loads
 intj.make_launcher(kern.k, no_gpu=True)  # and every later decoration
 """
     subprocess.run([sys.executable, "-c", probe], check=True)
+
+
+def test_option_holds_delayed_outside_option_fields():
+    def delayed():
+        return {}
+
+    option = MakeLauncherOption(store, delayed=delayed)
+    assert option.delayed is delayed
+    assert MakeLauncherOption(store).delayed is None
+    assert "delayed" not in OPTION_FIELDS
+    assert "delayed" not in MakeLauncherKwargs.__annotations__
