@@ -20,8 +20,15 @@ static PyObject *intj_lazy_call(PyObject *self, PyObject *const *args,
                                 Py_ssize_t nargs);
 #define INTJ_SHIM ((PyCFunction)(void (*)(void))intj_lazy_call)
 
-/* Take the build lock: 0, or -1 with an error set.  The thread holding it is
- * refused, not deadlocked: a launcher called or checked from its own build. */
+/* Build locks this thread holds: a builder (`delayed`) runs Python under one,
+ * and may reach another launcher. */
+static _Thread_local int intj_lazy_held;
+
+/* Take the build lock: 0, or -1 with an error set.  Two refusals, never a
+ * wait that could deadlock: the thread holding this lock (a launcher called or
+ * checked from its own build), and a thread already holding another launcher's
+ * lock when this one is taken (two threads each holding one and waiting on the
+ * other's would wait forever).  A thread holding none waits. */
 static int intj_lazy_lock(intj_launcher *h) {
   unsigned long me = PyThread_get_thread_ident();
   if (__atomic_load_n(&h->build_thread, __ATOMIC_RELAXED) == me) {
@@ -30,6 +37,11 @@ static int intj_lazy_lock(intj_launcher *h) {
     return -1;
   }
   if (!PyThread_acquire_lock(h->build_lock, NOWAIT_LOCK)) {
+    if (intj_lazy_held > 0) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "intj: a launcher was called while it was being built");
+      return -1;
+    }
     /* detached while waiting: the builder runs Python, and a free-threaded
      * stop-the-world must not wait on us */
     // clang-format off
@@ -38,11 +50,13 @@ static int intj_lazy_lock(intj_launcher *h) {
     Py_END_ALLOW_THREADS
     // clang-format on
   }
+  intj_lazy_held++;
   __atomic_store_n(&h->build_thread, me, __ATOMIC_RELAXED);
   return 0;
 }
 
 static void intj_lazy_unlock(intj_launcher *h) {
+  intj_lazy_held--;
   __atomic_store_n(&h->build_thread, 0UL, __ATOMIC_RELAXED);
   PyThread_release_lock(h->build_lock);
 }

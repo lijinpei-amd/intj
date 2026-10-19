@@ -184,34 +184,36 @@ def test_a_delayed_launcher_keeps_the_builtin_fast_call():
         }
 
 
-def test_a_racing_first_call_of_a_sibling_is_refused_not_deadlocked():
-    """`delayed` calls a sibling while another thread makes that sibling's first call."""
-    started, seen, errors = threading.Event(), [], []
-    box = {}
+def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
+    """Two siblings are first-called on two threads, each `delayed` checking the other.
+
+    Each thread holds its own launcher's build lock and would wait on the
+    other's: neither may wait.
+    """
+    both_building, seen, errors = threading.Barrier(2, timeout=10), [], []
+    mine = threading.local()
 
     def delayed():
-        started.set()
-        time.sleep(0.3)  # the other thread is inside k2's first call by now
+        both_building.wait()  # each thread is inside its own build by now
         try:
-            box["k2"].__self__.check()
+            mine.other.__self__.check()
         except RuntimeError as error:
             seen.append(str(error))
         return _HOST
 
-    box["k1"] = make_launcher(store, delayed=delayed)
-    box["k2"] = box["k1"].__self__.bind()
+    k1 = make_launcher(store, delayed=delayed)
+    k2 = k1.__self__.bind()
 
-    def run(launch, wait=None):
-        if wait is not None:
-            wait.wait()
+    def run(launch, other):
+        mine.other = other
         try:
             launch(0, 0, 1, 0, 4)
         except BaseException as error:  # noqa: BLE001  report, do not hang
             errors.append(error)
 
     threads = [
-        threading.Thread(target=run, args=(box["k1"],), daemon=True),
-        threading.Thread(target=run, args=(box["k2"], started), daemon=True),
+        threading.Thread(target=run, args=(k1, k2), daemon=True),
+        threading.Thread(target=run, args=(k2, k1), daemon=True),
     ]
     for t in threads:
         t.start()
@@ -219,4 +221,4 @@ def test_a_racing_first_call_of_a_sibling_is_refused_not_deadlocked():
         t.join(10)
     assert not any(t.is_alive() for t in threads), "deadlocked"
     assert errors == []
-    assert len(seen) == 1 and "while it was being built" in seen[0]
+    assert len(seen) == 2 and all("while it was being built" in s for s in seen)
