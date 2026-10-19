@@ -121,7 +121,10 @@ mapping of `make_launcher` keywords raises `TypeError`. If it raises, the
 exception propagates and the next call runs it again. Calling its own launcher
 inside it raises `RuntimeError`. A `delayed` that calls another launcher while
 that launcher is being built on another thread is refused with `RuntimeError`
-rather than waiting.
+rather than waiting. A `delayed` that waits on another thread which calls its
+own launcher (`pool.submit(k, ...).result()`) still deadlocks: that thread holds
+no build lock, so nothing refuses it, and it waits for this build while the
+build waits for it.
 `replace_delayed(fn)` swaps it, `chain_delayed(fn)` runs `fn` after it with
 `fn`'s keywords winning, and `resolve_delayed()` calls it now.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
@@ -155,8 +158,9 @@ instead, on every launch. Values must be `tl.constexpr` wrappers, `int`,
 A class global (a `NamedTuple` the kernel constructs, a Gluon layout class such as
 `AMDWMMALayout`) is keyed by `module.qualname`, like a called `@triton.jit`
 function; the kernel's source is already in the key. Replacing the class under the
-same name is not detected, so `make_launcher` emits one `intj.ClassGlobalWarning`
-(a `RuntimeWarning`) per launcher it builds, naming the classes; launches never warn.
+same name is not detected, so each launcher emits an `intj.ClassGlobalWarning`
+(a `RuntimeWarning`) on every `check()` and again at its build, naming the classes;
+launches never warn.
 Silence it with
 `warnings.filterwarnings("ignore", category=intj.ClassGlobalWarning)` or
 `-W ignore::intj.ClassGlobalWarning`. A plain global is not in Triton's own compile-cache key,
@@ -589,8 +593,8 @@ With verification off, declarations are promises, but call shape, value
 categories, null handling, and address width remain checked. A false promise
 can select the wrong cached binary. `PointerRange(32)` means the entire
 underlying storage is at most 2**31 - 1 bytes, not just a tensor view. A raw pointer
-address cannot prove that range: even checked `BindValue.POINTER` warns once
-per `make_launcher` call, at the first `check()`, and trusts the range promise.
+address cannot prove that range: even checked `BindValue.POINTER` warns, per
+launcher, on each `check()` and at the build, and trusts the range promise.
 
 ## Supported arguments
 
