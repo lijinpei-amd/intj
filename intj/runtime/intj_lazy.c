@@ -1,11 +1,12 @@
 /* `_intj_lazy`: the type every launcher's object comes from, and the shim its
  * PyCFunction starts on.  Generic -- no kernel code, no GPU -- so a launcher
- * exists before its module is rendered.  The first call builds: the builder
- * renders and loads the module, whose `_init` allocates and fills the
- * launcher's state block and returns its entry; the shim swaps def.ml_meth to
- * that entry.  CPython reads m_ml->ml_meth on every call (tests/test_runtime.py
- * pins it, 3.8 to 3.14t), so references taken before the build reach the
- * entry as well. */
+ * exists before its module is rendered.  The first call builds: the
+ * subclass's `_build_body` renders and loads the module, whose `_init`
+ * allocates and fills the launcher's state block and returns its entry; the
+ * shim swaps def.ml_meth to that entry.  The rest of the Python side runs
+ * under the same build lock through `_C_locked`.  CPython reads
+ * m_ml->ml_meth on every call (tests/test_runtime.py pins it, 3.8 to 3.14t),
+ * so references taken before the build reach the entry as well. */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <string.h>
@@ -20,7 +21,7 @@ static PyObject *intj_lazy_call(PyObject *self, PyObject *const *args,
                                 Py_ssize_t nargs);
 #define INTJ_SHIM ((PyCFunction)(void (*)(void))intj_lazy_call)
 
-/* Build locks this thread holds: a builder (`delayed`) runs Python under one,
+/* Build locks this thread holds: a build (`delayed`) runs Python under one,
  * and may reach another launcher. */
 static _Thread_local int intj_lazy_held;
 
@@ -42,7 +43,7 @@ static int intj_lazy_lock(intj_launcher *h) {
                       "intj: a launcher was called while it was being built");
       return -1;
     }
-    /* detached while waiting: the builder runs Python, and a free-threaded
+    /* detached while waiting: the build runs Python, and a free-threaded
      * stop-the-world must not wait on us */
     // clang-format off
     Py_BEGIN_ALLOW_THREADS
@@ -61,7 +62,7 @@ static void intj_lazy_unlock(intj_launcher *h) {
   PyThread_release_lock(h->build_lock);
 }
 
-/* Run the builder once: 0, or -1 with an error set.  The builder returns
+/* Run `self._build_body()` once: 0, or -1 with an error set.  It returns
  * (entry address, resolved options, doc); they are published, then the entry
  * swapped in.  A failure publishes nothing and leaves the shim, so the next
  * call retries. */
@@ -71,27 +72,27 @@ static int intj_lazy_build(intj_launcher *h) {
   if (intj_lazy_lock(h) != 0)
     return -1;
   int rc = 0;
-  PyObject *done = NULL, *old = NULL;
+  PyObject *old = NULL;
   if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) == INTJ_SHIM) {
-    if (!h->builder) {
+    if (!h->options) {
       PyErr_SetString(PyExc_RuntimeError, "intj: launcher has been cleared");
       rc = -1;
     } else {
       PyObject *result =
-          PyObject_CallFunctionObjArgs(h->builder, (PyObject *)h, NULL);
+          PyObject_CallMethod((PyObject *)h, "_build_body", NULL);
       void *address = NULL;
       if (result &&
           (!PyTuple_CheckExact(result) || PyTuple_GET_SIZE(result) != 3 ||
            !PyBytes_CheckExact(PyTuple_GET_ITEM(result, 2))))
         PyErr_SetString(PyExc_TypeError,
-                        "intj: a launcher builder returns (entry, options, "
-                        "doc: bytes)");
+                        "intj: _build_body returns (entry, options, doc: "
+                        "bytes)");
       else if (result)
         address = PyLong_AsVoidPtr(PyTuple_GET_ITEM(result, 0));
       if (!address) {
         if (!PyErr_Occurred())
           PyErr_SetString(PyExc_RuntimeError,
-                          "intj: launcher builder returned no entry");
+                          "intj: _build_body returned no entry");
         rc = -1;
       } else {
         PyObject *options = PyTuple_GET_ITEM(result, 1);
@@ -108,16 +109,12 @@ static int intj_lazy_build(intj_launcher *h) {
         PyCFunction fn;
         memcpy(&fn, &address, sizeof(fn));
         __atomic_store_n(&h->def.ml_meth, fn, __ATOMIC_RELEASE);
-        done = h->builder;
-        h->builder = NULL;
       }
       Py_XDECREF(result);
     }
   }
   intj_lazy_unlock(h);
-  /* outside the lock: finalizers run Python */
-  Py_XDECREF(done);
-  Py_XDECREF(old);
+  Py_XDECREF(old); /* outside the lock: finalizers run Python */
   return rc;
 }
 
@@ -130,24 +127,20 @@ static PyObject *intj_lazy_call(PyObject *self, PyObject *const *args,
   return ((intj_fast_fn)(void (*)(void))entry)(self, args, nargs);
 }
 
-/* _C_check(): the subclass's `_dry_run` under the build lock, which refuses
- * a launcher checked from its own build; nothing once built. */
-static PyObject *intj_lazy_check(PyObject *self, PyObject *unused) {
-  (void)unused;
+/* _C_locked(fn): fn() under the build lock, the one a first call builds
+ * under; fn's result or error.  The lock refuses fn reaching this launcher's
+ * own _C_locked or first call.  fn's result is released after the unlock, so
+ * returning what it replaced keeps finalizers outside the lock. */
+static PyObject *intj_lazy_locked(PyObject *self, PyObject *fn) {
   intj_launcher *h = (intj_launcher *)self;
-  if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) != INTJ_SHIM)
-    Py_RETURN_NONE;
   if (intj_lazy_lock(h) != 0)
     return NULL;
   PyObject *result;
-  if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) != INTJ_SHIM) {
-    result = Py_None;
-    Py_INCREF(result);
-  } else if (!h->options) {
+  if (!h->options) {
     PyErr_SetString(PyExc_RuntimeError, "intj: launcher has been cleared");
     result = NULL;
   } else {
-    result = PyObject_CallMethod(self, "_dry_run", NULL);
+    result = PyObject_CallFunctionObjArgs(fn, NULL);
   }
   intj_lazy_unlock(h);
   return result;
@@ -199,36 +192,38 @@ static PyObject *intj_lazy_key_chain(PyObject *self, PyObject *const *args,
   return h->ops->key_chain(state, args, nargs);
 }
 
-/* _C_edit_options(edit): options = edit(options) under the build lock, so
- * concurrent edits and a first call are ordered; refused once built. */
-static PyObject *intj_lazy_edit_options(PyObject *self, PyObject *edit) {
+/* _C_set_options(options): only from inside _C_locked on this thread, so
+ * edits and a first call are ordered; refused once built. */
+static PyObject *intj_lazy_set_options(PyObject *self, PyObject *options) {
   intj_launcher *h = (intj_launcher *)self;
-  if (intj_lazy_lock(h) != 0)
+  if (__atomic_load_n(&h->build_thread, __ATOMIC_RELAXED) !=
+      PyThread_get_thread_ident()) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "intj: _C_set_options needs this launcher's build lock "
+                    "(_C_locked)");
     return NULL;
-  PyObject *old = NULL, *result = NULL;
+  }
   if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) != INTJ_SHIM) {
     PyErr_SetString(PyExc_RuntimeError,
-                    "intj: a built launcher's options are fixed; the method "
-                    "without the leading underscore returns an edited copy");
-  } else if (!h->options) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: launcher has been cleared");
-  } else {
-    PyObject *current = h->options;
-    Py_INCREF(current);
-    PyObject *edited = PyObject_CallFunctionObjArgs(edit, current, NULL);
-    Py_DECREF(current);
-    if (edited) {
-      Py_BEGIN_CRITICAL_SECTION(self);
-      old = h->options;
-      h->options = edited;
-      Py_END_CRITICAL_SECTION();
-      result = Py_None;
-      Py_INCREF(result);
-    }
+                    "intj: a built launcher's options are fixed");
+    return NULL;
   }
-  intj_lazy_unlock(h);
-  Py_XDECREF(old); /* outside the lock: finalizers run Python */
-  return result;
+  PyObject *old;
+  Py_INCREF(options);
+  Py_BEGIN_CRITICAL_SECTION(self);
+  old = h->options;
+  h->options = options;
+  Py_END_CRITICAL_SECTION();
+  Py_XDECREF(old); /* _C_locked's fn holds it, to drop after the unlock */
+  Py_RETURN_NONE;
+}
+
+/* _C_built: whether the first call has swapped the entry in. */
+static PyObject *intj_lazy_built(PyObject *self, void *closure) {
+  (void)closure;
+  intj_launcher *h = (intj_launcher *)self;
+  return PyBool_FromLong(__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) !=
+                         INTJ_SHIM);
 }
 
 #define INTJ_MEMBER(field) ((void *)offsetof(intj_launcher, field))
@@ -252,7 +247,6 @@ static int intj_lazy_traverse(PyObject *self, visitproc visit, void *arg) {
 #endif
     Py_VISIT(Py_TYPE(self));
   Py_VISIT(h->options);
-  Py_VISIT(h->builder);
   Py_VISIT(h->module);
   /* the module's hook visits what `_init` stored in the state block */
   return h->state ? h->ops->traverse(h->state, visit, arg) : 0;
@@ -266,7 +260,6 @@ static int intj_lazy_clear(PyObject *self) {
   if (state)
     h->ops->release(state);
   Py_CLEAR(h->options);
-  Py_CLEAR(h->builder);
   Py_CLEAR(h->module);
   return 0;
 }
@@ -293,22 +286,23 @@ static PyObject *intj_lazy_new(PyTypeObject *type, PyObject *args,
 }
 
 /* `_C_` marks every attribute and method this type defines;
- * intj.launcher.Launcher exposes the public ones as `options`, `check()`,
- * `build()`, `spec_key()` and `key_chain()`, and wraps `_C_edit_options` in
- * its `_foo` edits. */
+ * intj.launcher.Launcher exposes the public ones as `options`, `build()`,
+ * `spec_key()` and `key_chain()`, and runs `check()` and its `_foo` edits
+ * under `_C_locked`.  It defines `_build_body`, which the first call runs. */
 static PyGetSetDef intj_lazy_getset[] = {
     {(char *)"_C_options", intj_lazy_member, NULL, NULL, INTJ_MEMBER(options)},
     {(char *)"_C_module", intj_lazy_member, NULL, NULL, INTJ_MEMBER(module)},
+    {(char *)"_C_built", intj_lazy_built, NULL, NULL, NULL},
     {NULL, NULL, NULL, NULL, NULL}};
 
 static PyMethodDef intj_lazy_type_methods[] = {
-    {"_C_check", intj_lazy_check, METH_NOARGS, NULL},
     {"_C_build", intj_lazy_build_method, METH_NOARGS, NULL},
     {"_C_spec_key", (PyCFunction)(void (*)(void))intj_lazy_spec_key,
      METH_FASTCALL, NULL},
     {"_C_key_chain", (PyCFunction)(void (*)(void))intj_lazy_key_chain,
      METH_FASTCALL, NULL},
-    {"_C_edit_options", intj_lazy_edit_options, METH_O, NULL},
+    {"_C_locked", intj_lazy_locked, METH_O, NULL},
+    {"_C_set_options", intj_lazy_set_options, METH_O, NULL},
     {NULL, NULL, 0, NULL}};
 
 static PyType_Slot intj_lazy_slots[] = {
@@ -329,19 +323,18 @@ static PyType_Spec intj_lazy_spec = {
     ,
     intj_lazy_slots};
 
-/* new_launcher(cls, options, builder) -> an unbuilt launcher: a
- * PyCFunction over a `cls` instance, `cls` being Launcher or a subclass that
- * adds no storage. */
+/* new_launcher(cls, options) -> an unbuilt launcher: a PyCFunction over a
+ * `cls` instance, `cls` being Launcher or a subclass that adds no storage; the
+ * first call runs its `_build_body`. */
 static PyObject *new_launcher(PyObject *m, PyObject *const *args,
                               Py_ssize_t nargs) {
   intj_lazy_state *st = (intj_lazy_state *)PyModule_GetState(m);
   PyTypeObject *cls =
-      nargs == 3 && PyType_Check(args[0]) ? (PyTypeObject *)args[0] : NULL;
+      nargs == 2 && PyType_Check(args[0]) ? (PyTypeObject *)args[0] : NULL;
   if (!cls || !PyType_IsSubtype(cls, st->type) ||
       cls->tp_basicsize != (Py_ssize_t)sizeof(intj_launcher) ||
-      cls->tp_itemsize != 0 || !PyCallable_Check(args[2])) {
-    PyErr_SetString(PyExc_TypeError,
-                    "intj: new_launcher(cls, options, builder)");
+      cls->tp_itemsize != 0) {
+    PyErr_SetString(PyExc_TypeError, "intj: new_launcher(cls, options)");
     return NULL;
   }
   intj_launcher *h = (intj_launcher *)cls->tp_alloc(cls, 0);
@@ -354,8 +347,6 @@ static PyObject *new_launcher(PyObject *m, PyObject *const *args,
   }
   Py_INCREF(args[1]);
   h->options = args[1];
-  Py_INCREF(args[2]);
-  h->builder = args[2];
   h->def.ml_name = "launch";
   h->def.ml_meth = INTJ_SHIM;
   h->def.ml_flags = METH_FASTCALL;
@@ -400,7 +391,7 @@ static int intj_lazy_module_clear(PyObject *m) {
 
 static PyMethodDef intj_lazy_methods[] = {
     {"new_launcher", (PyCFunction)(void (*)(void))new_launcher, METH_FASTCALL,
-     "new_launcher(cls, options, builder) -> launcher"},
+     "new_launcher(cls, options) -> launcher"},
     {"_header_size", header_size, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 

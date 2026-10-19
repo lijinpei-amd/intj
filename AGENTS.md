@@ -66,11 +66,14 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 starts as, follows the same rule. Every launcher is a `PyCFunction` over a
 `PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
 `__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size). The first
-call swaps its `ml_meth` from the build shim to the rendered entry. Every
+call runs the subclass's `_build_body`, called by name, and swaps its
+`ml_meth` from the build shim to the rendered entry. C keeps only the build
+lock and that swap: everything else Python does under the lock goes through
+`_C_locked(fn)`, and `_C_set_options` refuses outside it or once built. Every
 attribute and method the C type defines is `_C_*`; a public one in the
 Python subclass backed by C wraps its `_C_foo`. Each option edit comes in two
 forms: `foo` returns a new, unbuilt launcher, and the public `_foo` edits this
-one in place (through `_C_edit_options`, under the build lock) until it is
+one in place (through `_C_locked`, under the build lock) until it is
 built. No other private helper is named `_` + a public name. The launcher holds
 one `MakeLauncherOption`, `delayed` included, and nothing derived from it: the
 build resolves `delayed`, checks (`_check_options` -> `_BuildOptions`, a

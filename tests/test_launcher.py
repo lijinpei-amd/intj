@@ -268,11 +268,12 @@ def _launcher_over(module):
     from intj.launcher import _Interner, _launcher_compile, _stub
 
     stub = _stub()
-    launch = stub.new_launcher(
-        stub.Launcher,
-        None,
-        lambda h: (module._init(h, _launcher_compile(module), _Interner()), None, b""),
-    )
+
+    def build(h):
+        return module._init(h, _launcher_compile(module), _Interner()), None, b""
+
+    cls = type("Over", (stub.Launcher,), {"__slots__": (), "_build_body": build})
+    launch = stub.new_launcher(cls, None)
     launch.__self__._C_build()
     return launch
 

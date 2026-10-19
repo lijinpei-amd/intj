@@ -541,10 +541,11 @@ class Launcher:
     `k` is a C function whose entry is a build shim until its first call
     succeeds, then the rendered launch.  This object holds that entry, the
     options and, once built, the module's per-launcher state.  The C base
-    (`_intj_lazy.Launcher`) defines the `_C_*` attributes and methods this
-    class's public ones wrap.  Every edit comes in two forms: `foo` returns a
-    new, unbuilt launcher and `_foo` changes this one in place until it is
-    built.
+    (`_intj_lazy.Launcher`) defines the `_C_*` attributes and methods, and
+    runs `_build_body` on the first call; `check()` and the in-place edits run
+    under its build lock through `_C_locked`.  Every edit comes in two forms:
+    `foo` returns a new, unbuilt launcher and `_foo` changes this one in place
+    until it is built.
     """
 
     __slots__ = ()
@@ -555,13 +556,13 @@ class Launcher:
         def _C_options(self) -> MakeLauncherOption: ...
         @property
         def _C_module(self) -> types.ModuleType | None: ...
-        def _C_check(self) -> None: ...
+        @property
+        def _C_built(self) -> bool: ...
         def _C_build(self) -> types.ModuleType: ...
         def _C_spec_key(self, *args: object) -> tuple[bytes, int]: ...
         def _C_key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]: ...
-        def _C_edit_options(
-            self, edit: Callable[[MakeLauncherOption], MakeLauncherOption], /
-        ) -> None: ...
+        def _C_locked(self, fn: Callable[[], object], /) -> object: ...
+        def _C_set_options(self, options: MakeLauncherOption, /) -> None: ...
 
     @property
     def options(self) -> MakeLauncherOption:
@@ -574,7 +575,8 @@ class Launcher:
         Calls `options.delayed` if set; the first call calls it again.  Does
         nothing once built.
         """
-        self._C_check()
+        if not self._C_built:
+            self._C_locked(self._dry_run)
 
     def build(self) -> types.ModuleType:
         """Builds now if the first call has not, and returns the rendered module."""
@@ -600,7 +602,7 @@ class Launcher:
         Raises:
             RuntimeError: The launcher is built.
         """
-        self._C_edit_options(
+        self._edit_options(
             lambda o: dataclasses.replace(
                 o, bind_values={**(o.bind_values or {}), **values}
             )
@@ -623,7 +625,7 @@ class Launcher:
         Raises:
             RuntimeError: The launcher is built.
         """
-        self._C_edit_options(
+        self._edit_options(
             lambda o: dataclasses.replace(
                 o, bind_device=ordinal, bind_values={**(o.bind_values or {}), **values}
             )
@@ -642,7 +644,7 @@ class Launcher:
 
     def _unbind(self) -> None:
         """Drops this launcher's bound values in place; `unbind` copies instead."""
-        self._C_edit_options(lambda o: dataclasses.replace(o, bind_values=None))
+        self._edit_options(lambda o: dataclasses.replace(o, bind_values=None))
 
     def unbind(self) -> LaunchFunction:
         """Returns a new launcher with no bound values."""
@@ -652,7 +654,7 @@ class Launcher:
 
     def _unbind_device(self) -> None:
         """Makes this launcher take the device per call; `unbind_device` copies instead."""
-        self._C_edit_options(lambda o: dataclasses.replace(o, bind_device=None))
+        self._edit_options(lambda o: dataclasses.replace(o, bind_device=None))
 
     def unbind_device(self) -> LaunchFunction:
         """Returns a new launcher that takes the device per call."""
@@ -671,7 +673,7 @@ class Launcher:
             raise TypeError(
                 "intj: delayed must be None or a callable taking no arguments"
             )
-        self._C_edit_options(lambda o: dataclasses.replace(o, delayed=fn))
+        self._edit_options(lambda o: dataclasses.replace(o, delayed=fn))
 
     def replace_delayed(
         self, fn: Callable[[], Mapping[str, Any]] | None, /
@@ -690,7 +692,7 @@ class Launcher:
         """
         if not callable(fn):
             raise TypeError("intj: chain_delayed takes a callable taking no arguments")
-        self._C_edit_options(
+        self._edit_options(
             lambda o: dataclasses.replace(o, delayed=_chained(o.delayed, fn))
         )
 
@@ -708,7 +710,7 @@ class Launcher:
         if self._C_options.delayed is None:
             return
         try:
-            self._C_edit_options(_resolved)
+            self._edit_options(_resolved)
         except RuntimeError:
             # another thread built it after the check above: a built launcher
             # holds resolved options, so there is nothing left to resolve
@@ -725,11 +727,31 @@ class Launcher:
         return _new_launcher(self._C_options)
 
     def _dry_run(self) -> None:
-        # check()'s body: _C_check calls it under the build lock
-        _check_options(_resolved(self._C_options))
+        # check()'s body, under the build lock: a first call may have built it since
+        if not self._C_built:
+            _check_options(_resolved(self._C_options))
+
+    def _edit_options(
+        self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]
+    ) -> None:
+        # the `_foo` edits' body: options = edit(options) under the build lock
+        def body() -> MakeLauncherOption:
+            if self._C_built:
+                raise RuntimeError(
+                    "intj: a built launcher's options are fixed; the method "
+                    "without the leading underscore returns an edited copy"
+                )
+            old = self._C_options
+            self._C_set_options(edit(old))
+            # dropped by _C_locked's caller, after the unlock: finalizers run Python
+            return old
+
+        self._C_locked(body)
 
     def _build_body(self) -> tuple[int, MakeLauncherOption, bytes]:
         """Builds this launcher on its first call and returns what `_intj_lazy` publishes.
+
+        `_intj_lazy` calls it by name, under the build lock.
 
         Resolves `delayed`, checks, then queries the target, renders, compiles,
         loads, and fills this launcher's state block. Returns the rendered
@@ -824,7 +846,7 @@ class LaunchFunction(Protocol):
 
 def _new_launcher(options: MakeLauncherOption) -> LaunchFunction:
     stub, cls = _stub_and_type()
-    return stub.new_launcher(cls, options, cls._build_body)  # pyright: ignore[reportPrivateUsage]  # the builder
+    return stub.new_launcher(cls, options)
 
 
 @overload

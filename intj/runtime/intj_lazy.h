@@ -57,7 +57,6 @@ typedef struct intj_launcher {
   void *state;
   PyMethodDef def;   /* the launcher PyCFunction's; ml_meth is swapped once */
   PyObject *options; /* MakeLauncherOption; the resolved one once built */
-  PyObject *builder; /* until built: (launcher) -> (entry, options, doc) */
   PyObject *module;
   PyObject *doc; /* bytes behind def.ml_doc, once built */
   PyThread_type_lock build_lock;
