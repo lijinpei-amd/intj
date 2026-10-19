@@ -99,16 +99,18 @@ def test_bind_and_unbind_derive_new_launchers():
         bound.__self__.unbind()(0, 0, 1, 4)
 
 
-def test_derivatives_share_one_analysis(monkeypatch):
+def test_each_launcher_checks_its_own_options(monkeypatch):
     import intj.launcher as launcher
 
     calls = []
-    real = launcher._analyze
-    monkeypatch.setattr(launcher, "_analyze", lambda o: calls.append(1) or real(o))
+    real = launcher._check_options
+    monkeypatch.setattr(
+        launcher, "_check_options", lambda o: calls.append(o.bind_device) or real(o)
+    )
     base = make_launcher(store, extra_annotation={"x": _POINTER}, **_HOST)
     for k in (base.__self__.bind(x=0), base.__self__.bind_device(0, x=0)):
         k.__self__.check()
-    assert calls == [1]
+    assert calls == [None, 0]
 
 
 def test_bind_on_a_built_launcher_returns_an_unbuilt_one():

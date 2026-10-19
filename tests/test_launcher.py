@@ -1294,7 +1294,8 @@ def test_bind_pointer_checks_once_and_warns_at_check(
         assert bound(0, 0, 1) is None
         assert bound(0, 0, 1) is None
         assert owner.reads == 1
-        assert len(caught) == int(verify)
+        # each launcher checks its own options: bind(x=4096), bind(x=4100), bind(x=owner)
+        assert len(caught) == 3 * int(verify)
 
 
 @pytest.mark.parametrize("verify", [False, True])
@@ -1327,13 +1328,14 @@ def test_binding_warnings_are_per_parameter_at_check(bound_kernel, verify, bind_
             controls = (0, 1) if bind_device else (0, 0, 1)
             for n in (7, 9):
                 assert bound(*controls, n) is None
-        # the analysis warns once per make_launcher call, at the first check
+        # each launcher checks its own options: one warning per parameter per launcher
         assert [str(w.message) for w in caught] == (
             [
                 f"intj: pointer-range assumption for bound pointer {name!r} "
                 "cannot be verified from an address and will be trusted"
                 for name in ("x", "p")
             ]
+            * 2
             if verify
             else []
         )

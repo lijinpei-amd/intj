@@ -170,51 +170,39 @@ class _Once(Generic[T]):
 
 
 @dataclasses.dataclass(frozen=True)
-class _Analysis:
-    """What `check()` derives from a `make_launcher` call's non-bind options.
+class _BuildOptions:
+    """Everything the build needs from a checked `MakeLauncherOption`.
 
-    Computed once per `make_launcher` call and shared by every launcher
-    derived from it: bind fields are not inputs.
+    `_check_options` returns it; nothing stores it beyond one build.  The
+    target and live knob values are not here: reading them is a GPU query,
+    made by the build.
     """
 
-    jit_func: JitFunction
-    params: tuple[ResolvedParam, ...]
-    options: tuple[tuple[str, Any], ...]
+    jit_func: JitFunction  # the chain unwrapped, checked
+    tuned: _Tuned | None
+    params: tuple[ResolvedParam, ...]  # bound tensors' types resolved
     torch_access_mode: TorchAccessMode
-    #: what `torch_access_mode` was resolved from: None selects
-    torch_access_request: TorchAccessMode | None
-    kernel_cache: KernelCache
-    verify_annotation: bool
-    no_gpu: bool
-    grid_arg: int | None = None
-    grid_py: Callable[[dict[str, object]], object] | None = None
-    grid_cpp: GridCode | None = None
-    return_compiled: bool = False
-    tuned: _Tuned | None = None
-    grid_fn: object | None = None
-    ndebug: bool = True
-    dynamic: tuple[str, ...] = ()
-    global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
+    grid_code: GridCode | None  # `grid_cpp` compiled
+    dynamic: tuple[str, ...]
     #: `dynamic_options` naming a tl.constexpr parameter: no slot, and only
     #: checked to be a compile option once the target is known
-    declared_parameters: tuple[str, ...] = ()
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _Binding:
-    """One launcher's checked bind fields."""
-
+    declared_parameters: tuple[str, ...]
+    global_values: tuple[tuple[str, str, tuple[object, ...]], ...]
     device_binding: DeviceBinding
-    params: tuple[ResolvedParam, ...]  # bound tensors' types resolved
     args: tuple[object, ...]  # `_init`'s trailing arguments: [device], *bound values
     hidden: tuple[object, ...]  # grid_py's fixed values
     doc: bytes  # the launcher's `__text_signature__`
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _Plan:
-    analysis: _Analysis
-    binding: _Binding
+    # the option's own values, checked and normalized
+    compile_options: tuple[tuple[str, Any], ...]
+    torch_access_request: TorchAccessMode | None
+    kernel_cache: KernelCache
+    no_gpu: bool
+    verify_annotation: bool
+    ndebug: bool
+    return_compiled: bool
+    grid_arg: int | None
+    grid_py: Callable[[dict[str, object]], object] | None
+    grid_cpp_fn: object | None  # the `grid_cpp` def itself
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -225,7 +213,6 @@ class _Origin:
     names: frozenset[str]  # the keywords passed explicitly
     delayed: Callable[[], object] | None = None
     merged: _Once[MakeLauncherOption] = dataclasses.field(default_factory=_Once)
-    analysis: _Once[_Analysis] = dataclasses.field(default_factory=_Once)
 
 
 class Delayed:
@@ -297,13 +284,14 @@ def _warn(message: str, category: type[Warning]) -> None:
     warnings.warn(message, category, stacklevel=level)
 
 
-def _analyze(option: MakeLauncherOption) -> _Analysis:
-    """Runs every check on `option`'s non-bind fields: `make_launcher`'s old body.
+def _check_options(option: MakeLauncherOption) -> _BuildOptions:
+    """Runs every GPU-free check on `option` and returns what the build needs.
 
     Raises:
         UnsupportedKernel: The kernel or an option is outside intj's scope,
             or the kernel cache's library cannot be provisioned.
-        TypeError: A malformed option.
+        TypeError: A malformed option, or bind_device/bind_values that do not
+            fit the kernel.
         ValueError: A malformed grid option.
 
     Warns:
@@ -470,26 +458,6 @@ def _analyze(option: MakeLauncherOption) -> _Analysis:
                 )
     # GPU-free but may reach the network: here, never on a build
     _provision(kernel_cache)
-    analysis = _Analysis(
-        kernel,
-        resolved,
-        tuple(options.items()),
-        access,
-        torch_access_mode,
-        kernel_cache,
-        verify_annotation,
-        no_gpu,
-        grid_arg,
-        grid_py,
-        compiled_grid,
-        return_compiled,
-        tuned,
-        grid_cpp,
-        ndebug=ndebug,
-        dynamic=dynamic,
-        global_values=global_values,
-        declared_parameters=tuple(n for n in declared if n in kernel.arg_names),
-    )
     classes = sorted(
         {".".join(c[1:]) for _, _, v in global_values for c in _class_globals(v)}
     )
@@ -500,11 +468,54 @@ def _analyze(option: MakeLauncherOption) -> _Analysis:
             "replaced (assume_constant_globals=True)",
             ClassGlobalWarning,
         )
-    return analysis
+    device_binding, params, args, hidden, doc = _check_binding(
+        option, resolved, dynamic=dynamic, grid_code=compiled_grid
+    )
+    return _BuildOptions(
+        jit_func=kernel,
+        tuned=tuned,
+        params=params,
+        torch_access_mode=access,
+        grid_code=compiled_grid,
+        dynamic=dynamic,
+        declared_parameters=tuple(n for n in declared if n in kernel.arg_names),
+        global_values=global_values,
+        device_binding=device_binding,
+        args=args,
+        hidden=hidden,
+        doc=doc,
+        compile_options=tuple(options.items()),
+        torch_access_request=torch_access_mode,
+        kernel_cache=kernel_cache,
+        no_gpu=no_gpu,
+        verify_annotation=verify_annotation,
+        ndebug=ndebug,
+        return_compiled=return_compiled,
+        grid_arg=grid_arg,
+        grid_py=grid_py,
+        grid_cpp_fn=grid_cpp,
+    )
 
 
-def _bind(a: _Analysis, option: MakeLauncherOption) -> _Binding:
-    """Checks one launcher's `bind_device` and `bind_values` against its analysis."""
+def _check_binding(
+    option: MakeLauncherOption,
+    params: tuple[ResolvedParam, ...],
+    *,
+    dynamic: tuple[str, ...],
+    grid_code: GridCode | None,
+) -> tuple[
+    DeviceBinding,
+    tuple[ResolvedParam, ...],
+    tuple[object, ...],
+    tuple[object, ...],
+    bytes,
+]:
+    """Checks `bind_device` and `bind_values` against the resolved `params`.
+
+    Returns `(device_binding, params, args, hidden, doc)`: `params` with bound
+    tensors' types resolved, `_init`'s trailing arguments, grid_py's fixed
+    values, and the `__text_signature__`.
+    """
     device = option.bind_device
     if type(device) is bool:
         raise TypeError(
@@ -518,7 +529,7 @@ def _bind(a: _Analysis, option: MakeLauncherOption) -> _Binding:
         values = {}
     if not (isinstance(values, Mapping) and all(type(k) is str for k in values)):
         raise TypeError("intj: bind_values must be None or a mapping keyed by str")
-    names = {p.name for p in a.params if p.annotation.bind_value is not None}
+    names = {p.name for p in params if p.annotation.bind_value is not None}
     unknown = values.keys() - names
     if unknown:
         raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
@@ -528,7 +539,7 @@ def _bind(a: _Analysis, option: MakeLauncherOption) -> _Binding:
     _imports.ensure_torch_imported()
     _imports.ensure_triton_imported()
     resolved: list[ResolvedParam] = []
-    for p in a.params:
+    for p in params:
         annotation = p.annotation
         if annotation.bind_value == "tensor":
             value = values[p.name]
@@ -566,16 +577,16 @@ def _bind(a: _Analysis, option: MakeLauncherOption) -> _Binding:
     )
     binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
     args = (*(() if device is None else (device,)), *bound_values)
-    params, _, _ = _render_params(state, binding)
+    rendered, _, _ = _render_params(state, binding)
     doc = _launch_doc(
-        params,
+        rendered,
         device is not None,
-        a.grid_arg,
-        a.grid_cpp,
-        a.grid_py is not None,
-        dynamic=a.dynamic,
+        option.grid_arg,
+        grid_code,
+        option.grid_py is not None,
+        dynamic=dynamic,
     )
-    return _Binding(binding, state, args, hidden, doc)
+    return binding, state, args, hidden, doc
 
 
 class Launcher:
@@ -597,7 +608,7 @@ class Launcher:
         @property
         def _C_origin(self) -> _Origin: ...
         @property
-        def _C_plan(self) -> _Plan | None: ...
+        def _C_plan(self) -> _BuildOptions | None: ...
         @property
         def _C_module(self) -> types.ModuleType | None: ...
         def _C_check(self) -> None: ...
@@ -605,7 +616,7 @@ class Launcher:
         def _C_spec_key(self, *args: object) -> tuple[bytes, int]: ...
         def _C_key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]: ...
         def _C_set_plan(
-            self, options: MakeLauncherOption, plan: _Plan, doc: bytes
+            self, options: MakeLauncherOption, plan: _BuildOptions, doc: bytes
         ) -> None: ...
 
     @property
@@ -676,10 +687,9 @@ class Launcher:
         derived = options.then(edit) if isinstance(options, Delayed) else edit(options)
         return _new_launcher(derived, self._C_origin)
 
-    def _resolved(self) -> tuple[MakeLauncherOption, _Analysis]:
+    def _resolved(self) -> MakeLauncherOption:
         options = self._C_options
-        option = options() if isinstance(options, Delayed) else options
-        return option, self._C_origin.analysis.get(lambda: _analyze(option))
+        return options() if isinstance(options, Delayed) else options
 
     def _prepare(self) -> None:
         # the C side runs it before the build lock: the work every launcher
@@ -690,9 +700,9 @@ class Launcher:
         # check()'s body: _C_check calls it under the build lock, as does _build
         if self._C_plan is not None:
             return
-        option, analysis = self._resolved()
-        binding = _bind(analysis, option)
-        self._C_set_plan(option, _Plan(analysis, binding), binding.doc)
+        option = self._resolved()
+        build = _check_options(option)
+        self._C_set_plan(option, build, build.doc)
 
     def _build(self) -> int:
         """Builds this launcher on its first call and returns the rendered entry.
@@ -709,9 +719,8 @@ class Launcher:
         it is turned on later.
         """
         self._check()
-        plan = self._C_plan
-        assert plan is not None
-        a, b = plan.analysis, plan.binding
+        b = self._C_plan
+        assert b is not None
         _imports.ensure_triton_imported()
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
@@ -719,62 +728,64 @@ class Launcher:
         # of the RenderKey, so it cannot build a module per value
         knob_values = (
             None
-            if a.no_gpu
-            else {k: v for k, v in _live_knobs().items() if k not in a.dynamic}
+            if b.no_gpu
+            else {k: v for k, v in _live_knobs().items() if k not in b.dynamic}
         )
-        if a.tuned is not None:
+        if b.tuned is not None:
             assert knob_values is not None, "_plan_tuning refuses no_gpu"
-            _check_tuned_configs(a.tuned.plan, b.params, dict(a.options), knob_values)
+            _check_tuned_configs(
+                b.tuned.plan, b.params, dict(b.compile_options), knob_values
+            )
         module = _materialize_module(
-            a.jit_func,
+            b.jit_func,
             b.params,
-            dict(a.options),
-            a.torch_access_mode,
-            a.torch_access_request,
-            a.kernel_cache,
-            a.no_gpu,
-            a.verify_annotation,
+            dict(b.compile_options),
+            b.torch_access_mode,
+            b.torch_access_request,
+            b.kernel_cache,
+            b.no_gpu,
+            b.verify_annotation,
             b.device_binding,
-            grid_arg=a.grid_arg,
-            grid_py_mode=a.grid_py is not None,
-            grid_cpp=a.grid_cpp,
-            return_compiled=a.return_compiled,
-            tuning=a.tuned.render if a.tuned else None,
+            grid_arg=b.grid_arg,
+            grid_py_mode=b.grid_py is not None,
+            grid_cpp=b.grid_code,
+            return_compiled=b.return_compiled,
+            tuning=b.tuned.render if b.tuned else None,
             knob_values=knob_values,
-            dynamic=a.dynamic,
-            global_values=a.global_values,
-            declared_parameters=a.declared_parameters,
-            ndebug=a.ndebug,
+            dynamic=b.dynamic,
+            global_values=b.global_values,
+            declared_parameters=b.declared_parameters,
+            ndebug=b.ndebug,
         )
-        if a.tuned is None:
+        if b.tuned is None:
             callback: Callable[..., Any] = _launcher_compile(module)
         else:
             from .tuning import TunedGrid, make_tuned_callback
 
-            assert a.tuned.render is not None and knob_values is not None
-            if a.grid_py is not None:
-                grid = TunedGrid("py", a.grid_py)
-            elif a.grid_cpp is not None:
-                code = getattr(a.grid_fn, "__code__")
+            assert b.tuned.render is not None and knob_values is not None
+            if b.grid_py is not None:
+                grid = TunedGrid("py", b.grid_py)
+            elif b.grid_code is not None:
+                code = getattr(b.grid_cpp_fn, "__code__")
                 grid = TunedGrid(
                     "cpp",
-                    a.grid_fn,
+                    b.grid_cpp_fn,
                     tuple(code.co_varnames[: code.co_argcount]),
-                    a.grid_cpp.extras,
+                    b.grid_code.extras,
                 )
             else:
                 grid = TunedGrid("dims")
             callback = make_tuned_callback(
-                a.tuned.plan,
+                b.tuned.plan,
                 b.params,
-                dict(a.options),
+                dict(b.compile_options),
                 grid,
-                a.tuned.render,
-                a.return_compiled,
+                b.tuned.render,
+                b.return_compiled,
                 knob_values,
-                a.dynamic,
+                b.dynamic,
             )
-        grid_py = () if a.grid_py is None else (a.grid_py, b.hidden)
+        grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
         return module._init(self, callback, _Interner(), *grid_py, *b.args)
 
 
