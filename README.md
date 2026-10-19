@@ -95,9 +95,10 @@ def my_kernel(x, y, o, n, BLOCK: tl.constexpr):
     ...
 ```
 
-`delayed` runs once, on the launcher's first call (or
-`my_kernel.__self__.check()`), and its keywords join the ones passed to
-`make_launcher`; passing one keyword both ways raises.
+`delayed` runs on the launcher's first call, and its keywords replace the ones
+passed to `make_launcher`. `my_kernel.__self__.check()` is a dry run that calls
+it too; `resolve_delayed()` calls it once, now, and returns a launcher without
+it.
 
 To compute the grid in the extension from launch values, use an annotated
 Python `def` with `grid_cpp`:

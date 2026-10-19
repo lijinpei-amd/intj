@@ -22,13 +22,16 @@ launcher = make_launcher(
     return_compiled=False, # keyword-only: return the cached Triton CompiledKernel
     assume_constant_globals=False, # keyword-only: accept kernels reading globals
     ndebug=True,           # keyword-only: compile the module with NDEBUG (asserts off)
-    delayed=None,          # keyword-only: () -> more of these keywords, run on first use
+    delayed=None,          # keyword-only: () -> more of these keywords, replacing them, run on first use
 )
 ```
 
-`make_launcher` always returns a launcher. Its `__self__` has `bind()`,
-`bind_device()`, `unbind()` and `unbind_device()`, which return new launchers,
-and `check()`. Call it once, outside any hot loop.
+`make_launcher` always returns a launcher. Its `__self__` edits options two
+ways: `bind()`, `bind_device()`, `unbind()`, `unbind_device()`,
+`replace_delayed()`, `chain_delayed()` and `resolve_delayed()` return a new,
+unbuilt launcher; the same names with a leading underscore (`_bind()`, ...)
+change this launcher in place and raise `RuntimeError` once it is built. It
+also has `check()`. Call `make_launcher` once, outside any hot loop.
 
 ### Lazy build
 
@@ -54,18 +57,21 @@ loads `_intj_lazy`, the C stub every launcher starts as, which can raise:
 Only the Triton refusal is cached: after any other of these failures, the
 next `make_launcher` tries again.
 
-`launcher.__self__.check()` does the rest without touching the GPU: it runs
-`delayed`, validates arguments, resolves annotations, analyzes an
-autotune/heuristics chain, lowers `grid_cpp`, checks bound values, and
-provisions a non-default `kernel_cache`.
-It runs once; launchers derived by `bind()` and the like share its analysis.
-The **first call** checks if `check()` has not, then builds: it queries the GPU
+`launcher.__self__.check()` is a dry run of the first call's checks, without
+touching the GPU: it calls `delayed`, validates arguments, resolves
+annotations, analyzes an autotune/heuristics chain, lowers `grid_cpp`, checks
+bound values, and provisions a non-default `kernel_cache`. It stores nothing:
+the first call runs the same checks again (and calls `delayed` again), and
+each launcher checks its own options. The checks' warnings fire on each
+`check()` and again at the first call.
+The **first call** resolves `delayed`, checks, then builds: it queries the GPU
 target, renders the C extension, compiles it with the host compiler (cached on
 disk under intj's module digest), loads it, fills the launcher's state, and
 swaps its entry. After that, every reference to the launcher, including ones
 taken before the build, calls the native entry directly. If the check or
 build raises, that call raises and the next call retries. Concurrent first
-calls build once.
+calls build once. Once built, `launcher.__self__.options` is the resolved
+option (`delayed=None`) and the `__text_signature__` is set.
 
 Decorating a module-level kernel is therefore safe at import on a machine
 without a GPU, and under `TRITON_INTERPRET=1` -- that refusal, like the others
@@ -78,7 +84,7 @@ failing `hipDeviceGet` / `cuDeviceGet`). Triton's `debug`, `instrumentation_mode
 `fpsan_homomorphic_casts` knobs are read then too, and fixed for the launcher.
 Every launcher is a builtin function whose `__self__` is an
 `intj.launcher.Launcher`, whatever it binds. Its `__text_signature__` is set by
-`check()`, so `inspect.signature(launcher)` needs a check or a call first.
+the build, so `inspect.signature(launcher)` needs a call first.
 `intj.launcher.module_of(launcher)` builds if needed and returns the rendered
 module, for debugging.
 
@@ -108,14 +114,16 @@ for values that need the GPU (a backend-dependent `num_warps`, say):
 def k(...): ...
 ```
 
-It runs once per `make_launcher` call, on the first `check()` or call of any
-launcher derived from it, and its result is shared by all of them. Its keywords
-join the explicit ones and enter module identity the same way; a keyword
-passed both ways raises `UnsupportedKernel`, and a result that is not a
+Each launcher calls it on its first call (`check()` calls it too, storing
+nothing), and its keywords replace the explicit ones, whole key, entering
+module identity the same way. A result that is not a
 mapping of `make_launcher` keywords raises `TypeError`. If it raises, the
-exception propagates and the next call runs it again. Calling a launcher from
-the same `make_launcher` call inside it raises `RuntimeError`; waiting there
-on another thread that calls one deadlocks.
+exception propagates and the next call runs it again. Calling its own launcher
+inside it raises `RuntimeError`. A `delayed` that calls another launcher while
+that launcher is being built on another thread is refused with `RuntimeError`
+rather than waiting.
+`replace_delayed(fn)` swaps it, `chain_delayed(fn)` runs `fn` after it with
+`fn`'s keywords winning, and `resolve_delayed()` calls it now.
 `extra_annotation` can fix types or specialization facts, bake values, or mark
 values for binding. `verify_annotation=True` checks declared promises before
 cache lookup; the default trusts them. `bind_device=<ordinal>` fixes the

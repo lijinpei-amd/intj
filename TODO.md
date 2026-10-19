@@ -66,12 +66,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   `bench_time` and `configs_timings` after tuning, but not `cache` itself, so
   code inspecting `len(kernel.cache)` sees 0 even after a tuned launch; either
   mirror entries back per key or warm-start intj's own cache from it.
-- **A `delayed=` launcher has no `jit_func` before `check()`.** Its
-  `__self__.options` is an `intj.launcher.Delayed` until `check()` runs the
-  delayed function, which may query the GPU; code that only wants the kernel
-  back must check first or, like aiter's `launch_on_current_stream`, take only
-  launchers without `delayed=`. The kernel is known at `make_launcher`; expose
-  it on `Delayed`.
 - **Keyword arguments at launch.** Launchers are `METH_FASTCALL` (positional
   only); `METH_FASTCALL | METH_KEYWORDS` (vectorcall `kwnames`) would accept
   keywords with no cost for positional calls (`kwnames` `NULL`) -- needs a

@@ -67,9 +67,15 @@ starts as, follows the same rule. Every launcher is a `PyCFunction` over a
 `PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
 `__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size). The first
 call swaps its `ml_meth` from the build shim to the rendered entry. Every
-attribute and method the C type defines is `_C_*`; the Python subclass's own
-are `foo` if public, `_foo` if private, and a public one backed by C wraps its
-`_C_foo`. The
+attribute and method the C type defines is `_C_*`; a public one in the
+Python subclass backed by C wraps its `_C_foo`. Each option edit comes in two
+forms: `foo` returns a new, unbuilt launcher, and the public `_foo` edits this
+one in place (through `_C_edit_options`, under the build lock) until it is
+built. No other private helper is named `_` + a public name. The launcher holds
+one `MakeLauncherOption`, `delayed` included, and nothing derived from it: the
+build resolves `delayed`, checks (`_check_options` -> `_BuildOptions`, a
+return value only), renders, and returns `(entry, resolved options, doc)` for
+C to publish before it swaps the entry in. The
 module's `_init` allocates the launcher's state block behind `state` and
 installs the `traverse`/`release` ops GC and dealloc reach it through. All
 mutable launch state (cache, lock, miss callback) is the launcher's; the
