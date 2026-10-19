@@ -204,6 +204,19 @@ def _resolved(option: MakeLauncherOption) -> MakeLauncherOption:
     )
 
 
+def _chained(
+    first: Callable[[], Mapping[str, Any]] | None,
+    then: Callable[[], Mapping[str, Any]],
+) -> Callable[[], Mapping[str, Any]]:
+    if first is None:
+        return then
+
+    def chained() -> Mapping[str, Any]:
+        return {**_delayed_keywords(first), **_delayed_keywords(then)}
+
+    return chained
+
+
 _PACKAGE = os.path.dirname(__file__) + os.sep
 
 
@@ -529,7 +542,9 @@ class Launcher:
     succeeds, then the rendered launch.  This object holds that entry, the
     options and, once built, the module's per-launcher state.  The C base
     (`_intj_lazy.Launcher`) defines the `_C_*` attributes and methods this
-    class's public ones wrap.
+    class's public ones wrap.  Every edit comes in two forms: `foo` returns a
+    new, unbuilt launcher and `_foo` changes this one in place until it is
+    built.
     """
 
     __slots__ = ()
@@ -579,6 +594,18 @@ class Launcher:
         """
         return self._C_key_chain(*args)
 
+    def _bind(self, /, **values: object) -> None:
+        """Merges `values` into this launcher's `bind_values`; `bind` copies instead.
+
+        Raises:
+            RuntimeError: The launcher is built.
+        """
+        self._C_edit_options(
+            lambda o: dataclasses.replace(
+                o, bind_values={**(o.bind_values or {}), **values}
+            )
+        )
+
     def bind(self, /, **values: object) -> LaunchFunction:
         """Returns a new launcher with `values` merged into `bind_values`.
 
@@ -586,9 +613,19 @@ class Launcher:
         new launcher's `check()`.  A bound tensor takes an exact
         `torch.Tensor`, `torch.nn.Parameter`, or None.
         """
-        return self._derive(
+        k = self._copy()
+        k.__self__._bind(**values)
+        return k
+
+    def _bind_device(self, ordinal: int | None, /, **values: object) -> None:
+        """Fixes this launcher to device `ordinal` in place; see `bind_device`.
+
+        Raises:
+            RuntimeError: The launcher is built.
+        """
+        self._C_edit_options(
             lambda o: dataclasses.replace(
-                o, bind_values={**(o.bind_values or {}), **values}
+                o, bind_device=ordinal, bind_values={**(o.bind_values or {}), **values}
             )
         )
 
@@ -599,25 +636,85 @@ class Launcher:
         cache, or one kernel when no dynamic specialization key remains.
         None is `unbind_device()`.
         """
-        return self._derive(
-            lambda o: dataclasses.replace(
-                o, bind_device=ordinal, bind_values={**(o.bind_values or {}), **values}
-            )
-        )
+        k = self._copy()
+        k.__self__._bind_device(ordinal, **values)
+        return k
+
+    def _unbind(self) -> None:
+        """Drops this launcher's bound values in place; `unbind` copies instead."""
+        self._C_edit_options(lambda o: dataclasses.replace(o, bind_values=None))
 
     def unbind(self) -> LaunchFunction:
         """Returns a new launcher with no bound values."""
-        return self._derive(lambda o: dataclasses.replace(o, bind_values=None))
+        k = self._copy()
+        k.__self__._unbind()
+        return k
+
+    def _unbind_device(self) -> None:
+        """Makes this launcher take the device per call; `unbind_device` copies instead."""
+        self._C_edit_options(lambda o: dataclasses.replace(o, bind_device=None))
 
     def unbind_device(self) -> LaunchFunction:
         """Returns a new launcher that takes the device per call."""
-        return self._derive(lambda o: dataclasses.replace(o, bind_device=None))
-
-    def _derive(
-        self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]
-    ) -> LaunchFunction:
         k = self._copy()
-        k.__self__._C_edit_options(edit)
+        k.__self__._unbind_device()
+        return k
+
+    def _replace_delayed(self, fn: Callable[[], Mapping[str, Any]] | None, /) -> None:
+        """Sets this launcher's `delayed` to `fn` (None drops it); `replace_delayed` copies instead.
+
+        Raises:
+            TypeError: `fn` is neither None nor callable.
+            RuntimeError: The launcher is built.
+        """
+        if fn is not None and not callable(fn):
+            raise TypeError(
+                "intj: delayed must be None or a callable taking no arguments"
+            )
+        self._C_edit_options(lambda o: dataclasses.replace(o, delayed=fn))
+
+    def replace_delayed(
+        self, fn: Callable[[], Mapping[str, Any]] | None, /
+    ) -> LaunchFunction:
+        """Returns a new launcher whose `delayed` is `fn`; None drops it."""
+        k = self._copy()
+        k.__self__._replace_delayed(fn)
+        return k
+
+    def _chain_delayed(self, fn: Callable[[], Mapping[str, Any]], /) -> None:
+        """Chains `fn` after this launcher's `delayed`; `chain_delayed` copies instead.
+
+        Raises:
+            TypeError: `fn` is not callable.
+            RuntimeError: The launcher is built.
+        """
+        if not callable(fn):
+            raise TypeError("intj: chain_delayed takes a callable taking no arguments")
+        self._C_edit_options(
+            lambda o: dataclasses.replace(o, delayed=_chained(o.delayed, fn))
+        )
+
+    def chain_delayed(self, fn: Callable[[], Mapping[str, Any]], /) -> LaunchFunction:
+        """Returns a new launcher whose `delayed` also runs `fn`, whose keywords win."""
+        k = self._copy()
+        k.__self__._chain_delayed(fn)
+        return k
+
+    def _resolve_delayed(self) -> None:
+        """Calls `delayed` now and applies its keywords in place; `resolve_delayed` copies instead.
+
+        Does nothing when there is no `delayed`, built or not.
+
+        Raises:
+            RuntimeError: The launcher is built.
+        """
+        if self._C_options.delayed is not None:
+            self._C_edit_options(_resolved)
+
+    def resolve_delayed(self) -> LaunchFunction:
+        """Returns a new launcher with `delayed` called now and its keywords applied."""
+        k = self._copy()
+        k.__self__._resolve_delayed()
         return k
 
     def _copy(self) -> LaunchFunction:
@@ -835,8 +932,9 @@ def make_launcher(
 
     Returns:
         The launcher, a C function whose `__self__` is its `Launcher`
-        (`bind`, `bind_device`, `unbind`, `unbind_device`, `check`). Without
-        `jit_func`, a decorator that makes one.
+        (`bind`, `bind_device`, `unbind`, `unbind_device`, `replace_delayed`,
+        `chain_delayed`, `resolve_delayed`, each with an in-place `_` twin,
+        and `check`). Without `jit_func`, a decorator that makes one.
 
     Raises:
         TypeError: A None kernel, an unknown keyword, or a `delayed` that is
