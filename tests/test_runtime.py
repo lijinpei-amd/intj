@@ -627,7 +627,7 @@ module._set_torch_version({torch_version()!r}, {layout.as_args() if layout else 
 spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
 lazy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lazy)
-launch = lazy.new_launcher(lazy.Launcher, None, None, lambda header: module._init(header, print, print))
+launch = lazy.new_launcher(lazy.Launcher, None, lambda header: (module._init(header, print, print), None, b""))
 assert not sys._is_gil_enabled()
 grid = [0, 1000, 1000]
 stop = threading.Event()
@@ -847,6 +847,11 @@ def _interner():
     return lambda v: ids.setdefault(v, len(ids)) if type(v) is str else None
 
 
+def _built(address, options=None):
+    # a builder's result: the entry, the options to publish, no signature
+    return address, options, b""
+
+
 @pytest.fixture(scope="module")
 def launch(built, stub_module):
     """A built launcher over the fixture module: what `module.entry` used to be."""
@@ -854,9 +859,8 @@ def launch(built, stub_module):
     fn = stub_module.new_launcher(
         stub_module.Launcher,
         None,
-        None,
-        lambda header: module._init(
-            header, launcher._launcher_compile(module), _interner()
+        lambda header: _built(
+            module._init(header, launcher._launcher_compile(module), _interner())
         ),
     )
     fn(*_args())
@@ -879,9 +883,11 @@ def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
 
     def build(header):
         builds.append(1)
-        return module._init(header, launcher._launcher_compile(module), _interner())
+        return _built(
+            module._init(header, launcher._launcher_compile(module), _interner())
+        )
 
-    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, build)
     before = launch  # a reference taken before the build
     function = ctypes.pythonapi.PyCFunction_GetFunction
     function.argtypes, function.restype = [ctypes.py_object], ctypes.c_void_p
@@ -920,9 +926,11 @@ def test_failed_build_raises_and_the_next_call_retries(built, stub_module):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("first build fails")
-        return module._init(header, launcher._launcher_compile(module), _interner())
+        return _built(
+            module._init(header, launcher._launcher_compile(module), _interner())
+        )
 
-    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, build)
     with pytest.raises(RuntimeError, match="first build fails"):
         launch(*_args())
     assert launch(*_args()) is None and len(attempts) == 2
@@ -935,9 +943,11 @@ def test_concurrent_first_calls_build_once(built, stub_module):
     def build(header):
         builds.append(1)
         time.sleep(0.05)  # hold the build lock while the others arrive
-        return module._init(header, launcher._launcher_compile(module), _interner())
+        return _built(
+            module._init(header, launcher._launcher_compile(module), _interner())
+        )
 
-    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, build)
     barrier, results, errors = threading.Barrier(8), [], []
 
     def worker():
@@ -964,9 +974,11 @@ def test_call_during_build_is_refused(built, stub_module):
             launch(*_args())
         except RuntimeError as error:
             seen.append(str(error))
-        return module._init(header, launcher._launcher_compile(module), _interner())
+        return _built(
+            module._init(header, launcher._launcher_compile(module), _interner())
+        )
 
-    launch = stub_module.new_launcher(stub_module.Launcher, None, None, build)
+    launch = stub_module.new_launcher(stub_module.Launcher, None, build)
     assert launch(*_args()) is None
     assert seen and "while it was being built" in seen[0]
 
@@ -987,10 +999,13 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass)
         owner = Owner()
 
         def build(header, owner=owner):  # the builder holds its owner: a cycle
-            return module._init(header, launcher._launcher_compile(module), _interner())
+            return _built(
+                module._init(header, launcher._launcher_compile(module), _interner()),
+                owner,
+            )
 
-        # options and origin hold the owner too: cycles through every member
-        owner.launch = stub_module.new_launcher(cls, owner, owner, build)
+        # the options (before and after the build) hold the owner too
+        owner.launch = stub_module.new_launcher(cls, owner, build)
         if call_first:
             owner.launch(*_args())
         ref = weakref.ref(owner)
@@ -1013,9 +1028,8 @@ def test_memo_referent_cycle_is_collected(built, stub_module):
     value.launch = stub_module.new_launcher(
         stub_module.Launcher,
         None,
-        None,
-        lambda h: module._init(
-            h, compile_cb, lambda v: 0 if type(v) is Value else None
+        lambda h: _built(
+            module._init(h, compile_cb, lambda v: 0 if type(v) is Value else None)
         ),
     )
     value.launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, value)  # memoized
@@ -1030,8 +1044,9 @@ def test_str_constexpr_keys_by_value(built, stub_module):
     launch = stub_module.new_launcher(
         stub_module.Launcher,
         None,
-        None,
-        lambda h: module._init(h, launcher._launcher_compile(module), _interner()),
+        lambda h: _built(
+            module._init(h, launcher._launcher_compile(module), _interner())
+        ),
     )
     launch(*_args())
     x = torch.zeros(4)
@@ -1048,8 +1063,9 @@ def test_memo_holds_its_object_until_replaced(built, stub_module):
     launch = stub_module.new_launcher(
         stub_module.Launcher,
         None,
-        None,
-        lambda h: module._init(h, launcher._launcher_compile(module), _interner()),
+        lambda h: _built(
+            module._init(h, launcher._launcher_compile(module), _interner())
+        ),
     )
     first, second = "".join(["o", "n", "e"]), "".join(["t", "w", "o"])
     launch(*_CALL, torch.zeros(4), 5, -7, 1.5, True, first)
@@ -1074,36 +1090,66 @@ def test_launchers_come_only_from_new_launcher(stub_module):
     wide = type("Wide", (stub_module.Launcher,), {"__slots__": ("extra",)})
     for cls in (object, int, wide):  # not a Launcher, or one more word
         with pytest.raises(TypeError, match="new_launcher"):
-            stub_module.new_launcher(cls, None, None, print)
+            stub_module.new_launcher(cls, None, print)
     with pytest.raises(TypeError, match="new_launcher"):
-        stub_module.new_launcher(stub_module.Launcher, None, None, 7)
-    assert type(stub_module.new_launcher(Sub, None, None, print).__self__) is Sub
+        stub_module.new_launcher(stub_module.Launcher, None, 7)
+    assert type(stub_module.new_launcher(Sub, None, print).__self__) is Sub
 
 
-def test_set_plan_publishes_options_and_signature_once(stub_module):
-    launch = stub_module.new_launcher(stub_module.Launcher, "delayed", "origin", print)
+def test_edit_options_applies_under_the_lock(stub_module):
+    launch = stub_module.new_launcher(stub_module.Launcher, "before", print)
     h = launch.__self__
-    assert (h._C_options, h._C_origin, h._C_plan, h._C_module) == (
-        "delayed",
-        "origin",
+    assert (h._C_options, h._C_module, launch.__text_signature__) == (
+        "before",
         None,
         None,
     )
+    assert h._C_edit_options(lambda o: o + "!") is None
+    assert h._C_options == "before!"
+    with pytest.raises(KeyError):
+        h._C_edit_options(lambda o: {}[o])  # the edit's error, options kept
+    assert h._C_options == "before!"
+
+
+def test_builder_must_return_entry_options_and_doc(stub_module):
+    for result, error in (
+        (7, TypeError),
+        ((7, "o"), TypeError),
+        ((7, "o", "not bytes"), TypeError),
+        ((0, "o", b""), RuntimeError),  # a NULL entry
+    ):
+        launch = stub_module.new_launcher(
+            stub_module.Launcher, "before", lambda h, r=result: r
+        )
+        with pytest.raises(error):
+            launch()
+        assert launch.__self__._C_options == "before"  # nothing published
+
+
+def test_build_publishes_options_and_signature_and_refuses_edits(built, stub_module):
+    module, _, _ = built
+    launch = stub_module.new_launcher(
+        stub_module.Launcher,
+        "unbuilt",
+        lambda h: (
+            module._init(h, launcher._launcher_compile(module), _interner()),
+            "resolved",
+            b"launch(a, /)\n--\n\n",
+        ),
+    )
+    h = launch.__self__
     assert launch.__text_signature__ is None
-    h._C_set_plan("resolved", "plan", b"launch(a, /)\n--\n\n")
-    assert (h._C_options, h._C_plan) == ("resolved", "plan")
-    assert launch.__text_signature__ == "(a, /)"
-    h._C_check()  # a plan is set: nothing runs
-    with pytest.raises(RuntimeError, match="set once"):
-        h._C_set_plan("again", "plan", b"")
-    fresh = stub_module.new_launcher(stub_module.Launcher, None, None, print)
-    with pytest.raises(TypeError, match="_C_set_plan"):
-        fresh.__self__._C_set_plan(None, None, "not bytes")
+    launch(*_args())
+    assert h._C_options == "resolved" and launch.__text_signature__ == "(a, /)"
+    h._C_check()  # built: nothing runs
+    with pytest.raises(RuntimeError, match="fixed"):
+        h._C_edit_options(lambda o: "again")
+    assert h._C_options == "resolved"
 
 
-def test_options_reads_race_set_plan_safely(stub_module):
+def test_options_reads_race_edits_safely(stub_module):
     launchers = [
-        stub_module.new_launcher(stub_module.Launcher, "before", None, print)
+        stub_module.new_launcher(stub_module.Launcher, "before", print)
         for _ in range(200)
     ]
     seen, stop = set(), threading.Event()
@@ -1117,7 +1163,7 @@ def test_options_reads_race_set_plan_safely(stub_module):
     for t in readers:
         t.start()
     for k in launchers:
-        k.__self__._C_set_plan("after", None, b"")
+        k.__self__._C_edit_options(lambda o: "after")
     stop.set()
     for t in readers:
         t.join()

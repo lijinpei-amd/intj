@@ -21,7 +21,7 @@ from collections.abc import (
     Sequence,
 )
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from . import _imports, lazy
 from ._version import __version__
@@ -140,35 +140,6 @@ class CompilerInput:
         )
 
 
-T = TypeVar("T")
-
-
-class _Once(Generic[T]):
-    # a value computed once, under a lock; a failure is not kept, and the
-    # computing thread re-entering is refused rather than deadlocked
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._running = False
-        self._result: tuple[T] | None = None  # one load: all or nothing
-
-    def get(self, compute: Callable[[], T]) -> T:
-        result = self._result
-        if result is None:
-            with self._lock:
-                result = self._result
-                if result is None:
-                    if self._running:
-                        raise RuntimeError(
-                            "intj: a launcher was called while it was being built"
-                        )
-                    self._running = True
-                    try:
-                        result = self._result = (compute(),)
-                    finally:
-                        self._running = False
-        return result[0]
-
-
 @dataclasses.dataclass(frozen=True)
 class _BuildOptions:
     """Everything the build needs from a checked `MakeLauncherOption`.
@@ -205,50 +176,9 @@ class _BuildOptions:
     grid_cpp_fn: object | None  # the `grid_cpp` def itself
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
-class _Origin:
-    """One `make_launcher` call, shared by every launcher derived from it."""
-
-    explicit: MakeLauncherOption
-    names: frozenset[str]  # the keywords passed explicitly
-    delayed: Callable[[], object] | None = None
-    merged: _Once[MakeLauncherOption] = dataclasses.field(default_factory=_Once)
-
-
-class Delayed:
-    """A delayed launcher's `options` until `check()` resolves it.
-
-    Calling it runs the `make_launcher(delayed=...)` function, once per
-    `make_launcher` call, merges its keywords with the explicit ones, then
-    applies this launcher's bind/unbind edits.
-    """
-
-    __slots__ = ("_origin", "_edits")
-
-    def __init__(
-        self,
-        origin: _Origin,
-        edits: tuple[Callable[[MakeLauncherOption], MakeLauncherOption], ...] = (),
-    ) -> None:
-        self._origin = origin
-        self._edits = edits
-
-    def __call__(self) -> MakeLauncherOption:
-        origin = self._origin
-        option = origin.merged.get(lambda: _merge_delayed(origin))
-        for edit in self._edits:
-            option = edit(option)
-        return option
-
-    def then(self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]) -> Delayed:
-        """Returns this `Delayed` with `edit` applied after the others."""
-        return Delayed(self._origin, (*self._edits, edit))
-
-
-def _merge_delayed(origin: _Origin) -> MakeLauncherOption:
-    assert origin.delayed is not None
-    values = origin.delayed()
-    if not isinstance(values, Mapping):
+def _delayed_keywords(delayed: Callable[[], Mapping[str, Any]]) -> dict[str, Any]:
+    values = delayed()
+    if not isinstance(values, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # user code
         raise TypeError(
             "intj: delayed must return a mapping of make_launcher keywords, "
             f"got {type(values).__name__}"
@@ -262,14 +192,16 @@ def _merge_delayed(origin: _Origin) -> MakeLauncherOption:
             "intj: delayed returned unknown make_launcher keyword(s) "
             f"[{', '.join(unknown)}]"
         )
-    keywords = cast("dict[str, Any]", dict(values))
-    clash = sorted(k for k in keywords if k in origin.names)
-    if clash:
-        raise UnsupportedKernel(
-            f"intj: delayed returned {clash}, also passed to make_launcher; "
-            "pass each keyword once"
-        )
-    return dataclasses.replace(origin.explicit, **keywords)
+    return cast("dict[str, Any]", dict(values))
+
+
+def _resolved(option: MakeLauncherOption) -> MakeLauncherOption:
+    """Returns `option` with `delayed` called and its keywords replacing the others."""
+    if option.delayed is None:
+        return option
+    return dataclasses.replace(
+        option, **_delayed_keywords(option.delayed), delayed=None
+    )
 
 
 _PACKAGE = os.path.dirname(__file__) + os.sep
@@ -300,6 +232,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         RuntimeWarning: `verify_annotation=True` cannot verify a bound
             pointer's range assumption.
     """
+    assert option.delayed is None, "resolve delayed first"
     jit_func = option.jit_func
     dynamic_options = option.dynamic_options
     extra_annotation = option.extra_annotation
@@ -604,28 +537,28 @@ class Launcher:
     if TYPE_CHECKING:
 
         @property
-        def _C_options(self) -> MakeLauncherOption | Delayed: ...
-        @property
-        def _C_origin(self) -> _Origin: ...
-        @property
-        def _C_plan(self) -> _BuildOptions | None: ...
+        def _C_options(self) -> MakeLauncherOption: ...
         @property
         def _C_module(self) -> types.ModuleType | None: ...
         def _C_check(self) -> None: ...
         def _C_build(self) -> types.ModuleType: ...
         def _C_spec_key(self, *args: object) -> tuple[bytes, int]: ...
         def _C_key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]: ...
-        def _C_set_plan(
-            self, options: MakeLauncherOption, plan: _BuildOptions, doc: bytes
+        def _C_edit_options(
+            self, edit: Callable[[MakeLauncherOption], MakeLauncherOption], /
         ) -> None: ...
 
     @property
-    def options(self) -> MakeLauncherOption | Delayed:
-        """The launcher's `MakeLauncherOption`; a `Delayed` until `check()` resolves it."""
+    def options(self) -> MakeLauncherOption:
+        """The launcher's options; once built, the resolved ones (`delayed` None)."""
         return self._C_options
 
     def check(self) -> None:
-        """Runs every check `make_launcher` defers, once; the first call runs it too."""
+        """Runs every check the first call would, without building or storing anything.
+
+        Calls `options.delayed` if set; the first call calls it again.  Does
+        nothing once built.
+        """
         self._C_check()
 
     def build(self) -> types.ModuleType:
@@ -683,33 +616,24 @@ class Launcher:
     def _derive(
         self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]
     ) -> LaunchFunction:
-        options = self._C_options
-        derived = options.then(edit) if isinstance(options, Delayed) else edit(options)
-        return _new_launcher(derived, self._C_origin)
+        k = self._copy()
+        k.__self__._C_edit_options(edit)
+        return k
 
-    def _resolved(self) -> MakeLauncherOption:
-        options = self._C_options
-        return options() if isinstance(options, Delayed) else options
+    def _copy(self) -> LaunchFunction:
+        return _new_launcher(self._C_options)
 
-    def _prepare(self) -> None:
-        # the C side runs it before the build lock: the work every launcher
-        # from one make_launcher call shares runs under no launcher's lock
-        self._resolved()
+    def _dry_run(self) -> None:
+        # check()'s body: _C_check calls it under the build lock
+        _check_options(_resolved(self._C_options))
 
-    def _check(self) -> None:
-        # check()'s body: _C_check calls it under the build lock, as does _build
-        if self._C_plan is not None:
-            return
-        option = self._resolved()
-        build = _check_options(option)
-        self._C_set_plan(option, build, build.doc)
+    def _build_body(self) -> tuple[int, MakeLauncherOption, bytes]:
+        """Builds this launcher on its first call and returns what `_intj_lazy` publishes.
 
-    def _build(self) -> int:
-        """Builds this launcher on its first call and returns the rendered entry.
-
-        Checks, then queries the target, renders, compiles, loads, and fills
-        this launcher's state block. The returned address is the rendered
-        entry, for `_intj_lazy` to swap in.
+        Resolves `delayed`, checks, then queries the target, renders, compiles,
+        loads, and fills this launcher's state block. Returns the rendered
+        entry's address, the resolved options and the `__text_signature__`,
+        for `_intj_lazy` to publish and swap in.
 
         `TRITON_INTERPRET=1` is refused here, on the first call: decoration
         never runs a kernel, so a module-level decorator does not make its
@@ -718,9 +642,8 @@ class Launcher:
         again, so a launcher built with the interpreter off keeps launching if
         it is turned on later.
         """
-        self._check()
-        b = self._C_plan
-        assert b is not None
+        option = _resolved(self._C_options)
+        b = _check_options(option)
         _imports.ensure_triton_imported()
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
@@ -786,7 +709,8 @@ class Launcher:
                 b.dynamic,
             )
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
-        return module._init(self, callback, _Interner(), *grid_py, *b.args)
+        address = module._init(self, callback, _Interner(), *grid_py, *b.args)
+        return address, option, b.doc
 
 
 class LaunchFunction(Protocol):
@@ -797,11 +721,9 @@ class LaunchFunction(Protocol):
     def __call__(self, *args: Any) -> Any: ...
 
 
-def _new_launcher(
-    options: MakeLauncherOption | Delayed, origin: _Origin
-) -> LaunchFunction:
+def _new_launcher(options: MakeLauncherOption) -> LaunchFunction:
     stub, cls = _stub_and_type()
-    return stub.new_launcher(cls, options, origin, cls._build)  # pyright: ignore[reportPrivateUsage]  # the builder
+    return stub.new_launcher(cls, options, cls._build_body)  # pyright: ignore[reportPrivateUsage]  # the builder
 
 
 @overload
@@ -847,14 +769,13 @@ def make_launcher(
         @triton.jit
         def k(...): ...
 
-    Decoration only records a `MakeLauncherOption` (or, with `delayed`, how
-    to make one): no kernel check, no GPU, no torch import.  Until one
-    succeeds in this process, a call also imports triton and loads
-    `_intj_lazy`, the C stub every launcher starts as, which can fail (see
-    Raises); only the Triton refusal is remembered, and any other failure
-    there is retried on the next call.  `k.__self__.check()` runs every
-    other check now; otherwise the first call does, then builds the module
-    (see docs/Usage.md, "Lazy build").
+    Decoration only records a `MakeLauncherOption`: no kernel check, no GPU,
+    no torch import.  Until one succeeds in this process, a call also imports
+    triton and loads `_intj_lazy`, the C stub every launcher starts as, which
+    can fail (see Raises); only the Triton refusal is remembered, and any
+    other failure there is retried on the next call.  `k.__self__.check()`
+    runs every other check now; otherwise the first call does, then builds the
+    module (see docs/Usage.md, "Lazy build").
 
     The returned callable is a C function:
 
@@ -872,10 +793,10 @@ def make_launcher(
             `triton.autotune`/`triton.heuristics`. Omit it for the decorator
             factory form.
         delayed: A function of no arguments returning more of these
-            keywords, as a mapping. It runs once, on the first `check()` or
-            call of any launcher this call makes; a keyword also passed here
-            raises `UnsupportedKernel`, and its own exception propagates and
-            is retried on the next call.
+            keywords, as a mapping; they replace the ones passed here. Each
+            launcher calls it on its first call (and on every `check()`
+            before that); its exception propagates and is retried on the
+            next call.
         dynamic_options: Compile options and `knobs.<group>.<name>` paths
             passed per call, right after the grid controls, and keyed.
         extra_annotation: Parameter name -> annotation or shorthand: fixes
@@ -940,9 +861,8 @@ def make_launcher(
         return functools.partial(make_launcher, delayed=delayed, **kwargs)
     if jit_func is None:
         raise TypeError("intj: make_launcher got None instead of a kernel")
-    option = MakeLauncherOption(jit_func, **kwargs)
-    origin = _Origin(option, frozenset(kwargs), delayed)
-    return _new_launcher(option if delayed is None else Delayed(origin), origin)
+    option = MakeLauncherOption(jit_func, delayed=delayed, **kwargs)
+    return _new_launcher(option)
 
 
 def _materialize_module(

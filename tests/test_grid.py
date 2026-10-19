@@ -81,7 +81,7 @@ def test_grid_arg_zero_skips_launch_and_argument_decode():
     fixed = make_launcher(write_programs, grid_arg=3, no_gpu=True).__self__.bind_device(
         0
     )
-    fixed.__self__.check()  # the signature is set by check()
+    fixed.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(fixed).parameters) == (
         "stream",
         "grid_x",
@@ -202,7 +202,7 @@ def test_grid_py_receives_baked_and_bound_values():
         },
     )
     launch = factory.__self__.bind_device(0, out=0)
-    launch.__self__.check()  # the signature is set by check()
+    launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters) == ("stream", "Y")
     assert launch(0, 2) is None
     assert seen == [{"out": 0, "X": 3, "Y": 2}]
@@ -319,7 +319,7 @@ def test_grid_cpp_fixed_device_reuses_baked_value_and_prepends_extra():
         },
     )
     launch = factory.__self__.bind_device(0, out=0)
-    launch.__self__.check()  # the signature is set by check()
+    launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters) == ("stream", "cap", "Y")
     assert launch(0, 7, 4) is None  # 3 + 4 - 7 = 0
     with pytest.raises(ValueError, match="grid dimensions"):

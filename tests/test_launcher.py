@@ -271,8 +271,7 @@ def _launcher_over(module):
     launch = stub.new_launcher(
         stub.Launcher,
         None,
-        None,
-        lambda h: module._init(h, _launcher_compile(module), _Interner()),
+        lambda h: (module._init(h, _launcher_compile(module), _Interner()), None, b""),
     )
     launch.__self__._C_build()
     return launch
@@ -312,7 +311,7 @@ def test_bind_device_takes_one_positional_ordinal(device_kernel):
     with pytest.raises(TypeError):
         launch.__self__.bind_device(device_ordinal=0)  # pyright: ignore[reportCallIssue]
     fixed = launch.__self__.bind_device(0)
-    fixed.__self__.check()
+    fixed.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(fixed).parameters) == ("stream", "grid", "x")
     assert type(fixed).__flags__ & (1 << 11)  # Py_TPFLAGS_HAVE_VECTORCALL
     assert fixed(0, 1, 7) is None
@@ -405,7 +404,7 @@ def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
     with pytest.raises(TypeError, match="unknown.*other"):
         factory.__self__.bind_device(0, **values, other=1).__self__.check()
     launch = factory.__self__.bind_device(0, **values)
-    launch.__self__.check()  # the signature is set by check()
+    launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters) == ("stream", "grid", "n")
     assert launch(0, 1, 7) is None
 
@@ -418,7 +417,7 @@ def test_bind_device_signature_avoids_public_control_names(tmp_path):
         no_gpu=True,
         torch_access_mode=TorchAccessMode.INTERPRETER,
     ).__self__.bind_device(0)
-    launch.__self__.check()  # the signature is set by check()
+    launch.__self__.build()  # the build sets the signature
     signature = inspect.signature(launch)
     assert tuple(signature.parameters) == ("stream__", "grid__", *names)
     assert all(
@@ -838,7 +837,7 @@ def test_bound_launcher_is_fastcall_and_hides_bound_parameters(bound_kernel):
         no_gpu=True,
     )
     launch = factory.__self__.bind(x=torch.ones(4), p=0)
-    launch.__self__.check()  # the signature is set by check()
+    launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters) == (
         "device",
         "stream",
@@ -930,7 +929,7 @@ def test_bind_uses_declaration_order_and_accepts_method_parameter_names(tmp_path
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
     bound = factory.__self__.bind(args=12288, values=8192, self=4096)
-    bound.__self__.check()  # the signature is set by check()
+    bound.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(bound).parameters) == (
         "device",
         "stream",
@@ -983,7 +982,7 @@ def test_bind_signature_control_names_avoid_kernel_names(
         torch_access_mode=TorchAccessMode.INTERPRETER,
     )
     bound = factory.__self__.bind(x=0)
-    bound.__self__.check()  # the signature is set by check()
+    bound.__self__.build()  # the build sets the signature
     signature = inspect.signature(bound)
     assert tuple(signature.parameters) == (*control_names, *public_names)
     assert all(
@@ -991,7 +990,7 @@ def test_bind_signature_control_names_avoid_kernel_names(
         for p in signature.parameters.values()
     )
     other = factory.__self__.bind(x=4096)
-    other.__self__.check()
+    other.__self__.build()
     assert inspect.signature(other) == signature
     assert bound(0, 0, 1, *range(4, 4 + len(public_names))) is None
 
@@ -1709,7 +1708,7 @@ def test_bind_mixed_and_baked_values_follow_declaration_order_on_gpu():
         torch_access_mode=TorchAccessMode.STATIC_COMPILE,
     )
     bound = factory.__self__.bind(o=out, x=tensor)
-    bound.__self__.check()  # the signature is set by check()
+    bound.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(bound).parameters) == (
         "device",
         "stream",
@@ -1820,7 +1819,7 @@ def test_bind_native_failure_releases_partial_owners(bound_kernel, mode):
     )
     tensor = torch.empty(4)
     bound = factory.__self__.bind(x=tensor, p=2**64)  # p fails in C, on the first call
-    bound.__self__.check()  # the plan holds the tensor from the first check on
+    bound.__self__.check()  # a dry run: it holds nothing, nor does a failed build
     references, native = sys.getrefcount(tensor), getattr(tensor, "_use_count")()
     for _ in range(3):
         with pytest.raises(OverflowError, match="p"):
@@ -5415,7 +5414,7 @@ def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
     """A class global (the NamedTuple repro) is keyed by its qualified name.
 
     It is refused by default, and launched under `assume_constant_globals=True`
-    with one ClassGlobalWarning per `make_launcher` and none on a launch.
+    with one ClassGlobalWarning per check and per build, and none on a launch.
     """
     from intj import ClassGlobalWarning
 
@@ -5428,9 +5427,10 @@ def test_class_global_is_keyed_by_name_and_warns_once_per_build(tmp_path):
     assert len(record) == 1
     assert record[0].filename == __file__  # stacklevel points at the caller
     o = torch.zeros(1, device="cuda", dtype=torch.int32)
+    with pytest.warns(ClassGlobalWarning):
+        launch(0, 0, 1, o)  # the build checks again, and the miss
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        launch(0, 0, 1, o)  # the miss
         launch(0, 0, 1, o)  # a hit
     assert o.item() == 3
     with warnings.catch_warnings():
@@ -6732,7 +6732,7 @@ def test_constexpr_option_parameter_feeds_the_option(declared):
     nothing.
     """
     launch = make_launcher(warps_store, dynamic_options=declared, return_compiled=True)
-    launch.__self__.check()  # the signature is set by check()
+    launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters)[3:] == (
         "o",
         "num_warps",

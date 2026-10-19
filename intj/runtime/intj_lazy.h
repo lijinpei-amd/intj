@@ -34,8 +34,8 @@ typedef char intj_rwlock;
 #define INTJ_RWUNLOCK(l) ((void)(l))
 #endif
 
-/* Free-threaded builds lock the object around its member reads and
- * `_C_set_plan`; before 3.13 these are plain blocks. */
+/* Free-threaded builds lock the object around its member reads and writes;
+ * before 3.13 these are plain blocks. */
 #ifndef Py_BEGIN_CRITICAL_SECTION
 #define Py_BEGIN_CRITICAL_SECTION(op) {
 #define Py_END_CRITICAL_SECTION() }
@@ -56,12 +56,10 @@ typedef struct intj_launcher {
   /* hot: the module's intj_launcher_state; NULL until built, and after clear */
   void *state;
   PyMethodDef def;   /* the launcher PyCFunction's; ml_meth is swapped once */
-  PyObject *options; /* MakeLauncherOption, or the Delayed until check() */
-  PyObject *origin;  /* _Origin, shared with every bind/unbind derivative */
-  PyObject *plan;    /* check()'s _Plan; NULL until checked */
-  PyObject *builder; /* until built: callable(launcher) -> entry address */
+  PyObject *options; /* MakeLauncherOption; the resolved one once built */
+  PyObject *builder; /* until built: (launcher) -> (entry, options, doc) */
   PyObject *module;
-  PyObject *doc; /* bytes behind def.ml_doc, once checked */
+  PyObject *doc; /* bytes behind def.ml_doc, once built */
   PyThread_type_lock build_lock;
   unsigned long build_thread;   /* thread holding build_lock, else 0 */
   const intj_launcher_ops *ops; /* the module's, once built */

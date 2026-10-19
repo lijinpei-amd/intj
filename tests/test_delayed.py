@@ -15,7 +15,7 @@ import triton.language as tl
 
 from intj import make_launcher
 from intj.annotation import NEVER, Argument, BindValue
-from intj.launcher import Delayed, UnsupportedKernel, module_of
+from intj.launcher import module_of
 from intj.torch_intf.torch_abi import TorchAccessMode
 
 
@@ -40,15 +40,16 @@ def _counting(values):
     return delayed, calls
 
 
-def test_runs_once_on_first_use_across_bind_children():
+def test_each_launcher_resolves_its_own_delayed():
     delayed, calls = _counting(_HOST)
     base = make_launcher(store, extra_annotation={"x": _POINTER}, delayed=delayed)
-    assert calls == [] and isinstance(base.__self__.options, Delayed)
+    assert calls == [] and base.__self__.options.delayed is delayed
+    assert base.__self__.options.jit_func is store  # known before any call
     children = [base.__self__.bind(x=0), base.__self__.bind_device(0, x=0)]
     assert children[0](0, 0, 1, 4) is None and children[1](0, 1, 4) is None
-    assert calls == [1]
+    assert calls == [1, 1]
     options = children[0].__self__.options
-    assert not isinstance(options, Delayed)  # resolved in place
+    assert options.delayed is None  # resolved by the build
     assert options.no_gpu is True and options.bind_values == {"x": 0}
 
 
@@ -59,9 +60,15 @@ def test_decorator_form():
     assert launch(0, 0, 1, 0, 4) is None and calls == [1]
 
 
-def test_conflict_and_bad_results():
-    with pytest.raises(UnsupportedKernel, match=r"delayed returned \['no_gpu'\]"):
-        make_launcher(store, no_gpu=True, delayed=lambda: _HOST).__self__.check()
+def test_override_and_bad_results():
+    # delayed replaces an eager keyword, whole key
+    launch = make_launcher(
+        store,
+        verify_annotation=True,
+        delayed=lambda: {**_HOST, "verify_annotation": False},
+    )
+    assert launch(0, 0, 1, 0, 4) is None
+    assert launch.__self__.options.verify_annotation is False
     with pytest.raises(TypeError, match="must return a mapping"):
         make_launcher(store, delayed=lambda: [("no_gpu", True)]).__self__.check()  # pyright: ignore[reportArgumentType]
     for key in ("bogus", "jit_func", "delayed", 1):
@@ -87,7 +94,7 @@ def test_a_failure_is_not_cached():
 
 
 @pytest.mark.parametrize("siblings", [False, True])
-def test_concurrent_first_calls_run_it_once(siblings):
+def test_concurrent_first_calls_run_it_once_per_launcher(siblings):
     delayed, calls = _counting(_HOST)
     base = make_launcher(store, delayed=delayed)
     launchers = [base.__self__.bind() if siblings else base for _ in range(8)]
@@ -105,7 +112,7 @@ def test_concurrent_first_calls_run_it_once(siblings):
         t.start()
     for t in threads:
         t.join()
-    assert errors == [] and calls == [1]
+    assert errors == [] and calls == [1] * (8 if siblings else 1)
 
 
 def test_results_enter_module_identity():
@@ -136,7 +143,8 @@ def test_calling_itself_or_a_sibling_is_refused():
     box["k"] = make_launcher(store, delayed=delayed)
     box["sibling"] = box["k"].__self__.bind()
     assert box["k"](0, 0, 1, 0, 4) is None
-    assert len(seen) == 3 and all("while it was being built" in s for s in seen)
+    # k() and k.check() refused; sibling.check() runs delayed again, where all three are refused
+    assert len(seen) == 5 and all("while it was being built" in s for s in seen)
     assert box["sibling"](0, 0, 1, 0, 4) is None  # refused once, not poisoned
 
 

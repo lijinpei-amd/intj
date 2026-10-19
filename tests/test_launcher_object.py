@@ -117,8 +117,28 @@ def test_bind_on_a_built_launcher_returns_an_unbuilt_one():
     base = make_launcher(store, **_HOST)
     assert base(0, 0, 1, 0, 4) is None
     child = base.__self__.bind_device(0)
-    assert child.__self__._C_module is None and child.__self__._C_plan is None
+    assert child.__self__._C_module is None
     assert child(0, 1, 0, 4) is None and base(0, 0, 1, 0, 4) is None
+
+
+def test_check_is_a_dry_run():
+    delayed_calls = []
+
+    def delayed():
+        delayed_calls.append(1)
+        return _HOST
+
+    launch = make_launcher(store, delayed=delayed)
+    launch.__self__.check()
+    launch.__self__.check()
+    assert delayed_calls == [1, 1]
+    assert launch.__self__.options.delayed is delayed  # nothing stored
+    assert launch.__text_signature__ is None  # pyright: ignore[reportAttributeAccessIssue]  # a C function's
+    assert launch(0, 0, 1, 0, 4) is None and delayed_calls == [1, 1, 1]
+    assert launch.__self__.options.delayed is None
+    assert launch.__text_signature__ is not None  # pyright: ignore[reportAttributeAccessIssue]  # a C function's
+    launch.__self__.check()  # built: nothing runs
+    assert delayed_calls == [1, 1, 1]
 
 
 def test_launcher_object_is_not_instantiable():
