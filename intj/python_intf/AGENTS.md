@@ -101,9 +101,10 @@ are unsupported; the generated module declares this on CPython 3.12+.
 ## Compatibility helpers
 
 The C header supplies older interpreters with calls the runtime uses:
-vectorcall and `PyObject_CallMethodNoArgs` before 3.9, `Py_NewRef` before 3.10,
-and the raised-exception get/set functions before 3.12. This keeps version
-branches out of callers. Guard each shim by the version that added its call.
+vectorcall, `PyObject_VectorcallMethod` and `PyObject_CallMethodNoArgs` before
+3.9, `Py_NewRef` before 3.10, and the raised-exception get/set functions before
+3.12. This keeps version branches out of callers. Guard each shim by the
+version that added its call.
 
 Lazy launchers rely on CPython reading `PyCFunctionObject.m_ml->ml_meth` at
 every call, including from specialized call sites (3.11
@@ -128,7 +129,7 @@ live in the map and a put can move them; puts take it exclusive
 no lock: it is written once, before the module is reachable. The launcher
 object's members (`_C_options`, `_C_module`) are read under its critical
 section; `_C_set_options` and the build write `options` under it, and the build
-publishes `doc` once; `_init` stores `state` last, and
+publishes `doc` once; `_init` release-stores `state` last, and
 the shim then release-stores the entry. That order is untested on non-TSO hosts
 (aarch64). A cache miss checks again under the write lock before
 inserting its result because another thread may have filled the same key

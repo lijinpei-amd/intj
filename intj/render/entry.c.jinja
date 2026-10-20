@@ -111,6 +111,7 @@ typedef int32_t (*intj_device_get_t)(int32_t *device, int32_t ordinal);
 typedef struct {
   PyTypeObject *tensor_type;
   PyTypeObject *param_type;
+  PyObject *compile_name;
   intj_torch_abi abi;
   intj_launch_t launch;
 {% if fixed_device %}  intj_device_get_t device_get;
@@ -606,28 +607,25 @@ static PyObject *intj_launch_error(intj_state *st, int32_t status) {
  * thread may fill this key meanwhile, and the put rechecks. */
 static int intj_fill(intj_state *st, intj_bound_launcher *bound,
                      const uint64_t *key, int np, int64_t device_ordinal,
-                     PyObject *const *call_args) {
-  (void)st;
-  /* set by _init before the state block was published; only release drops it */
-  PyObject *cb = Py_NewRef(bound->compile_cb);
+                     PyObject *const *call_args, PyObject *launcher) {
   PyObject *blob = PyBytes_FromStringAndSize((const char *)key, INTJ_KEY_BYTES);
   PyObject *nparams_obj = blob ? PyLong_FromLong(np) : NULL;
   PyObject *device_obj = nparams_obj ? PyLong_FromLongLong(device_ordinal) : NULL;
   if (!device_obj) {
     Py_XDECREF(blob);
     Py_XDECREF(nparams_obj);
-    Py_DECREF(cb);
     return -1;
   }
   /* call_args: the dynamic values, then the public kernel arguments */
-  PyObject *cb_args[3 + INTJ_NDYN + INTJ_NPARAMS];
-  cb_args[0] = blob;
-  cb_args[1] = nparams_obj;
-  cb_args[2] = device_obj;
+  PyObject *cb_args[4 + INTJ_NDYN + INTJ_NPARAMS];
+  cb_args[0] = launcher;
+  cb_args[1] = blob;
+  cb_args[2] = nparams_obj;
+  cb_args[3] = device_obj;
   for (int i = 0; i < INTJ_NDYN + INTJ_NPARAMS; i++)
-    cb_args[3 + i] = call_args[i];
-  PyObject *res = PyObject_Vectorcall(cb, cb_args, 3 + INTJ_NDYN + INTJ_NPARAMS, NULL);
-  Py_DECREF(cb);
+    cb_args[4 + i] = call_args[i];
+  PyObject *res = PyObject_VectorcallMethod(st->compile_name, cb_args,
+                                            4 + INTJ_NDYN + INTJ_NPARAMS, NULL);
   Py_DECREF(blob);
   Py_DECREF(nparams_obj);
   Py_DECREF(device_obj);
@@ -759,7 +757,8 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_bound_launcher *bound,
                                  const uint64_t *key,
                                  int np, int64_t device_ordinal, uint64_t stream,
                                  uint32_t gx, uint32_t gy, uint32_t gz,
-                                 PyObject *const *args, int64_t *comp, int64_t *dep) {
+                                 PyObject *const *args, int64_t *comp, int64_t *dep,
+                                 PyObject *launcher) {
 {% if grid_cpp_source %}
   PyObject *controls = PyTuple_New({{ grid_count }});
   if (!controls)
@@ -784,14 +783,15 @@ static PyObject *intj_tuned_fill(intj_state *st, intj_bound_launcher *bound,
     return NULL;
   }
   /* after the controls: the dynamic values, then the public kernel arguments */
-  PyObject *cb_args[5 + INTJ_NDYN + INTJ_NPARAMS];
-  cb_args[0] = blob; cb_args[1] = nparams_obj; cb_args[2] = device_obj;
-  cb_args[3] = stream_obj; cb_args[4] = controls;
+  PyObject *cb_args[6 + INTJ_NDYN + INTJ_NPARAMS];
+  cb_args[0] = launcher;
+  cb_args[1] = blob; cb_args[2] = nparams_obj; cb_args[3] = device_obj;
+  cb_args[4] = stream_obj; cb_args[5] = controls;
   for (int i = 0; i < INTJ_NDYN + INTJ_NPARAMS; i++)
-    cb_args[5 + i] = args[{{ grid_count }} + i];
-  PyObject *cb = Py_NewRef(bound->compile_cb);
-  PyObject *res = PyObject_Vectorcall(cb, cb_args, 5 + INTJ_NDYN + INTJ_NPARAMS, NULL);
-  Py_DECREF(cb); Py_DECREF(blob); Py_DECREF(nparams_obj);
+    cb_args[6 + i] = args[{{ grid_count }} + i];
+  PyObject *res = PyObject_VectorcallMethod(st->compile_name, cb_args,
+                                            6 + INTJ_NDYN + INTJ_NPARAMS, NULL);
+  Py_DECREF(blob); Py_DECREF(nparams_obj);
   Py_DECREF(device_obj); Py_DECREF(stream_obj); Py_DECREF(controls);
   if (!res)
     return NULL;
@@ -1071,7 +1071,7 @@ static INTJ_ALWAYS_INLINE int intj_parse_call(intj_state *st,
 static PyObject *intj_call(intj_state *st,
                            int64_t device_ordinal, uint64_t stream,
                            PyObject *const *args, Py_ssize_t nargs,
-                           intj_bound_launcher *bound) {
+                           intj_bound_launcher *bound, PyObject *launcher) {
   (void)nargs;
   PyObject *const *dyn = args + {{ grid_count }};
   PyObject *const *kargs = dyn + INTJ_NDYN;
@@ -1141,7 +1141,7 @@ static PyObject *intj_call(intj_state *st,
     if (missed < 0)
       return NULL;
     return intj_tuned_fill(st, bound, key, np, device_ordinal, stream,
-                           gx, gy, gz, args, comp, dep);
+                           gx, gy, gz, args, comp, dep, launcher);
   }
   (void)dep;
 {% if grid_py_mode %}
@@ -1181,7 +1181,7 @@ static PyObject *intj_call(intj_state *st,
 {% endif %}
   if (INTJ_UNLIKELY(!kernel)) {
     INTJ_RWUNLOCK(&bound->lock);
-    if (intj_fill(st, bound, key, np, device_ordinal, dyn) != 0)
+    if (intj_fill(st, bound, key, np, device_ordinal, dyn, launcher) != 0)
       return NULL;
     INTJ_RDLOCK(&bound->lock);
 {% if nwords %}
@@ -1252,7 +1252,7 @@ static PyObject *intj_bound_entry(PyObject *self, PyObject *const *args,
   try {
 #endif
     result = intj_call(st, device, stream, args + {{ lead_args }},
-                        nargs - {{ lead_args }}, bound);
+                        nargs - {{ lead_args }}, bound, self);
 #ifdef __cplusplus
   } catch (const std::bad_alloc &) {
     PyErr_NoMemory();
@@ -1273,7 +1273,7 @@ static int intj_traverse_state(void *state, visitproc visit, void *arg) {
   /* `_intj_lazy` visits the type and the object's members; never twice */
   Py_VISIT(bound->grid_py);
   Py_VISIT(bound->grid_hidden);
-  Py_VISIT(bound->compile_cb);
+  Py_VISIT(bound->compile_state);
   Py_VISIT(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_VISIT(bound->memo[k].obj);
@@ -1303,7 +1303,7 @@ static void intj_release(void *state) {
   intj_bound_launcher *bound = (intj_bound_launcher *)state;
   Py_CLEAR(bound->grid_py);
   Py_CLEAR(bound->grid_hidden);
-  Py_CLEAR(bound->compile_cb);
+  Py_CLEAR(bound->compile_state);
   Py_CLEAR(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_CLEAR(bound->memo[k].obj);
@@ -1336,16 +1336,21 @@ static PyObject *intj_spec_key(void *state, PyObject *const *args, Py_ssize_t na
 {% if tuned %}
 static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t nargs);
 {% endif %}
-static const intj_launcher_ops intj_ops = {intj_traverse_state, intj_release, intj_spec_key,
-                                           {{ 'intj_key_chain' if tuned else 'NULL' }}};
+static PyObject *intj_compile_state(void *state) {
+  return Py_NewRef(((intj_bound_launcher *)state)->compile_state);
+}
 
-/* _init(launcher, callback, interner, [grid_py, fixed values], [device], *bound)
+static const intj_launcher_ops intj_ops = {intj_traverse_state, intj_release, intj_spec_key,
+                                           {{ 'intj_key_chain' if tuned else 'NULL' }},
+                                           intj_compile_state};
+
+/* _init(launcher, compile_state, interner, [grid_py, fixed values], [device], *bound)
  * -> the entry's address.  Allocates and fills the launcher's state block, then
  * publishes it.  On failure the launcher is left unbuilt, so its next call
  * retries.
- * `callback` is this launcher's miss callback: the tuned callback, or a
- * per-launcher wrapper of the module's compile function.  `interner` is the
- * launcher's own intern table: object value -> id, or None if unsupported. */
+ * `compile_state` is the Python state used by Launcher._compile_miss.
+ * `interner` is the launcher's own intern table: object value -> id, or None
+ * if unsupported. */
 static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   intj_bound_launcher *bound = NULL;
@@ -1361,11 +1366,7 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
     PyErr_SetString(PyExc_TypeError, "intj: _init needs an unbuilt launcher");
     return NULL;
   }
-  PyObject *callback = args[1];
-  if (!PyCallable_Check(callback)) {
-    PyErr_SetString(PyExc_TypeError, "intj: _init needs the launcher's miss callback");
-    return NULL;
-  }
+  PyObject *compile_state = args[1];
   PyObject *interner = args[2];
   if (!PyCallable_Check(interner)) {
     PyErr_SetString(PyExc_TypeError, "intj: _init needs the launcher's interner");
@@ -1401,7 +1402,7 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
 #ifdef __cplusplus
   try {
 #endif
-    bound->compile_cb = Py_NewRef(callback);
+    bound->compile_state = Py_NewRef(compile_state);
     bound->intern = Py_NewRef(interner);
     {
       /* optional: the type the object table keys by `name` (tl.dtype) */
@@ -1479,7 +1480,8 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
     Py_BEGIN_CRITICAL_SECTION((PyObject *)h);
     h->module = Py_NewRef(self);
     Py_END_CRITICAL_SECTION();
-    h->state = bound; /* last: the entry reads it first */
+    /* Last: the entry and _C_compile_state read it with acquire ordering. */
+    __atomic_store_n(&h->state, bound, __ATOMIC_RELEASE);
     return entry;
 #ifdef __cplusplus
   } catch (const std::bad_alloc &) {
@@ -1763,6 +1765,9 @@ static int intj_exec(PyObject *m) {
   }
   st->tensor_type = (PyTypeObject *)tensor;
   st->param_type = (PyTypeObject *)parameter;
+  st->compile_name = PyUnicode_InternFromString("_compile_miss");
+  if (!st->compile_name)
+    return -1;
 
   if (intj_intern_names() != 0)
     return -1;
@@ -1802,6 +1807,7 @@ static int intj_traverse(PyObject *m, visitproc visit, void *arg) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
   Py_VISIT(st->tensor_type);
   Py_VISIT(st->param_type);
+  Py_VISIT(st->compile_name);
   return 0;
 }
 
@@ -1809,6 +1815,7 @@ static int intj_clear(PyObject *m) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
   Py_CLEAR(st->tensor_type);
   Py_CLEAR(st->param_type);
+  Py_CLEAR(st->compile_name);
   return 0;
 }
 

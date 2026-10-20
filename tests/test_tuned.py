@@ -80,6 +80,36 @@ def test_tunes_on_miss_and_launches_natively_on_hit():
     assert bench.calls == [1, 2, 1, 2], "a hit must not reach Triton"
 
 
+def test_tuned_misses_dispatch_through_launcher_method(monkeypatch):
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    bench = Bench(out, {16: {1: 1.0, 2: 2.0}, 64: {1: 2.0, 2: 1.0}})
+    _, launch = tuned_launcher(bench)
+    device, stream = controls()
+    bench.key = 16
+    launch(device, stream, x, out, 16)
+    cls = type(launch.__self__)
+    original = getattr(cls, "_compile_miss", None)
+    assert original is not None, "tuned misses must dispatch through Launcher"
+
+    def refuse(self, *call):
+        raise RuntimeError("compile method refused the tuned miss")
+
+    monkeypatch.setattr(cls, "_compile_miss", refuse)
+    out.zero_()
+    launch(device, stream, x, out, 16)
+    torch.cuda.synchronize()
+    assert out[0].item() == 1 and bench.calls == [1, 2]
+    bench.key = 64
+    with pytest.raises(RuntimeError, match="compile method refused"):
+        launch(device, stream, x, out, 64)
+    assert bench.calls == [1, 2]
+    monkeypatch.setattr(cls, "_compile_miss", original)
+    launch(device, stream, x, out, 64)
+    torch.cuda.synchronize()
+    assert out[0].item() == 2 and bench.calls == [1, 2, 1, 2]
+
+
 def test_autotune_miss_does_not_retain_call_tensors():
     """An autotune miss does not keep its argument tensors alive.
 
@@ -414,18 +444,13 @@ def test_tuned_callback_block_dim_zero_is_refused(monkeypatch):
     """
     import intj.tuning as tuning_mod
 
-    original = tuning_mod.make_tuned_callback
+    original = tuning_mod.TunedCompileState.run
 
-    def zeroed(*args, **kwargs):
-        cb = original(*args, **kwargs)
+    def zeroed(self, *args):
+        function, _block_dim, shared, nparams, *rest = original(self, *args)
+        return (function, 0, shared, nparams, *rest)
 
-        def wrapped(*a, **k):
-            function, _block_dim, shared, nparams, *rest = cb(*a, **k)
-            return (function, 0, shared, nparams, *rest)
-
-        return wrapped
-
-    monkeypatch.setattr(tuning_mod, "make_tuned_callback", zeroed)
+    monkeypatch.setattr(tuning_mod.TunedCompileState, "run", zeroed)
 
     x = torch.zeros(64, device="cuda", dtype=torch.int32)
     out = torch.zeros_like(x)

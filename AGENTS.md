@@ -87,8 +87,16 @@ return value only), renders, and returns `(entry, resolved options, doc)` for
 C to publish before it swaps the entry in. The
 module's `_init` allocates the launcher's state block behind `state` and
 installs the `traverse`/`release` ops GC and dealloc reach it through. All
-mutable launch state (cache, lock, miss callback) is the launcher's; the
+mutable launch state (cache, lock, Python compile state) is the launcher's; the
 module's C state is written once, at load.
+
+The rendered C miss path calls `Launcher._compile_miss` by name through the
+Python C API. `_init` stores its Python state in the launcher's state block,
+exposed by `_C_compile_state`: the per-launcher specialization check map and,
+when tuned, a private `TunedCompileState`. Ordinary misses look up the module's
+`_intj_compile` each time, preserving compile overrides and the shared compiled
+kernel cache. Tuned misses run their private chain, including the final launch;
+C caches the record without launching it again. A cache hit skips this method.
 
 ## The kernel cache is swappable, and intj's own is the default
 

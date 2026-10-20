@@ -128,6 +128,18 @@ static INTJ_ALWAYS_INLINE int intj_as_int(PyObject *o, uint64_t *out) {
 #if PY_VERSION_HEX < 0x030C0000
 #if PY_VERSION_HEX < 0x03090000
 #define PyObject_Vectorcall _PyObject_Vectorcall
+static inline PyObject *PyObject_VectorcallMethod(PyObject *name,
+                                                  PyObject *const *args,
+                                                  size_t nargsf,
+                                                  PyObject *kwnames) {
+  PyObject *method = PyObject_GetAttr(args[0], name);
+  if (!method)
+    return NULL;
+  PyObject *result = PyObject_Vectorcall(
+      method, args + 1, PyVectorcall_NARGS(nargsf) - 1, kwnames);
+  Py_DECREF(method);
+  return result;
+}
 static inline PyObject *PyObject_CallMethodNoArgs(PyObject *self,
                                                   PyObject *name) {
   return PyObject_CallMethodObjArgs(self, name, NULL);

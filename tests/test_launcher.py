@@ -266,14 +266,16 @@ def _launcher_module(launcher):
 
 def _launcher_over(module):
     """A built, binding-free launcher of `module`, for its `_C_spec_key`."""
-    from intj.launcher import _Interner, _launcher_compile, _stub
+    from intj.launcher import Launcher, _CompileState, _Interner, _stub
 
     stub = _stub()
 
     def build(h):
-        return module._init(h, _launcher_compile(module), _Interner()), None, b""
+        return module._init(h, _CompileState(), _Interner()), None, b""
 
-    cls = type("Over", (stub.Launcher,), {"__slots__": (), "_build_body": build})
+    cls = type(
+        "Over", (Launcher, stub.Launcher), {"__slots__": (), "_build_body": build}
+    )
     launch = stub.new_launcher(cls, None)
     launch.__self__._C_build()
     return launch

@@ -326,87 +326,96 @@ def c_scalar(name: str, value: object) -> object:
     )
 
 
-def make_tuned_callback(
-    plan: TuningPlan,
-    resolved: tuple[Any, ...],
-    options: Mapping[str, Any],
-    grid: TunedGrid,
-    render: Any,
-    return_compiled: bool,
-    knob_values: Mapping[str, object],
-    dynamic: Sequence[str] = (),
-) -> Callable[..., tuple[Any, ...]]:
-    """Returns the C miss callback for one bound launcher.
+class TunedCompileState:
+    """One launcher's private tuning chain and candidate compile cache."""
 
-    The callback owns private copies of the plan's tuners, runs Triton's
-    tuning through them on a miss, and returns the record C caches. Its
-    arguments after the grid controls are the dynamic values, then the public
-    arguments. Misses are serialized; re-entering it while tuning raises
-    `UnsupportedKernel`.
-    """
-    from .backend import canonical_options, current_device, current_target
-    from .launcher import (
-        Param,
-        _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _split_dynamic,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-    )
+    def __init__(
+        self,
+        plan: TuningPlan,
+        resolved: tuple[Any, ...],
+        options: Mapping[str, Any],
+        grid: TunedGrid,
+        render: Any,
+        knob_values: Mapping[str, object],
+        dynamic: Sequence[str] = (),
+    ) -> None:
+        from .backend import current_target
+        from .launcher import (
+            Param,
+            _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        )
 
-    del return_compiled  # C decides whether the record keeps the object
-    jit_func = plan.jit_func
-    target = current_target()
-    backend = _imports.make_backend(target)
-    # every parameter public: the shim sees the full call Triton makes
-    params = tuple(Param(p.name, p.index, p.index, p.annotation) for p in resolved)
-    # keeps every CompiledKernel alive; a CompiledKernel is loaded on one device
-    compiled: dict[tuple[Any, str, tuple[tuple[str, object], ...], int], Any] = {}
-    # this miss's declared knob values; misses are serialized by `lock`
-    call_knobs: list[dict[str, object]] = [{}]
-    # passed, baked or tuned alike: Triton's layers pass a tuned one by keyword
-    fed = _parameter_options(backend, params)
+        self.plan = plan
+        self.jit_func = plan.jit_func
+        self.target = current_target()
+        self.backend = _imports.make_backend(self.target)
+        self.options = options
+        self.grid = grid
+        self.render = render
+        self.knob_values = knob_values
+        self.dynamic = dynamic
+        # Every parameter is public: the shim sees the full Triton call.
+        self.params = tuple(
+            Param(p.name, p.index, p.index, p.annotation) for p in resolved
+        )
+        # A CompiledKernel is loaded on one device; keep candidates alive.
+        self.compiled: dict[
+            tuple[Any, str, tuple[tuple[str, object], ...], int], Any
+        ] = {}
+        self.call_knobs: dict[str, object] = {}
+        self.fed = _parameter_options(self.backend, self.params)
+        self.shim = _Shim(self.jit_func, self._compile_kernel)
+        self.private = _private_chain(plan.layers, self.shim)
+        self.public = [
+            p.name
+            for p in resolved
+            if not p.annotation.baked_value and not p.annotation.tuned
+        ]
+        self.baked = {p.name: p.baked for p in resolved if p.annotation.baked_value}
+        self.lock = threading.RLock()
+        self.running = False
 
-    def compile_kernel(values: dict[str, Any], config_options: dict[str, Any]) -> Any:
+    def _compile_kernel(
+        self, values: dict[str, Any], config_options: dict[str, Any]
+    ) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
+        from .backend import canonical_options, current_device
+        from .launcher import (
+            _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        )
+
         canonical = canonical_options(
-            target,
+            self.target,
             _knob_options(
-                jit_func,
-                {**options, **config_options, **{n: values[n] for n in fed}},
-                {**knob_values, **call_knobs[0]},
+                self.jit_func,
+                {**self.options, **config_options, **{n: values[n] for n in self.fed}},
+                {**self.knob_values, **self.call_knobs},
             ),
         )
         compiler_input = _compiler_input(
-            jit_func, params, [values[p.name] for p in params], backend
+            self.jit_func,
+            self.params,
+            [values[p.name] for p in self.params],
+            self.backend,
         )
         # knobs feeding no option change the binary too
         key = (
             compiler_input,
             canonical.hash(),
-            tuple(sorted(call_knobs[0].items())),
+            tuple(sorted(self.call_knobs.items())),
             current_device(),
         )
-        kernel = compiled.get(key)
+        kernel = self.compiled.get(key)
         if kernel is None:
-            kernel = compiled[key] = _checked_compile(
-                jit_func, compiler_input, target, canonical
+            kernel = self.compiled[key] = _checked_compile(
+                self.jit_func, compiler_input, self.target, canonical
             )
         return kernel
 
-    shim = _Shim(jit_func, compile_kernel)
-    private = _private_chain(plan.layers, shim)
-    public = [
-        p.name
-        for p in resolved
-        if not p.annotation.baked_value and not p.annotation.tuned
-    ]
-    baked = {p.name: p.baked for p in resolved if p.annotation.baked_value}
-    lock = threading.RLock()
-    running = [False]
-
-    def callback(
+    def run(
+        self,
         keyblob: bytes,
         nparams: int,
         device: int,
@@ -416,21 +425,32 @@ def make_tuned_callback(
     ) -> tuple[Any, ...]:
         """Tunes for one miss under `lock`, refusing re-entry."""
         del keyblob
-        with lock:
-            if running[0]:
+        with self.lock:
+            if self.running:
                 raise UnsupportedKernel(
                     "intj: a tuned launcher was re-entered while tuning"
                 )
-            running[0] = True
+            self.running = True
             try:
-                return tune(nparams, device, stream, controls, args)
+                return self._tune(nparams, device, stream, controls, args)
             finally:
-                running[0] = False
+                self.running = False
 
-    def tune(
-        nparams: int, device: int, stream: int, controls: Any, args: tuple[Any, ...]
+    def _tune(
+        self,
+        nparams: int,
+        device: int,
+        stream: int,
+        controls: Any,
+        args: tuple[Any, ...],
     ) -> tuple[Any, ...]:
         """Runs the private chain on `stream` and returns the record for C."""
+        from .backend import current_device
+        from .launcher import (
+            _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _split_dynamic,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+        )
+
         _imports.ensure_torch_imported()
         current = current_device()
         if device != current:
@@ -438,42 +458,42 @@ def make_tuned_callback(
                 f"intj: launching on device {device} while device {current} is current; "
                 "make the target device current before the first launch"
             )
-        dyn_values, args = args[: len(dynamic)], args[len(dynamic) :]
-        dyn_options, dyn_knobs = _split_dynamic(dynamic, dyn_values)
+        dyn_values, args = args[: len(self.dynamic)], args[len(self.dynamic) :]
+        dyn_options, dyn_knobs = _split_dynamic(self.dynamic, dyn_values)
         _check_live_knobs(dyn_knobs)
-        call_knobs[0] = dyn_knobs
-        named = {**dict(zip(public, args)), **baked}
+        self.call_knobs = dyn_knobs
+        named = {**dict(zip(self.public, args)), **self.baked}
         # Positional up to the first tuned parameter, as a Triton caller would
         # write it: prune functions read `named_args`, which is positional only.
         prefix: list[Any] = []
-        for name in jit_func.arg_names:
-            if name in plan.tuned:
+        for name in self.jit_func.arg_names:
+            if name in self.plan.tuned:
                 break
             prefix.append(named.pop(name))
-        if grid.mode == "dims":
+        if self.grid.mode == "dims":
             if not all(controls):
                 raise ValueError("intj: cannot tune on a zero-volume grid")
             triton_grid: Any = controls
-        elif grid.mode == "cpp":
-            extras = dict(zip(grid.extras, controls))
+        elif self.grid.mode == "cpp":
+            extras = dict(zip(self.grid.extras, controls))
 
             def cpp_grid(meta: dict[str, Any]) -> Any:
-                return grid.fn(*[meta[n] for n in grid.positional], **extras)
+                return self.grid.fn(*[meta[n] for n in self.grid.positional], **extras)
 
             triton_grid = cpp_grid
         else:
-            triton_grid = grid.fn
-        shim.reset()
+            triton_grid = self.grid.fn
+        self.shim.reset()
         try:
             # option values reach every config through the shim's kwargs
             cuda = _imports.torch.cuda
             with cuda.stream(cuda.ExternalStream(stream, device=device)):
-                private[0].run(
+                self.private[0].run(
                     *prefix, grid=triton_grid, warmup=False, **named, **dyn_options
                 )
-            _copy_back(plan.layers, private)
-            assert shim.final is not None, "Triton finished without a final launch"
-            values, config_options, kernel = shim.final
+            _copy_back(self.plan.layers, self.private)
+            assert self.shim.final is not None, "Triton finished without a final launch"
+            values, config_options, kernel = self.shim.final
             tuned_values = {**values, **config_options}
             md = kernel.metadata
             expected = sum(
@@ -490,10 +510,10 @@ def make_tuned_callback(
                 md.shared,
                 nparams,
                 kernel,
-                tuple(c_scalar(n, tuned_values[n]) for n in render.dep_names),
-                tuple(tuned_values[n] for n in render.computed_names),
-                tuple(values[n] for n in render.meta_names)
-                if grid.mode == "py"
+                tuple(c_scalar(n, tuned_values[n]) for n in self.render.dep_names),
+                tuple(tuned_values[n] for n in self.render.computed_names),
+                tuple(values[n] for n in self.render.meta_names)
+                if self.grid.mode == "py"
                 else None,
             )
         finally:
@@ -504,12 +524,10 @@ def make_tuned_callback(
             # post_hook that never runs for a single matching config. `private`
             # outlives this call (it is reused for every future miss), so leaving
             # either set keeps this call's tensors alive until the next miss.
-            shim.final = None
-            call_knobs[0] = {}
-            for layer in private:
+            self.shim.final = None
+            self.call_knobs = {}
+            for layer in self.private:
                 if type(layer) is _imports.Autotuner:
                     layer.nargs = None
                     # set by a closure in Autotuner.__init__
                     layer.restore_copies = {}
-
-    return callback

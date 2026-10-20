@@ -845,8 +845,8 @@ struct intj_launcher_state {
   /* Cold. */
   /* callable(value) -> id or None: this launcher's intern table */
   PyObject *intern;
-  /* this launcher's miss callback (the tuned callback if tuned) */
-  PyObject *compile_cb;
+  /* Python state used by this launcher's _compile_miss method */
+  PyObject *compile_state;
   intj_rwlock lock; /* guards this launcher's cache, memos and intern writes */
   PyObject *grid_py;
   PyObject *grid_hidden;

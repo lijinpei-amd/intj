@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     from typing_extensions import Unpack
 
     from .grid import GridCode
+    from .tuning import TunedCompileState
 
 
 class UnsupportedKernel(NotImplementedError):
@@ -542,6 +543,14 @@ def _check_binding(
     return binding, state, args, hidden, doc
 
 
+@dataclasses.dataclass
+class _CompileState:
+    """One launcher's specialization checks and optional private tuning state."""
+
+    seen: dict[bytes, object] = dataclasses.field(default_factory=dict)
+    tuned: TunedCompileState | None = None
+
+
 class Launcher:
     """A launcher's object: `k.__self__` for `k = make_launcher(...)`.
 
@@ -563,6 +572,8 @@ class Launcher:
         def _C_options(self) -> MakeLauncherOption: ...
         @property
         def _C_module(self) -> types.ModuleType | None: ...
+        @property
+        def _C_compile_state(self) -> _CompileState: ...
         @property
         def _C_built(self) -> bool: ...
         def _C_build(self) -> types.ModuleType: ...
@@ -783,10 +794,9 @@ class Launcher:
                 b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
             )
         module = _materialize_module(b)
-        if b.tuned is None:
-            callback: Callable[..., Any] = _launcher_compile(module)
-        else:
-            from .tuning import TunedGrid, make_tuned_callback
+        compile_state = _CompileState()
+        if b.tuned is not None:
+            from .tuning import TunedCompileState, TunedGrid
 
             assert b.tuned.render is not None and b.knob_values is not None
             if b.grid_py is not None:
@@ -801,19 +811,34 @@ class Launcher:
                 )
             else:
                 grid = TunedGrid("dims")
-            callback = make_tuned_callback(
+            compile_state.tuned = TunedCompileState(
                 b.tuned.plan,
                 b.params,
                 dict(b.compile_options),
                 grid,
                 b.tuned.render,
-                b.return_compiled,
                 b.knob_values,
                 b.dynamic,
             )
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
-        address = module._init(self, callback, _Interner(), *grid_py, *b.args)
+        address = module._init(self, compile_state, _Interner(), *grid_py, *b.args)
         return address, option, b.doc
+
+    def _compile_miss(self, *call: Any) -> Any:
+        """Returns the kernel record for a C cache miss.
+
+        Ordinary misses pass `(keyblob, nparams, device, *args)`; tuned misses
+        also pass `stream` and grid controls before `args`. Dynamic values
+        precede public kernel arguments. Tuning performs the final launch;
+        an ordinary miss leaves that launch to C.
+        """
+        state = self._C_compile_state
+        if state.tuned is not None:
+            return state.tuned.run(*call)
+        module = self._C_module
+        assert module is not None, "compile misses require an initialized launcher"
+        # Read per miss so override_compile reaches already built launchers.
+        return getattr(module, "_intj_compile")(state.seen, *call)
 
 
 class LaunchFunction(Protocol):
@@ -2153,21 +2178,6 @@ def _refuse_module_compile(*args: Any) -> Any:
     raise RuntimeError("intj: tuned modules compile through their bound launcher")
 
 
-def _launcher_compile(module: types.ModuleType) -> Callable[..., Any]:
-    """Returns one launcher's miss callback over the module's compile function.
-
-    The callback passes its own `seen` map, then the call, to the module's
-    compile function, looked up per miss so `override_compile` reaches built
-    launchers too.
-    """
-    seen: dict[bytes, object] = {}
-
-    def callback(*call: Any) -> Any:
-        return getattr(module, "_intj_compile")(seen, *call)
-
-    return callback
-
-
 def override_compile(module: types.ModuleType, fn: Callable[..., Any]) -> Any:
     """Makes `module`'s launchers compile misses with `fn`; for tests and benchmarks.
 
@@ -2201,8 +2211,8 @@ def _make_compile_callback(
 ]:
     """Returns the module's compile function.
 
-    It is called from C on a spec-key miss through the missing launcher's
-    callback: `(seen, keyblob, nparams, device, *args)`, `args` being the
+    It is called on a spec-key miss through the missing launcher's
+    `_compile_miss`: `(seen, keyblob, nparams, device, *args)`, `args` being the
     dynamic values, then the public arguments.
     """
     target = backends.current_target()
