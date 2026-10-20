@@ -94,7 +94,7 @@ def callback(iters: int, batches: int) -> None:
     def compile_callback(_key, nparams, _device, *_args):
         nonlocal count
         count += 1
-        return 0, 1, 0, nparams  # fake handle: no_gpu skips the driver launch
+        return 0, 1, 0, nparams  # fake handle: the host driver launches nothing
 
     override_compile(module, compile_callback)
     for i in range(100):

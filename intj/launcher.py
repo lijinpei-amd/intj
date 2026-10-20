@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import abc
 import dataclasses
 import functools
 import inspect
@@ -24,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from . import _imports, lazy
+from . import backend as backends
 from ._version import __version__
 from .annotation import (
     CanonicalAnnotation,
@@ -972,10 +972,10 @@ def make_launcher(
 def _materialize_module(b: _BuildOptions) -> types.ModuleType:
     """Returns the loaded module for this kernel and configuration.
 
-    Queries the target (unless `no_gpu`), and loads, building if needed, the
-    module for its `RenderKey`.  `torch_access_request` is what
-    `torch_access_mode` was resolved from, for choosing again where a build
-    finds STATIC_COMPILE unavailable after all.
+    Selects the backend and its target (`no_gpu`'s is `HOST`, with none), and
+    loads, building if needed, the module for its `RenderKey`.
+    `torch_access_request` is what `torch_access_mode` was resolved from, for
+    choosing again where a build finds STATIC_COMPILE unavailable after all.
 
     Raises:
         UnsupportedKernel: The target's backend is not registered, a
@@ -985,24 +985,15 @@ def _materialize_module(b: _BuildOptions) -> types.ModuleType:
     options = dict(b.compile_options)
     knob_values = b.knob_values
     tuning = b.tuned.render if b.tuned is not None else None
-    if b.no_gpu:
-        target = None
-        backend = None
-        canonical_options = None
-    else:
-        target = _current_target()
-        backend = BACKENDS.get(target.backend)
-        if backend is None:
-            raise UnsupportedKernel(
-                f"intj: backend {target.backend!r} is unknown; subclass intj.launcher.Backend and "
-                f"register() it (have: {', '.join(sorted(BACKENDS))})"
-            )
+    backend, target = backends.select(b.no_gpu)
+    canonical_options = None
+    if target is not None:
         assert knob_values is not None, "GPU builds read knobs at the first call"
-        canonical_options = _canonical_options(
+        canonical_options = backends.canonical_options(
             target, _knob_options(b.jit_func, options, knob_values)
         )
         # the names only: each value is canonicalized on its own miss
-        _refuse_unknown_options(
+        backends.refuse_unknown_options(
             canonical_options,
             [n for n in b.dynamic if not n.startswith("knobs.")]
             + list(b.declared_parameters),
@@ -1035,18 +1026,17 @@ def _materialize_module(b: _BuildOptions) -> types.ModuleType:
         device_binding=b.device_binding,
         device_offset=device_offset,
         verify_annotation=b.verify_annotation,
-        no_gpu=b.no_gpu,
         max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
         # after the knob is flipped back on.
-        spec_pointer_range=1 if backend is not None and backend.pointer_range else 0,
-        driver_path=backend.library_path() if backend is not None else "",
-        launch_symbol=backend.launch_symbol if backend is not None else "",
-        device_symbol=backend.device_symbol if backend is not None else "",
-        error_symbol=backend.error_symbol if backend is not None else "",
-        error_style=backend.error_style if backend is not None else "return",
+        spec_pointer_range=int(backend.pointer_range),
+        driver_path=backend.library_path(),
+        launch_symbol=backend.launch_symbol,
+        device_symbol=backend.device_symbol,
+        error_symbol=backend.error_symbol,
+        error_style=backend.error_style,
         # `_for_access` fills in these and `compiler`, `build_flags`
         torch_access_mode="",
         torch_version=None,
@@ -1084,6 +1074,21 @@ def _materialize_module(b: _BuildOptions) -> types.ModuleType:
     )
     baked_values = {p.index: p.baked for p in b.params if p.annotation.baked_value}
 
+    def compile_function() -> Callable[..., Any]:
+        if tuning is not None:
+            return _refuse_module_compile
+        if target is None:
+            return _make_host_compile_callback()
+        return _make_compile_callback(
+            b.jit_func,
+            params,
+            options,
+            baked_values,
+            return_compiled=b.return_compiled,
+            knob_values=knob_values or {},
+            dynamic=b.dynamic,
+        )
+
     def loaded(mode: TorchAccessMode) -> types.ModuleType:
         # the c++ mode gets it too, not to read from but to check its own
         # compiled-in offset against
@@ -1093,14 +1098,7 @@ def _materialize_module(b: _BuildOptions) -> types.ModuleType:
             else None
         )
         return _loaded_module(
-            _for_access(key, mode),
-            b.jit_func,
-            params,
-            options,
-            layout,
-            baked_values,
-            knob_values,
-            b.dynamic,
+            _for_access(key, mode), b.jit_func.__module__, layout, compile_function
         )
 
     try:
@@ -1497,21 +1495,18 @@ _LOAD_LOCK = threading.Lock()
 
 def _loaded_module(
     key: RenderKey,
-    jit_func: JitFunction,
-    params: Sequence[Param],
-    options: Mapping[str, Any],
+    kernel_module: str,
     layout: TensorABI | None,
-    baked_values: Mapping[int, object],
-    knob_values: Mapping[str, object] | None = None,
-    dynamic: tuple[str, ...] = (),
+    compile_function: Callable[[], Callable[..., Any]],
 ) -> types.ModuleType:
     """Returns the one module for `key`, loading it once per process.
 
-    Reusing the module reuses its compile function (`_intj_compile`), whose
-    compile cache owns the `CompiledKernel`s its launchers' records point
-    into -- installing a second one would drop the first, freeing kernels
-    whose function handles are still cached. So a hit returns the module
-    untouched.
+    `compile_function()` makes the module's compile function (`_intj_compile`),
+    called only by the load that installs it.  Reusing the module reuses that
+    function, whose compile cache owns the `CompiledKernel`s its launchers'
+    records point into -- installing a second one would drop the first,
+    freeing kernels whose function handles are still cached. So a hit returns
+    the module untouched.
 
     The lock matters: without it two threads both compile and both load, and the
     loser's module (with its own kernel cache) is silently dropped.
@@ -1519,30 +1514,14 @@ def _loaded_module(
     with _LOAD_LOCK:
         module = _LOADED.get(key)
         if module is None:
-            module = load(key, jit_func.__module__)
+            module = load(key, kernel_module)
             if module._header_size() != _stub()._header_size():
                 raise ImportError(
                     f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
                     "header; it was built by another intj -- delete it to rebuild"
                 )
             # the module object's dict, written once under _LOAD_LOCK; not C state
-            setattr(
-                module,
-                "_intj_compile",
-                _refuse_module_compile
-                if key.tuning is not None
-                else _make_host_compile_callback()
-                if key.no_gpu
-                else _make_compile_callback(
-                    jit_func,
-                    params,
-                    options,
-                    baked_values,
-                    return_compiled=key.return_compiled,
-                    knob_values=knob_values or {},
-                    dynamic=dynamic,
-                ),
-            )
+            setattr(module, "_intj_compile", compile_function())
             # Pass relative cdata; the compiled setter saves the absolute offset
             # for the torch running now before exposing the module.
             module._set_torch_version(
@@ -1552,129 +1531,6 @@ def _loaded_module(
             )
             _LOADED[key] = module
         return module
-
-
-class Backend(abc.ABC):
-    """How intj reaches one triton backend's driver API.
-
-    Everything backend-specific lives in a subclass; nothing else in intj, and
-    nothing in the template, branches on a backend name.  Supporting another
-    triton backend is a subclass plus a `register()` call, provided its driver
-    exposes a `cuLaunchKernel`-shaped launch entry point.
-    """
-
-    #: triton target backend name, i.e. `get_current_target().backend`
-    name: str
-    #: f(fn, gx,gy,gz, bx,by,bz, shared, stream, params, extra) -> error code
-    launch_symbol: str
-    #: f(int32_t *device, int32_t ordinal) -> error code
-    device_symbol: str
-    #: error-string lookup, called as `error_style` says
-    error_symbol: str
-    #: "return"   const char *f(int)
-    #: "outparam" int f(int, const char **)
-    error_style: str
-    #: backend specializes pointers on a 2 GiB range (AMD's "S" spec bit)
-    pointer_range: bool
-
-    @abc.abstractmethod
-    def library_path(self) -> str:
-        """Returns the driver dylib to dlopen -- the same one triton itself uses."""
-
-
-class HipBackend(Backend):
-    """The HIP driver API, for triton's AMD backend."""
-
-    name = "hip"
-    launch_symbol = "hipModuleLaunchKernel"
-    device_symbol = "hipDeviceGet"
-    error_symbol = "hipGetErrorString"
-    error_style = "return"
-    pointer_range = True
-
-    def library_path(self) -> str:
-        # private, but it is the resolution order triton itself launches through;
-        # imported here, as a triton built without the AMD backend lacks it
-        from triton.backends.amd import driver
-
-        return driver._get_path_to_hip_runtime_dylib()  # pyright: ignore[reportPrivateUsage]
-
-
-class CudaBackend(Backend):
-    """The CUDA driver API, for triton's NVIDIA backend.
-
-    Compile-checked only; untested on a GPU.
-    """
-
-    name = "cuda"
-    launch_symbol = "cuLaunchKernel"
-    device_symbol = "cuDeviceGet"
-    error_symbol = "cuGetErrorString"
-    error_style = "outparam"
-    pointer_range = False
-
-    def library_path(self) -> str:
-        return "libcuda.so.1"  # already mapped by torch, resolved through the normal search path
-
-
-BACKENDS: dict[str, Backend] = {}
-
-
-def register(backend: Backend) -> Backend:
-    """Makes `backend` usable by `make_launcher`, replacing any same-named one.
-
-    Returns:
-        `backend` itself.
-    """
-    BACKENDS[backend.name] = backend
-    return backend
-
-
-register(HipBackend())
-register(CudaBackend())
-
-
-def _current_target() -> Any:
-    """Returns the active triton target, which triton types as optional.
-
-    Raises:
-        UnsupportedKernel: There is no active target (no visible GPU).
-    """
-    _imports.ensure_triton_imported()
-    target = _imports.driver.active.get_current_target()
-    if target is None:
-        raise UnsupportedKernel("intj: no active triton target; is a GPU visible?")
-    return target
-
-
-def _current_device() -> int:
-    _imports.ensure_triton_imported()
-    # get_current_device() is on every concrete driver, just not on DriverBase
-    return _imports.driver.active.get_current_device()
-
-
-def _canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
-    """Runs `options` through the triton compiler backend's `parse_options`.
-
-    That fills in defaults and normalizes the odd fields (`extern_libs`,
-    `llvm_fn_attrs`, `warp_size`), so `{}` and `{"num_warps": 4}` reach the same
-    rendered module instead of building it twice.  It also rejects what the
-    backend rejects when the module is built, not on the first kernel compile.
-
-    `parse_options` ignores keys it does not know, so unknown ones are caught
-    here -- otherwise a typo would silently compile with the default.
-    """
-    _imports.ensure_triton_imported()
-    parsed: Any = _imports.make_backend(target).parse_options(dict(options))
-    _refuse_unknown_options(parsed, options)
-    return parsed
-
-
-def _refuse_unknown_options(parsed: Any, names: Iterable[str]) -> None:
-    """Refuses the names that are no field of `parsed` (triton's options)."""
-    unknown = set(names) - {f.name for f in dataclasses.fields(parsed)}
-    if unknown:
-        raise UnsupportedKernel(f"intj: unknown compile option(s) {sorted(unknown)}")
 
 
 #: options a launch fixes itself; never `options=` or `dynamic_options`
@@ -1863,9 +1719,9 @@ def _check_tuned_configs(
 
     Called on the first call, because the target is a GPU query.
     """
-    target = _current_target()
+    target = backends.current_target()
     for config_options in _config_options(plan, resolved):
-        _canonical_options(
+        backends.canonical_options(
             target,
             _knob_options(plan.jit_func, {**options, **config_options}, knob_values),
         )
@@ -2349,7 +2205,7 @@ def _make_compile_callback(
     callback: `(seen, keyblob, nparams, device, *args)`, `args` being the
     dynamic values, then the public arguments.
     """
-    target = _current_target()
+    target = backends.current_target()
     backend = _imports.make_backend(target)
     fed = {p.name: p for p in params if p.name in _parameter_options(backend, params)}
     options = {
@@ -2365,7 +2221,9 @@ def _make_compile_callback(
     fixed_options = (
         None
         if dynamic or per_call
-        else _canonical_options(target, _knob_options(jit_func, options, knob_values))
+        else backends.canonical_options(
+            target, _knob_options(jit_func, options, knob_values)
+        )
     )
     # The module's compile cache: a sibling launcher's miss reuses the kernel
     # and only builds its own C record.  With return_compiled the records own
@@ -2384,7 +2242,7 @@ def _make_compile_callback(
 
         `seen` is the calling launcher's own key -> input map.
         """
-        current = _current_device()
+        current = backends.current_device()
         if device != current:
             # _init_handles() loads the binary on the *current* device;
             # launching that function on another device's stream is a
@@ -2400,7 +2258,7 @@ def _make_compile_callback(
         canonical = (
             fixed_options
             if fixed_options is not None
-            else _canonical_options(
+            else backends.canonical_options(
                 target,
                 _knob_options(
                     jit_func,
@@ -2454,6 +2312,6 @@ def triton_specialization(
     jit_func: JitFunction, args: Iterable[Any], options: Mapping[str, Any] | None = None
 ) -> list[tuple[str, Any]]:
     """Returns the `list[(type_str, key)]` triton would compute for these arguments."""
-    binder = jit_func.device_caches[_current_device()][4]
+    binder = jit_func.device_caches[backends.current_device()][4]
     kwargs = _knob_options(jit_func, options or {}, _live_knobs())
     return binder(*args, **kwargs)[1]

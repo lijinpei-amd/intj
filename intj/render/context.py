@@ -181,7 +181,6 @@ class RenderContext:
     module_name: str
     kernel_repr: str
     nwords: int  # spec-key length, in uint64 words
-    no_gpu: bool
     spec_pointer_range: int
     driver_path: str
     launch_symbol: str
@@ -204,7 +203,6 @@ class RenderContext:
     bound_params: tuple[ParamView, ...]
     dynamic: tuple[DynamicView, ...]
     fixed_device: bool
-    device_get: bool  # resolves the driver's device lookup
     tuned: bool
     tuned_meta: bool  # records hold the tuned values, for grid_py
     tuned_level0: bool  # level 0 keys computed values too
@@ -309,7 +307,6 @@ class RenderContext:
             module_name=key.module_name,
             kernel_repr=key.kernel_repr,
             nwords=key.nwords,
-            no_gpu=key.no_gpu,
             spec_pointer_range=key.spec_pointer_range,
             driver_path=key.driver_path,
             launch_symbol=key.launch_symbol,
@@ -330,7 +327,6 @@ class RenderContext:
             bound_params=tuple(v for v in params if v.bound_slot is not None),
             dynamic=tuple(_dynamic_view(slot) for slot in key.dynamic),
             fixed_device=fixed_device,
-            device_get=fixed_device and not key.no_gpu,
             tuned=tuned,
             tuned_meta=tuned_meta,
             tuned_level0=tuned and levels[0].computed > 0,

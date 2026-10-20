@@ -836,11 +836,9 @@ def test_baked_constexpr_chooses_narrowest_matching_type(tmp_path):
 
 
 def test_make_launcher_resolves_before_target_discovery(tmp_path, monkeypatch):
-    import intj.launcher as launcher
-
     kernel = kernel_with_params(tmp_path, "x: intj.Argument(type=tl.float16)")
     monkeypatch.setattr(
-        launcher, "_current_target", lambda: pytest.fail("target discovered")
+        "intj.backend.current_target", lambda: pytest.fail("target discovered")
     )
     with pytest.raises(ValueError, match="unsupported"):
         intj.make_launcher(kernel).__self__.check()

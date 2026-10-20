@@ -169,7 +169,6 @@ def _key(mode: TorchAccessMode, driver_path: str = "") -> RenderKey:
         device_binding=DeviceBinding.NOT_FIXED,
         device_offset=_DEVICE_OFFSET,
         verify_annotation=False,
-        no_gpu=False,
         max_slots=5,
         spec_pointer_range=1,
         driver_path=driver_path,

@@ -84,7 +84,6 @@ class RenderKey:
     device_binding: DeviceBinding
     device_offset: int | None
     verify_annotation: bool
-    no_gpu: bool
     max_slots: int  # kernel param slots, upper bound
     spec_pointer_range: int  # 1 if the backend specializes pointers on a 2 GiB range
     driver_path: str

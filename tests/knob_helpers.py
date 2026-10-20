@@ -20,7 +20,7 @@ def _specializes_pointer_range():
     the field the renderer and the spec key branch on, so a new backend that
     sets it gets these tests without being named here.
     """
-    from intj.launcher import BACKENDS
+    from intj.backend import BACKENDS
 
     if _BACKEND_NAME is None:
         return False

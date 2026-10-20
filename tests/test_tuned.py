@@ -901,12 +901,10 @@ def test_tuned_launcher_on_two_devices():
 
 
 def test_tuned_decoration_needs_no_gpu(monkeypatch):
-    from intj import launcher as launcher_mod
-
     def forbidden(*args, **kwargs):
         raise AssertionError("decoration touched the GPU")
 
-    monkeypatch.setattr(launcher_mod, "_current_target", forbidden)
+    monkeypatch.setattr("intj.backend.current_target", forbidden)
     launch = make_launcher(
         triton.autotune(
             configs=configs(),

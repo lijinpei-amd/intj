@@ -131,8 +131,9 @@ build waits for it.
 values for binding. `verify_annotation=True` checks declared promises before
 cache lookup; the default trusts them. `bind_device=<ordinal>` fixes the
 device. `no_gpu=True` renders and times host decoding and cache lookup
-without querying a GPU target or driver, compiling a kernel, or launching one.
-It accepts only default compile options. The `torch_access_mode` and `kernel_cache`
+without querying a GPU target or driver, compiling a kernel, or launching one:
+it builds for `intj.backend.HostBackend`, a fake driver whose launch does
+nothing. It accepts only default compile options. The `torch_access_mode` and `kernel_cache`
 choices are described below.
 
 `ndebug=True`, the default, defines `NDEBUG` at the top of the rendered source,
@@ -636,7 +637,7 @@ buffer-ops binary on a > 2 GiB tensor.
 Everything below is refused at `check()` (the first call runs it), or on the
 first launch that hits it:
 
-- Backends with no registered `intj.launcher.Backend`. `HipBackend` and
+- Backends with no registered `intj.backend.Backend`. `HipBackend` and
   `CudaBackend` ship; any triton backend whose driver exposes a
   `cuLaunchKernel`-shaped entry point is supported by subclassing `Backend` (dylib,
   launch symbol, error-string convention, whether it specializes pointers on a 2 GiB

@@ -1,7 +1,9 @@
 """Builds and loads `_intj_lazy`, the generic stub every launcher starts as.
 
 Kernel-free, so it needs only the host C compiler and no GPU: `make_launcher`
-allocates launchers from it at decoration time (see runtime/intj_lazy.c).
+allocates launchers from it at decoration time (see runtime/intj_lazy.c).  It
+also exports the host backend's no-op driver, which `no_gpu=True` modules
+launch through.
 Cached on disk per interpreter and intj version; loaded by hand, never
 imported, like every module intj builds.  No triton here: the Python-version
 matrix (tests/run_python_matrix.sh) loads it on interpreters triton skips.

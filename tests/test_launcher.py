@@ -39,6 +39,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 import intj
+import intj.backend
 from intj import launcher, make_launcher
 from intj import (
     AUTO,
@@ -349,12 +350,12 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
         pytest.fail("fixed host binding reached a GPU path")
 
     for name in (
-        "_current_target",
-        "_current_device",
-        "_canonical_options",
-        "_make_compile_callback",
+        "intj.backend.current_target",
+        "intj.backend.current_device",
+        "intj.backend.canonical_options",
+        "intj.launcher._make_compile_callback",
     ):
-        monkeypatch.setattr(f"intj.launcher.{name}", forbidden)
+        monkeypatch.setattr(name, forbidden)
     factory = make_launcher(
         device_kernel,
         no_gpu=True,
@@ -682,20 +683,25 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
     assert module_ref() is None
 
 
-@pytest.mark.parametrize("backend_name", ["hip", "cuda"])
 @pytest.mark.parametrize(
-    "no_gpu,return_compiled", [(True, False), (False, False), (False, True)]
+    "backend_name,return_compiled",
+    [("hip", False), ("hip", True), ("cuda", False), ("cuda", True), ("host", False)],
 )
 def test_bind_device_cuda_template_backend_branches_compile(
-    tmp_path, device_kernel, backend_name, no_gpu, return_compiled
+    tmp_path, device_kernel, backend_name, return_compiled
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import BACKENDS, _render_params
+    from intj.backend import BACKENDS, HOST
+    from intj.launcher import _render_params
 
-    backend = BACKENDS[backend_name]
+    backend = BACKENDS.get(backend_name, HOST)
     assert (
         backend.device_symbol
-        == {"hip": "hipDeviceGet", "cuda": "cuDeviceGet"}[backend_name]
+        == {
+            "hip": "hipDeviceGet",
+            "cuda": "cuDeviceGet",
+            "host": "intj_host_device_get",
+        }[backend_name]
     )
     params, offset, nwords = _render_params(
         _resolve_annotations(
@@ -712,7 +718,6 @@ def test_bind_device_cuda_template_backend_branches_compile(
         device_binding=DeviceBinding.FIXED,
         device_offset=offset,
         torch_access_mode="interpreter",
-        no_gpu=no_gpu,
         driver_path="/intj-test-no-driver.so",
         launch_symbol=backend.launch_symbol,
         device_symbol=backend.device_symbol,
@@ -724,12 +729,8 @@ def test_bind_device_cuda_template_backend_branches_compile(
     build(binary, key)  # Build both real-driver branches, but load neither driver.
     assert binary.is_file()
     source = binary.with_suffix(".c").read_text()
-    if no_gpu:
-        assert "dlopen(" not in source and "dlsym(" not in source
-        assert backend.device_symbol not in source
-    else:
-        assert f'intj_dlsym(gpu, "{backend.device_symbol}")' in source
-        assert "st->device_get(&bound->device_handle," in source
+    assert f'intj_dlsym(gpu, "{backend.device_symbol}")' in source
+    assert "st->device_get(&bound->device_handle," in source
 
 
 def test_bind_device_resolves_without_changing_current_and_checks_first_compile(
@@ -742,7 +743,7 @@ def test_bind_device_resolves_without_changing_current_and_checks_first_compile(
     )
     launch = factory.__self__.bind_device(ordinal)
     assert torch.cuda.current_device() == current
-    monkeypatch.setattr("intj.launcher._current_device", lambda: ordinal + 1)
+    monkeypatch.setattr("intj.backend.current_device", lambda: ordinal + 1)
     with pytest.raises(
         UnsupportedKernel,
         match="make the target device current before the first launch",
@@ -1045,7 +1046,8 @@ def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mo
 def test_bind_none_materializes_triton_constexpr(
     pointer_kernel, annotation, bind_device, verify
 ):
-    from intj.launcher import _LOADED, _compiler_input, _current_target
+    from intj.backend import current_target
+    from intj.launcher import _LOADED, _compiler_input
     from triton.compiler import make_backend
 
     factory = make_launcher(
@@ -1067,7 +1069,7 @@ def test_bind_none_materializes_triton_constexpr(
     key = next(key for key, module in _LOADED.items() if module is built)
     assert key.params[0].annotation.types == (None,)
     source = _compiler_input(
-        pointer_kernel, key.params, (), make_backend(_current_target())
+        pointer_kernel, key.params, (), make_backend(current_target())
     )
     assert source.signature == (("x", "constexpr"),)
     assert source.constants == (((0,), ("none",)),)
@@ -1727,12 +1729,12 @@ def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkey
         pytest.fail("binding reached a GPU path")
 
     for name in (
-        "_current_target",
-        "_current_device",
-        "_canonical_options",
-        "_make_compile_callback",
+        "intj.backend.current_target",
+        "intj.backend.current_device",
+        "intj.backend.canonical_options",
+        "intj.launcher._make_compile_callback",
     ):
-        monkeypatch.setattr(f"intj.launcher.{name}", forbidden)
+        monkeypatch.setattr(name, forbidden)
     factory = make_launcher(
         pointer_kernel,
         extra_annotation={
@@ -2379,7 +2381,7 @@ def test_ordinary_unannotated_none_and_never(scalar_kernel):
 
 
 def test_ordinary_never_omits_pointer_range(pointer_kernel):
-    from intj.launcher import _LOADED, _loaded_module
+    from intj.launcher import _LOADED, _loaded_module, _make_host_compile_callback
 
     # CPU storage is virtual: exercise both sides of the threshold without
     # touching the bytes or requiring a GPU/backend initialization.
@@ -2397,12 +2399,7 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
         key = next(key for key, module in _LOADED.items() if module is baseline)
         ranged_key = dataclasses.replace(key, spec_pointer_range=1)
         ranged = _loaded_module(
-            ranged_key,
-            pointer_kernel,
-            ranged_key.params,
-            {},
-            None,
-            {},
+            ranged_key, pointer_kernel.__module__, None, _make_host_compile_callback
         )
         ranged_launch = _launcher_over(ranged)
         small_key = ranged_launch.__self__._C_spec_key(0, small)
@@ -2581,9 +2578,9 @@ def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("GPU path was reached")
 
-    monkeypatch.setattr(launcher, "_current_target", forbidden)
-    monkeypatch.setattr(launcher, "_current_device", forbidden)
-    monkeypatch.setattr(launcher, "_canonical_options", forbidden)
+    monkeypatch.setattr("intj.backend.current_target", forbidden)
+    monkeypatch.setattr("intj.backend.current_device", forbidden)
+    monkeypatch.setattr("intj.backend.canonical_options", forbidden)
     monkeypatch.setattr(launcher, "_make_compile_callback", forbidden)
     host = make_launcher(
         scale, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
@@ -2593,6 +2590,11 @@ def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
     assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
     assert torch.count_nonzero(out) == 0
+    # launched like any backend, through the fake driver _intj_lazy exports
+    module = module_of(host)
+    key = next(key for key, loaded in launcher._LOADED.items() if loaded is module)
+    assert key.driver_path == launcher._stub().__file__
+    assert key.launch_symbol == "intj_host_launch"
 
 
 def test_no_gpu_rejects_real_backend_options(monkeypatch):
@@ -2628,7 +2630,7 @@ def test_no_gpu_does_not_read_gpu_compilation_knobs(scalar_kernel, monkeypatch):
     monkeypatch.setattr(
         type(knobs.compilation), "instrumentation_mode", property(forbidden)
     )
-    monkeypatch.setattr("intj.launcher._canonical_options", forbidden)
+    monkeypatch.setattr("intj.backend.canonical_options", forbidden)
     host = make_launcher(
         scalar_kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
     )
@@ -3042,12 +3044,8 @@ def test_annotated_effective_compile_options_and_identity(
         captured.update(options)
         raise CompilationCaptured
 
-    def capture_module(
-        key, fn, params, options, layout, baked_values, knob_values, *rest
-    ):
-        callback = launcher._make_compile_callback(
-            fn, params, options, baked_values, knob_values=knob_values
-        )
+    def capture_module(key, kernel_module, layout, compile_function):
+        callback = compile_function()
         with pytest.raises(CompilationCaptured):
             callback({}, b"\x00" * 8, 1, torch.cuda.current_device(), 7)
         assert captured["debug"] is expected_debug
@@ -3060,7 +3058,7 @@ def test_annotated_effective_compile_options_and_identity(
         if fpsan_casts is not None:
             expected_values["fpsan_homomorphic_casts"] = fpsan_casts
         expected_options = triton.compiler.make_backend(
-            launcher._current_target()
+            intj.backend.current_target()
         ).parse_options(expected_values)
         assert key.options == getattr(expected_options, "hash")()
         assert (key.options != baseline_key.options) == (
@@ -3304,7 +3302,8 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
         )
     module = module_of(launch)
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
     from triton.compiler import make_backend
 
     params, _, _ = _render_params(
@@ -3314,7 +3313,7 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
     plain_params, _, _ = _render_params(
         _resolve_annotations(axpy, extra), DeviceBinding.NOT_FIXED
     )
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     base = torch.randn(4096, device="cuda")
     tensors = [
         base,  # 16B aligned
@@ -3377,7 +3376,8 @@ def test_python_annotated_params_compile_like_triton():
     unannotated `m` still folds 1 -- intj must hand the compiler exactly that.
     """
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
     from triton.compiler import make_backend
 
     launch = make_launcher(python_annotated)
@@ -3385,7 +3385,7 @@ def test_python_annotated_params_compile_like_triton():
     params, _, _ = _render_params(
         _resolve_annotations(python_annotated, None), DeviceBinding.NOT_FIXED
     )
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     o = torch.zeros(1, device="cuda")
     seen = {}
     for n, w, f, b, m in itertools.product(
@@ -3505,10 +3505,11 @@ def test_ast_source_hashes_as_triton_launch(kernel):
     from triton.compiler import make_backend
 
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
 
     jit = PARITY_KERNELS[kernel]
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     for args in _parity_calls():
         for extra in _parity_annotations(_triton_facts(jit, args)):
             params, _, _ = _render_params(
@@ -3602,10 +3603,11 @@ def test_baked_int_specializes_like_triton(kernel):
     from triton.compiler import make_backend
 
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
 
     jit = {**PARITY_KERNELS, "i64": parity_i64, "u8": parity_u8}[kernel]
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     o, x = torch.zeros(64, device="cuda"), torch.ones(64, device="cuda")
     for value in BAKED_VALUES[kernel]:
         args = (o, x, value, 1.5, 4)
@@ -3773,7 +3775,8 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     This is the invariant for interned values, whichever object carries them.
     """
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
     from triton.compiler import make_backend
 
     launch = make_launcher(act_store)
@@ -3781,7 +3784,7 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     params, _, _ = _render_params(
         _resolve_annotations(act_store, None), DeviceBinding.NOT_FIXED
     )
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     o = torch.zeros(1, device="cuda")
     values = [
         "neg",
@@ -4361,14 +4364,15 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
     scalar_kernel, annotation, values
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
     from triton.compiler import make_backend
 
     extra = {"x": annotation}
     params, _, _ = _render_params(
         _resolve_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED
     )
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     launch = make_launcher(
         scalar_kernel,
         extra_annotation=extra,
@@ -4401,7 +4405,8 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     pointer_kernel, specialize
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _current_target, _render_params
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _render_params
     from triton.compiler import make_backend
 
     base = torch.empty(16, device="cuda")
@@ -4410,7 +4415,7 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     params, _, _ = _render_params(
         _resolve_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED
     )
-    backend = make_backend(_current_target())
+    backend = make_backend(current_target())
     launch = make_launcher(
         pointer_kernel,
         extra_annotation=extra,
@@ -4466,7 +4471,8 @@ def _recording_input_launcher(
         handle when `bind_device`), a function mapping public arguments to
         their ASTSource, and the list of recorded misses.
     """
-    from intj.launcher import _compiler_input, _current_target, _make_compile_callback
+    from intj.backend import current_target
+    from intj.launcher import _compiler_input, _make_compile_callback
     from triton.backends.compiler import GPUTarget
     from triton.compiler import make_backend
 
@@ -4485,7 +4491,7 @@ def _recording_input_launcher(
 
     params = next(key.params for key, value in _LOADED.items() if value is module)
     backend = make_backend(
-        GPUTarget("hip", "gfx942", 64) if no_gpu else _current_target()
+        GPUTarget("hip", "gfx942", 64) if no_gpu else current_target()
     )
     real_compile = (
         None
@@ -4798,7 +4804,6 @@ def _make_render_key(**overrides):
         device_binding=DeviceBinding.NOT_FIXED,
         device_offset=device_offset,
         verify_annotation=False,
-        no_gpu=False,
         max_slots=1,
         spec_pointer_range=1,
         driver_path="/driver.so",
@@ -6443,8 +6448,8 @@ def test_decoration_needs_no_gpu(monkeypatch):
         raise AssertionError("decoration touched the GPU")
 
     with monkeypatch.context() as patch:
-        patch.setattr(launcher, "_current_target", forbidden)
-        patch.setattr(launcher, "_current_device", forbidden)
+        patch.setattr("intj.backend.current_target", forbidden)
+        patch.setattr("intj.backend.current_device", forbidden)
         plain = make_launcher(grid_arg=1)(scale)
         fixed = make_launcher(scale).__self__.bind_device(torch.cuda.current_device())
         plain.__self__.check()
@@ -6671,10 +6676,9 @@ def check_dynamic_invariant():
     from triton.compiler import make_backend
 
     from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.backend import canonical_options, current_target
     from intj.launcher import (
-        _canonical_options,
         _compiler_input,
-        _current_target,
         _knob_options,
         _live_knobs,
         _render_params,
@@ -6686,7 +6690,7 @@ def check_dynamic_invariant():
     params, _, _ = _render_params(
         _resolve_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED
     )
-    target = _current_target()
+    target = current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
     x = torch.randn(64, device="cuda")
     o = torch.empty_like(x)
@@ -6696,7 +6700,7 @@ def check_dynamic_invariant():
         options, dyn_knobs = _split_dynamic(_DYNAMIC, dyn)
         knob_values = {**knobs_now, **dyn_knobs}
         with live_knob_values(dyn_knobs):
-            canonical = _canonical_options(
+            canonical = canonical_options(
                 target, _knob_options(dyn_axpy, options, knob_values)
             ).hash()
             for act in ("neg", "".join(["n", "e", "g"]), "pos"):
@@ -6811,10 +6815,9 @@ def check_option_parameter_invariant():
     from triton.compiler import make_backend
 
     from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.backend import canonical_options, current_target
     from intj.launcher import (
-        _canonical_options,
         _compiler_input,
-        _current_target,
         _knob_options,
         _live_knobs,
         _render_params,
@@ -6825,7 +6828,7 @@ def check_option_parameter_invariant():
     params, _, _ = _render_params(
         _resolve_annotations(option_axpy, None), DeviceBinding.NOT_FIXED
     )
-    target = _current_target()
+    target = current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
     x = torch.randn(64, device="cuda")
     o = torch.empty_like(x)
@@ -6836,7 +6839,7 @@ def check_option_parameter_invariant():
         key, _ = launch.__self__.spec_key(device, *public)
         truth = (
             _compiler_input(option_axpy, params, public, backend),
-            _canonical_options(
+            canonical_options(
                 target, _knob_options(option_axpy, options, knobs_now)
             ).hash(),
         )

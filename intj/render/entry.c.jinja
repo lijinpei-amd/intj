@@ -103,7 +103,7 @@ static_assert(sizeof(intj_cache) <= sizeof(((intj_bound_launcher *)0)->cache),
 #define INTJ_NDYN {{ ndyn }}
 #define INTJ_NSLOTS {{ nslots }}
 
-{% if device_get %}
+{% if fixed_device %}
 typedef int32_t (*intj_device_get_t)(int32_t *device, int32_t ordinal);
 {% endif %}
 
@@ -112,12 +112,11 @@ typedef struct {
   PyTypeObject *tensor_type;
   PyTypeObject *param_type;
   intj_torch_abi abi;
-{% if not no_gpu %}  intj_launch_t launch;
+  intj_launch_t launch;
 {% if fixed_device %}  intj_device_get_t device_get;
 {% endif %}
 {% if error_style == 'return' %}  intj_error_string_ret_t error_string;
 {% else %}  intj_error_string_out_t error_string;
-{% endif %}
 {% endif %}
 } intj_state;
 
@@ -572,7 +571,6 @@ static inline int intj_cache_traverse(intj_bound_launcher *bound, visitproc visi
   return intj_snapshot_visit(&s, failed, visit, arg);
 }
 
-{% if not no_gpu %}
 /* Two trailing scratch slots are mandatory on AMD; intj refuses kernels that
  * need non-empty scratch, so they are always null. */
 static INTJ_ALWAYS_INLINE int32_t intj_launch(intj_state *st, const intj_kernel *k,
@@ -601,7 +599,6 @@ static PyObject *intj_launch_error(intj_state *st, int32_t status) {
                message ? message : "unknown error");
   return NULL;
 }
-{% endif %}
 
 {% if not tuned %}
 /* Cold path: Python assembles the final canonical ASTSource from the public
@@ -1204,12 +1201,10 @@ static PyObject *intj_call(intj_state *st,
   uint32_t recorded_np = kernel->k.nparams;
   int32_t status = 0;
   if (INTJ_LIKELY((uint32_t)np == recorded_np)) {
-{% if not no_gpu %}
 {% if launch_guard %}
     if (gx && gy && gz)
 {% endif %}
       status = intj_launch(st, &kernel->k, gx, gy, gz, stream, vals, np);
-{% endif %}
 {% if return_compiled %}
     if (!status)
       out = Py_NewRef(kernel->k.compiled);
@@ -1223,10 +1218,8 @@ static PyObject *intj_call(intj_state *st,
                  np, recorded_np);
     return NULL;
   }
-{% if not no_gpu %}
   if (INTJ_UNLIKELY(status != 0))
     return intj_launch_error(st, status);
-{% endif %}
 {% if return_compiled %}
   return out;
 {% else %}
@@ -1428,9 +1421,6 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
 {% endif %}
 {% if fixed_device %}
     bound->device_ordinal = ordinal;
-{% if no_gpu %}
-    bound->device_handle = (int32_t)ordinal;
-{% else %}
     int32_t status = st->device_get(&bound->device_handle, (int32_t)ordinal);
     if (status != 0) {
       const char *message = NULL;
@@ -1445,7 +1435,6 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
                    message ? message : "unknown error");
       goto fail;
     }
-{% endif %}
 {% endif %}
 {% if nwords %}
     if (intj_cache_init(INTJ_BOUND_CACHE_OF(bound)) != 0) {
@@ -1740,7 +1729,6 @@ static PyObject *intj_set_torch_version(PyObject *self, PyObject *const *args,
   Py_RETURN_NONE;
 }
 
-{% if not no_gpu %}
 static void *intj_dlopen(const char *path) {
   void *h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
   if (!h)
@@ -1757,7 +1745,6 @@ static void *intj_dlsym(void *handle, const char *name) {
     PyErr_Format(PyExc_RuntimeError, "intj: missing symbol %s", name);
   return sym;
 }
-{% endif %}
 
 static int intj_exec(PyObject *m) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
@@ -1792,7 +1779,6 @@ static int intj_exec(PyObject *m) {
   }
 {% endif %}
 
-{% if not no_gpu %}
   void *gpu = intj_dlopen("{{ driver_path }}");
   if (!gpu)
     return -1;
@@ -1808,7 +1794,6 @@ static int intj_exec(PyObject *m) {
   st->error_string = (intj_error_string_ret_t)dlsym(gpu, "{{ error_symbol }}");
 {% else %}
   st->error_string = (intj_error_string_out_t)dlsym(gpu, "{{ error_symbol }}");
-{% endif %}
 {% endif %}
   return 0;
 }

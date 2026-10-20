@@ -48,10 +48,16 @@ guards that.
 
 ## Backends are data, not branches
 
-Everything backend-specific lives in a `Backend` subclass in `launcher.py`
+Everything backend-specific lives in a `Backend` subclass in `backend.py`
 (`HipBackend`, `CudaBackend`), and the template branches on its fields
 (`error_style`), never on a backend name. Supporting another triton backend should be
 a subclass plus `register()`.
+
+`no_gpu=True` is one more backend, not a mode: `HostBackend` (`HOST`, never
+registered) is a fake driver whose launch and device lookup are no-op exports of
+`_intj_lazy`, so a host module renders and runs the same C as a GPU one.
+`backend.select` is the one place a build reads `no_gpu`; past it, "no triton
+target" is what says nothing compiles.
 
 ## Modules stay out of the import system
 

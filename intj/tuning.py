@@ -344,13 +344,11 @@ def make_tuned_callback(
     arguments. Misses are serialized; re-entering it while tuning raises
     `UnsupportedKernel`.
     """
+    from .backend import canonical_options, current_device, current_target
     from .launcher import (
         Param,
-        _canonical_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _current_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        _current_target,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
@@ -359,7 +357,7 @@ def make_tuned_callback(
 
     del return_compiled  # C decides whether the record keeps the object
     jit_func = plan.jit_func
-    target = _current_target()
+    target = current_target()
     backend = _imports.make_backend(target)
     # every parameter public: the shim sees the full call Triton makes
     params = tuple(Param(p.name, p.index, p.index, p.annotation) for p in resolved)
@@ -372,7 +370,7 @@ def make_tuned_callback(
 
     def compile_kernel(values: dict[str, Any], config_options: dict[str, Any]) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
-        canonical = _canonical_options(
+        canonical = canonical_options(
             target,
             _knob_options(
                 jit_func,
@@ -388,7 +386,7 @@ def make_tuned_callback(
             compiler_input,
             canonical.hash(),
             tuple(sorted(call_knobs[0].items())),
-            _current_device(),
+            current_device(),
         )
         kernel = compiled.get(key)
         if kernel is None:
@@ -434,7 +432,7 @@ def make_tuned_callback(
     ) -> tuple[Any, ...]:
         """Runs the private chain on `stream` and returns the record for C."""
         _imports.ensure_torch_imported()
-        current = _current_device()
+        current = current_device()
         if device != current:
             raise UnsupportedKernel(
                 f"intj: launching on device {device} while device {current} is current; "

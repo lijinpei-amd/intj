@@ -356,6 +356,30 @@ static PyObject *new_launcher(PyObject *m, PyObject *const *args,
   return launcher;
 }
 
+/* The host backend's driver (intj.backend.HostBackend), for `no_gpu=True`: a
+ * module dlsyms these from this library as it would hipModuleLaunchKernel and
+ * hipDeviceGet from libamdhip64.  Every launch succeeds and does nothing. */
+#define INTJ_EXPORT __attribute__((visibility("default")))
+
+INTJ_EXPORT int32_t intj_host_launch(void *f, uint32_t gx, uint32_t gy,
+                                     uint32_t gz, uint32_t bx, uint32_t by,
+                                     uint32_t bz, uint32_t shared, void *stream,
+                                     void **params, void **extra) {
+  (void)f, (void)gx, (void)gy, (void)gz, (void)bx, (void)by, (void)bz;
+  (void)shared, (void)stream, (void)params, (void)extra;
+  return 0;
+}
+
+INTJ_EXPORT int32_t intj_host_device_get(int32_t *device, int32_t ordinal) {
+  *device = ordinal;
+  return 0;
+}
+
+INTJ_EXPORT const char *intj_host_error_string(int32_t status) {
+  (void)status;
+  return "intj host backend error";
+}
+
 static PyObject *header_size(PyObject *m, PyObject *unused) {
   (void)m;
   (void)unused;
