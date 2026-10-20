@@ -3091,8 +3091,10 @@ def test_newer_triton_fpsan_knob_is_baked_into_compile_options(
     class Captured(Exception):
         pass
 
-    def capture(kernel, _resolved, options, *_args, **kwargs):
-        seen.update(launcher._knob_options(kernel, options, kwargs["knob_values"]))
+    def capture(b):
+        seen.update(
+            launcher._knob_options(b.jit_func, dict(b.compile_options), b.knob_values)
+        )
         raise Captured
 
     monkeypatch.setattr(

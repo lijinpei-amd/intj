@@ -145,8 +145,7 @@ class _BuildOptions:
     """Everything the build needs from a checked `MakeLauncherOption`.
 
     `_check_options` returns it; nothing stores it beyond one build.  The
-    target and live knob values are not here: reading them is a GPU query,
-    made by the build.
+    target is not here: reading it is a GPU query, made by the build.
     """
 
     jit_func: JitFunction  # the chain unwrapped, checked
@@ -174,6 +173,8 @@ class _BuildOptions:
     grid_arg: int | None
     grid_py: Callable[[dict[str, object]], object] | None
     grid_cpp_fn: object | None  # the `grid_cpp` def itself
+    #: the live knobs but the declared ones; None under no_gpu
+    knob_values: Mapping[str, object] | None
 
 
 def _delayed_keywords(delayed: Callable[[], Mapping[str, Any]]) -> dict[str, Any]:
@@ -415,6 +416,11 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     device_binding, params, args, hidden, doc = _check_binding(
         option, resolved, dynamic=dynamic, grid_code=compiled_grid
     )
+    # a declared knob is per call: leaving its live value out keeps it out
+    # of the RenderKey, so it cannot build a module per value
+    knob_values = (
+        None if no_gpu else {k: v for k, v in _live_knobs().items() if k not in dynamic}
+    )
     # GPU-free but may reach the network: after every refusal above, never on a build
     _provision(kernel_cache)
     return _BuildOptions(
@@ -440,6 +446,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         grid_arg=grid_arg,
         grid_py=grid_py,
         grid_cpp_fn=grid_cpp,
+        knob_values=knob_values,
     )
 
 
@@ -770,45 +777,18 @@ class Launcher:
         _imports.ensure_triton_imported()
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
-        # a declared knob is per call: leaving its live value out keeps it out
-        # of the RenderKey, so it cannot build a module per value
-        knob_values = (
-            None
-            if b.no_gpu
-            else {k: v for k, v in _live_knobs().items() if k not in b.dynamic}
-        )
         if b.tuned is not None:
-            assert knob_values is not None, "_plan_tuning refuses no_gpu"
+            assert b.knob_values is not None, "_plan_tuning refuses no_gpu"
             _check_tuned_configs(
-                b.tuned.plan, b.params, dict(b.compile_options), knob_values
+                b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
             )
-        module = _materialize_module(
-            b.jit_func,
-            b.params,
-            dict(b.compile_options),
-            b.torch_access_mode,
-            b.torch_access_request,
-            b.kernel_cache,
-            b.no_gpu,
-            b.verify_annotation,
-            b.device_binding,
-            grid_arg=b.grid_arg,
-            grid_py_mode=b.grid_py is not None,
-            grid_cpp=b.grid_code,
-            return_compiled=b.return_compiled,
-            tuning=b.tuned.render if b.tuned else None,
-            knob_values=knob_values,
-            dynamic=b.dynamic,
-            global_values=b.global_values,
-            declared_parameters=b.declared_parameters,
-            ndebug=b.ndebug,
-        )
+        module = _materialize_module(b)
         if b.tuned is None:
             callback: Callable[..., Any] = _launcher_compile(module)
         else:
             from .tuning import TunedGrid, make_tuned_callback
 
-            assert b.tuned.render is not None and knob_values is not None
+            assert b.tuned.render is not None and b.knob_values is not None
             if b.grid_py is not None:
                 grid = TunedGrid("py", b.grid_py)
             elif b.grid_code is not None:
@@ -828,7 +808,7 @@ class Launcher:
                 grid,
                 b.tuned.render,
                 b.return_compiled,
-                knob_values,
+                b.knob_values,
                 b.dynamic,
             )
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
@@ -989,40 +969,23 @@ def make_launcher(
     return _new_launcher(option)
 
 
-def _materialize_module(
-    jit_func: JitFunction,
-    resolved: tuple[ResolvedParam, ...],
-    options: Mapping[str, Any],
-    access: TorchAccessMode,
-    requested_access: TorchAccessMode | None,
-    kernel_cache: KernelCache,
-    no_gpu: bool,
-    verify_annotation: bool,
-    device_binding: DeviceBinding = DeviceBinding.NOT_FIXED,
-    grid_arg: int | None = None,
-    grid_py_mode: bool = False,
-    grid_cpp: GridCode | None = None,
-    return_compiled: bool = False,
-    tuning: TuningRender | None = None,
-    knob_values: Mapping[str, object] | None = None,
-    dynamic: tuple[str, ...] = (),
-    global_values: tuple[tuple[str, str, tuple[object, ...]], ...] = (),
-    declared_parameters: tuple[str, ...] = (),
-    ndebug: bool = True,
-) -> types.ModuleType:
+def _materialize_module(b: _BuildOptions) -> types.ModuleType:
     """Returns the loaded module for this kernel and configuration.
 
     Queries the target (unless `no_gpu`), and loads, building if needed, the
-    module for its `RenderKey`.  `requested_access` is what `access` was
-    resolved from, for choosing again where a build finds STATIC_COMPILE
-    unavailable after all.
+    module for its `RenderKey`.  `torch_access_request` is what
+    `torch_access_mode` was resolved from, for choosing again where a build
+    finds STATIC_COMPILE unavailable after all.
 
     Raises:
         UnsupportedKernel: The target's backend is not registered, a
             compile option name is unknown to it, or STATIC_COMPILE was
             requested and the module needs a build cpp_extension cannot do.
     """
-    if no_gpu:
+    options = dict(b.compile_options)
+    knob_values = b.knob_values
+    tuning = b.tuned.render if b.tuned is not None else None
+    if b.no_gpu:
         target = None
         backend = None
         canonical_options = None
@@ -1036,19 +999,19 @@ def _materialize_module(
             )
         assert knob_values is not None, "GPU builds read knobs at the first call"
         canonical_options = _canonical_options(
-            target, _knob_options(jit_func, options, knob_values)
+            target, _knob_options(b.jit_func, options, knob_values)
         )
         # the names only: each value is canonicalized on its own miss
         _refuse_unknown_options(
             canonical_options,
-            [n for n in dynamic if not n.startswith("knobs.")]
-            + list(declared_parameters),
+            [n for n in b.dynamic if not n.startswith("knobs.")]
+            + list(b.declared_parameters),
         )
     params, device_offset, nwords, computed_fields, slots = _spec_key_layout(
-        resolved,
-        device_binding,
+        b.params,
+        b.device_binding,
         tuning.computed[0] if tuning is not None else 0,
-        dynamic,
+        b.dynamic,
     )
     if tuning is not None:
         # final only now: level-0 computed keys are placed with the spec fields
@@ -1057,22 +1020,22 @@ def _materialize_module(
     nwords = max(nwords, 1) if tuning is not None else nwords
     # check() provisioned already: this is the idempotent, no-network
     # lookup of the toolchain it installed
-    cache_toolchain = _provision(kernel_cache)
+    cache_toolchain = _provision(b.kernel_cache)
     # the kernel's own name, unless python allows something C does not
-    module_name = jit_func.__name__
+    module_name = b.jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
         module_name = "kernel"
     # The rendered source is a pure function of the template, the runtime header
     # and the fields it reads, so hash those rather than the render itself.
     key = RenderKey(
         module_name=module_name,
-        kernel_repr=get_full_name(jit_func),
+        kernel_repr=get_full_name(b.jit_func),
         params=params,
         nwords=nwords,
-        device_binding=device_binding,
+        device_binding=b.device_binding,
         device_offset=device_offset,
-        verify_annotation=bool(verify_annotation),
-        no_gpu=no_gpu,
+        verify_annotation=b.verify_annotation,
+        no_gpu=b.no_gpu,
         max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
@@ -1088,24 +1051,24 @@ def _materialize_module(
         torch_access_mode="",
         torch_version=None,
         cxx_abi=None,
-        kernel_cache=kernel_cache.value,
+        kernel_cache=b.kernel_cache.value,
         cache_include_dirs=cache_toolchain["include_dirs"],
         cache_archives=cache_toolchain["archives"],
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=_verified_cpython_header(),
         pointer_types=_pointer_types(params),
-        grid_arg=grid_arg,
-        grid_py_mode=grid_py_mode,
-        grid_cpp_source=grid_cpp.source if grid_cpp else "",
-        grid_extra=grid_cpp.extras if grid_cpp else (),
-        return_compiled=return_compiled,
-        ndebug=ndebug,
+        grid_arg=b.grid_arg,
+        grid_py_mode=b.grid_py is not None,
+        grid_cpp_source=b.grid_code.source if b.grid_code else "",
+        grid_extra=b.grid_code.extras if b.grid_code else (),
+        return_compiled=b.return_compiled,
+        ndebug=b.ndebug,
         tuning=tuning,
         dynamic=slots,
         template=ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=runtime_headers().hex(),
-        cache_key=jit_func.cache_key + (":gluon" if jit_func.is_gluon() else ""),
+        cache_key=b.jit_func.cache_key + (":gluon" if b.jit_func.is_gluon() else ""),
         target=(target.backend, target.arch, target.warp_size)
         if target is not None
         else ("host-only",),
@@ -1117,9 +1080,9 @@ def _materialize_module(
         build_flags=(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
         intj_version=_cache_version(),
-        global_values=global_values,
+        global_values=b.global_values,
     )
-    baked_values = {p.index: p.baked for p in resolved if p.annotation.baked_value}
+    baked_values = {p.index: p.baked for p in b.params if p.annotation.baked_value}
 
     def loaded(mode: TorchAccessMode) -> types.ModuleType:
         # the c++ mode gets it too, not to read from but to check its own
@@ -1131,23 +1094,25 @@ def _materialize_module(
         )
         return _loaded_module(
             _for_access(key, mode),
-            jit_func,
+            b.jit_func,
             params,
             options,
             layout,
             baked_values,
             knob_values,
-            dynamic,
+            b.dynamic,
         )
 
     try:
-        return loaded(access)
+        return loaded(b.torch_access_mode)
     except CppExtensionUnavailable as error:
         # `check()` chose STATIC_COMPILE without importing cpp_extension, and
         # no `.so` was on disk: choose again, as `check()` used to, from
         # cpp_extension itself.  An explicit request is refused.
         try:
-            confirmed = _resolve_torch_access_mode(requested_access, confirmed=True)
+            confirmed = _resolve_torch_access_mode(
+                b.torch_access_request, confirmed=True
+            )
         except UnsupportedKernel as refusal:
             raise refusal from error
         return loaded(confirmed)
