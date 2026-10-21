@@ -200,6 +200,36 @@ def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
     assert x.item() == 7
 
 
+def test_compile_override_keeps_cached_kernel_alive(monkeypatch):
+    import intj.launcher as launcher_module
+
+    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    real_compile = launcher_module._checked_compile
+    kernels = []
+
+    def compile_kernel(*args, **kwargs):
+        kernel = real_compile(*args, **kwargs)
+        kernels.append(weakref.ref(kernel))
+        return kernel
+
+    monkeypatch.setattr(launcher_module, "_checked_compile", compile_kernel)
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    launch = make_launcher(reentrant_store)
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    launch(device, stream, (1,), x, 5)
+
+    def refuse(*args):
+        pytest.fail("a cached launch reached the compile override")
+
+    override_compile(module_of(launch), refuse)
+    gc.collect()
+    assert len(kernels) == 1 and kernels[0]() is not None
+    launch(device, stream, (1,), x, 7)
+    torch.cuda.synchronize()
+    assert x.item() == 7
+
+
 @pytest.mark.parametrize("cache", list(KernelCache), ids=lambda cache: cache.value)
 def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
     import intj.launcher as launcher_module

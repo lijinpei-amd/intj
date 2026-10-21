@@ -538,11 +538,55 @@ def _check_binding(
     return binding, state, args, hidden, doc
 
 
+class _MissCompileState(Protocol):
+    """The Python state that handles one launcher's C cache misses."""
+
+    def run(
+        self,
+        keyblob: bytes,
+        nparams: int,
+        device: int,
+        stream: int,
+        controls: Any,
+        *args: Any,
+    ) -> Any: ...
+
+
+@dataclasses.dataclass
+class _SharedCompiler:
+    """An ordinary module's compile cache and replaceable miss override."""
+
+    callback: Callable[..., Any] | None
+    override: Callable[..., Any] | None = None
+
+    def compile(self, seen: dict[bytes, object], *call: Any) -> Any:
+        """Returns a kernel record, using the current override when installed."""
+        override = self.override
+        if override is not None:
+            return override(*call)
+        assert self.callback is not None, "the module has no kernel compiler"
+        return self.callback(seen, *call)
+
+
 @dataclasses.dataclass
 class _CompileState:
-    """One ordinary launcher's spec key -> compile identity checks."""
+    """One ordinary launcher's identity checks and shared kernel compiler."""
 
+    compiler: _SharedCompiler
     seen: dict[bytes, object] = dataclasses.field(default_factory=dict)
+
+    def run(
+        self,
+        keyblob: bytes,
+        nparams: int,
+        device: int,
+        stream: int,
+        controls: Any,
+        *args: Any,
+    ) -> Any:
+        """Returns the kernel record for one miss, which C then launches."""
+        del stream, controls
+        return self.compiler.compile(self.seen, keyblob, nparams, device, *args)
 
 
 class Launcher:
@@ -787,7 +831,7 @@ class Launcher:
         module = _materialize_module(b)
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
         address = module._init(
-            self, self._new_compile_state(b), _Interner(), *grid_py, *b.args
+            self, self._new_compile_state(b, module), _Interner(), *grid_py, *b.args
         )
         return address, option, b.doc
 
@@ -795,10 +839,12 @@ class Launcher:
         """Runs the build's checks that need the target, after every GPU-free one."""
         assert b.tuned is None, "make_launcher gives a chain a TunedLauncher"
 
-    def _new_compile_state(self, b: _BuildOptions) -> object:
+    def _new_compile_state(
+        self, b: _BuildOptions, module: types.ModuleType
+    ) -> _MissCompileState:
         """Returns the Python state `_init` stores and `_compile_miss` reads back."""
         del b
-        return _CompileState()
+        return _CompileState(cast(_SharedCompiler, module._intj_compiler))
 
     def _compile_miss(
         self,
@@ -810,19 +856,14 @@ class Launcher:
         /,
         *args: Any,
     ) -> Any:
-        """Returns the kernel record for a C cache miss, which C then launches.
+        """Handles a C cache miss through this launcher's Python compile state.
 
-        Every module calls it alike; `stream` and the grid `controls` matter
-        only to a `TunedLauncher`, which launches its own.  `args` are the
-        dynamic values, then the public kernel arguments.
+        An ordinary state returns a record for C to launch; a tuned state
+        launches the winner itself before returning its record. `args` are
+        the dynamic values, then the public kernel arguments.
         """
-        del stream, controls
-        module = self._C_module
-        assert module is not None, "compile misses require an initialized launcher"
-        state = cast(_CompileState, self._C_compile_state)
-        # Read per miss so override_compile reaches already built launchers.
-        return getattr(module, "_intj_compile")(
-            state.seen, keyblob, nparams, device, *args
+        return cast(_MissCompileState, self._C_compile_state).run(
+            keyblob, nparams, device, stream, controls, *args
         )
 
 
@@ -1092,8 +1133,6 @@ def _materialize_module(b: _BuildOptions) -> types.ModuleType:
     baked_values = {p.index: p.baked for p in b.params if p.annotation.baked_value}
 
     def compile_function() -> Callable[..., Any]:
-        if tuning is not None:
-            return _refuse_module_compile
         if target is None:
             return _make_host_compile_callback()
         return _make_compile_callback(
@@ -1115,7 +1154,10 @@ def _materialize_module(b: _BuildOptions) -> types.ModuleType:
             else None
         )
         return _loaded_module(
-            _for_access(key, mode), b.jit_func.__module__, layout, compile_function
+            _for_access(key, mode),
+            b.jit_func.__module__,
+            layout,
+            compile_function if tuning is None else None,
         )
 
     try:
@@ -1564,16 +1606,14 @@ def _loaded_module(
     key: RenderKey,
     kernel_module: str,
     layout: TensorABI | None,
-    compile_function: Callable[[], Callable[..., Any]],
+    compile_function: Callable[[], Callable[..., Any]] | None,
 ) -> types.ModuleType:
     """Returns the one module for `key`, loading it once per process.
 
-    `compile_function()` makes the module's compile function (`_intj_compile`),
-    called only by the load that installs it.  Reusing the module reuses that
-    function, whose compile cache owns the `CompiledKernel`s its launchers'
-    records point into -- installing a second one would drop the first,
-    freeing kernels whose function handles are still cached. So a hit returns
-    the module untouched.
+    Ordinary launchers share the compiler created by `compile_function()`.
+    Its cache owns the `CompiledKernel`s their records point into, so a
+    repeat load leaves it untouched. Tuned launchers own their compilers
+    privately and pass no factory.
 
     The lock matters: without it two threads both compile and both load, and the
     loser's module (with its own kernel cache) is silently dropped.
@@ -1587,8 +1627,9 @@ def _loaded_module(
                     f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
                     "header; it was built by another intj -- delete it to rebuild"
                 )
-            # the module object's dict, written once under _LOAD_LOCK; not C state
-            setattr(module, "_intj_compile", compile_function())
+            if compile_function is not None:
+                # Python state shared by ordinary launchers, never read by C.
+                setattr(module, "_intj_compiler", _SharedCompiler(compile_function()))
             # Pass relative cdata; the compiled setter saves the absolute offset
             # for the torch running now before exposing the module.
             module._set_torch_version(
@@ -2074,7 +2115,7 @@ class _Identity:
 class _KernelCompiler:
     """Compiles `jit_func` for cache misses, once per identity and device.
 
-    A module's ordinary launchers share one through its `_intj_compile`; each
+    A module's ordinary launchers share one through its `_SharedCompiler`; each
     tuned launcher owns one for its candidates.
     """
 
@@ -2142,32 +2183,30 @@ def _record(kernel: CompiledKernel, nparams: int) -> tuple[int, int, int, int]:
     return (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
 
 
-def _refuse_module_compile(*args: Any) -> Any:
-    """Refuses a compile; a tuned module's own callback.
+def override_compile(
+    module: types.ModuleType, fn: Callable[..., Any]
+) -> Callable[[], None]:
+    """Overrides ordinary compile misses; returns a function restoring the override.
 
-    Tuned launches compile through their bound launcher and never read this one.
-    """
-    del args
-    raise RuntimeError("intj: tuned modules compile through their bound launcher")
-
-
-def override_compile(module: types.ModuleType, fn: Callable[..., Any]) -> Any:
-    """Makes `module`'s launchers compile misses with `fn`; for tests and benchmarks.
-
-    `fn` is called as `fn(keyblob, nparams, device, *args)`.
+    For tests and benchmarks. `fn` is called as
+    `fn(keyblob, nparams, device, *args)`. Already built launchers see the
+    override on their next miss. The original compiler remains alive so its
+    cached kernels' function handles stay valid.
 
     Returns:
-        The previous compile function; restore it with
-        `setattr(module, "_intj_compile", previous)`.
+        A function taking no arguments that restores the previous override.
     """
-    previous = getattr(module, "_intj_compile", None)
+    compiler = cast(_SharedCompiler | None, getattr(module, "_intj_compiler", None))
+    if compiler is None:
+        compiler = _SharedCompiler(None)
+        setattr(module, "_intj_compiler", compiler)
+    previous = compiler.override
+    compiler.override = fn
 
-    def compile_function(seen: dict[bytes, object], *call: Any) -> Any:
-        del seen
-        return fn(*call)
+    def restore() -> None:
+        compiler.override = previous
 
-    setattr(module, "_intj_compile", compile_function)
-    return previous
+    return restore
 
 
 def _make_compile_callback(

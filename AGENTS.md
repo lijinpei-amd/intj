@@ -97,13 +97,16 @@ device, stream, controls, *dynamic, *args)` by name through the Python C API,
 the same call from every module, and reads back `(function, block_dim, shared,
 nparams[, compiled[, deps, computed[, meta]]])`. `_init` stores its Python
 state in the launcher's state block, exposed by `_C_compile_state`: a
-`_CompileState` (the per-launcher specialization check map) or, for a
-`TunedLauncher`, its private `TunedCompileState`. `Launcher._compile_miss`
-looks up the module's `_intj_compile` each time, preserving compile overrides
-and the shared compiled kernel cache, and C launches the record.
-`TunedLauncher._compile_miss` runs its private chain, including the final
-launch; C stores the record without launching it again. Both compile through
-`_KernelCompiler`. An ordinary launcher is the one-level case of the tuned
+`_CompileState` (the per-launcher specialization check map and a reference to
+the module's `_SharedCompiler`) or, for a `TunedLauncher`, its private
+`TunedCompileState`. The same `Launcher._compile_miss` calls the state's
+`run` method in both cases. An ordinary state uses the shared compiled kernel
+cache and current compile override, and C launches the returned record. A
+tuned state runs its private chain, including the final launch; C stores the
+record without launching it again. Both compile through `_KernelCompiler`.
+`override_compile(module, fn)` returns a no-argument function restoring the
+previous override; replacing an override keeps the shared compiler alive.
+An ordinary launcher is the one-level case of the tuned
 walk, so `key_chain` works on both. A cache hit skips this method.
 
 ## The kernel cache is swappable, and intj's own is the default

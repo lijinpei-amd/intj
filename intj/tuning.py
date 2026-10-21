@@ -15,8 +15,9 @@ import copy
 import dataclasses
 import inspect
 import threading
+import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from . import _imports
 from . import backend as backends
@@ -712,7 +713,11 @@ class TunedLauncher(Launcher):
             b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
         )
 
-    def _new_compile_state(self, b: _BuildOptions) -> TunedCompileState:
+    def _new_compile_state(
+        self, b: _BuildOptions, module: types.ModuleType
+    ) -> TunedCompileState:
+        """Returns this launcher's private tuning state."""
+        del module
         assert (
             b.tuned is not None
             and b.tuned.render is not None
@@ -727,7 +732,3 @@ class TunedLauncher(Launcher):
             b.knob_values,
             b.dynamic,
         )
-
-    def _compile_miss(self, *call: Any) -> Any:
-        """Tunes for a C cache miss and returns the winner's record, launched."""
-        return cast(TunedCompileState, self._C_compile_state).run(*call)

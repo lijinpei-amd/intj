@@ -271,7 +271,11 @@ def _launcher_over(module):
     stub = _stub()
 
     def build(h):
-        return module._init(h, _CompileState(), _Interner()), None, b""
+        return (
+            module._init(h, _CompileState(module._intj_compiler), _Interner()),
+            None,
+            b"",
+        )
 
     cls = type(
         "Over", (Launcher, stub.Launcher), {"__slots__": (), "_build_body": build}
@@ -3163,17 +3167,42 @@ def test_launchers_of_one_kernel_stay_independent(compiled_kernels):
 
 
 def test_one_module_per_key():
-    """A repeat `make_launcher` reuses the loaded module, compile function included.
+    """A repeat `make_launcher` reuses the module and its shared compiler.
 
-    Installing a second compile function would drop the first, freeing the
-    `CompiledKernel`s whose function handles launcher caches still hold.
+    Replacing the shared compiler would free kernels whose function handles
+    launcher caches still hold.
     """
     first = make_launcher(scale, options={"num_stages": 3})
     second = make_launcher(scale, options={"num_stages": 3})
-    compile_function = getattr(module_of(first), "_intj_compile")
+    compiler = module_of(first)._intj_compiler
     assert module_of(first) is module_of(second)
-    assert getattr(module_of(second), "_intj_compile") is compile_function
+    assert module_of(second)._intj_compiler is compiler
     assert first is not second  # each launcher owns its cache
+
+
+def test_compile_override_restores_built_siblings(power_kernel):
+    first = make_launcher(
+        power_kernel, no_gpu=True, extra_annotation={"N": Constexpr()}
+    )
+    second = make_launcher(
+        power_kernel, no_gpu=True, extra_annotation={"N": Constexpr()}
+    )
+    module = module_of(first)
+    assert module_of(second) is module
+    calls = []
+
+    def record(key, nparams, device, value):
+        calls.append(value)
+        return 0, 1, 0, nparams
+
+    restore = override_compile(module, record)
+    first(0, 0, 1, 2)
+    second(0, 0, 1, 3)
+    assert calls == [2, 3]
+    restore()
+    first(0, 0, 1, 4)
+    second(0, 0, 1, 5)
+    assert calls == [2, 3]
 
 
 def test_cached_build_is_reused_without_rendering(monkeypatch):
