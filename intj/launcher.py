@@ -409,8 +409,75 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
             "replaced (assume_constant_globals=True)",
             ClassGlobalWarning,
         )
-    device_binding, params, args, hidden, doc = _check_binding(
-        option, resolved, dynamic=dynamic, grid_code=compiled_grid
+    device = option.bind_device
+    if type(device) is bool:
+        raise TypeError(
+            "intj: bind_device takes an int device ordinal, not a flag; "
+            "use k.__self__.bind_device(ordinal)"
+        )
+    if device is not None and (type(device) is not int or not 0 <= device <= 2**31 - 1):
+        raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
+    values = cast(object, option.bind_values)  # as given: nothing checked it
+    if values is None:
+        values = {}
+    if not (isinstance(values, Mapping) and all(type(k) is str for k in values)):
+        raise TypeError("intj: bind_values must be None or a mapping keyed by str")
+    names = {p.name for p in resolved if p.annotation.bind_value is not None}
+    unknown = values.keys() - names
+    if unknown:
+        raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
+    missing = names - values.keys()
+    if missing:
+        raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
+    _imports.ensure_torch_imported()
+    _imports.ensure_triton_imported()
+    bound_params: list[ResolvedParam] = []
+    for p in resolved:
+        annotation = p.annotation
+        if annotation.bind_value == "tensor":
+            value = values[p.name]
+            if value is not None and type(value) not in (
+                _imports.torch.Tensor,
+                _imports.torch.nn.Parameter,
+            ):
+                raise TypeError(
+                    f"intj: bound tensor {p.name!r} must be a tensor or None"
+                )
+            if annotation.types == (None,) and value is not None:
+                raise TypeError(
+                    f"intj: bound tensor {p.name!r} must match declared None type"
+                )
+            if annotation.types is None:
+                ty = None
+                if value is not None:
+                    tensor: Any = value
+                    dtype = _imports.type_canonicalisation_dict.get(
+                        str(tensor.dtype).split(".")[-1]
+                    )
+                    if dtype is None:
+                        raise TypeError(
+                            f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}"
+                        )
+                    ty = "*" + dtype
+                annotation = dataclasses.replace(annotation, types=(ty,))
+        bound_params.append(dataclasses.replace(p, annotation=annotation))
+    params = tuple(bound_params)
+    bound_values = tuple(values[p.name] for p in params if p.name in names)
+    hidden = tuple(
+        values[p.name] if p.name in names else p.baked
+        for p in params
+        if p.annotation.bind_value is not None or p.annotation.baked_value
+    )
+    device_binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
+    args = (*(() if device is None else (device,)), *bound_values)
+    rendered, _, _ = _render_params(params, device_binding)
+    doc = _launch_doc(
+        rendered,
+        device is not None,
+        grid_arg,
+        compiled_grid,
+        grid_py is not None,
+        dynamic=dynamic,
     )
     # a declared knob is per call: leaving its live value out keeps it out
     # of the RenderKey, so it cannot build a module per value
@@ -444,98 +511,6 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         grid_cpp_fn=grid_cpp,
         knob_values=knob_values,
     )
-
-
-def _check_binding(
-    option: MakeLauncherOption,
-    params: tuple[ResolvedParam, ...],
-    *,
-    dynamic: tuple[str, ...],
-    grid_code: GridCode | None,
-) -> tuple[
-    DeviceBinding,
-    tuple[ResolvedParam, ...],
-    tuple[object, ...],
-    tuple[object, ...],
-    bytes,
-]:
-    """Checks `bind_device` and `bind_values` against the resolved `params`.
-
-    Returns `(device_binding, params, args, hidden, doc)`: `params` with bound
-    tensors' types resolved, `_init`'s trailing arguments, grid_py's fixed
-    values, and the `__text_signature__`.
-    """
-    device = option.bind_device
-    if type(device) is bool:
-        raise TypeError(
-            "intj: bind_device takes an int device ordinal, not a flag; "
-            "use k.__self__.bind_device(ordinal)"
-        )
-    if device is not None and (type(device) is not int or not 0 <= device <= 2**31 - 1):
-        raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
-    values = cast(object, option.bind_values)  # as given: nothing checked it
-    if values is None:
-        values = {}
-    if not (isinstance(values, Mapping) and all(type(k) is str for k in values)):
-        raise TypeError("intj: bind_values must be None or a mapping keyed by str")
-    names = {p.name for p in params if p.annotation.bind_value is not None}
-    unknown = values.keys() - names
-    if unknown:
-        raise TypeError(f"intj: unknown bound parameter(s) {sorted(unknown)}")
-    missing = names - values.keys()
-    if missing:
-        raise TypeError(f"intj: missing bound parameter(s) {sorted(missing)}")
-    _imports.ensure_torch_imported()
-    _imports.ensure_triton_imported()
-    resolved: list[ResolvedParam] = []
-    for p in params:
-        annotation = p.annotation
-        if annotation.bind_value == "tensor":
-            value = values[p.name]
-            if value is not None and type(value) not in (
-                _imports.torch.Tensor,
-                _imports.torch.nn.Parameter,
-            ):
-                raise TypeError(
-                    f"intj: bound tensor {p.name!r} must be a tensor or None"
-                )
-            if annotation.types == (None,) and value is not None:
-                raise TypeError(
-                    f"intj: bound tensor {p.name!r} must match declared None type"
-                )
-            if annotation.types is None:
-                ty = None
-                if value is not None:
-                    tensor: Any = value
-                    dtype = _imports.type_canonicalisation_dict.get(
-                        str(tensor.dtype).split(".")[-1]
-                    )
-                    if dtype is None:
-                        raise TypeError(
-                            f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}"
-                        )
-                    ty = "*" + dtype
-                annotation = dataclasses.replace(annotation, types=(ty,))
-        resolved.append(dataclasses.replace(p, annotation=annotation))
-    state = tuple(resolved)
-    bound_values = tuple(values[p.name] for p in state if p.name in names)
-    hidden = tuple(
-        values[p.name] if p.name in names else p.baked
-        for p in state
-        if p.annotation.bind_value is not None or p.annotation.baked_value
-    )
-    binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
-    args = (*(() if device is None else (device,)), *bound_values)
-    rendered, _, _ = _render_params(state, binding)
-    doc = _launch_doc(
-        rendered,
-        device is not None,
-        option.grid_arg,
-        grid_code,
-        option.grid_py is not None,
-        dynamic=dynamic,
-    )
-    return binding, state, args, hidden, doc
 
 
 class _MissCompileState(Protocol):
