@@ -581,8 +581,8 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(
         )
     ]
     assert "#define INTJ_HAS_KEY 0" in source
-    assert "intj_hash(" not in call_body
-    assert "intj_cache_get(" not in call_body
+    assert "intj_hash(" not in call_body + walk_body
+    assert "intj_cache_get(" not in call_body + walk_body
     assert "intj_cache_put(" not in call_body
     assert "intj_cache_init(" not in source
     assert "intj_cache_free(" not in source
@@ -6150,6 +6150,7 @@ for mode in (None, TorchAccessMode.STATIC_COMPILE):
     print(module_of(launch).__file__)
 print("torch.utils.cpp_extension" in sys.modules)
 print("triton.runtime.interpreter" in sys.modules)
+print("intj.tuning" in sys.modules)
 """
     run = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path / "warm_kernel.py")],
@@ -6159,7 +6160,7 @@ print("triton.runtime.interpreter" in sys.modules)
         text=True,
     )
     assert run.returncode == 0, run.stderr
-    assert run.stdout.split() == [path, path, "False", "False"]
+    assert run.stdout.split() == [path, path, "False", "False", "False"]
 
 
 def test_public_torch_access_modes():

@@ -326,7 +326,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     _verified_cpython_header()
     options = dict(sorted((options or {}).items()))
     chain = kernel
-    while type(kernel) in (_imports.Autotuner, _imports.Heuristics):
+    while _is_chain(kernel):
         kernel = kernel.fn
     interpreted = _imports.interpreted_function()
     if interpreted is not None and isinstance(kernel, interpreted):
@@ -834,11 +834,16 @@ class LaunchFunction(Protocol):
     def __call__(self, *args: Any) -> Any: ...
 
 
+def _is_chain(kernel: object) -> bool:
+    # an autotune/heuristics layer: what make_launcher gives a TunedLauncher
+    return type(kernel) in (_imports.Autotuner, _imports.Heuristics)
+
+
 def _new_launcher(options: MakeLauncherOption) -> LaunchFunction:
-    stub, plain, tuned = _stub_and_types()
+    stub, plain = _stub_and_type()
     # `delayed` cannot replace jit_func, so whether it is a chain is fixed now
-    chain = type(options.jit_func) in (_imports.Autotuner, _imports.Heuristics)
-    return stub.new_launcher(tuned if chain else plain, options)
+    chain = _is_chain(options.jit_func)
+    return stub.new_launcher(_tuned_type() if chain else plain, options)
 
 
 @overload
@@ -1175,14 +1180,26 @@ def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
     raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
 
 
-_stub_loaded: tuple[types.ModuleType, type[Launcher], type[Launcher]] | None = None
+_stub_loaded: tuple[types.ModuleType, type[Launcher]] | None = None
+_tuned_loaded: type[Launcher] | None = None
 _STUB_LOCK = threading.Lock()
 
 
-def _stub_and_types() -> tuple[types.ModuleType, type[Launcher], type[Launcher]]:
-    """Returns the process's one `_intj_lazy` and the launcher types over it.
+def _over_stub(base: type[Launcher], stub: types.ModuleType) -> type[Launcher]:
+    # `base` mixed with this load's `_intj_lazy.Launcher`
+    return cast(
+        "type[Launcher]",
+        type(
+            base.__name__,
+            (base, stub.Launcher),
+            {"__slots__": (), "__module__": base.__module__},
+        ),
+    )
 
-    `Launcher` and `TunedLauncher`, each mixed with `_intj_lazy.Launcher`.
+
+def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
+    """Returns the process's one `_intj_lazy` and the `Launcher` type over it.
+
     Loaded beside the modules intj renders, once, under a lock: a second load
     has its own `_intj_lazy.Launcher`, and `new_launcher` refuses a type over
     another load's.
@@ -1194,29 +1211,31 @@ def _stub_and_types() -> tuple[types.ModuleType, type[Launcher], type[Launcher]]
             loaded = _stub_loaded
             if loaded is None:
                 _imports.ensure_triton_imported()
-                from .tuning import TunedLauncher  # not at top: tuning imports this
-
                 stub = lazy.load_stub(
                     Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy",
                     compiler_path("c"),
                 )
-                plain, tuned = (
-                    cast(
-                        "type[Launcher]",
-                        type(
-                            base.__name__,
-                            (base, stub.Launcher),
-                            {"__slots__": (), "__module__": base.__module__},
-                        ),
-                    )
-                    for base in (Launcher, TunedLauncher)
-                )
-                loaded = _stub_loaded = (stub, plain, tuned)
+                loaded = _stub_loaded = (stub, _over_stub(Launcher, stub))
     return loaded
 
 
+def _tuned_type() -> type[Launcher]:
+    """Returns `TunedLauncher` over the process's `_intj_lazy`, built on first use."""
+    global _tuned_loaded
+    tuned = _tuned_loaded
+    if tuned is None:
+        stub = _stub()
+        with _STUB_LOCK:
+            tuned = _tuned_loaded
+            if tuned is None:
+                from .tuning import TunedLauncher  # not at top: tuning imports this
+
+                tuned = _tuned_loaded = _over_stub(TunedLauncher, stub)
+    return tuned
+
+
 def _stub() -> types.ModuleType:
-    return _stub_and_types()[0]
+    return _stub_and_type()[0]
 
 
 def module_of(launcher: Callable[..., Any]) -> types.ModuleType:

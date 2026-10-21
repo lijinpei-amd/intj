@@ -301,6 +301,8 @@ class RenderContext:
             for p in key.params
         )
         levels = _levels(tuning)
+        # a keyless module keeps one record: only an ordinary one is keyless
+        assert key.nwords or len(levels) == 1, "tuned modules always key"
         ndeps = sum(level.deps for level in levels)
         ncomp = sum(level.computed for level in levels)
         tuned_meta = tuned and key.grid_py_mode

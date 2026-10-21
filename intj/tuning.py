@@ -91,10 +91,12 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             parameter tuned, a name assigned twice, a read of a value an inner
             layer assigns, or an unparseable heuristic).
     """
+    from .launcher import _is_chain  # pyright: ignore[reportPrivateUsage]  # launcher internals
+
     _imports.ensure_triton_imported()
     layers: list[Any] = []
     inner = kernel
-    while type(inner) in (_imports.Autotuner, _imports.Heuristics):
+    while _is_chain(inner):
         layers.append(inner)
         inner = inner.fn
     if not layers:
