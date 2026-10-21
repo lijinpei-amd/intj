@@ -202,7 +202,7 @@ def _key(mode: TorchAccessMode, driver_path: str = "") -> RenderKey:
 
 
 @pytest.fixture(scope="module", params=_MODES, ids=lambda m: m.value)
-def built(request, stub, tmp_path_factory):
+def built(request, stub, stub_module, tmp_path_factory):
     """Builds the entry module for one access mode against the stub driver.
 
     Returns:
@@ -250,6 +250,7 @@ def built(request, stub, tmp_path_factory):
     spec = importlib.util.spec_from_file_location(key.module_name, so)
     module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportArgumentType]
     spec.loader.exec_module(module)  # pyright: ignore
+    module._set_launcher_type(stub_module.Launcher)
 
     compiles = []
 
@@ -627,6 +628,7 @@ module._set_torch_version({torch_version()!r}, {layout.as_args() if layout else 
 spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
 lazy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lazy)
+module._set_launcher_type(lazy.Launcher)
 build = lambda header: (module._init(header, {{}}, print), None, b"")
 launch = lazy.new_launcher(type("L", (lazy.Launcher,), {{"__slots__": (), "_build_body": build}}), None)
 assert not sys._is_gil_enabled()
@@ -1167,13 +1169,80 @@ def test_launchers_come_only_from_new_launcher(stub_module):
 
     with pytest.raises(TypeError, match="come from make_launcher"):
         Sub()
-    wide = type("Wide", (stub_module.Launcher,), {"__slots__": ("extra",)})
-    for cls in (object, int, wide):  # not a Launcher, or one more word
+    for cls in (object, int):
         with pytest.raises(TypeError, match="new_launcher"):
             stub_module.new_launcher(cls, None)
     with pytest.raises(TypeError, match="new_launcher"):
         stub_module.new_launcher(Sub, None, print)  # no builder argument
     assert type(stub_module.new_launcher(Sub, None).__self__) is Sub
+
+
+@pytest.mark.parametrize("slots", [("extra",), None], ids=["slots", "dict"])
+def test_launcher_subclass_fields_survive_build_and_are_collected(
+    built, stub_module, slots
+):
+    module, driver, compiles = built
+
+    def build_body(self):
+        return _built(
+            module._init(
+                self, launcher._CompileState(module._intj_compiler), _interner()
+            )
+        )
+
+    namespace = {"_build_body": build_body}
+    if slots is not None:
+        namespace["__slots__"] = slots
+    cls = type("L", (launcher.Launcher, stub_module.Launcher), namespace)
+    launch = stub_module.new_launcher(cls, None)
+
+    class Owner:
+        launch: Callable[..., object]
+
+    owner = Owner()
+    owner.launch = launch
+    launch.__self__.extra = owner
+    ref = weakref.ref(owner)
+    args = _args()
+    calls, misses = driver.calls(), len(compiles)
+    assert launch(*args) is None
+    assert launch(*args) is None
+    assert driver.calls() == calls + 2 and len(compiles) == misses + 1
+    assert launch.__self__.extra is owner
+    assert launch.__self__._C_module is module
+    with pytest.raises(TypeError, match="unbuilt launcher"):
+        module._init(launch.__self__, None, _interner())
+    del owner, launch
+    gc.collect()
+    assert ref() is None
+
+
+def test_init_rejects_objects_with_unrelated_c_layouts(built, stub_module):
+    module, _, _ = built
+    words = (stub_module._header_size() - object.__basicsize__) // struct.calcsize("P")
+    same = type("SameSize", (), {"__slots__": tuple(f"slot{i}" for i in range(words))})
+    larger = type("Larger", (same,), {"__slots__": ("extra",)})
+    assert same.__basicsize__ == stub_module._header_size()
+    for value in (object(), same(), larger()):
+        with pytest.raises(TypeError, match="unbuilt launcher"):
+            module._init(value, None, _interner())
+
+
+def test_launcher_type_cannot_be_replaced(built, tmp_path):
+    module, _, _ = built
+    other = lazy.load_stub(tmp_path, _cc("c"))
+    with pytest.raises(RuntimeError, match="launcher type already installed"):
+        module._set_launcher_type(other.Launcher)
+
+
+def test_init_rejects_a_launcher_from_another_stub(built, tmp_path):
+    module, _, _ = built
+    other = lazy.load_stub(tmp_path, _cc("c"))
+    cls = type("Other", (other.Launcher,), {"__slots__": ()})
+    launch = other.new_launcher(cls, None)
+    with pytest.raises(TypeError, match="unbuilt launcher"):
+        module._init(launch.__self__, None, _interner())
+    assert launch.__self__._C_module is None
 
 
 def test_locked_runs_python_under_the_build_lock(stub_module):

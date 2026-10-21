@@ -331,16 +331,14 @@ static PyType_Spec intj_lazy_spec = {
     intj_lazy_slots};
 
 /* new_launcher(cls, options) -> an unbuilt launcher: a PyCFunction over a
- * `cls` instance, `cls` being Launcher or a subclass that adds no storage; the
- * first call runs its `_build_body`. */
+ * `cls` instance, with intj_launcher as its C base; Python subclasses may add
+ * storage.  The first call runs its `_build_body`. */
 static PyObject *new_launcher(PyObject *m, PyObject *const *args,
                               Py_ssize_t nargs) {
   intj_lazy_state *st = (intj_lazy_state *)PyModule_GetState(m);
   PyTypeObject *cls =
       nargs == 2 && PyType_Check(args[0]) ? (PyTypeObject *)args[0] : NULL;
-  if (!cls || !PyType_IsSubtype(cls, st->type) ||
-      cls->tp_basicsize != (Py_ssize_t)sizeof(intj_launcher) ||
-      cls->tp_itemsize != 0) {
+  if (!cls || !PyType_IsSubtype(cls, st->type) || cls->tp_itemsize != 0) {
     PyErr_SetString(PyExc_TypeError, "intj: new_launcher(cls, options)");
     return NULL;
   }

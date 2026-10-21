@@ -109,6 +109,7 @@ typedef int32_t (*intj_device_get_t)(int32_t *device, int32_t ordinal);
 
 /* Read-only once loaded: every mutable launch state is its launcher's. */
 typedef struct {
+  PyTypeObject *launcher_type;
   PyTypeObject *tensor_type;
   PyTypeObject *param_type;
   PyObject *compile_name;
@@ -1288,9 +1289,13 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
     return NULL;
   }
   PyTypeObject *type = Py_TYPE(args[0]);
+  if (!st->launcher_type || !PyType_IsSubtype(type, st->launcher_type) ||
+      type->tp_itemsize != 0) {
+    PyErr_SetString(PyExc_TypeError, "intj: _init needs an unbuilt launcher");
+    return NULL;
+  }
   intj_launcher *h = (intj_launcher *)args[0];
-  if (type->tp_basicsize != (Py_ssize_t)sizeof(intj_launcher) || type->tp_itemsize != 0 ||
-      h->state || h->module) {
+  if (h->state || h->module) {
     PyErr_SetString(PyExc_TypeError, "intj: _init needs an unbuilt launcher");
     return NULL;
   }
@@ -1430,6 +1435,23 @@ static PyObject *header_size(PyObject *self, PyObject *unused) {
   (void)self;
   (void)unused;
   return PyLong_FromSize_t(sizeof(intj_launcher));
+}
+
+/* Install this load's C launcher base before _init can read its fields. */
+static PyObject *intj_set_launcher_type(PyObject *self, PyObject *value) {
+  intj_state *st = (intj_state *)PyModule_GetState(self);
+  if (!PyType_Check(value) ||
+      ((PyTypeObject *)value)->tp_basicsize < (Py_ssize_t)sizeof(intj_launcher) ||
+      ((PyTypeObject *)value)->tp_itemsize != 0) {
+    PyErr_SetString(PyExc_TypeError, "intj: _set_launcher_type needs a C launcher base");
+    return NULL;
+  }
+  if (st->launcher_type) {
+    PyErr_SetString(PyExc_RuntimeError, "intj: launcher type already installed");
+    return NULL;
+  }
+  st->launcher_type = (PyTypeObject *)Py_NewRef(value);
+  Py_RETURN_NONE;
 }
 
 /* Debug/test entry point: the spec key intj would compute for these arguments,
@@ -1731,6 +1753,7 @@ static int intj_exec(PyObject *m) {
 
 static int intj_traverse(PyObject *m, visitproc visit, void *arg) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
+  Py_VISIT(st->launcher_type);
   Py_VISIT(st->tensor_type);
   Py_VISIT(st->param_type);
   Py_VISIT(st->compile_name);
@@ -1739,6 +1762,7 @@ static int intj_traverse(PyObject *m, visitproc visit, void *arg) {
 
 static int intj_clear(PyObject *m) {
   intj_state *st = (intj_state *)PyModule_GetState(m);
+  Py_CLEAR(st->launcher_type);
   Py_CLEAR(st->tensor_type);
   Py_CLEAR(st->param_type);
   Py_CLEAR(st->compile_name);
@@ -1748,6 +1772,7 @@ static int intj_clear(PyObject *m) {
 static PyMethodDef intj_methods[] = {
     {"_init", (PyCFunction)(void (*)(void))intj_init, METH_FASTCALL, NULL},
     {"_header_size", header_size, METH_NOARGS, NULL},
+    {"_set_launcher_type", intj_set_launcher_type, METH_O, NULL},
     {"_set_torch_version", (PyCFunction)(void (*)(void))intj_set_torch_version,
      METH_FASTCALL, NULL},
     {NULL, NULL, 0, NULL}};

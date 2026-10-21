@@ -1407,11 +1407,13 @@ def _loaded_module(  # pyright: ignore[reportUnusedFunction]  # consumed by rend
         module = _LOADED.get(key)
         if module is None:
             module = load(key, kernel_module)
-            if module._header_size() != _stub()._header_size():
+            stub = _stub()
+            if module._header_size() != stub._header_size():
                 raise ImportError(
                     f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
                     "header; it was built by another intj -- delete it to rebuild"
                 )
+            module._set_launcher_type(stub.Launcher)
             if compile_function is not None:
                 # Python state shared by ordinary launchers, never read by C.
                 setattr(module, "_intj_compiler", _SharedCompiler(compile_function()))

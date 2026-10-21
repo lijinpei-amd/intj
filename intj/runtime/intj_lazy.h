@@ -1,4 +1,5 @@
-/* A launcher's fixed-size object.  `_intj_lazy` allocates it at decoration;
+/* A launcher's C base.  Python subclasses may append instance storage.
+ * `_intj_lazy` allocates the concrete instance at decoration;
  * a rendered module's `_init` allocates the per-launcher state block behind
  * `state` and installs `ops`.  Both compile this one definition;
  * `_header_size` lets Python check they agree. */

@@ -71,9 +71,10 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 `_intj_lazy` (`intj/lazy.py`, `runtime/intj_lazy.c`), the stub every launcher
 starts as, follows the same rule. Every launcher is a `PyCFunction` over a
 `PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
-`__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size; an
+`__slots__ = ()` subclass of `_intj_lazy.Launcher`). Subclasses may append Python
+instance storage while preserving the C base layout. An
 autotune/heuristics chain gets `intj.tuning.TunedLauncher`, a `Launcher` subclass
-`make_launcher` picks from the kernel's type, which `delayed` cannot change). The first
+`make_launcher` picks from the kernel's type, which `delayed` cannot change. The first
 call runs the subclass's `_build_body`, called by name, and swaps its
 `ml_meth` from the build shim to the rendered entry. C keeps only the build
 lock and that swap: everything else Python does under the lock goes through
@@ -90,7 +91,9 @@ C to publish before it swaps the entry in. The
 module's `_init` allocates the launcher's state block behind `state` and
 installs the `traverse`/`release` ops GC and dealloc reach it through. All
 mutable launch state (cache, lock, Python compile state) is the launcher's; the
-module's C state is written once, at load.
+module's C state is written once, at load. `_set_launcher_type` installs the
+stub's C base type at load, so `_init` validates the subtype before reading the
+launcher's C fields.
 
 The rendered C miss path calls `Launcher._compile_miss(keyblob, nparams,
 device, stream, controls, *dynamic, *args)` by name through the Python C API,
