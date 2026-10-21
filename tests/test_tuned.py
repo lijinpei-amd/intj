@@ -1243,3 +1243,27 @@ def test_tuned_and_ordinary_misses_share_the_kernel_compiler(monkeypatch):
     torch.cuda.synchronize()
     assert len(calls) == tuned_calls + 1
     assert int(out[0].item()) == 1
+
+
+def test_a_chain_gets_a_tuned_launcher_and_its_copies_keep_it():
+    from intj.launcher import Launcher, _CompileState
+    from intj.tuning import TunedCompileState, TunedLauncher
+
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    bench = Bench(out, {16: {1: 1.0, 2: 2.0}})
+    _, launch = tuned_launcher(bench)
+    device, stream = controls()
+    copies = [
+        launch.__self__.bind_device(device),
+        launch.__self__.replace_delayed(None),
+    ]
+    assert all(isinstance(k.__self__, TunedLauncher) for k in (launch, *copies))
+    plain = make_launcher(tagged)
+    assert isinstance(plain.__self__, Launcher)
+    assert not isinstance(plain.__self__, TunedLauncher)
+    bench.key = 16
+    launch(device, stream, x, out, 16)
+    plain(device, stream, (1,), x, out, 16, 1, 32)
+    assert type(launch.__self__._C_compile_state) is TunedCompileState
+    assert type(plain.__self__._C_compile_state) is _CompileState

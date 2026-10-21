@@ -16,17 +16,18 @@ import dataclasses
 import inspect
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
 from . import backend as backends
 from .annotation import DeviceBinding, ResolvedParam
 from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
-from .launcher import UnsupportedKernel
+from .launcher import Launcher, UnsupportedKernel
 from .render.key import Param, TuningRender
 
 if TYPE_CHECKING:
     from .grid import GridCode
+    from .launcher import _BuildOptions  # pyright: ignore[reportPrivateUsage]  # launcher internals
 
 
 @dataclasses.dataclass(frozen=True)
@@ -689,3 +690,42 @@ class TunedCompileState:
                     layer.nargs = None
                     # set by a closure in Autotuner.__init__
                     layer.restore_copies = {}
+
+
+class TunedLauncher(Launcher):
+    """The launcher of an autotune/heuristics chain: `k.__self__` for such a `k`.
+
+    `make_launcher` picks it from the kernel's type.  Its build also checks
+    every config against the target, and a miss tunes through a private copy
+    of the chain, which launches the winner itself; the rest is `Launcher`'s.
+    """
+
+    __slots__ = ()
+
+    def _check_target(self, b: _BuildOptions) -> None:
+        assert b.tuned is not None and b.knob_values is not None, (
+            "plan_tuning refuses no_gpu"
+        )
+        check_tuned_configs(
+            b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
+        )
+
+    def _new_compile_state(self, b: _BuildOptions) -> TunedCompileState:
+        assert (
+            b.tuned is not None
+            and b.tuned.render is not None
+            and b.knob_values is not None
+        )
+        return TunedCompileState(
+            b.tuned.plan,
+            b.params,
+            dict(b.compile_options),
+            tuned_grid(b.grid_py, b.grid_cpp_fn, b.grid_code),
+            b.tuned.render,
+            b.knob_values,
+            b.dynamic,
+        )
+
+    def _compile_miss(self, *call: Any) -> Any:
+        """Tunes for a C cache miss and returns the winner's record, launched."""
+        return cast(TunedCompileState, self._C_compile_state).run(*call)

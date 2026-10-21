@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from typing_extensions import Unpack
 
     from .grid import GridCode
-    from .tuning import Tuned, TunedCompileState
+    from .tuning import Tuned
 
 
 class UnsupportedKernel(NotImplementedError):
@@ -540,10 +540,9 @@ def _check_binding(
 
 @dataclasses.dataclass
 class _CompileState:
-    """One launcher's specialization checks and optional private tuning state."""
+    """One ordinary launcher's spec key -> compile identity checks."""
 
     seen: dict[bytes, object] = dataclasses.field(default_factory=dict)
-    tuned: TunedCompileState | None = None
 
 
 class Launcher:
@@ -568,7 +567,7 @@ class Launcher:
         @property
         def _C_module(self) -> types.ModuleType | None: ...
         @property
-        def _C_compile_state(self) -> _CompileState: ...
+        def _C_compile_state(self) -> object: ...
         @property
         def _C_built(self) -> bool: ...
         def _C_build(self) -> types.ModuleType: ...
@@ -783,45 +782,32 @@ class Launcher:
         _imports.ensure_triton_imported()
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
-        if b.tuned is not None:
-            from .tuning import check_tuned_configs
-
-            assert b.knob_values is not None, "plan_tuning refuses no_gpu"
-            check_tuned_configs(
-                b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
-            )
+        self._check_target(b)
         module = _materialize_module(b)
-        compile_state = _CompileState()
-        if b.tuned is not None:
-            from .tuning import TunedCompileState, tuned_grid
-
-            assert b.tuned.render is not None and b.knob_values is not None
-            compile_state.tuned = TunedCompileState(
-                b.tuned.plan,
-                b.params,
-                dict(b.compile_options),
-                tuned_grid(b.grid_py, b.grid_cpp_fn, b.grid_code),
-                b.tuned.render,
-                b.knob_values,
-                b.dynamic,
-            )
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
-        address = module._init(self, compile_state, _Interner(), *grid_py, *b.args)
+        address = module._init(
+            self, self._new_compile_state(b), _Interner(), *grid_py, *b.args
+        )
         return address, option, b.doc
 
-    def _compile_miss(self, *call: Any) -> Any:
-        """Returns the kernel record for a C cache miss.
+    def _check_target(self, b: _BuildOptions) -> None:
+        """Runs the build's checks that need the target, after every GPU-free one."""
+        assert b.tuned is None, "make_launcher gives a chain a TunedLauncher"
 
-        Ordinary misses pass `(keyblob, nparams, device, *args)`; tuned misses
-        also pass `stream` and grid controls before `args`. Dynamic values
-        precede public kernel arguments. Tuning performs the final launch;
-        an ordinary miss leaves that launch to C.
+    def _new_compile_state(self, b: _BuildOptions) -> object:
+        """Returns the Python state `_init` stores and `_compile_miss` reads back."""
+        del b
+        return _CompileState()
+
+    def _compile_miss(self, *call: Any) -> Any:
+        """Returns the kernel record for a C cache miss, which C then launches.
+
+        Called as `(keyblob, nparams, device, *args)`, the dynamic values
+        preceding the public kernel arguments.
         """
-        state = self._C_compile_state
-        if state.tuned is not None:
-            return state.tuned.run(*call)
         module = self._C_module
         assert module is not None, "compile misses require an initialized launcher"
+        state = cast(_CompileState, self._C_compile_state)
         # Read per miss so override_compile reaches already built launchers.
         return getattr(module, "_intj_compile")(state.seen, *call)
 
@@ -835,8 +821,10 @@ class LaunchFunction(Protocol):
 
 
 def _new_launcher(options: MakeLauncherOption) -> LaunchFunction:
-    stub, cls = _stub_and_type()
-    return stub.new_launcher(cls, options)
+    stub, plain, tuned = _stub_and_types()
+    # `delayed` cannot replace jit_func, so whether it is a chain is fixed now
+    chain = type(options.jit_func) in (_imports.Autotuner, _imports.Heuristics)
+    return stub.new_launcher(tuned if chain else plain, options)
 
 
 @overload
@@ -1173,13 +1161,14 @@ def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
     raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
 
 
-_stub_loaded: tuple[types.ModuleType, type[Launcher]] | None = None
+_stub_loaded: tuple[types.ModuleType, type[Launcher], type[Launcher]] | None = None
 _STUB_LOCK = threading.Lock()
 
 
-def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
-    """Returns the process's one `_intj_lazy` and the `Launcher` type over it.
+def _stub_and_types() -> tuple[types.ModuleType, type[Launcher], type[Launcher]]:
+    """Returns the process's one `_intj_lazy` and the launcher types over it.
 
+    `Launcher` and `TunedLauncher`, each mixed with `_intj_lazy.Launcher`.
     Loaded beside the modules intj renders, once, under a lock: a second load
     has its own `_intj_lazy.Launcher`, and `new_launcher` refuses a type over
     another load's.
@@ -1191,18 +1180,29 @@ def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
             loaded = _stub_loaded
             if loaded is None:
                 _imports.ensure_triton_imported()
+                from .tuning import TunedLauncher  # not at top: tuning imports this
+
                 stub = lazy.load_stub(
                     Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy",
                     compiler_path("c"),
                 )
-                namespace = {"__slots__": (), "__module__": __name__}
-                cls = type("Launcher", (Launcher, stub.Launcher), namespace)
-                loaded = _stub_loaded = (stub, cast("type[Launcher]", cls))
+                plain, tuned = (
+                    cast(
+                        "type[Launcher]",
+                        type(
+                            base.__name__,
+                            (base, stub.Launcher),
+                            {"__slots__": (), "__module__": base.__module__},
+                        ),
+                    )
+                    for base in (Launcher, TunedLauncher)
+                )
+                loaded = _stub_loaded = (stub, plain, tuned)
     return loaded
 
 
 def _stub() -> types.ModuleType:
-    return _stub_and_type()[0]
+    return _stub_and_types()[0]
 
 
 def module_of(launcher: Callable[..., Any]) -> types.ModuleType:

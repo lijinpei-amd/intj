@@ -71,7 +71,9 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 `_intj_lazy` (`intj/lazy.py`, `runtime/intj_lazy.c`), the stub every launcher
 starts as, follows the same rule. Every launcher is a `PyCFunction` over a
 `PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
-`__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size). The first
+`__slots__ = ()` subclass of `_intj_lazy.Launcher`, one fixed size; an
+autotune/heuristics chain gets `intj.tuning.TunedLauncher`, a `Launcher` subclass
+`make_launcher` picks from the kernel's type, which `delayed` cannot change). The first
 call runs the subclass's `_build_body`, called by name, and swaps its
 `ml_meth` from the build shim to the rendered entry. C keeps only the build
 lock and that swap: everything else Python does under the lock goes through
@@ -92,8 +94,9 @@ module's C state is written once, at load.
 
 The rendered C miss path calls `Launcher._compile_miss` by name through the
 Python C API. `_init` stores its Python state in the launcher's state block,
-exposed by `_C_compile_state`: the per-launcher specialization check map and,
-when tuned, a private `TunedCompileState`. Ordinary misses look up the module's
+exposed by `_C_compile_state`: a `_CompileState` (the per-launcher
+specialization check map) or, for a `TunedLauncher`, its private
+`TunedCompileState`. Ordinary misses look up the module's
 `_intj_compile` each time, preserving compile overrides and the shared compiled
 kernel cache. Tuned misses run their private chain, including the final launch;
 C caches the record without launching it again. A cache hit skips this method.
