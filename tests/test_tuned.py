@@ -1215,3 +1215,31 @@ def test_tuned_constexpr_option_parameter_feeds_the_option(layer):
     assert (out == 8).all()
     with pytest.raises(UnsupportedKernel, match="set by the autotune configs"):
         make_launcher(kernel, dynamic_options=("num_warps",)).__self__.check()
+
+
+def test_tuned_and_ordinary_misses_share_the_kernel_compiler(monkeypatch):
+    """Both miss paths reach Triton through `_KernelCompiler.compile`."""
+    import intj.launcher as launcher_mod
+
+    real = launcher_mod._KernelCompiler.compile
+    calls = []
+
+    def counting(self, identity, canonical):
+        calls.append(identity)
+        return real(self, identity, canonical)
+
+    monkeypatch.setattr(launcher_mod._KernelCompiler, "compile", counting)
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    bench = Bench(out, {16: {1: 1.0, 2: 2.0}})
+    _, tuned = tuned_launcher(bench)
+    device, stream = controls()
+    bench.key = 16
+    tuned(device, stream, x, out, 16)
+    tuned_calls = len(calls)
+    assert tuned_calls >= 2, "each autotune config compiles through it"
+    plain = make_launcher(tagged)
+    plain(device, stream, (1,), x, out, 16, 1, 32)
+    torch.cuda.synchronize()
+    assert len(calls) == tuned_calls + 1
+    assert int(out[0].item()) == 1

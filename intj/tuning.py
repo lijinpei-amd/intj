@@ -541,28 +541,24 @@ class TunedCompileState:
         dynamic: Sequence[str] = (),
     ) -> None:
         from .launcher import (
+            _KernelCompiler,  # pyright: ignore[reportPrivateUsage]  # launcher internals
             _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
         self.plan = plan
         self.jit_func = plan.jit_func
-        self.target = backends.current_target()
-        self.backend = _imports.make_backend(self.target)
-        self.options = options
+        # its own, strong: a CompiledKernel is loaded on one device, and
+        # records point into candidates no module sees
+        self.compiler = _KernelCompiler(self.jit_func, options, knob_values, weak=False)
         self.grid = grid
         self.render = render
-        self.knob_values = knob_values
         self.dynamic = dynamic
         # Every parameter is public: the shim sees the full Triton call.
         self.params = tuple(
             Param(p.name, p.index, p.index, p.annotation) for p in resolved
         )
-        # A CompiledKernel is loaded on one device; keep candidates alive.
-        self.compiled: dict[
-            tuple[Any, str, tuple[tuple[str, object], ...], int], Any
-        ] = {}
         self.call_knobs: dict[str, object] = {}
-        self.fed = _parameter_options(self.backend, self.params)
+        self.fed = _parameter_options(self.compiler.backend, self.params)
         self.shim = _Shim(self.jit_func, self._compile_kernel)
         self.private = _private_chain(plan.layers, self.shim)
         self.public = [
@@ -579,38 +575,22 @@ class TunedCompileState:
     ) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
         from .launcher import (
-            _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
             _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-            _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _Identity,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
-        canonical = backends.canonical_options(
-            self.target,
-            _knob_options(
-                self.jit_func,
-                {**self.options, **config_options, **{n: values[n] for n in self.fed}},
-                {**self.knob_values, **self.call_knobs},
-            ),
+        canonical = self.compiler.canonical(
+            {**config_options, **{n: values[n] for n in self.fed}}, self.call_knobs
         )
         compiler_input = _compiler_input(
             self.jit_func,
             self.params,
             [values[p.name] for p in self.params],
-            self.backend,
+            self.compiler.backend,
         )
-        # knobs feeding no option change the binary too
-        key = (
-            compiler_input,
-            canonical.hash(),
-            tuple(sorted(self.call_knobs.items())),
-            backends.current_device(),
+        return self.compiler.compile(
+            _Identity.of(compiler_input, canonical, self.call_knobs), canonical
         )
-        kernel = self.compiled.get(key)
-        if kernel is None:
-            kernel = self.compiled[key] = _checked_compile(
-                self.jit_func, compiler_input, self.target, canonical
-            )
-        return kernel
 
     def run(
         self,
@@ -644,21 +624,14 @@ class TunedCompileState:
     ) -> tuple[Any, ...]:
         """Runs the private chain on `stream` and returns the record for C."""
         from .launcher import (
-            _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-            _split_dynamic,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _check_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _record,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+            _split_call,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
         _imports.ensure_torch_imported()
-        current = backends.current_device()
-        if device != current:
-            raise UnsupportedKernel(
-                f"intj: launching on device {device} while device {current} is current; "
-                "make the target device current before the first launch"
-            )
-        dyn_values, args = args[: len(self.dynamic)], args[len(self.dynamic) :]
-        dyn_options, dyn_knobs = _split_dynamic(self.dynamic, dyn_values)
-        _check_live_knobs(dyn_knobs)
-        self.call_knobs = dyn_knobs
+        _check_device(device)
+        dyn_options, self.call_knobs, args = _split_call(self.dynamic, args)
         named = {**dict(zip(self.public, args)), **self.baked}
         # Positional up to the first tuned parameter, as a Triton caller would
         # write it: prune functions read `named_args`, which is positional only.
@@ -692,20 +665,8 @@ class TunedCompileState:
             assert self.shim.final is not None, "Triton finished without a final launch"
             values, config_options, kernel = self.shim.final
             tuned_values = {**values, **config_options}
-            md = kernel.metadata
-            expected = sum(
-                1 for ty in kernel.src.signature.values() if ty != "constexpr"
-            )
-            if expected != nparams:
-                raise RuntimeError(
-                    f"intj: packed {nparams} kernel arguments but triton compiled "
-                    f"{expected}; this is an intj bug"
-                )
             return (
-                kernel.function,
-                md.warp_size * md.num_warps,
-                md.shared,
-                nparams,
+                *_record(kernel, nparams),
                 kernel,
                 tuple(c_scalar(n, tuned_values[n]) for n in self.render.dep_names),
                 tuple(tuned_values[n] for n in self.render.computed_names),

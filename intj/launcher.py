@@ -1424,6 +1424,30 @@ def _check_live_knobs(values: Mapping[str, object]) -> None:
             )
 
 
+def _split_call(
+    dynamic: Sequence[str], args: tuple[Any, ...]
+) -> tuple[dict[str, object], dict[str, object], tuple[Any, ...]]:
+    """Splits a miss's arguments into its dynamic options, its knobs, and the rest.
+
+    Raises:
+        ValueError: A declared knob was passed other than its live value.
+    """
+    options, knobs = _split_dynamic(dynamic, args[: len(dynamic)])
+    _check_live_knobs(knobs)
+    return options, knobs, args[len(dynamic) :]
+
+
+def _check_device(device: int) -> None:
+    # _init_handles() loads the binary on the *current* device; launching that
+    # function on another device's stream is a wrong-context launch
+    current = backends.current_device()
+    if device != current:
+        raise UnsupportedKernel(
+            f"intj: launching on device {device} while device {current} is current; "
+            "make the target device current before the first launch"
+        )
+
+
 def get_full_name(fn: Any) -> str:
     """Returns `fn`'s `<module>.<qualname>`."""
     return f"{fn.__module__}.{fn.__qualname__}"
@@ -1993,6 +2017,98 @@ def _checked_compile(
     return kernel
 
 
+@dataclasses.dataclass(frozen=True)
+class _Identity:
+    """What one compile is cached and self-checked by.
+
+    Knobs change the binary even where they feed no option.
+    """
+
+    compiler_input: CompilerInput
+    options_hash: str
+    knobs: tuple[tuple[str, object], ...]
+
+    @classmethod
+    def of(
+        cls,
+        compiler_input: CompilerInput,
+        canonical: Any,
+        knobs: Mapping[str, object],
+    ) -> _Identity:
+        return cls(compiler_input, canonical.hash(), tuple(sorted(knobs.items())))
+
+
+class _KernelCompiler:
+    """Compiles `jit_func` for cache misses, once per identity and device.
+
+    A module's ordinary launchers share one through its `_intj_compile`; each
+    tuned launcher owns one for its candidates.
+    """
+
+    def __init__(
+        self,
+        jit_func: JitFunction,
+        options: Mapping[str, Any],
+        knob_values: Mapping[str, object],
+        *,
+        weak: bool,
+    ) -> None:
+        self.jit_func = jit_func
+        self.target = backends.current_target()
+        self.backend = _imports.make_backend(self.target)
+        self._options = dict(options)
+        self._knob_values = dict(knob_values)
+        # weak where the records own their CompiledKernel (return_compiled):
+        # the cache must not keep it alive past them
+        self._compiled: MutableMapping[tuple[object, ...], CompiledKernel] = (
+            weakref.WeakValueDictionary() if weak else {}
+        )
+        # Reentrant: a compile can launch this kernel again (a nested miss on
+        # the same thread).
+        self._lock = threading.RLock()
+
+    def canonical(self, options: Mapping[str, Any], knobs: Mapping[str, object]) -> Any:
+        """Returns the target's options: `options` over the base ones, then knobs."""
+        return backends.canonical_options(
+            self.target,
+            _knob_options(
+                self.jit_func,
+                {**self._options, **options},
+                {**self._knob_values, **knobs},
+            ),
+        )
+
+    def compile(self, identity: _Identity, canonical: Any) -> CompiledKernel:
+        """Returns the kernel for `identity` on the current device, compiled once."""
+        key = (identity, backends.current_device())
+        with self._lock:
+            kernel = self._compiled.get(key)
+            if kernel is None:
+                fresh = _checked_compile(
+                    self.jit_func, identity.compiler_input, self.target, canonical
+                )
+                # a nested miss may have stored one meanwhile; its record may
+                # already be cached, so its kernel is the one that must stay
+                kernel = self._compiled.setdefault(key, fresh)
+        return kernel
+
+
+def _record(kernel: CompiledKernel, nparams: int) -> tuple[int, int, int, int]:
+    """Returns `kernel`'s record for C: function, block_dim, shared, nparams.
+
+    Raises:
+        RuntimeError: Triton compiled another argument count than C packed.
+    """
+    md = kernel.metadata
+    expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
+    if expected != nparams:
+        raise RuntimeError(
+            f"intj: packed {nparams} kernel arguments but triton compiled {expected}; "
+            "this is an intj bug"
+        )
+    return (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
+
+
 def _refuse_module_compile(*args: Any) -> Any:
     """Refuses a compile; a tuned module's own callback.
 
@@ -2039,94 +2155,49 @@ def _make_compile_callback(
     `_compile_miss`: `(seen, keyblob, nparams, device, *args)`, `args` being the
     dynamic values, then the public arguments.
     """
-    target = backends.current_target()
-    backend = _imports.make_backend(target)
-    fed = {p.name: p for p in params if p.name in _parameter_options(backend, params)}
-    options = {
-        **options,
-        **{
-            n: (baked_values or {})[p.index]
-            for n, p in fed.items()
-            if p.call_index is None
-        },
+    # The module's compile cache: a sibling launcher's miss reuses the kernel
+    # and only builds its own C record.
+    compiler = _KernelCompiler(jit_func, options, knob_values, weak=return_compiled)
+    fed = {
+        p.name: p
+        for p in params
+        if p.name in _parameter_options(compiler.backend, params)
+    }
+    fixed = {
+        n: (baked_values or {})[p.index] for n, p in fed.items() if p.call_index is None
     }
     per_call = {n: p.call_index for n, p in fed.items() if p.call_index is not None}
     # without per-call values every record has the same options
-    fixed_options = (
-        None
-        if dynamic or per_call
-        else backends.canonical_options(
-            target, _knob_options(jit_func, options, knob_values)
-        )
-    )
-    # The module's compile cache: a sibling launcher's miss reuses the kernel
-    # and only builds its own C record.  With return_compiled the records own
-    # their CompiledKernel, so the cache must not keep it alive past them.
-    compiled: MutableMapping[tuple[object, ...], CompiledKernel] = (
-        weakref.WeakValueDictionary() if return_compiled else {}
-    )
-    # One compile per input across the module's launchers.  Reentrant: a
-    # compile can launch this kernel again (a nested miss on the same thread).
-    lock = threading.RLock()
+    fixed_options = None if dynamic or per_call else compiler.canonical(fixed, {})
 
     def compile_callback(
         seen: dict[bytes, object], keyblob: bytes, nparams: int, device: int, *args: Any
     ) -> tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]:
         """Compiles, or reuses, the kernel for one miss.
 
-        `seen` is the calling launcher's own key -> input map.
+        `seen` is the calling launcher's own key -> identity map.
         """
-        current = backends.current_device()
-        if device != current:
-            # _init_handles() loads the binary on the *current* device;
-            # launching that function on another device's stream is a
-            # wrong-context launch, so refuse instead.
-            raise UnsupportedKernel(
-                f"intj: launching on device {device} while device {current} is current; "
-                "make the target device current before the first launch"
-            )
-        values, args = args[: len(dynamic)], args[len(dynamic) :]
-        dyn_options, dyn_knobs = _split_dynamic(dynamic, values)
-        dyn_options.update({n: args[i] for n, i in per_call.items()})
-        _check_live_knobs(dyn_knobs)
+        _check_device(device)
+        dyn_options, dyn_knobs, args = _split_call(dynamic, args)
         canonical = (
             fixed_options
             if fixed_options is not None
-            else backends.canonical_options(
-                target,
-                _knob_options(
-                    jit_func,
-                    {**options, **dyn_options},
-                    {**knob_values, **dyn_knobs},
-                ),
+            else compiler.canonical(
+                {**fixed, **dyn_options, **{n: args[i] for n, i in per_call.items()}},
+                dyn_knobs,
             )
         )
         compiler_input = _compiler_input(
-            jit_func, params, args, backend, baked_values=baked_values
+            jit_func, params, args, compiler.backend, baked_values=baked_values
         )
-        # knobs feeding no option change the binary too
-        identity = (compiler_input, canonical.hash(), tuple(sorted(dyn_knobs.items())))
+        identity = _Identity.of(compiler_input, canonical, dyn_knobs)
         # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
         if seen.setdefault(keyblob, identity) != identity:
             raise RuntimeError(
                 "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
             )
-        cache_key = (*identity, current)
-        with lock:
-            kernel = compiled.get(cache_key)
-            if kernel is None:
-                fresh = _checked_compile(jit_func, compiler_input, target, canonical)
-                # a nested miss may have stored one meanwhile; its record may
-                # already be cached, so its kernel is the one that must stay
-                kernel = compiled.setdefault(cache_key, fresh)
-        md = kernel.metadata
-        expected = sum(1 for ty in kernel.src.signature.values() if ty != "constexpr")
-        if expected != nparams:
-            raise RuntimeError(
-                f"intj: packed {nparams} kernel arguments but triton compiled {expected}; "
-                "this is an intj bug"
-            )
-        result = (kernel.function, md.warp_size * md.num_warps, md.shared, nparams)
+        kernel = compiler.compile(identity, canonical)
+        result = _record(kernel, nparams)
         return (*result, kernel) if return_compiled else result
 
     return compile_callback
