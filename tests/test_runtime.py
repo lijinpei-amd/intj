@@ -38,6 +38,7 @@ import torch
 from intj import launcher, lazy
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
 from intj.render import build
+from intj.render import module as render_module
 from intj.render.context import render
 from intj.render.key import RenderKey
 from intj.python_intf import cpython_abi
@@ -181,7 +182,7 @@ def _key(mode: TorchAccessMode, driver_path: str = "") -> RenderKey:
         cache_include_dirs=(),
         cache_archives=(),
         torch_version=torch_version() if static else None,
-        cxx_abi=launcher._cxx_abi() if static else None,
+        cxx_abi=render_module._cxx_abi() if static else None,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=cpython_abi.header_for() or "",

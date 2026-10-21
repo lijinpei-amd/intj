@@ -308,7 +308,7 @@ def tuning_render(
 ) -> TuningRender:
     """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
 
-    `computed_fields` is left empty: `_materialize_module` places it."""
+    `computed_fields` is left empty: `render.module._build_module` places it."""
     from .launcher import (
         _render_params,  # pyright: ignore[reportPrivateUsage]  # launcher internals
     )

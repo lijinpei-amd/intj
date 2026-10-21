@@ -69,6 +69,7 @@ from knob_helpers import (
 )
 from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
 from intj.python_intf import cpython_abi
+from intj.render import module as render_module
 from intj.render.build import build, compiler_identity
 from intj.render.key import DynamicSlot, RenderKey
 from intj.torch_intf.abi_detect import probe_layout
@@ -1593,7 +1594,7 @@ def test_baked_constraints_fail_before_materialization(
     def forbidden(*args, **kwargs):
         pytest.fail("invalid baked value reached module materialization")
 
-    monkeypatch.setattr("intj.launcher._materialize_module", forbidden)
+    monkeypatch.setattr(render_module, "_build_module", forbidden)
     with pytest.raises(ValueError, match=f"x.*{constraint}"):
         make_launcher(
             scalar_kernel,
@@ -3116,7 +3117,6 @@ def test_annotated_effective_compile_options_and_identity(
 def test_newer_triton_fpsan_knob_is_baked_into_compile_options(
     scalar_kernel, monkeypatch
 ):
-    import intj.launcher as launcher
     from triton import knobs
 
     seen = {}
@@ -3133,7 +3133,7 @@ def test_newer_triton_fpsan_knob_is_baked_into_compile_options(
     monkeypatch.setattr(
         knobs.compilation, "fpsan_homomorphic_casts", True, raising=False
     )
-    monkeypatch.setattr(launcher, "_materialize_module", capture)
+    monkeypatch.setattr(render_module, "_build_module", capture)
     with pytest.raises(Captured):
         module_of(
             make_launcher(scalar_kernel, torch_access_mode=TorchAccessMode.INTERPRETER)
@@ -4907,14 +4907,12 @@ def test_package_version_has_one_source():
 
 
 def test_render_key_uses_major_minor_version_only(monkeypatch):
-    import intj.launcher as launcher
-
-    monkeypatch.setattr(launcher, "__version__", "7.8.9")
-    assert launcher._cache_version() == (7, 8)
-    monkeypatch.setattr(launcher, "__version__", "7.8.10")
-    assert launcher._cache_version() == (7, 8)
-    monkeypatch.setattr(launcher, "__version__", "7.9.0")
-    assert launcher._cache_version() == (7, 9)
+    monkeypatch.setattr(render_module, "__version__", "7.8.9")
+    assert render_module._cache_version() == (7, 8)
+    monkeypatch.setattr(render_module, "__version__", "7.8.10")
+    assert render_module._cache_version() == (7, 8)
+    monkeypatch.setattr(render_module, "__version__", "7.9.0")
+    assert render_module._cache_version() == (7, 9)
 
 
 @pytest.mark.parametrize(
@@ -6252,6 +6250,7 @@ def test_static_compile_needs_no_table(monkeypatch):
     from intj import launcher as launcher_mod
 
     monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
+    monkeypatch.setattr(render_module, "layout_for", lambda *a: None)
     x = torch.arange(128, device="cuda", dtype=torch.float32)
     o = torch.empty_like(x)
     check_matches_triton(
@@ -6269,7 +6268,6 @@ def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
     Their `.so` is reusable across Torch versions, while STATIC_COMPILE compiles
     against Torch's headers and must get a different digest.
     """
-    from intj import launcher as launcher_mod
 
     def digest_dir(m):
         return pathlib.Path(
@@ -6277,7 +6275,7 @@ def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
         ).parent.parent.name
 
     before = {m: digest_dir(m) for m in ACCESS_MODES}
-    monkeypatch.setattr(launcher_mod, "torch_version", lambda: (99, 99))
+    monkeypatch.setattr(render_module, "torch_version", lambda: (99, 99))
     after = {m: digest_dir(m) for m in ACCESS_MODES}
 
     assert after[TorchAccessMode.RUNTIME_SHIM] == before[TorchAccessMode.RUNTIME_SHIM]
@@ -6528,9 +6526,7 @@ def test_decoration_needs_no_gpu(monkeypatch):
 
 
 def test_failed_first_call_leaves_the_launcher_unbuilt(scalar_kernel, monkeypatch):
-    import intj.launcher as launcher
-
-    real, calls = launcher._materialize_module, []
+    real, calls = render_module._build_module, []
 
     def flaky(*args, **kwargs):
         calls.append(1)
@@ -6538,7 +6534,7 @@ def test_failed_first_call_leaves_the_launcher_unbuilt(scalar_kernel, monkeypatc
             raise UnsupportedKernel("intj: transient")
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(launcher, "_materialize_module", flaky)
+    monkeypatch.setattr(render_module, "_build_module", flaky)
     launch = make_launcher(
         scalar_kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
     )
