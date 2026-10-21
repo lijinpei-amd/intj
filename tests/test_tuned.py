@@ -438,7 +438,7 @@ def test_tuned_callback_block_dim_zero_is_refused(monkeypatch):
     """A tuned callback returning block_dim 0 is refused.
 
     block_dim 0 marks an empty map slot (test_kernel_cache.py covers the compile
-    callback); the tuned callback rejects it too, in `intj_tuned_fill`. Triton
+    callback); the tuned callback rejects it too, in `intj_fill`. Triton
     never actually returns block_dim 0, so the tuned callback is wrapped to force
     it.
     """

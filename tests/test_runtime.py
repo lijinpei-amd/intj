@@ -1228,6 +1228,33 @@ def test_options_reads_race_edits_safely(stub_module):
     assert all(k.__self__._C_options == "after" for k in launchers)
 
 
-def test_key_chain_is_for_tuned_launchers_only(launch):
-    with pytest.raises(TypeError, match="tuned launchers only"):
-        launch.__self__._C_key_chain(0, torch.zeros(4), 5, -7, 1.5, True, 64)
+def test_key_chain_of_an_ordinary_launcher_is_its_spec_key(launch):
+    """One level: the chain is the spec key, found once that key launched."""
+    h = launch.__self__
+    public = _args()[len(_CALL) :]
+    launch(*_CALL, *public)
+    keys, found = h._C_key_chain(_CALL[0], *public)
+    assert keys == (h._C_spec_key(_CALL[0], *public)[0],)
+    assert found is True
+
+
+def test_ordinary_miss_gets_stream_and_grid_controls(built, stub_module):
+    """Every module misses through one call: stream and grid controls included."""
+    module, _, _ = built
+    calls = []
+
+    def compile_miss(self, keyblob, nparams, device, stream, controls, *args):
+        calls.append((device, stream, controls, len(args)))
+        return launcher.Launcher._compile_miss(
+            self, keyblob, nparams, device, stream, controls, *args
+        )
+
+    launch = _new_launcher(
+        stub_module,
+        None,
+        lambda h: _built(module._init(h, launcher._CompileState(), _interner())),
+        compile_miss=compile_miss,
+    )
+    args = _args()
+    assert launch(*args) is None
+    assert calls == [(_CALL[0], _CALL[1], (1, 1, 1), len(args) - len(_CALL))]

@@ -604,7 +604,8 @@ class Launcher:
     def key_chain(self, *args: object) -> tuple[tuple[bytes, ...], bool]:
         """Returns `((key bytes, ...), found)` for `(device, *dynamic, *public_args)`.
 
-        Tuned launchers only; builds first.
+        One key per lookup level the call walks: an ordinary launcher's chain
+        is its spec key alone.  Builds first.
         """
         return self._C_key_chain(*args)
 
@@ -799,17 +800,30 @@ class Launcher:
         del b
         return _CompileState()
 
-    def _compile_miss(self, *call: Any) -> Any:
+    def _compile_miss(
+        self,
+        keyblob: bytes,
+        nparams: int,
+        device: int,
+        stream: int,
+        controls: object,
+        /,
+        *args: Any,
+    ) -> Any:
         """Returns the kernel record for a C cache miss, which C then launches.
 
-        Called as `(keyblob, nparams, device, *args)`, the dynamic values
-        preceding the public kernel arguments.
+        Every module calls it alike; `stream` and the grid `controls` matter
+        only to a `TunedLauncher`, which launches its own.  `args` are the
+        dynamic values, then the public kernel arguments.
         """
+        del stream, controls
         module = self._C_module
         assert module is not None, "compile misses require an initialized launcher"
         state = cast(_CompileState, self._C_compile_state)
         # Read per miss so override_compile reaches already built launchers.
-        return getattr(module, "_intj_compile")(state.seen, *call)
+        return getattr(module, "_intj_compile")(
+            state.seen, keyblob, nparams, device, *args
+        )
 
 
 class LaunchFunction(Protocol):

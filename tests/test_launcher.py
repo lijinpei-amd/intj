@@ -384,6 +384,18 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
     assert calls == [(b"", 0), (b"", 255), (b"", 256), (b"", 2**31 - 1)]
 
 
+def test_key_chain_of_a_keyless_launcher_is_one_empty_key(device_kernel):
+    handle = make_launcher(
+        device_kernel,
+        no_gpu=True,
+        extra_annotation={"x": Argument(type=tl.int32, specialize=NEVER)},
+        torch_access_mode=TorchAccessMode.INTERPRETER,
+    ).__self__.bind_device(0)
+    assert handle.__self__.key_chain(0, 7) == ((b"",), False)
+    assert handle(0, 1, 7) is None
+    assert handle.__self__.key_chain(0, 7) == ((b"",), True)
+
+
 def test_bind_device_accepts_every_bound_parameter_name(tmp_path):
     names = ("self", "args", "values", "device", "device_ordinal", "stream", "grid")
     kernel = _kernel_from_source(
@@ -508,8 +520,14 @@ def test_repeated_key_uses_last_lookup_before_hash(device_kernel, bind_device):
             "static PyObject *intj_bound_entry"
         )
     ]
-    assert "intj_cache_lookup(INTJ_BOUND_CACHE_OF(bound), key)" in call
-    assert "intj_hash(key)" not in call
+    walk_body = source[
+        source.index("static INTJ_ALWAYS_INLINE intj_final *intj_walk") : source.index(
+            "static const char *const intj_computed_names"
+        )
+    ]
+    assert "intj_walk(" in call
+    assert "intj_cache_lookup(INTJ_BOUND_CACHE_OF(bound), key)" in walk_body
+    assert "intj_hash(key)" not in call and "intj_hash(key)" not in walk_body
 
 
 @pytest.mark.parametrize(
@@ -557,13 +575,18 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(
             "static PyObject *intj_bound_entry"
         )
     ]
+    walk_body = source[
+        source.index("static INTJ_ALWAYS_INLINE intj_final *intj_walk") : source.index(
+            "static const char *const intj_computed_names"
+        )
+    ]
     assert "#define INTJ_HAS_KEY 0" in source
     assert "intj_hash(" not in call_body
     assert "intj_cache_get(" not in call_body
     assert "intj_cache_put(" not in call_body
     assert "intj_cache_init(" not in source
     assert "intj_cache_free(" not in source
-    assert "bound->fixed_kernel" in call_body
+    assert "intj_walk(" in call_body and "bound->fixed_kernel" in walk_body
 
 
 @pytest.mark.parametrize("has_key", [False, True])
@@ -1450,14 +1473,20 @@ def test_binding_checked_source_checks_only_where_values_change(
                 "static PyObject *intj_bound_entry"
             )
         ]
+        walk_body = source[
+            source.index(
+                "static INTJ_ALWAYS_INLINE intj_final *intj_walk"
+            ) : source.index("static const char *const intj_computed_names")
+        ]
         lookup = (
-            "kernel = (intj_final *)bound->fixed_kernel"
+            "s0 = (intj_final *)bound->fixed_kernel"
             if cache_owner == "no-map"
             else "intj_cache_lookup("
         )
-        assert call.index("intj_pack(") < call.index(lookup), (
+        assert call.index("intj_pack(") < call.index("intj_walk("), (
             "argument validation must precede cache lookup"
         )
+        assert lookup in walk_body
         for i, body in ((0, pack), (1, bind), (2, pack)):
             branch, assume = f"INTJ_UNLIKELY(!valid_{i})", f"INTJ_ASSUME(valid_{i})"
             assert source.count(branch) == source.count(assume) == int(verify)

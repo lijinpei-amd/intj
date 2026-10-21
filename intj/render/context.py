@@ -247,6 +247,7 @@ class RenderContext:
     dep_len: int
     comp_len: int
     computed_names_len: int
+    computed_names: tuple[str, ...]  # every level's computed keys, for errors
     nmeta: int
 
     @classmethod
@@ -382,6 +383,7 @@ class RenderContext:
             dep_len=max(2 * ndeps, 1),
             comp_len=max(2 * ncomp, 1),
             computed_names_len=ncomp + 1,
+            computed_names=tuning.computed_names if tuning is not None else (),
             nmeta=len(meta_names),
         )
 

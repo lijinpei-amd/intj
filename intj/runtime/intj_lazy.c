@@ -182,14 +182,7 @@ static PyObject *intj_lazy_key_chain(PyObject *self, PyObject *const *args,
                                      Py_ssize_t nargs) {
   intj_launcher *h = (intj_launcher *)self;
   void *state = intj_lazy_built_state(h);
-  if (!state)
-    return NULL;
-  if (!h->ops->key_chain) {
-    PyErr_SetString(PyExc_TypeError,
-                    "intj: key_chain is for tuned launchers only");
-    return NULL;
-  }
-  return h->ops->key_chain(state, args, nargs);
+  return state ? h->ops->key_chain(state, args, nargs) : NULL;
 }
 
 static PyObject *intj_lazy_compile_state(PyObject *self, void *closure) {

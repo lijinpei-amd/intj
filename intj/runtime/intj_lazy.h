@@ -47,7 +47,7 @@ typedef struct intj_launcher_ops {
   /* drops the block's references, frees its cache and lock, then the block */
   void (*release)(void *state);
   PyObject *(*spec_key)(void *state, PyObject *const *args, Py_ssize_t nargs);
-  /* NULL unless tuned */
+  /* every level's key a call walks; an ordinary launcher's one */
   PyObject *(*key_chain)(void *state, PyObject *const *args, Py_ssize_t nargs);
   PyObject *(*compile_state)(void *state);
 } intj_launcher_ops;

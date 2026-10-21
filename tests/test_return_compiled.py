@@ -447,3 +447,16 @@ def test_undeclared_knobs_are_read_at_the_first_call(monkeypatch):
         torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream, 1, x, 5
     )
     assert kernel.metadata.debug is True
+
+
+def test_return_compiled_record_carries_its_kernel(monkeypatch):
+    import intj.launcher as launcher_module
+
+    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    launch = make_launcher(store_value, return_compiled=True)
+    override_compile(module_of(launch), lambda _key, nparams, *_: (0, 1, 0, nparams))
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    with pytest.raises(TypeError, match="CompiledKernel"):
+        launch(device, stream, (1,), x, 3)
