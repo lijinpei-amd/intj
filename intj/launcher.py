@@ -1955,7 +1955,7 @@ def override_compile(
     Returns:
         A function taking no arguments that restores the previous override.
     """
-    compiler = cast(_SharedCompiler | None, getattr(module, "_intj_compiler", None))
+    compiler = cast("_SharedCompiler | None", getattr(module, "_intj_compiler", None))
     if compiler is None:
         compiler = _SharedCompiler(None)
         setattr(module, "_intj_compiler", compiler)
