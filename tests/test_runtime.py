@@ -1092,9 +1092,9 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass)
     for call_first in (False, True) if subclass else (False,):
         owner = Owner()
 
-        def build(
-            header, owner=owner
-        ):  # the type's `_build_body` holds its owner: a cycle
+        # Python 3.13t immortalizes classes after the first thread starts.
+        # Keep the owner on the instance so the class cannot retain it.
+        def build(header):
             return _built(
                 _init_launcher(
                     module,
@@ -1102,10 +1102,10 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass)
                     launcher._CompileState(module._intj_compiler),
                     _interner(),
                 ),
-                owner,
+                header._C_options,
             )
 
-        # the options (before and after the build) hold the owner too
+        # The options hold the owner before and after the build, forming a cycle.
         owner.launch = (
             _new_launcher(stub_module, owner, build)
             if subclass
