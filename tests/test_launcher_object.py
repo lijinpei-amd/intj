@@ -2,11 +2,13 @@
 """The launcher object: decoration records options; check() and bind/unbind."""
 
 import dataclasses
+import gc
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+import weakref
 
 import pytest
 import triton
@@ -47,6 +49,44 @@ def test_unknown_keyword_fails_at_decoration():
         make_launcher(store, bogus=1)  # pyright: ignore[reportCallIssue]
     with pytest.raises(TypeError, match="bogus"):
         make_launcher(bogus=1)  # pyright: ignore[reportCallIssue]
+
+
+def test_compile_state_is_published_only_after_initialization(monkeypatch):
+    import intj.launcher as launcher_mod
+    from intj.render import module as render_module
+
+    launch = make_launcher(store, **_HOST)
+    h = launch.__self__
+    assert not hasattr(h, "_compile_state")
+    states = []
+    original_state = Launcher._new_compile_state
+
+    def new_state(self, *args):
+        state = original_state(self, *args)
+        states.append(weakref.ref(state))
+        return state
+
+    original_build = render_module._build_module
+
+    def refuse_init(*args):
+        raise RuntimeError("initialization refused")
+
+    def build_module(b):
+        module = original_build(b)
+        monkeypatch.setattr(module, "_init", refuse_init)
+        return module
+
+    monkeypatch.setattr(Launcher, "_new_compile_state", new_state)
+    monkeypatch.setattr(render_module, "_build_module", build_module)
+    with pytest.raises(RuntimeError, match="initialization refused"):
+        h.build()
+    gc.collect()
+    assert states[0]() is None
+    assert not hasattr(h, "_compile_state") and not h._C_built
+    assert h._C_module is None
+    monkeypatch.undo()
+    h.build()
+    assert type(h._compile_state) is launcher_mod._CompileState
 
 
 @pytest.fixture

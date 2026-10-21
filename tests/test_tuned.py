@@ -110,6 +110,24 @@ def test_tuned_misses_dispatch_through_launcher_method(monkeypatch):
     assert out[0].item() == 2 and bench.calls == [1, 2, 1, 2]
 
 
+def test_tuned_misses_use_the_subclass_compile_method(monkeypatch):
+    from intj.launcher import Launcher
+
+    def refuse(self, *call):
+        raise RuntimeError("ordinary compile method called for a tuned miss")
+
+    monkeypatch.setattr(Launcher, "_compile_miss", refuse)
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    bench = Bench(out, {16: {1: 1.0, 2: 2.0}})
+    _, launch = tuned_launcher(bench)
+    device, stream = controls()
+    bench.key = 16
+    launch(device, stream, x, out, 16)
+    torch.cuda.synchronize()
+    assert out[0].item() == 1 and bench.calls == [1, 2]
+
+
 def test_autotune_miss_does_not_retain_call_tensors():
     """An autotune miss does not keep its argument tensors alive.
 
@@ -1265,5 +1283,5 @@ def test_a_chain_gets_a_tuned_launcher_and_its_copies_keep_it():
     bench.key = 16
     launch(device, stream, x, out, 16)
     plain(device, stream, (1,), x, out, 16, 1, 32)
-    assert type(launch.__self__._C_compile_state) is TunedCompileState
-    assert type(plain.__self__._C_compile_state) is _CompileState
+    assert type(launch.__self__._compile_state) is TunedCompileState
+    assert type(plain.__self__._compile_state) is _CompileState

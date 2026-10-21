@@ -185,19 +185,6 @@ static PyObject *intj_lazy_key_chain(PyObject *self, PyObject *const *args,
   return state ? h->ops->key_chain(state, args, nargs) : NULL;
 }
 
-static PyObject *intj_lazy_compile_state(PyObject *self, void *closure) {
-  (void)closure;
-  intj_launcher *h = (intj_launcher *)self;
-  /* _init publishes this before the build shim swaps the entry.  Reading it
-   * from _compile_miss must not try to acquire the build lock again. */
-  void *state = __atomic_load_n(&h->state, __ATOMIC_ACQUIRE);
-  if (!state) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: launcher has no compile state");
-    return NULL;
-  }
-  return h->ops->compile_state(state);
-}
-
 /* _C_set_options(options): only from inside _C_locked on this thread, so
  * edits and a first call are ordered; refused once built. */
 static PyObject *intj_lazy_set_options(PyObject *self, PyObject *options) {
@@ -298,7 +285,6 @@ static PyObject *intj_lazy_new(PyTypeObject *type, PyObject *args,
 static PyGetSetDef intj_lazy_getset[] = {
     {(char *)"_C_options", intj_lazy_member, NULL, NULL, INTJ_MEMBER(options)},
     {(char *)"_C_module", intj_lazy_member, NULL, NULL, INTJ_MEMBER(module)},
-    {(char *)"_C_compile_state", intj_lazy_compile_state, NULL, NULL, NULL},
     {(char *)"_C_built", intj_lazy_built, NULL, NULL, NULL},
     {NULL, NULL, NULL, NULL, NULL}};
 

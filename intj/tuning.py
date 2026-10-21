@@ -17,7 +17,7 @@ import inspect
 import threading
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
 from . import backend as backends
@@ -732,3 +732,17 @@ class TunedLauncher(Launcher):
             b.knob_values,
             b.dynamic,
         )
+
+    def _compile_miss(
+        self,
+        keyblob: bytes,
+        nparams: int,
+        device: int,
+        stream: int,
+        controls: object,
+        /,
+        *args: Any,
+    ) -> Any:
+        """Tunes and launches the winner, returning its record for C to cache."""
+        state = cast(TunedCompileState, self._compile_state)
+        return state.run(keyblob, nparams, device, stream, controls, *args)

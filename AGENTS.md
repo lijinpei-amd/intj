@@ -71,8 +71,10 @@ state. `test_modules_stay_out_of_the_import_system` guards both halves.
 `_intj_lazy` (`intj/lazy.py`, `runtime/intj_lazy.c`), the stub every launcher
 starts as, follows the same rule. Every launcher is a `PyCFunction` over a
 `PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
-`__slots__ = ()` subclass of `_intj_lazy.Launcher`). Subclasses may append Python
-instance storage while preserving the C base layout. An
+subclass of `_intj_lazy.Launcher` with a Python `_compile_state` slot). The
+Python behavior bases keep `__slots__ = ()`; `_over_stub` adds the slot to the
+concrete class so the two bases remain layout-compatible. Subclasses may append
+Python instance storage while preserving the C base layout. An
 autotune/heuristics chain gets `intj.tuning.TunedLauncher`, a `Launcher` subclass
 `make_launcher` picks from the kernel's type, which `delayed` cannot change. The first
 call runs the subclass's `_build_body`, called by name, and swaps its
@@ -98,15 +100,17 @@ launcher's C fields.
 The rendered C miss path calls `Launcher._compile_miss(keyblob, nparams,
 device, stream, controls, *dynamic, *args)` by name through the Python C API,
 the same call from every module, and reads back `(function, block_dim, shared,
-nparams[, compiled[, deps, computed[, meta]]])`. `_init` stores its Python
-state in the launcher's state block, exposed by `_C_compile_state`: a
+nparams[, compiled[, deps, computed[, meta]]])`. `_build_body` stores the Python
+compile state in the launcher's `_compile_state` slot after `_init` succeeds,
+before C publishes the rendered entry: a
 `_CompileState` (the per-launcher specialization check map and a reference to
 the module's `_SharedCompiler`) or, for a `TunedLauncher`, its private
-`TunedCompileState`. The same `Launcher._compile_miss` calls the state's
-`run` method in both cases. An ordinary state uses the shared compiled kernel
-cache and current compile override, and C launches the returned record. A
-tuned state runs its private chain, including the final launch; C stores the
-record without launching it again. Both compile through `_KernelCompiler`.
+`TunedCompileState`. `Launcher._compile_miss` uses the ordinary state's shared
+compiled kernel cache and current compile override, and C launches the returned
+record. `TunedLauncher._compile_miss` overrides it to run the private chain,
+including the final launch; C stores the record without launching it again.
+Both compile through `_KernelCompiler`. C neither stores nor exposes Python
+compile state; Python's slot traversal and clearing manage its lifetime.
 `override_compile(module, fn)` returns a no-argument function restoring the
 previous override; replacing an override keeps the shared compiler alive.
 An ordinary launcher is the one-level case of the tuned

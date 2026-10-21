@@ -272,14 +272,19 @@ def _launcher_over(module):
     stub = _stub()
 
     def build(h):
+        state = _CompileState(module._intj_compiler)
+        address = module._init(h, _Interner())
+        h._compile_state = state
         return (
-            module._init(h, _CompileState(module._intj_compiler), _Interner()),
+            address,
             None,
             b"",
         )
 
     cls = type(
-        "Over", (Launcher, stub.Launcher), {"__slots__": (), "_build_body": build}
+        "Over",
+        (Launcher, stub.Launcher),
+        {"__slots__": ("_compile_state",), "_build_body": build},
     )
     launch = stub.new_launcher(cls, None)
     launch.__self__._C_build()
@@ -6445,8 +6450,8 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
             launch.__self__.spec_key(0, mkl, o, 16, 2.0, 128)
 
 
-def test_every_launcher_shares_one_fixed_size_object(bound_kernel, device_kernel):
-    """Every launcher object is one fixed-size type; its state lives behind `state`."""
+def test_bindings_share_a_launcher_type_with_private_state(bound_kernel, device_kernel):
+    """Bindings share a launcher type and keep compile state private."""
     from intj.launcher import _stub
 
     pointer = Argument(
@@ -6466,8 +6471,8 @@ def test_every_launcher_shares_one_fixed_size_object(bound_kernel, device_kernel
     assert two(0, 0, 1, 7) is None and none(0, 1, 7) is None
     t2, t0 = type(two.__self__), type(none.__self__)
     assert t2 is t0 and issubclass(t2, _stub().Launcher)
-    assert t2.__basicsize__ == _stub()._header_size()
     assert t2.__itemsize__ == 0
+    assert two.__self__._compile_state is not none.__self__._compile_state
 
 
 def test_sibling_launchers_compile_once(monkeypatch):

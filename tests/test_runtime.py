@@ -629,7 +629,7 @@ spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file_
 lazy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lazy)
 module._set_launcher_type(lazy.Launcher)
-build = lambda header: (module._init(header, {{}}, print), None, b"")
+build = lambda header: (module._init(header, print), None, b"")
 launch = lazy.new_launcher(type("L", (lazy.Launcher,), {{"__slots__": (), "_build_body": build}}), None)
 assert not sys._is_gil_enabled()
 grid = [0, 1000, 1000]
@@ -855,9 +855,15 @@ def _built(address, options=None):
     return address, options, b""
 
 
+def _init_launcher(module, holder, state, interner):
+    address = module._init(holder, interner)
+    holder._compile_state = state
+    return address
+
+
 def _new_launcher(stub_module, options, build, *, compile_miss=None):
     # a launcher whose type's `_build_body` is `build(launcher)`
-    namespace = {"__slots__": (), "_build_body": build}
+    namespace = {"__slots__": ("_compile_state",), "_build_body": build}
     if compile_miss is not None:
         namespace["_compile_miss"] = compile_miss
     cls = type("L", (launcher.Launcher, stub_module.Launcher), namespace)
@@ -872,8 +878,11 @@ def launch(built, stub_module):
         stub_module,
         None,
         lambda header: _built(
-            module._init(
-                header, launcher._CompileState(module._intj_compiler), _interner()
+            _init_launcher(
+                module,
+                header,
+                launcher._CompileState(module._intj_compiler),
+                _interner(),
             )
         ),
     )
@@ -891,7 +900,9 @@ def test_compile_method_is_called_only_on_misses(built, stub_module, monkeypatch
         stub_module,
         None,
         lambda h: _built(
-            module._init(h, launcher._CompileState(module._intj_compiler), _interner())
+            _init_launcher(
+                module, h, launcher._CompileState(module._intj_compiler), _interner()
+            )
         ),
     )
     args = _args()
@@ -925,11 +936,13 @@ def test_compile_state_referent_cycle_is_collected(built, stub_module):
     owner = Owner()
     state = launcher._CompileState(module._intj_compiler, seen={b"owner": owner})
     launch = _new_launcher(
-        stub_module, None, lambda h: _built(module._init(h, state, _interner()))
+        stub_module,
+        None,
+        lambda h: _built(_init_launcher(module, h, state, _interner())),
     )
     launch(*_args())
     owner.launch = launch
-    assert launch.__self__._C_compile_state is state
+    assert launch.__self__._compile_state is state
     ref = weakref.ref(owner)
     del owner, state, launch
     gc.collect()
@@ -949,8 +962,11 @@ def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
     def build(header):
         builds.append(1)
         return _built(
-            module._init(
-                header, launcher._CompileState(module._intj_compiler), _interner()
+            _init_launcher(
+                module,
+                header,
+                launcher._CompileState(module._intj_compiler),
+                _interner(),
             )
         )
 
@@ -994,8 +1010,11 @@ def test_failed_build_raises_and_the_next_call_retries(built, stub_module):
         if len(attempts) == 1:
             raise RuntimeError("first build fails")
         return _built(
-            module._init(
-                header, launcher._CompileState(module._intj_compiler), _interner()
+            _init_launcher(
+                module,
+                header,
+                launcher._CompileState(module._intj_compiler),
+                _interner(),
             )
         )
 
@@ -1013,8 +1032,11 @@ def test_concurrent_first_calls_build_once(built, stub_module):
         builds.append(1)
         time.sleep(0.05)  # hold the build lock while the others arrive
         return _built(
-            module._init(
-                header, launcher._CompileState(module._intj_compiler), _interner()
+            _init_launcher(
+                module,
+                header,
+                launcher._CompileState(module._intj_compiler),
+                _interner(),
             )
         )
 
@@ -1046,8 +1068,11 @@ def test_call_during_build_is_refused(built, stub_module):
         except RuntimeError as error:
             seen.append(str(error))
         return _built(
-            module._init(
-                header, launcher._CompileState(module._intj_compiler), _interner()
+            _init_launcher(
+                module,
+                header,
+                launcher._CompileState(module._intj_compiler),
+                _interner(),
             )
         )
 
@@ -1071,8 +1096,11 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass)
             header, owner=owner
         ):  # the type's `_build_body` holds its owner: a cycle
             return _built(
-                module._init(
-                    header, launcher._CompileState(module._intj_compiler), _interner()
+                _init_launcher(
+                    module,
+                    header,
+                    launcher._CompileState(module._intj_compiler),
+                    _interner(),
                 ),
                 owner,
             )
@@ -1106,7 +1134,8 @@ def test_memo_referent_cycle_is_collected(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            module._init(
+            _init_launcher(
+                module,
                 h,
                 launcher._CompileState(module._intj_compiler),
                 lambda v: 0 if type(v) is Value else None,
@@ -1127,7 +1156,9 @@ def test_str_constexpr_keys_by_value(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            module._init(h, launcher._CompileState(module._intj_compiler), _interner())
+            _init_launcher(
+                module, h, launcher._CompileState(module._intj_compiler), _interner()
+            )
         ),
     )
     launch(*_args())
@@ -1146,7 +1177,9 @@ def test_memo_holds_its_object_until_replaced(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            module._init(h, launcher._CompileState(module._intj_compiler), _interner())
+            _init_launcher(
+                module, h, launcher._CompileState(module._intj_compiler), _interner()
+            )
         ),
     )
     first, second = "".join(["o", "n", "e"]), "".join(["t", "w", "o"])
@@ -1185,14 +1218,14 @@ def test_launcher_subclass_fields_survive_build_and_are_collected(
 
     def build_body(self):
         return _built(
-            module._init(
-                self, launcher._CompileState(module._intj_compiler), _interner()
+            _init_launcher(
+                module, self, launcher._CompileState(module._intj_compiler), _interner()
             )
         )
 
-    namespace = {"_build_body": build_body}
+    namespace: dict[str, object] = {"_build_body": build_body}
     if slots is not None:
-        namespace["__slots__"] = slots
+        namespace["__slots__"] = ("_compile_state", *slots)
     cls = type("L", (launcher.Launcher, stub_module.Launcher), namespace)
     launch = stub_module.new_launcher(cls, None)
 
@@ -1211,7 +1244,7 @@ def test_launcher_subclass_fields_survive_build_and_are_collected(
     assert launch.__self__.extra is owner
     assert launch.__self__._C_module is module
     with pytest.raises(TypeError, match="unbuilt launcher"):
-        module._init(launch.__self__, None, _interner())
+        module._init(launch.__self__, _interner())
     del owner, launch
     gc.collect()
     assert ref() is None
@@ -1225,7 +1258,7 @@ def test_init_rejects_objects_with_unrelated_c_layouts(built, stub_module):
     assert same.__basicsize__ == stub_module._header_size()
     for value in (object(), same(), larger()):
         with pytest.raises(TypeError, match="unbuilt launcher"):
-            module._init(value, None, _interner())
+            module._init(value, _interner())
 
 
 def test_launcher_type_cannot_be_replaced(built, tmp_path):
@@ -1241,7 +1274,7 @@ def test_init_rejects_a_launcher_from_another_stub(built, tmp_path):
     cls = type("Other", (other.Launcher,), {"__slots__": ()})
     launch = other.new_launcher(cls, None)
     with pytest.raises(TypeError, match="unbuilt launcher"):
-        module._init(launch.__self__, None, _interner())
+        module._init(launch.__self__, _interner())
     assert launch.__self__._C_module is None
 
 
@@ -1289,7 +1322,9 @@ def test_build_publishes_options_and_signature_and_refuses_edits(built, stub_mod
         stub_module,
         "unbuilt",
         lambda h: (
-            module._init(h, launcher._CompileState(module._intj_compiler), _interner()),
+            _init_launcher(
+                module, h, launcher._CompileState(module._intj_compiler), _interner()
+            ),
             "resolved",
             b"launch(a, /)\n--\n\n",
         ),
@@ -1351,7 +1386,9 @@ def test_ordinary_miss_gets_stream_and_grid_controls(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            module._init(h, launcher._CompileState(module._intj_compiler), _interner())
+            _init_launcher(
+                module, h, launcher._CompileState(module._intj_compiler), _interner()
+            )
         ),
         compile_miss=compile_miss,
     )

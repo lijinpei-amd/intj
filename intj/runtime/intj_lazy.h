@@ -50,7 +50,6 @@ typedef struct intj_launcher_ops {
   PyObject *(*spec_key)(void *state, PyObject *const *args, Py_ssize_t nargs);
   /* every level's key a call walks; an ordinary launcher's one */
   PyObject *(*key_chain)(void *state, PyObject *const *args, Py_ssize_t nargs);
-  PyObject *(*compile_state)(void *state);
 } intj_launcher_ops;
 
 typedef struct intj_launcher {

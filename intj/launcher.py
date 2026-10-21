@@ -501,20 +501,6 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     )
 
 
-class _MissCompileState(Protocol):
-    """The Python state that handles one launcher's C cache misses."""
-
-    def run(
-        self,
-        keyblob: bytes,
-        nparams: int,
-        device: int,
-        stream: int,
-        controls: Any,
-        *args: Any,
-    ) -> Any: ...
-
-
 @dataclasses.dataclass
 class _SharedCompiler:
     """An ordinary module's compile cache and replaceable miss override."""
@@ -538,19 +524,6 @@ class _CompileState:
     compiler: _SharedCompiler
     seen: dict[bytes, object] = dataclasses.field(default_factory=dict)
 
-    def run(
-        self,
-        keyblob: bytes,
-        nparams: int,
-        device: int,
-        stream: int,
-        controls: Any,
-        *args: Any,
-    ) -> Any:
-        """Returns the kernel record for one miss, which C then launches."""
-        del stream, controls
-        return self.compiler.compile(self.seen, keyblob, nparams, device, *args)
-
 
 class Launcher:
     """A launcher's object: `k.__self__` for `k = make_launcher(...)`.
@@ -568,13 +541,12 @@ class Launcher:
     __slots__ = ()
 
     if TYPE_CHECKING:
+        _compile_state: object
 
         @property
         def _C_options(self) -> MakeLauncherOption: ...
         @property
         def _C_module(self) -> types.ModuleType | None: ...
-        @property
-        def _C_compile_state(self) -> object: ...
         @property
         def _C_built(self) -> bool: ...
         def _C_build(self) -> types.ModuleType: ...
@@ -793,19 +765,17 @@ class Launcher:
         self._check_target(b)
         module = render_module._build_module(b)  # pyright: ignore[reportPrivateUsage]  # renderer's build entry
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
-        address = module._init(
-            self, self._new_compile_state(b, module), _Interner(), *grid_py, *b.args
-        )
+        state = self._new_compile_state(b, module)
+        address = module._init(self, _Interner(), *grid_py, *b.args)
+        self._compile_state = state
         return address, option, b.doc
 
     def _check_target(self, b: _BuildOptions) -> None:
         """Runs the build's checks that need the target, after every GPU-free one."""
         assert b.tuned is None, "make_launcher gives a chain a TunedLauncher"
 
-    def _new_compile_state(
-        self, b: _BuildOptions, module: types.ModuleType
-    ) -> _MissCompileState:
-        """Returns the Python state `_init` stores and `_compile_miss` reads back."""
+    def _new_compile_state(self, b: _BuildOptions, module: types.ModuleType) -> object:
+        """Returns the Python compile state stored after initialization succeeds."""
         del b
         return _CompileState(cast(_SharedCompiler, module._intj_compiler))
 
@@ -819,15 +789,13 @@ class Launcher:
         /,
         *args: Any,
     ) -> Any:
-        """Handles a C cache miss through this launcher's Python compile state.
+        """Returns the record for C to launch on an ordinary cache miss.
 
-        An ordinary state returns a record for C to launch; a tuned state
-        launches the winner itself before returning its record. `args` are
-        the dynamic values, then the public kernel arguments.
+        `args` are the dynamic values, then the public kernel arguments.
         """
-        return cast(_MissCompileState, self._C_compile_state).run(
-            keyblob, nparams, device, stream, controls, *args
-        )
+        del stream, controls
+        state = cast(_CompileState, self._compile_state)
+        return state.compiler.compile(state.seen, keyblob, nparams, device, *args)
 
 
 class LaunchFunction(Protocol):
@@ -1021,13 +989,13 @@ _STUB_LOCK = threading.Lock()
 
 
 def _over_stub(base: type[Launcher], stub: types.ModuleType) -> type[Launcher]:
-    # `base` mixed with this load's `_intj_lazy.Launcher`
+    # Only the concrete class adds storage: both bases must remain layout-compatible.
     return cast(
         "type[Launcher]",
         type(
             base.__name__,
             (base, stub.Launcher),
-            {"__slots__": (), "__module__": base.__module__},
+            {"__slots__": ("_compile_state",), "__module__": base.__module__},
         ),
     )
 

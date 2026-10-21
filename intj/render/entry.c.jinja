@@ -1204,7 +1204,6 @@ static int intj_traverse_state(void *state, visitproc visit, void *arg) {
   /* `_intj_lazy` visits the type and the object's members; never twice */
   Py_VISIT(bound->grid_py);
   Py_VISIT(bound->grid_hidden);
-  Py_VISIT(bound->compile_state);
   Py_VISIT(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_VISIT(bound->memo[k].obj);
@@ -1234,7 +1233,6 @@ static void intj_release(void *state) {
   intj_bound_launcher *bound = (intj_bound_launcher *)state;
   Py_CLEAR(bound->grid_py);
   Py_CLEAR(bound->grid_hidden);
-  Py_CLEAR(bound->compile_state);
   Py_CLEAR(bound->intern);
   for (int k = 0; k < INTJ_NMEMO; k++)
     Py_CLEAR(bound->memo[k].obj);
@@ -1265,27 +1263,21 @@ static void intj_release(void *state) {
 
 static PyObject *intj_spec_key(void *state, PyObject *const *args, Py_ssize_t nargs);
 static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t nargs);
-static PyObject *intj_compile_state(void *state) {
-  return Py_NewRef(((intj_bound_launcher *)state)->compile_state);
-}
-
 static const intj_launcher_ops intj_ops = {intj_traverse_state, intj_release, intj_spec_key,
-                                           intj_key_chain,
-                                           intj_compile_state};
+                                           intj_key_chain};
 
-/* _init(launcher, compile_state, interner, [grid_py, fixed values], [device], *bound)
+/* _init(launcher, interner, [grid_py, fixed values], [device], *bound)
  * -> the entry's address.  Allocates and fills the launcher's state block, then
  * publishes it.  On failure the launcher is left unbuilt, so its next call
  * retries.
- * `compile_state` is the Python state used by Launcher._compile_miss.
  * `interner` is the launcher's own intern table: object value -> id, or None
  * if unsupported. */
 static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   intj_bound_launcher *bound = NULL;
-  if (nargs != 3 + {{ init_extra }} + INTJ_NBOUND) {
+  if (nargs != 2 + {{ init_extra }} + INTJ_NBOUND) {
     PyErr_Format(PyExc_TypeError, "intj: _init takes %d arguments, got %zd",
-                 3 + {{ init_extra }} + INTJ_NBOUND, nargs);
+                 2 + {{ init_extra }} + INTJ_NBOUND, nargs);
     return NULL;
   }
   PyTypeObject *type = Py_TYPE(args[0]);
@@ -1299,13 +1291,12 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
     PyErr_SetString(PyExc_TypeError, "intj: _init needs an unbuilt launcher");
     return NULL;
   }
-  PyObject *compile_state = args[1];
-  PyObject *interner = args[2];
+  PyObject *interner = args[1];
   if (!PyCallable_Check(interner)) {
     PyErr_SetString(PyExc_TypeError, "intj: _init needs the launcher's interner");
     return NULL;
   }
-  args += 3;
+  args += 2;
   if (!st->abi.ready) {
     PyErr_SetString(PyExc_RuntimeError, "intj: _set_torch_version has not been called");
     return NULL;
@@ -1335,7 +1326,6 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
 #ifdef __cplusplus
   try {
 #endif
-    bound->compile_state = Py_NewRef(compile_state);
     bound->intern = Py_NewRef(interner);
     {
       /* optional: the type the object table keys by `name` (tl.dtype) */
@@ -1413,7 +1403,7 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
     Py_BEGIN_CRITICAL_SECTION((PyObject *)h);
     h->module = Py_NewRef(self);
     Py_END_CRITICAL_SECTION();
-    /* Last: the entry and _C_compile_state read it with acquire ordering. */
+    /* Last: the entry reads it with acquire ordering. */
     __atomic_store_n(&h->state, bound, __ATOMIC_RELEASE);
     return entry;
 #ifdef __cplusplus
