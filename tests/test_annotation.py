@@ -871,7 +871,7 @@ def test_layout_key_fields_are_grouped_by_descending_alignment(
 
 def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _render_params
+    from intj.render.module import _render_params
 
     kernel = kernel_with_params(
         tmp_path,
@@ -928,7 +928,8 @@ class CompilerBackendStub:
 
 def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
 
     kernel = kernel_with_params(tmp_path, "x, n, BLOCK")
     resolved = _resolve_annotations(
@@ -1052,7 +1053,8 @@ def test_compiler_input_canonical_overrides(
     monkeypatch, tmp_path, annotation, value, inferred, signature, constant, attrs
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
 
     kernel = kernel_with_params(tmp_path, "x")
     params, _, _ = _render_params(
@@ -1078,7 +1080,8 @@ def test_compiler_input_canonical_overrides(
 
 def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
 
     kernel = kernel_with_params(tmp_path, "a, b, c, d")
     original = float("-0.0")
@@ -1118,7 +1121,8 @@ def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_p
 
 def test_compiler_input_compares_tagged_constants_not_python_equality(tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
 
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
     params, _, _ = _render_params(

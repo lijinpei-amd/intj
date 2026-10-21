@@ -16,6 +16,7 @@ from triton.compiler import CompiledKernel
 
 from intj import Argument, BindValue, KernelCache, NEVER, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, override_compile
+from intj.render import module as render_module
 
 
 @triton.jit
@@ -94,7 +95,7 @@ def test_return_compiled_refuses_host_mode_before_provision(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("host return mode reached provisioning")
 
-    monkeypatch.setattr("intj.launcher._provision", forbidden)
+    monkeypatch.setattr("intj.kernel_cache._provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="return_compiled.*GPU"):
         make_launcher(store_value, no_gpu=True, return_compiled=True).__self__.check()
 
@@ -116,12 +117,11 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
         },
     )
     bound = factory.__self__.bind_device(device, x=x)
-    import intj.launcher as launcher_module
 
     built = module_of(bound)
     assert any(
         key.nwords == 0 and module.__file__ == built.__file__
-        for key, module in launcher_module._LOADED.items()
+        for key, module in render_module._LOADED.items()
     )
     kernel = bound(stream, (1,), 11)
     assert bound(stream, (1,), 12) is kernel
@@ -172,10 +172,9 @@ def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
     A nested miss records its kernel first; the outer compile must not replace it
     in that cache, or the record's function handle is freed.
     """
-    import intj.launcher as launcher_module
     import triton.compiler
 
-    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream
@@ -203,7 +202,7 @@ def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
 def test_compile_override_keeps_cached_kernel_alive(monkeypatch):
     import intj.launcher as launcher_module
 
-    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     real_compile = launcher_module._checked_compile
     kernels = []
 
@@ -266,9 +265,8 @@ def test_ordinary_compiler_cache_dies_with_its_launcher(monkeypatch):
 
 @pytest.mark.parametrize("cache", list(KernelCache), ids=lambda cache: cache.value)
 def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
-    import intj.launcher as launcher_module
 
-    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     launch = make_launcher(gc_cycle_store, kernel_cache=cache, return_compiled=True)
     module = module_of(launch)
     module_ref = weakref.ref(module)
@@ -290,7 +288,7 @@ def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
     )
     assert result is owner
     override_compile(launch, lambda *_args: None)
-    launcher_module._LOADED.clear()
+    render_module._LOADED.clear()
     del result, owner, compile_fake, launch, module
 
     gc.collect()
@@ -441,7 +439,6 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
 
 
 def test_bound_no_map_compiled_reference_is_gc_traversed():
-    import intj.launcher as launcher_module
 
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     factory = make_launcher(
@@ -460,7 +457,7 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
     built = module_of(bound)
     module = next(
         module
-        for module in launcher_module._LOADED.values()
+        for module in render_module._LOADED.values()
         if module.__file__ == built.__file__
     )
 
@@ -514,9 +511,8 @@ def test_undeclared_knobs_are_read_at_the_first_call(monkeypatch):
 
 
 def test_return_compiled_record_carries_its_kernel(monkeypatch):
-    import intj.launcher as launcher_module
 
-    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     launch = make_launcher(store_value, return_compiled=True)
     override_compile(launch, lambda _key, nparams, *_: (0, 1, 0, nparams))
     x = torch.zeros(1, device="cuda", dtype=torch.int32)

@@ -60,6 +60,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 from . import _imports
+from .errors import UnsupportedKernel
 
 #: What a failed `install` raises: network and disk (OSError, which
 #: urllib.error.URLError subclasses), a bad tarball, a failed compiler, and the
@@ -89,6 +90,31 @@ class KernelCache(enum.Enum):
     TSL = "tsl"
     #: `absl::flat_hash_map`.  Headers plus libraries, so it has to be built.
     ABSL = "absl"
+
+
+_INSTALL_FAILED: dict[KernelCache, Exception] = {}
+
+
+def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:  # pyright: ignore[reportUnusedFunction]  # shared with checks and module builds
+    """Returns the toolchain for `cache`, fetching and building it the first time.
+
+    Called by `check()` after its GPU-free refusals; module building then
+    reuses the installed toolchain.  A failure is remembered: a script that builds
+    twenty launchers offline should wait out one connect timeout, not twenty.
+    """
+    toolchain = toolchain_for(cache)
+    if toolchain is not None:
+        return toolchain
+    if cache not in _INSTALL_FAILED:
+        try:
+            return install(cache)
+        # INSTALL_ERRORS, not Exception: a TypeError from a bug in here is not a
+        # provisioning failure, and must not send the reader off to re-run a
+        # command that will fail identically.
+        except INSTALL_ERRORS as error:
+            _INSTALL_FAILED[cache] = error
+    failure = _INSTALL_FAILED[cache]
+    raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
 
 
 @dataclasses.dataclass(frozen=True)

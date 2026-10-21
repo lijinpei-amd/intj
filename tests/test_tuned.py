@@ -12,6 +12,7 @@ import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, triton_specialization
+from intj.render import module as render_module
 from knob_helpers import live_knob_values, needs_hip
 
 
@@ -917,7 +918,7 @@ def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
         return tuple(f for f in original(a) if f.kind not in ("exact", "exact_kind"))
 
     monkeypatch.setattr(annotation, "_key_fields", without_exact)
-    monkeypatch.setattr("intj.launcher._key_fields", without_exact)
+    monkeypatch.setattr("intj.render.module._key_fields", without_exact)
     with pytest.raises(AssertionError, match="collides"):
         check_tuned_invariant(_invariant_kernel, _invariant_cases())
 
@@ -1046,11 +1047,10 @@ def test_tuned_dynamic_values_are_never_coarser_than_triton():
 @needs_hip
 @pytest.mark.parametrize("dropped", _TUNED_DYNAMIC)
 def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
-    from intj import launcher as launcher_mod
 
-    original = launcher_mod._dynamic_key_fields
+    original = render_module._dynamic_key_fields
     monkeypatch.setattr(
-        launcher_mod,
+        render_module,
         "_dynamic_key_fields",
         lambda name: () if name == dropped else original(name),
     )
@@ -1196,7 +1196,7 @@ def test_tuned_dynamic_waves_per_eu_object_constexprs_return_compiled():
 
     # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
     # what makes the rest -- launcher, records, interned constexprs -- collectible.
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     module = module_of(launch)
     loaded_key = next(key for key, loaded in _LOADED.items() if loaded is module)

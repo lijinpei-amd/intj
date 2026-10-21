@@ -23,9 +23,14 @@ included by every rendered module.
 - `context.py`: `RenderContext.from_key(key)`, what the template renders from.
 - `entry.c.jinja`: the rendered entry point.
 - `build.py`: build flags, compiling, and loading the `.so`.
+- `module.py`: assembling the key, shared parameter layout and ABI checks, and
+  the per-process loaded-module cache.
 
-`launcher.py` builds the key and owns the per-process module dict and the compile
-callback; nothing there renders, compiles or loads.
+`launcher.py` checks launcher options and owns the compile callback and Python
+compile state; it passes its C stub to `module.py` for module initialization.
+Shared compile-option merging lives in `backend.py`, checked dependency
+provisioning in `kernel_cache.py`, and `UnsupportedKernel` in `errors.py`
+(re-exported by `launcher.py`).
 
 **`RenderContext` computes, the template writes C.** Every count, offset, slot, flag
 and choice (which decoder, which checks, the order of type tests) is a
@@ -63,8 +68,8 @@ target" is what says nothing compiles.
 
 Rendered extensions are loaded by hand (`spec_from_file_location` +
 `module_from_spec` + `exec_module`), never through `import_module`, so nothing lands
-in `sys.modules` and intj's `_LOADED` dict is the only owner. The template must stay
-multi-phase (`PyModuleDef_Init`): a single-phase `m_size = -1` module gets cached by
+in `sys.modules` and `intj.render.module._LOADED` is their sole process cache.
+The template must stay multi-phase (`PyModuleDef_Init`): a single-phase `m_size = -1` module gets cached by
 the interpreter per (name, path), and two launchers would then share one module's
 state. `test_modules_stay_out_of_the_import_system` guards both halves.
 

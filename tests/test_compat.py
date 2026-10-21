@@ -11,6 +11,7 @@ import triton.language as tl
 
 from intj.compat import launch
 from intj.launcher import UnsupportedKernel, override_compile
+from intj.render import module as render_module
 
 
 @triton.jit
@@ -247,7 +248,6 @@ def test_tensor_wrapper_pointer_annotation_uses_triton_global_default():
 def host_bridge(monkeypatch):
     """compat on the host: no_gpu launchers, a fake driver, fresh caches."""
     import intj.compat as compat
-    import intj.launcher as launcher_module
 
     from intj import TorchAccessMode, _imports, make_launcher
 
@@ -276,7 +276,7 @@ def host_bridge(monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(launcher_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     compat._cached_grid_py.cache_clear()
     yield compat, natives
     compat._cached_grid_py.cache_clear()

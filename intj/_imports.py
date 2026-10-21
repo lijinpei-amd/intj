@@ -14,6 +14,8 @@ import sys
 import types
 from typing import Any
 
+from .errors import UnsupportedKernel
+
 # triton and torch ship no type information, so every name here is `Any`.
 triton: Any = None
 knobs: Any = None
@@ -112,8 +114,6 @@ def interpreted_function() -> Any:
 
 
 def _triton_required(found: str) -> Exception:
-    from .launcher import UnsupportedKernel  # not at top: launcher imports this
-
     return UnsupportedKernel(
         f"intj: Triton >=3.7 is required; install `intj[launcher]`{found}"
     )

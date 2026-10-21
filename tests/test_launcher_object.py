@@ -71,8 +71,8 @@ def test_compile_state_is_published_only_after_initialization(monkeypatch):
     def refuse_init(*args):
         raise RuntimeError("initialization refused")
 
-    def build_module(b):
-        module = original_build(b)
+    def build_module(b, stub):
+        module = original_build(b, stub)
         monkeypatch.setattr(module, "_init", refuse_init)
         return module
 

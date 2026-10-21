@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING, Any, cast
 from . import _imports
 from . import backend as backends
 from .annotation import DeviceBinding, ResolvedParam
+from .errors import UnsupportedKernel
 from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
-from .launcher import Launcher, UnsupportedKernel
+from .launcher import Launcher
+from .render import module as render_module
 from .render.key import Param, TuningRender
 
 if TYPE_CHECKING:
@@ -287,15 +289,13 @@ def check_tuned_configs(
 
     Called on the first call, because the target is a GPU query.
     """
-    from .launcher import (
-        _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-    )
-
     target = backends.current_target()
     for config_options in _config_options(plan, resolved):
         backends.canonical_options(
             target,
-            _knob_options(plan.jit_func, {**options, **config_options}, knob_values),
+            backends._knob_options(  # pyright: ignore[reportPrivateUsage]  # shared compile options
+                plan.jit_func, {**options, **config_options}, knob_values
+            ),
         )
 
 
@@ -308,12 +308,11 @@ def tuning_render(
     """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
 
     `computed_fields` is left empty: `render.module._build_module` places it."""
-    from .launcher import (
-        _render_params,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-    )
-
     _imports.ensure_triton_imported()
-    by_name = {p.name: p for p in _render_params(resolved, DeviceBinding.NOT_FIXED)[0]}
+    by_name = {
+        p.name: p
+        for p in render_module._render_params(resolved, DeviceBinding.NOT_FIXED)[0]  # pyright: ignore[reportPrivateUsage]  # shared key layout
+    }
     grid_code = getattr(grid_cpp, "__code__", None)
     grid_reads: tuple[str, ...] = (
         grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()

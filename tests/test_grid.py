@@ -349,7 +349,7 @@ def test_grid_controls_do_not_change_kernel_specialization():
 
 def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
     from intj.backend import BACKENDS
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
     from intj.render.build import build
 
     launchers = {

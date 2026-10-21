@@ -22,6 +22,7 @@ import types
 from pathlib import Path
 
 from ._version import __version__
+from .errors import UnsupportedKernel
 
 _RUNTIME = Path(__file__).parent / "runtime"
 _SOURCE = _RUNTIME / "intj_lazy.c"
@@ -80,10 +81,6 @@ def load_stub(root: Path, cc: str) -> types.ModuleType:
                 )
                 result.check_returncode()
             except (subprocess.CalledProcessError, OSError) as error:
-                # Deferred: launcher imports lazy, so lazy cannot import
-                # launcher at module scope.
-                from .launcher import UnsupportedKernel
-
                 stderr = (
                     error.stderr.decode(errors="replace")
                     if isinstance(error, subprocess.CalledProcessError) and error.stderr

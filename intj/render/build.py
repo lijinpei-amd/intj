@@ -18,6 +18,7 @@ from typing import Any
 
 from .. import _imports, lazy
 from ..kernel_cache import KernelCache
+from ..errors import UnsupportedKernel
 from ..torch_intf.torch_abi import TorchAccessMode
 from .context import render
 from .key import RenderKey
@@ -281,8 +282,6 @@ def build_flags(key: RenderKey) -> dict[str, Any]:
             "fails to import or finds no torch headers"
         )
     if tuple(toolchain[1]) != tuple(flags["library_dirs"]):
-        from ..launcher import UnsupportedKernel  # not at top: launcher imports this
-
         raise UnsupportedKernel(
             "intj: torch.utils.cpp_extension disagrees with the STATIC_COMPILE "
             f"toolchain intj found without it: library dirs {flags['library_dirs']}, "

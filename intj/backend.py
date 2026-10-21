@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from . import _imports
+from .errors import UnsupportedKernel
 
 
 class Backend(abc.ABC):
@@ -130,10 +131,6 @@ def select(no_gpu: bool) -> tuple[Backend, Any]:
     target = current_target()
     backend = BACKENDS.get(target.backend)
     if backend is None:
-        from .launcher import (
-            UnsupportedKernel,
-        )  # deferred: launcher imports this module
-
         raise UnsupportedKernel(
             f"intj: backend {target.backend!r} is unknown; subclass intj.backend.Backend and "
             f"register() it (have: {', '.join(sorted(BACKENDS))})"
@@ -150,10 +147,6 @@ def current_target() -> Any:
     _imports.ensure_triton_imported()
     target = _imports.driver.active.get_current_target()
     if target is None:
-        from .launcher import (
-            UnsupportedKernel,
-        )  # deferred: launcher imports this module
-
         raise UnsupportedKernel("intj: no active triton target; is a GPU visible?")
     return target
 
@@ -185,8 +178,26 @@ def refuse_unknown_options(parsed: Any, names: Iterable[str]) -> None:
     """Refuses the names that are no field of `parsed` (triton's options)."""
     unknown = set(names) - {f.name for f in dataclasses.fields(parsed)}
     if unknown:
-        from .launcher import (
-            UnsupportedKernel,
-        )  # deferred: launcher imports this module
-
         raise UnsupportedKernel(f"intj: unknown compile option(s) {sorted(unknown)}")
+
+
+def _knob_options(  # pyright: ignore[reportUnusedFunction]  # shared with module and kernel compilation
+    jit_func: Any, options: Mapping[str, Any], knob_values: Mapping[str, object]
+) -> dict[str, Any]:
+    """Returns `options` plus what triton derives from knobs.
+
+    An explicit `debug` overrides the kernel's default, and the runtime knob
+    can still enable it.  A knob missing from `knob_values` (a declared
+    dynamic one, outside its miss) takes triton's default.
+    """
+    merged = dict(options)
+    merged["debug"] = options.get("debug", jit_func.debug) or knob_values.get(
+        "knobs.runtime.debug", False
+    )
+    merged["instrumentation_mode"] = knob_values.get(
+        "knobs.compilation.instrumentation_mode", ""
+    )
+    casts = knob_values.get("knobs.compilation.fpsan_homomorphic_casts")
+    if casts is not None:
+        merged["fpsan_homomorphic_casts"] = casts
+    return merged

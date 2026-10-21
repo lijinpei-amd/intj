@@ -41,6 +41,8 @@ from triton.experimental.gluon import language as gl
 import intj
 import intj.backend
 from intj import launcher, make_launcher
+from intj import backend as backends
+from intj import kernel_cache as kernel_cache_module
 from intj import (
     AUTO,
     NEVER,
@@ -356,7 +358,7 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
     device_kernel, monkeypatch
 ):
     from intj.annotation import DeviceBinding
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
 
@@ -675,7 +677,7 @@ def test_bound_handles_each_own_a_cache(pointer_kernel):
     "mode", [TorchAccessMode.INTERPRETER, TorchAccessMode.STATIC_COMPILE]
 )
 def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, mode):
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     factory = make_launcher(
         bound_kernel,
@@ -734,7 +736,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import BACKENDS, HOST
-    from intj.launcher import _render_params
+    from intj.render.module import _render_params
 
     backend = BACKENDS.get(backend_name, HOST)
     assert (
@@ -941,7 +943,7 @@ def test_bind_validates_names_before_loading(bound_kernel, monkeypatch):
         no_gpu=True,
     )
     monkeypatch.setattr(
-        "intj.launcher._loaded_module",
+        "intj.render.module._loaded_module",
         lambda *args: pytest.fail("loaded before validating binding names"),
     )
     for values, error in [
@@ -1048,7 +1050,7 @@ def test_bind_signature_control_names_avoid_kernel_names(
     ],
 )
 def test_bind_tensor_infers_effective_type_and_shares_modules(pointer_kernel, mode):
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     factory = make_launcher(
         pointer_kernel,
@@ -1089,7 +1091,8 @@ def test_bind_none_materializes_triton_constexpr(
     pointer_kernel, annotation, bind_device, verify
 ):
     from intj.backend import current_target
-    from intj.launcher import _LOADED, _compiler_input
+    from intj.render.module import _LOADED
+    from intj.launcher import _compiler_input
     from triton.compiler import make_backend
 
     factory = make_launcher(
@@ -1248,7 +1251,7 @@ def test_bind_checked_dtype_and_unchecked_promises(pointer_kernel, mode, binding
 def test_bind_tensor_rechecks_storage_after_set(
     pointer_kernel, mode, no_gpu, bind_device, monkeypatch
 ):
-    monkeypatch.setattr("intj.launcher._LOADED", {})
+    monkeypatch.setattr("intj.render.module._LOADED", {})
     factory = make_launcher(
         pointer_kernel,
         extra_annotation={
@@ -1559,7 +1562,7 @@ def test_checked_failures_precede_cold_and_hot_lookup(
     error,
     constraint,
 ):
-    monkeypatch.setattr("intj.launcher._LOADED", {})
+    monkeypatch.setattr("intj.render.module._LOADED", {})
     factory = make_launcher(
         scalar_kernel,
         extra_annotation={"x": annotation},
@@ -1811,7 +1814,7 @@ def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkey
 def test_bind_retains_extension_and_collects_owner_cycles(
     pointer_kernel, mode, binding
 ):
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     factory = make_launcher(
         pointer_kernel,
@@ -2430,7 +2433,7 @@ def test_ordinary_unannotated_none_and_never(scalar_kernel):
 
 
 def test_ordinary_never_omits_pointer_range(pointer_kernel):
-    from intj.launcher import _LOADED, _loaded_module
+    from intj.render.module import _LOADED, _loaded_module
 
     # CPU storage is virtual: exercise both sides of the threshold without
     # touching the bytes or requiring a GPU/backend initialization.
@@ -2447,7 +2450,9 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
         assert launch.__self__.spec_key(0, small) == launch.__self__.spec_key(0, large)
         key = next(key for key, module in _LOADED.items() if module is baseline)
         ranged_key = dataclasses.replace(key, spec_pointer_range=1)
-        ranged = _loaded_module(ranged_key, pointer_kernel.__module__, None)
+        ranged = _loaded_module(
+            ranged_key, pointer_kernel.__module__, None, launcher._stub()
+        )
         ranged_launch = _launcher_over(ranged)
         small_key = ranged_launch.__self__._C_spec_key(0, small)
         large_key = ranged_launch.__self__._C_spec_key(0, large)
@@ -2641,29 +2646,27 @@ def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     assert torch.count_nonzero(out) == 0
     # launched like any backend, through the fake driver _intj_lazy exports
     module = module_of(host)
-    key = next(key for key, loaded in launcher._LOADED.items() if loaded is module)
+    key = next(key for key, loaded in render_module._LOADED.items() if loaded is module)
     assert key.driver_path == launcher._stub().__file__
     assert key.launch_symbol == "intj_host_launch"
 
 
 def test_no_gpu_rejects_real_backend_options(monkeypatch):
-    import intj.launcher as launcher
 
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning was reached")
 
-    monkeypatch.setattr(launcher, "_provision", forbidden)
+    monkeypatch.setattr(kernel_cache_module, "_provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="no_gpu.*options"):
         make_launcher(scale, no_gpu=True, options={"num_warps": 8}).__self__.check()
 
 
 def test_binding_refusals_come_before_provisioning(monkeypatch):
-    import intj.launcher as launcher
 
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning was reached before a GPU-free refusal")
 
-    monkeypatch.setattr(launcher, "_provision", forbidden)
+    monkeypatch.setattr(kernel_cache_module, "_provision", forbidden)
     k = make_launcher(scale, bind_device=-1)  # pyright: ignore[reportArgumentType]
     with pytest.raises(TypeError, match="device ordinal"):
         k.__self__.check()
@@ -3076,7 +3079,7 @@ def test_annotated_effective_compile_options_and_identity(
         make_launcher(scalar_kernel, torch_access_mode=TorchAccessMode.INTERPRETER)
     )
     baseline_key = next(
-        key for key, module in launcher._LOADED.items() if module is baseline
+        key for key, module in render_module._LOADED.items() if module is baseline
     )
     monkeypatch.setattr(scalar_kernel, "debug", jit_debug)
     monkeypatch.setattr(knobs.runtime, "debug", runtime_debug)
@@ -3093,7 +3096,7 @@ def test_annotated_effective_compile_options_and_identity(
         captured.update(options)
         raise CompilationCaptured
 
-    def capture_module(key, kernel_module, layout):
+    def capture_module(key, kernel_module, layout, stub):
         expected_values = {
             "debug": expected_debug,
             "instrumentation_mode": instrumentation,
@@ -3108,10 +3111,10 @@ def test_annotated_effective_compile_options_and_identity(
         assert (key.options != baseline_key.options) == (
             expected_debug or bool(instrumentation)
         )
-        return loaded_module(key, kernel_module, layout)
+        return loaded_module(key, kernel_module, layout, stub)
 
     original_state = launcher.Launcher._new_compile_state
-    loaded_module = launcher._loaded_module
+    loaded_module = render_module._loaded_module
 
     def capture_state(self, b):
         state = original_state(self, b)
@@ -3123,7 +3126,7 @@ def test_annotated_effective_compile_options_and_identity(
         raise Captured
 
     monkeypatch.setattr(triton.compiler, "compile", capture_compile)
-    monkeypatch.setattr(launcher, "_loaded_module", capture_module)
+    monkeypatch.setattr(render_module, "_loaded_module", capture_module)
     monkeypatch.setattr(launcher.Launcher, "_new_compile_state", capture_state)
     with pytest.raises(Captured):
         module_of(
@@ -3145,9 +3148,9 @@ def test_newer_triton_fpsan_knob_is_baked_into_compile_options(
     class Captured(Exception):
         pass
 
-    def capture(b):
+    def capture(b, stub):
         seen.update(
-            launcher._knob_options(b.jit_func, dict(b.compile_options), b.knob_values)
+            backends._knob_options(b.jit_func, dict(b.compile_options), b.knob_values)
         )
         raise Captured
 
@@ -3227,11 +3230,10 @@ def test_compile_override_is_private_and_restores_built_launcher(power_kernel):
 
 def test_cached_build_is_reused_without_rendering(monkeypatch):
     """A dict miss with the .so already on disk must not render or compile again."""
-    import intj.launcher as launcher_module
     import intj.render.build as render_build
 
     module_of(make_launcher(scale, options={"num_stages": 5}))
-    launcher_module._LOADED.clear()
+    render_module._LOADED.clear()
 
     def fail(*args, **kwargs):
         raise AssertionError("rebuilt a module that was already on disk")
@@ -3250,21 +3252,19 @@ def test_modules_stay_out_of_the_import_system():
     import sys
     import weakref
 
-    import intj.launcher as launcher_module
-
     before = set(sys.modules)
     first = module_of(make_launcher(scale, options={"num_stages": 6}))
     assert first.__spec__ is not None and first.__spec__.name not in sys.modules
     assert "_intj_lazy" not in sys.modules  # the stub every launcher starts as
 
-    launcher_module._LOADED.clear()
+    render_module._LOADED.clear()
     second = module_of(make_launcher(scale, options={"num_stages": 6}))
     assert second.__file__ == first.__file__  # same .so ...
     assert second is not first  # ... but a module of its own
 
     reference = weakref.ref(second)
     del second
-    launcher_module._LOADED.clear()
+    render_module._LOADED.clear()
     gc.collect()
     assert reference() is None
 
@@ -3383,7 +3383,8 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
     module = module_of(launch)
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
     from triton.compiler import make_backend
 
     params, _, _ = _render_params(
@@ -3457,7 +3458,8 @@ def test_python_annotated_params_compile_like_triton():
     """
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
     from triton.compiler import make_backend
 
     launch = make_launcher(python_annotated)
@@ -3586,7 +3588,8 @@ def test_ast_source_hashes_as_triton_launch(kernel):
 
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
 
     jit = PARITY_KERNELS[kernel]
     backend = make_backend(current_target())
@@ -3684,7 +3687,8 @@ def test_baked_int_specializes_like_triton(kernel):
 
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
 
     jit = {**PARITY_KERNELS, "i64": parity_i64, "u8": parity_u8}[kernel]
     backend = make_backend(current_target())
@@ -3856,7 +3860,8 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     """
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
     from triton.compiler import make_backend
 
     launch = make_launcher(act_store)
@@ -3979,7 +3984,7 @@ def test_grid_py_dynamic_options_with_str_and_jit_constexprs(monkeypatch):
 
     # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
     # what makes the rest -- launcher, records, interned constexprs -- collectible.
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     key = next(key for key, loaded in _LOADED.items() if loaded is module)
     _LOADED.pop(key)
@@ -4034,7 +4039,7 @@ def test_bind_device_bound_tensor_dynamic_num_warps_object_constexprs():
 
     # `_LOADED` is the module's only owner (AGENTS.md); dropping it there is
     # what makes the rest -- factory, bound handle, records -- collectible.
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     loaded_key = next(key for key, loaded in _LOADED.items() if loaded is module)
     _LOADED.pop(loaded_key)
@@ -4054,7 +4059,7 @@ def test_sibling_launchers_intern_independently(monkeypatch):
     Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
     and each launcher's compiler cache compiles each variant once.
     """
-    monkeypatch.setattr(launcher, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     real, compiles = launcher._checked_compile, []
 
     def counted(*args, **kwargs):
@@ -4216,7 +4221,7 @@ def test_object_table_references_die_with_the_launcher(monkeypatch):
     The memo no longer holds it.  The object is a fresh tl.dtype, not a JIT
     function: triton keeps every JITFunction in a registry of its own.
     """
-    monkeypatch.setattr(launcher, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     launch = make_launcher(cast_store)
     module = module_of(launch)
     o = torch.zeros(1, device="cuda")
@@ -4229,7 +4234,7 @@ def test_object_table_references_die_with_the_launcher(monkeypatch):
     gc.collect()
     assert dt_ref() is not None  # the table holds it
     assert launch.__self__.spec_key(0, o, 2.0, tl.int32)[0] == key
-    launcher._LOADED.clear()
+    render_module._LOADED.clear()
     del launch, module
     gc.collect()
     assert launch_ref() is None and dt_ref() is None
@@ -4252,7 +4257,8 @@ def annotated_baked(x, BLOCK, o, bias):
 
 def test_annotated_cuda_compile_only():
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
     from triton.backends.compiler import GPUTarget
     from triton.compiler import compile as triton_compile, make_backend
 
@@ -4445,7 +4451,8 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
     from triton.compiler import make_backend
 
     extra = {"x": annotation}
@@ -4486,7 +4493,8 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _render_params
+    from intj.launcher import _compiler_input
+    from intj.render.module import _render_params
     from triton.compiler import make_backend
 
     base = torch.empty(16, device="cuda")
@@ -4515,7 +4523,8 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 @pytest.mark.parametrize("key", [b"", b"\x00" * 8])
 def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _KernelCompiler, _render_params
+    from intj.launcher import _KernelCompiler
+    from intj.render.module import _render_params
 
     params, _, _ = _render_params(
         _resolve_annotations(power_kernel, {"N": Constexpr()}), DeviceBinding.FIXED
@@ -4554,7 +4563,7 @@ def _recording_input_launcher(
     from triton.backends.compiler import GPUTarget
     from triton.compiler import make_backend
 
-    monkeypatch.setattr("intj.launcher._LOADED", {})
+    monkeypatch.setattr("intj.render.module._LOADED", {})
     factory = make_launcher(
         kernel,
         extra_annotation={"x": annotation},
@@ -4565,7 +4574,7 @@ def _recording_input_launcher(
     native = factory.__self__.bind_device(0, **bound_values) if bind_device else factory
     module = _launcher_module(native)
     # Use the placed, resolved annotations, including the inferred bound dtype.
-    from intj.launcher import _LOADED
+    from intj.render.module import _LOADED
 
     params = next(key.params for key, value in _LOADED.items() if value is module)
     backend = make_backend(
@@ -4817,7 +4826,7 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     import importlib.util
 
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _render_params
+    from intj.render.module import _render_params
 
     names = [f"p{i}" for i in range(nparams)]
     cxnames = [f"C{i}" for i in range(nconstexpr)]
@@ -4853,7 +4862,7 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
 def _make_render_key(**overrides):
     """Returns a valid two-parameter `RenderKey` with `overrides` applied."""
     from intj.annotation import DeviceBinding, ResolvedParam
-    from intj.launcher import _render_params
+    from intj.render.module import _render_params
 
     ordinary = CanonicalAnnotation(
         "argument", None, "auto", "auto", "auto", (), False, None, ()
@@ -4935,11 +4944,12 @@ def test_render_key_uses_major_minor_version_only(monkeypatch):
 def test_render_key_tracks_cache_compiler_language(
     scalar_kernel, monkeypatch, cache, language
 ):
-    import intj.launcher as launcher
 
     keys = []
     monkeypatch.setattr(
-        launcher, "_provision", lambda _: {"include_dirs": (), "archives": ()}
+        kernel_cache_module,
+        "_provision",
+        lambda _: {"include_dirs": (), "archives": ()},
     )
 
     class Captured(Exception):
@@ -4949,7 +4959,7 @@ def test_render_key_tracks_cache_compiler_language(
         keys.append(key)
         raise Captured
 
-    monkeypatch.setattr(launcher, "_loaded_module", capture)
+    monkeypatch.setattr(render_module, "_loaded_module", capture)
     with pytest.raises(Captured):
         module_of(
             make_launcher(
@@ -5146,9 +5156,11 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
     }
     # installed once calls is non-empty, like the real complete-tree check
     monkeypatch.setattr(
-        "intj.launcher.toolchain_for", lambda cache: toolchain if calls else None
+        "intj.kernel_cache.toolchain_for", lambda cache: toolchain if calls else None
     )
-    monkeypatch.setattr("intj.launcher.install", lambda c: calls.append(c) or toolchain)
+    monkeypatch.setattr(
+        "intj.kernel_cache.install", lambda c: calls.append(c) or toolchain
+    )
 
     # stop before the real build: the point is what reaches it, not that a
     # fabricated include directory compiles
@@ -5161,7 +5173,7 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
         keys.append(key)
         raise Captured
 
-    monkeypatch.setattr("intj.launcher._loaded_module", capture)
+    monkeypatch.setattr("intj.render.module._loaded_module", capture)
     launch = make_launcher(scale, kernel_cache=KernelCache.TSL)
     assert calls == []  # decoration provisions nothing
     launch.__self__.check()
@@ -5184,9 +5196,9 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
         attempts.append(cache)
         raise OSError("no network")
 
-    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
-    monkeypatch.setattr("intj.launcher.install", explode)
-    monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
+    monkeypatch.setattr("intj.kernel_cache.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.kernel_cache.install", explode)
+    monkeypatch.setattr("intj.kernel_cache._INSTALL_FAILED", {})
     for _ in range(3):
         with pytest.raises(
             UnsupportedKernel,
@@ -5198,9 +5210,11 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
 
 
 def test_kernel_cache_install_bug_is_not_dressed_up_as_a_download_failure(monkeypatch):
-    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
-    monkeypatch.setattr("intj.launcher._INSTALL_FAILED", {})
-    monkeypatch.setattr("intj.launcher.install", lambda cache: cache.no_such_attribute)
+    monkeypatch.setattr("intj.kernel_cache.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.kernel_cache._INSTALL_FAILED", {})
+    monkeypatch.setattr(
+        "intj.kernel_cache.install", lambda cache: cache.no_such_attribute
+    )
     with pytest.raises(AttributeError):
         make_launcher(scale, kernel_cache=KernelCache.TSL).__self__.check()
 
@@ -5210,12 +5224,12 @@ def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
 
     Only GPU-free refusals can precede it: an unknown `options=` name needs the
     target, so it raises on the first call, after make_launcher provisioned."""
-    monkeypatch.setattr("intj.launcher.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.kernel_cache.toolchain_for", lambda cache: None)
 
     def explode(cache):
         raise AssertionError("installed before refusing a global-reading kernel")
 
-    monkeypatch.setattr("intj.launcher.install", explode)
+    monkeypatch.setattr("intj.kernel_cache.install", explode)
     with pytest.raises(UnsupportedKernel, match="global variable"):
         make_launcher(uses_global, kernel_cache=KernelCache.ABSL).__self__.check()
 
@@ -5846,8 +5860,6 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     """The generated decoder writes each width at its globally placed offset."""
     import importlib.util
 
-    from intj import launcher as launcher_module
-
     names = [f"p{i}" for i in range(nparams)]
     path = tmp_path / f"k{nparams}.py"
     path.write_text(
@@ -5866,9 +5878,7 @@ def test_rendered_key_puts_every_byte_where_python_says(tmp_path, nparams):
     }
     launch = make_launcher(kernel.k, extra_annotation=annotation)
     module = module_of(launch)
-    key = next(
-        key for key, loaded in launcher_module._LOADED.items() if loaded is module
-    )
+    key = next(key for key, loaded in render_module._LOADED.items() if loaded is module)
     suffix = (
         ".cpp"
         if key.torch_access_mode == TorchAccessMode.STATIC_COMPILE.value
@@ -6055,24 +6065,23 @@ def test_launch_correctness_per_mode(scale_by_mode):
 
 
 def test_default_resolves_and_explicit_modes_validate(monkeypatch):
-    from intj import launcher as launcher_mod
 
-    resolve = launcher_mod._resolve_torch_access_mode
-    monkeypatch.setattr(launcher_mod, "cxx_lib_dirs", lambda: ("/lib",))
-    monkeypatch.setattr(launcher_mod, "layout_for", lambda: object())
+    resolve = render_module._resolve_torch_access_mode
+    monkeypatch.setattr(render_module, "cxx_lib_dirs", lambda: ("/lib",))
+    monkeypatch.setattr(render_module, "layout_for", lambda: object())
     for m in ACCESS_MODES:
         assert resolve(m) is m
     assert resolve(None) is TorchAccessMode.STATIC_COMPILE
     # `confirmed` asks cpp_extension itself, which here cannot import
-    monkeypatch.setattr(launcher_mod, "cxx_toolchain", lambda: None)
+    monkeypatch.setattr(render_module, "cxx_toolchain", lambda: None)
     with pytest.raises(UnsupportedKernel, match="STATIC_COMPILE needs"):
         resolve(TorchAccessMode.STATIC_COMPILE, confirmed=True)
     assert resolve(None, confirmed=True) is TorchAccessMode.RUNTIME_SHIM
-    monkeypatch.setattr(launcher_mod, "cxx_lib_dirs", lambda: None)
+    monkeypatch.setattr(render_module, "cxx_lib_dirs", lambda: None)
     with pytest.raises(UnsupportedKernel, match="STATIC_COMPILE needs"):
         resolve(TorchAccessMode.STATIC_COMPILE)
     assert resolve(None) is TorchAccessMode.RUNTIME_SHIM
-    monkeypatch.setattr(launcher_mod, "layout_for", lambda: None)
+    monkeypatch.setattr(render_module, "layout_for", lambda: None)
     assert resolve(None) is TorchAccessMode.INTERPRETER
 
 
@@ -6089,7 +6098,6 @@ def test_static_compile_cpp_extension_cannot_build_chooses_again(
     `SETUPTOOLS_USE_DISTUTILS=stdlib` on 3.12) says no only when a build asks:
     the automatic choice moves on, an explicit request is refused.
     """
-    from intj import launcher as launcher_mod
     from intj.render import build
 
     try:
@@ -6097,10 +6105,10 @@ def test_static_compile_cpp_extension_cannot_build_chooses_again(
     except Exception:
         pytest.skip("no C++ compiler")
     missing = (str(tmp_path / "lib"),)  # no `.so` on disk has this rpath
-    for module in (launcher_mod, build):
+    for module in (render_module, build):
         monkeypatch.setattr(module, "cxx_lib_dirs", lambda: missing)
         monkeypatch.setattr(module, "cxx_toolchain", lambda: None)
-    monkeypatch.setattr(launcher_mod, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     kernel = _kernel_from_source(tmp_path, "unconfirmed_kernel", "x, n")
     launch = make_launcher(kernel, no_gpu=True, torch_access_mode=mode)
     launch.__self__.check()
@@ -6108,14 +6116,14 @@ def test_static_compile_cpp_extension_cannot_build_chooses_again(
         with pytest.raises(UnsupportedKernel, match="STATIC_COMPILE needs") as refused:
             launch(0, 0, (1,), 0, 1)
         assert isinstance(refused.value.__cause__, build.CppExtensionUnavailable)
-        assert not launcher_mod._LOADED
+        assert not render_module._LOADED
         return
     launch(0, 0, (1,), 0, 1)
-    (key,) = launcher_mod._LOADED
-    assert launcher_mod._LOADED[key] is module_of(launch)
+    (key,) = render_module._LOADED
+    assert render_module._LOADED[key] is module_of(launch)
     expected = (
         TorchAccessMode.RUNTIME_SHIM
-        if launcher_mod.layout_for() is not None
+        if render_module.layout_for() is not None
         else TorchAccessMode.INTERPRETER
     )
     assert key.torch_access_mode == expected.value
@@ -6125,10 +6133,9 @@ def test_static_compile_on_disk_loads_without_asking_cpp_extension(
     tmp_path, monkeypatch
 ):
     """A c++ module already built loads even where cpp_extension now fails."""
-    from intj import launcher as launcher_mod
     from intj.render import build
 
-    if launcher_mod.cxx_lib_dirs() is None:  # also caches the answer
+    if render_module.cxx_lib_dirs() is None:  # also caches the answer
         pytest.skip("no C++ compiler or torch headers")
     kernel = _kernel_from_source(tmp_path, "on_disk_kernel", "x, n")
     built = make_launcher(
@@ -6139,9 +6146,9 @@ def test_static_compile_on_disk_loads_without_asking_cpp_extension(
     def unavailable():
         raise AssertionError("asked cpp_extension for a module already on disk")
 
-    for module in (launcher_mod, build):
+    for module in (render_module, build):
         monkeypatch.setattr(module, "cxx_toolchain", unavailable)
-    monkeypatch.setattr(launcher_mod, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     for mode in (None, TorchAccessMode.STATIC_COMPILE):
         launch = make_launcher(kernel, no_gpu=True, torch_access_mode=mode)
         launch(0, 0, (1,), 0, 1)
@@ -6245,9 +6252,8 @@ def test_hardcoded_layout_matches_torch_headers():
 
 def test_runtime_shim_is_refused_rather_than_guessed(monkeypatch):
     """An unverified torch must raise, never fall back to a guessed offset."""
-    from intj import launcher as launcher_mod
 
-    monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
+    monkeypatch.setattr(render_module, "layout_for", lambda *a: None)
     with pytest.raises(UnsupportedKernel, match="tensor layout"):
         make_launcher(
             scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM
@@ -6256,9 +6262,7 @@ def test_runtime_shim_is_refused_rather_than_guessed(monkeypatch):
 
 def test_static_compile_needs_no_table(monkeypatch):
     """The compiler supplies offsets, even for an unverified torch."""
-    from intj import launcher as launcher_mod
 
-    monkeypatch.setattr(launcher_mod, "layout_for", lambda *a: None)
     monkeypatch.setattr(render_module, "layout_for", lambda *a: None)
     x = torch.arange(128, device="cuda", dtype=torch.float32)
     o = torch.empty_like(x)
@@ -6511,7 +6515,6 @@ def test_sibling_launchers_compile_once_each(monkeypatch):
 
 def test_decoration_needs_no_gpu(monkeypatch):
     """Decoration, the decorator form, bind_device and check() never query a target."""
-    import intj.launcher as launcher
 
     def forbidden(*args, **kwargs):
         raise AssertionError("decoration touched the GPU")
@@ -6744,13 +6747,9 @@ def check_dynamic_invariant():
 
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import canonical_options, current_target
-    from intj.launcher import (
-        _compiler_input,
-        _knob_options,
-        _live_knobs,
-        _render_params,
-        _split_dynamic,
-    )
+    from intj.launcher import _compiler_input, _live_knobs, _split_dynamic
+    from intj.backend import _knob_options
+    from intj.render.module import _render_params
 
     launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
     module, device = module_of(launch), torch.cuda.current_device()
@@ -6791,9 +6790,9 @@ def test_dynamic_values_are_never_coarser_than_triton():
 
 @pytest.mark.parametrize("dropped", _DYNAMIC)
 def test_dynamic_invariant_catches_a_dropped_value(monkeypatch, dropped):
-    original = launcher._dynamic_key_fields
+    original = render_module._dynamic_key_fields
     monkeypatch.setattr(
-        launcher,
+        render_module,
         "_dynamic_key_fields",
         lambda name: () if name == dropped else original(name),
     )
@@ -6883,12 +6882,9 @@ def check_option_parameter_invariant():
 
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import canonical_options, current_target
-    from intj.launcher import (
-        _compiler_input,
-        _knob_options,
-        _live_knobs,
-        _render_params,
-    )
+    from intj.launcher import _compiler_input, _live_knobs
+    from intj.backend import _knob_options
+    from intj.render.module import _render_params
 
     launch = make_launcher(option_axpy, return_compiled=True)
     module, device = module_of(launch), torch.cuda.current_device()
@@ -6922,7 +6918,7 @@ def test_option_parameters_are_never_coarser_than_triton():
 def test_option_parameter_invariant_catches_an_unfed_option(monkeypatch):
     # the key is unchanged, so a fresh module table keeps the loaded module's
     # compile function (built unmutated) out of the way
-    monkeypatch.setattr(launcher, "_LOADED", {})
+    monkeypatch.setattr(render_module, "_LOADED", {})
     monkeypatch.setattr(launcher, "_parameter_options", lambda backend, params: ())
     with pytest.raises(AssertionError, match="option not fed"):
         check_option_parameter_invariant()

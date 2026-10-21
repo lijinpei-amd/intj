@@ -26,39 +26,19 @@ from . import backend as backends
 from .annotation import (
     CanonicalAnnotation,
     DeviceBinding,
-    KeyField,
     ResolvedParam,
     _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
-    _key_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
-    _layout_fields,  # pyright: ignore[reportPrivateUsage]  # private key layout
     _resolve_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
-from .kernel_cache import (
-    INSTALL_ERRORS,
-    KernelCache,
-    install,
-    toolchain_for,
-    unavailable_message,
-)
+from . import kernel_cache as kernel_caches
+from .errors import UnsupportedKernel as UnsupportedKernel
+from .kernel_cache import KernelCache
 from .options import OPTION_FIELDS, MakeLauncherKwargs, MakeLauncherOption
-from .python_intf import cpython_abi
 from .render import module as render_module
-from .render.build import (
-    compiler_path,
-    cxx_lib_dirs,
-    cxx_toolchain,
-    load,
-)
-from .render.key import DynamicSlot, Param, RenderKey
-from .torch_intf.torch_abi import (
-    TensorABI,
-    TorchAccessMode,
-    dtype_index_table,
-    layout_for,
-    supported_versions,
-    torch_version,
-)
+from .render.build import compiler_path
+from .render.key import Param
+from .torch_intf.torch_abi import TorchAccessMode
 
 # triton and torch ship no type information, so everything reaching into them is
 # typed `Any` on purpose.
@@ -70,10 +50,6 @@ if TYPE_CHECKING:
 
     from .grid import GridCode
     from .tuning import Tuned
-
-
-class UnsupportedKernel(NotImplementedError):
-    """A kernel or option outside intj's (deliberately small) scope."""
 
 
 class ClassGlobalWarning(RuntimeWarning):
@@ -311,7 +287,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         raise UnsupportedKernel("intj: return_compiled=True requires GPU mode")
     kernel: JitFunction = jit_func
     _imports.ensure_triton_imported()
-    _verified_cpython_header()
+    render_module._verified_cpython_header()  # pyright: ignore[reportPrivateUsage]  # shared ABI check
     options = dict(sorted((options or {}).items()))
     chain = kernel
     while _is_chain(kernel):
@@ -364,7 +340,9 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     if grid_cpp is not None:
         from .grid import GridError, compile_grid
 
-        grid_params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+        grid_params, _, _ = render_module._render_params(  # pyright: ignore[reportPrivateUsage]  # shared key layout
+            resolved, DeviceBinding.NOT_FIXED
+        )
         try:
             compiled_grid = compile_grid(
                 grid_cpp,
@@ -375,7 +353,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
             )
         except GridError as error:
             raise UnsupportedKernel(f"intj: {error}") from error
-    access = _resolve_torch_access_mode(torch_access_mode)
+    access = render_module._resolve_torch_access_mode(torch_access_mode)  # pyright: ignore[reportPrivateUsage]  # shared access checks
     if verify_annotation:
         for p in resolved:
             if (
@@ -458,7 +436,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     )
     device_binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
     args = (*(() if device is None else (device,)), *bound_values)
-    rendered, _, _ = _render_params(params, device_binding)
+    rendered, _, _ = render_module._render_params(params, device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
     doc = _launch_doc(
         rendered,
         device is not None,
@@ -473,7 +451,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         None if no_gpu else {k: v for k, v in _live_knobs().items() if k not in dynamic}
     )
     # GPU-free but may reach the network: after every refusal above, never on a build
-    _provision(kernel_cache)
+    kernel_caches._provision(kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
     return _BuildOptions(
         jit_func=kernel,
         tuned=tuned,
@@ -739,7 +717,7 @@ class Launcher:
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
         self._check_target(b)
-        module = render_module._build_module(b)  # pyright: ignore[reportPrivateUsage]  # renderer's build entry
+        module = render_module._build_module(b, _stub())  # pyright: ignore[reportPrivateUsage]  # renderer's build entry
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
         state = self._new_compile_state(b)
         address = module._init(self, _Interner(), *grid_py, *b.args)
@@ -756,7 +734,7 @@ class Launcher:
         if target is None:
             return _KernelCompiler(None)
         assert b.knob_values is not None, "GPU builds read knobs at the first call"
-        params, _, _ = _render_params(b.params, b.device_binding)
+        params, _, _ = render_module._render_params(b.params, b.device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
         return _KernelCompiler(
             b.jit_func,
             dict(b.compile_options),
@@ -951,31 +929,6 @@ def make_launcher(
     return _new_launcher(option)
 
 
-_INSTALL_FAILED: dict[KernelCache, Exception] = {}
-
-
-def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:
-    """Returns the toolchain for `cache`, fetching and building it the first time.
-
-    Only ever reached from `check()`, on the slow path that was already
-    going to invoke a compiler.  A failure is remembered: a script that builds
-    twenty launchers offline should wait out one connect timeout, not twenty.
-    """
-    toolchain = toolchain_for(cache)
-    if toolchain is not None:
-        return toolchain
-    if cache not in _INSTALL_FAILED:
-        try:
-            return install(cache)
-        # INSTALL_ERRORS, not Exception: a TypeError from a bug in here is not a
-        # provisioning failure, and must not send the reader off to re-run a
-        # command that will fail identically.
-        except INSTALL_ERRORS as error:
-            _INSTALL_FAILED[cache] = error
-    failure = _INSTALL_FAILED[cache]
-    raise UnsupportedKernel(unavailable_message(cache, failure)) from failure
-
-
 _stub_loaded: tuple[types.ModuleType, type[Launcher]] | None = None
 _tuned_loaded: type[Launcher] | None = None
 _STUB_LOCK = threading.Lock()
@@ -1103,38 +1056,6 @@ def _live_knobs() -> dict[str, object]:
         _, group, name = path.split(".")
         values[path] = getattr(getattr(_imports.knobs, group), name, None)
     return values
-
-
-def _knob_options(
-    jit_func: JitFunction, options: Mapping[str, Any], knob_values: Mapping[str, object]
-) -> dict[str, Any]:
-    """Returns `options` plus what triton derives from knobs.
-
-    An explicit `debug` overrides the kernel's default, and the runtime knob
-    can still enable it.  A knob missing from `knob_values` (a declared
-    dynamic one, outside its miss) takes triton's default.
-    """
-    merged = dict(options)
-    merged["debug"] = options.get("debug", jit_func.debug) or knob_values.get(
-        "knobs.runtime.debug", False
-    )
-    merged["instrumentation_mode"] = knob_values.get(
-        "knobs.compilation.instrumentation_mode", ""
-    )
-    casts = knob_values.get("knobs.compilation.fpsan_homomorphic_casts")
-    if casts is not None:
-        merged["fpsan_homomorphic_casts"] = casts
-    return merged
-
-
-def _dynamic_key_fields(name: str) -> tuple[KeyField, ...]:
-    """Returns one dynamic value's key fields: a kind byte and 8 value bytes.
-
-    Laid out like an exact key.  `name` picks nothing here; the invariant
-    tests' mutation checks drop one value's fields by name.
-    """
-    del name
-    return (KeyField("exact_kind", 1), KeyField("exact", 8))
 
 
 def _check_dynamic(
@@ -1278,108 +1199,6 @@ def _check_device(device: int) -> None:
         )
 
 
-def get_full_name(fn: Any) -> str:
-    """Returns `fn`'s `<module>.<qualname>`."""
-    return f"{fn.__module__}.{fn.__qualname__}"
-
-
-def _verified_cpython_header() -> str:
-    header = cpython_abi.header_for()
-    if header is None:
-        raise UnsupportedKernel(
-            f"intj: no verified CPython layer for python {'%d.%d.%d' % cpython_abi.python_version()} "
-            f"(have {', '.join('%d.%d' % v for v in cpython_abi.supported_versions())}); "
-            "run `python -m intj.python_intf.check` on it and add it to intj/python_intf/cpython_abi.py"
-        )
-    return header
-
-
-def _resolve_torch_access_mode(
-    requested: TorchAccessMode | None, *, confirmed: bool = False
-) -> TorchAccessMode:
-    """Selects a concrete mode from an automatic or explicit request.
-
-    Explicit modes are validated rather than silently downgraded: a caller who
-    asked for `RUNTIME_SHIM` because they measured it wants to hear that it is
-    unavailable, not to get `INTERPRETER` and wonder where the time went.
-
-    `check()` asks `cxx_lib_dirs`, which spares a first call whose `.so` is on
-    disk the cpp_extension import; `confirmed=True` asks `cxx_toolchain`, as a
-    build must (`render.module._build_module`). The two differ only where
-    cpp_extension is installed but cannot import.
-    """
-
-    def cxx() -> bool:
-        return (cxx_toolchain() if confirmed else cxx_lib_dirs()) is not None
-
-    if requested is TorchAccessMode.RUNTIME_SHIM and layout_for() is None:
-        raise UnsupportedKernel(_unverified_torch_message())
-    if requested is TorchAccessMode.STATIC_COMPILE and not cxx():
-        raise UnsupportedKernel(
-            "intj: STATIC_COMPILE needs a C++ compiler and torch's headers; "
-            "set $CXX or pass torch_access_mode=TorchAccessMode.RUNTIME_SHIM"
-        )
-    if requested is not None:
-        return requested
-    if cxx():
-        return TorchAccessMode.STATIC_COMPILE
-    if layout_for() is not None:
-        return TorchAccessMode.RUNTIME_SHIM
-    return TorchAccessMode.INTERPRETER
-
-
-def _unverified_torch_message() -> str:
-    return (
-        f"intj: no verified tensor layout for torch {_torch_version_string()} "
-        f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
-        "dtypes no longer match the recorded entry, or CPython's object header "
-        "makes the tensor offset unrepresentable; pass "
-        "torch_access_mode=TorchAccessMode.INTERPRETER, or add an entry to intj/torch_intf/torch_abi.toml "
-        "with `python -m intj.torch_intf.abi_detect` on this torch version"
-    )
-
-
-def _torch_version_string() -> str:
-    _imports.ensure_torch_imported()
-    return str(_imports.torch.__version__)
-
-
-_LOADED: dict[RenderKey, types.ModuleType] = {}
-_LOAD_LOCK = threading.Lock()
-
-
-def _loaded_module(  # pyright: ignore[reportUnusedFunction]  # consumed by render.module
-    key: RenderKey,
-    kernel_module: str,
-    layout: TensorABI | None,
-) -> types.ModuleType:
-    """Returns the one module for `key`, loading it once per process.
-
-    The lock matters: without it two threads both compile and both load, and the
-    loser's module is silently dropped.
-    """
-    with _LOAD_LOCK:
-        module = _LOADED.get(key)
-        if module is None:
-            module = load(key, kernel_module)
-            stub = _stub()
-            if module._header_size() != stub._header_size():
-                raise ImportError(
-                    f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
-                    "header; it was built by another intj -- delete it to rebuild"
-                )
-            module._set_launcher_type(stub.Launcher)
-            # Pass relative cdata; the compiled setter saves the absolute offset
-            # for the torch running now before exposing the module.
-            module._set_torch_version(
-                torch_version(),
-                layout.as_args() if layout else None,
-                dtype_index_table(),
-            )
-            _LOADED[key] = module
-        return module
-
-
 #: options a launch fixes itself; never `options=` or `dynamic_options`
 _FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
 
@@ -1491,112 +1310,6 @@ def _global_values(
             ) from None
         values.append((name, str(scope.get("__name__", "")), canonical))
     return tuple(sorted(values, key=lambda item: (item[0], item[1])))
-
-
-def _spec_key_layout(
-    resolved: tuple[ResolvedParam, ...],
-    device_binding: DeviceBinding,
-    computed0: int = 0,
-    dynamic: Sequence[str] = (),
-) -> tuple[
-    tuple[Param, ...],
-    int | None,
-    int,
-    tuple[tuple[int, int], ...],
-    tuple[DynamicSlot, ...],
-]:
-    """Places the key fields and numbers the arguments in the public call.
-
-    Level-0 computed keys and dynamic values are placed too.
-
-    A computed key is a (value, kind) pair: payload and descriptor, the way a
-    constexpr is keyed, so True and 1 key apart.  A dynamic value is keyed
-    like an exact key, and its memo follows the parameters'.
-    """
-    fields = tuple(
-        (p.index, field) for p in resolved for field in _key_fields(p.annotation)
-    )
-    fields += tuple(
-        (-1 - j, KeyField(kind, width))
-        for j in range(computed0)
-        for kind, width in (("payload", 8), ("descriptor", 1))
-    )
-    fields += tuple(
-        (-1 - computed0 - j, field)
-        for j, name in enumerate(dynamic)
-        for field in _dynamic_key_fields(name)
-    )
-    layout = _layout_fields(fields, device_binding)
-    params: list[Param] = []
-    call_index = 0
-    memo = 0
-    for p in resolved:
-        annotation = dataclasses.replace(
-            p.annotation,
-            key_fields=tuple(
-                sorted(
-                    (field for index, field in layout.fields if index == p.index),
-                    key=lambda field: field.offset,
-                )
-            ),
-        )
-        public = (
-            not annotation.baked_value
-            and annotation.bind_value is None
-            and not annotation.tuned
-        )
-        slot = None
-        if public and _object_capable(annotation):
-            slot, memo = memo, memo + 1
-        params.append(
-            Param(p.name, p.index, call_index if public else None, annotation, slot)
-        )
-        if public:
-            call_index += 1
-    placed = {
-        (index, field.kind): field.offset for index, field in layout.fields if index < 0
-    }
-    computed_fields = tuple(
-        (placed[(-1 - j, "payload")], placed[(-1 - j, "descriptor")])
-        for j in range(computed0)
-    )
-    slots = tuple(
-        DynamicSlot(
-            name,
-            placed.get((-1 - computed0 - j, "exact")),
-            placed.get((-1 - computed0 - j, "exact_kind")),
-            memo + j,
-        )
-        for j, name in enumerate(dynamic)
-    )
-    return (
-        tuple(params),
-        layout.device_offset,
-        layout.nwords,
-        computed_fields,
-        slots,
-    )
-
-
-def _render_params(
-    resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
-) -> tuple[tuple[Param, ...], int | None, int]:
-    """Places canonical key fields and numbers the arguments in the public call."""
-    params, device_offset, nwords, _, _ = _spec_key_layout(resolved, device_binding)
-    return params, device_offset, nwords
-
-
-def _object_capable(annotation: CanonicalAnnotation) -> bool:
-    """Returns whether a public parameter with `annotation` takes objects.
-
-    A constexpr keyed by descriptor + 8-byte payload does: str, tl.dtype and
-    JIT functions key as INTJ_B_CX_OBJECT plus an id.
-    """
-    return (
-        annotation.kind == "constexpr"
-        and annotation.types is None
-        and not annotation.power_of_two_or_zero
-    )
 
 
 class _Interner:
@@ -1893,7 +1606,7 @@ class _KernelCompiler:
         """Returns the target's options: `options` over the base ones, then knobs."""
         return backends.canonical_options(
             self.target,
-            _knob_options(
+            backends._knob_options(  # pyright: ignore[reportPrivateUsage]  # shared compile options
                 self.jit_func,
                 {**self._options, **options},
                 {**self._knob_values, **knobs},
@@ -2003,5 +1716,5 @@ def triton_specialization(
 ) -> list[tuple[str, Any]]:
     """Returns the `list[(type_str, key)]` triton would compute for these arguments."""
     binder = jit_func.device_caches[backends.current_device()][4]
-    kwargs = _knob_options(jit_func, options or {}, _live_knobs())
+    kwargs = backends._knob_options(jit_func, options or {}, _live_knobs())  # pyright: ignore[reportPrivateUsage]  # shared compile options
     return binder(*args, **kwargs)[1]

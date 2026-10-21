@@ -80,7 +80,7 @@ _AUTO = CanonicalAnnotation(
 )
 _NEVER = dataclasses.replace(_AUTO, equal_to_one="never", aligned_16="never")
 _CONSTEXPR = dataclasses.replace(_AUTO, kind="constexpr")
-_PARAMS, _DEVICE_OFFSET, _NWORDS = launcher._render_params(
+_PARAMS, _DEVICE_OFFSET, _NWORDS = render_module._render_params(
     (
         ResolvedParam("x", 0, _AUTO),
         ResolvedParam("n", 1, _AUTO),

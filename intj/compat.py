@@ -12,7 +12,8 @@ from typing import Any
 
 from . import _imports
 from .annotation import Argument, Constexpr
-from .launcher import UnsupportedKernel, make_launcher
+from .errors import UnsupportedKernel
+from .launcher import make_launcher
 
 
 def _pointer_type(dtype: Any) -> Any:
