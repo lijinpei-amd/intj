@@ -16,11 +16,17 @@ import dataclasses
 import inspect
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import _imports
-from .heuristic import Heuristic, HeuristicError, parse_heuristic
+from . import backend as backends
+from .annotation import DeviceBinding, ResolvedParam
+from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
 from .launcher import UnsupportedKernel
+from .render.key import Param, TuningRender
+
+if TYPE_CHECKING:
+    from .grid import GridCode
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,6 +201,183 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
 
 
 @dataclasses.dataclass(frozen=True)
+class Tuned:
+    """An autotune/heuristics chain's plan, and its render once the grid is known."""
+
+    plan: TuningPlan
+    render: TuningRender | None = None  # filled once the grid is known
+
+
+def plan_tuning(
+    chain: Any,
+    resolved: tuple[ResolvedParam, ...],
+    extra_annotation: Mapping[str, object] | None,
+    options: Mapping[str, Any],
+    no_gpu: bool,
+) -> tuple[Tuned, tuple[ResolvedParam, ...]]:
+    """Analyzes an autotune/heuristics `chain` into a `Tuned`, not yet rendered.
+
+    Returns it with `resolved` marked: each parameter's `tuned` and
+    `exact_key`.  GPU-free; config options are checked against the target on
+    the first call.
+
+    Raises:
+        UnsupportedKernel: `no_gpu`, a bound parameter, `extra_annotation` or
+            `options` naming a tuned value, or a config with `num_ctas > 1`.
+    """
+    if no_gpu:
+        raise UnsupportedKernel(
+            "intj: autotune/heuristics launchers need a GPU; no_gpu=True is not supported"
+        )
+    plan = analyze(chain, fixed=[p.name for p in resolved if p.annotation.baked_value])
+    for p in resolved:
+        if p.annotation.bind_value is not None:
+            raise UnsupportedKernel(
+                f"intj: bound parameter {p.name!r} cannot be tuned over"
+            )
+    clash = sorted(set(extra_annotation or {}) & plan.tuned)
+    if clash:
+        raise UnsupportedKernel(f"intj: extra_annotation names tuned value(s) {clash}")
+    owned = sorted(set(options) & plan.tuned)
+    if owned:
+        raise UnsupportedKernel(
+            f"intj: options {owned} are set by the autotune configs"
+        )
+    for config_options in _config_options(plan, resolved):
+        if config_options.get("num_ctas", 1) != 1:
+            raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
+    marked = tuple(
+        dataclasses.replace(
+            p,
+            annotation=dataclasses.replace(
+                p.annotation,
+                tuned=p.name in plan.tuned,
+                exact_key=p.name in plan.exact_keys,
+            ),
+        )
+        for p in resolved
+    )
+    return Tuned(plan), marked
+
+
+def _config_options(
+    plan: TuningPlan, resolved: tuple[ResolvedParam, ...]
+) -> Iterable[dict[str, Any]]:
+    """Yields each autotune config's compile options: its kwargs naming no parameter."""
+    _imports.ensure_triton_imported()
+    names = {p.name for p in resolved}
+    for layer in plan.layers:
+        if type(layer) is _imports.Autotuner:
+            for config in layer.configs:
+                yield {
+                    str(k): v for k, v in config.all_kwargs().items() if k not in names
+                }
+
+
+def check_tuned_configs(
+    plan: TuningPlan,
+    resolved: tuple[ResolvedParam, ...],
+    options: Mapping[str, Any],
+    knob_values: Mapping[str, object],
+) -> None:
+    """Runs every config's options through the target's `parse_options`.
+
+    Called on the first call, because the target is a GPU query.
+    """
+    from .launcher import (
+        _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+    )
+
+    target = backends.current_target()
+    for config_options in _config_options(plan, resolved):
+        backends.canonical_options(
+            target,
+            _knob_options(plan.jit_func, {**options, **config_options}, knob_values),
+        )
+
+
+def tuning_render(
+    plan: TuningPlan,
+    resolved: tuple[ResolvedParam, ...],
+    grid_cpp: object | None,
+    grid_py: object | None,
+) -> TuningRender:
+    """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
+
+    `computed_fields` is left empty: `_materialize_module` places it."""
+    from .launcher import (
+        _render_params,  # pyright: ignore[reportPrivateUsage]  # launcher internals
+    )
+
+    _imports.ensure_triton_imported()
+    by_name = {p.name: p for p in _render_params(resolved, DeviceBinding.NOT_FIXED)[0]}
+    grid_code = getattr(grid_cpp, "__code__", None)
+    grid_reads: tuple[str, ...] = (
+        grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()
+    )
+    levels = plan.levels
+    dependent_level: dict[str, int] = {d.name: d.level for d in plan.dependent}
+    computed = tuple(sorted(plan.computed, key=lambda c: c.level))
+    # A lowered read of a dependent value comes from a record walked before
+    # its level's key is computed; `analyze` levels it so.
+    for c in computed:
+        for n in c.heuristic.inputs:
+            if n in dependent_level and dependent_level[n] >= c.level:
+                raise UnsupportedKernel(
+                    f"intj: heuristic {c.name!r} reads {n!r} before it is known; "
+                    "this is an intj bug"
+                )
+    wanted = [n for c in computed for n in c.heuristic.inputs if n in dependent_level]
+    computed_reads = sorted({c.name for c in computed} & set(grid_reads))
+    if computed_reads:
+        raise UnsupportedKernel(
+            f"intj: grid_cpp reads computed heuristic key(s) {computed_reads}; "
+            "use grid_py or compute them in the grid"
+        )
+    wanted += [n for n in grid_reads if n in plan.tuned]
+    # stable: level-major, first use within a level
+    dep_names = tuple(sorted(dict.fromkeys(wanted), key=lambda n: dependent_level[n]))
+    # C reads these; config values are static, so check them now, not on a miss
+    for layer in plan.layers:
+        if type(layer) is _imports.Autotuner:
+            for config in layer.configs:
+                for name, value in config.all_kwargs().items():
+                    if name in dep_names:
+                        c_scalar(str(name), value)
+    sources: dict[str, Source] = {}
+    for p in resolved:
+        if p.annotation.baked_value:
+            sources[p.name] = Source("fixed", value=p.baked)
+        elif not p.annotation.tuned:
+            sources[p.name] = Source("arg", by_name[p.name].call_index or 0)
+    for slot, name in enumerate(dep_names):
+        sources[name] = Source("dep", slot)
+    for slot, c in enumerate(computed):
+        sources[c.name] = Source("comp", slot)
+    try:
+        source = lower([(c.heuristic, c.level) for c in computed], sources, levels)
+    except HeuristicError as error:
+        raise UnsupportedKernel(f"intj: {error}") from error
+    return TuningRender(
+        levels=levels,
+        computed=tuple(
+            sum(c.level == level for c in computed) for level in range(levels)
+        ),
+        computed_fields=(),
+        computed_names=tuple(c.name for c in computed),
+        deps=tuple(
+            sum(dependent_level[n] == level for n in dep_names)
+            for level in range(levels)
+        ),
+        dep_names=dep_names,
+        meta_names=tuple(p.name for p in resolved if p.annotation.tuned)
+        if grid_py is not None
+        else (),
+        source=source,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class TunedGrid:
     """The grid the miss path hands Triton, per launcher grid mode."""
 
@@ -202,6 +385,24 @@ class TunedGrid:
     fn: Any = None
     positional: tuple[str, ...] = ()
     extras: tuple[str, ...] = ()
+
+
+def tuned_grid(
+    grid_py: Callable[[dict[str, object]], object] | None,
+    grid_cpp: object | None,
+    grid_code: GridCode | None,
+) -> TunedGrid:
+    if grid_py is not None:
+        return TunedGrid("py", grid_py)
+    if grid_code is not None:
+        code = getattr(grid_cpp, "__code__")
+        return TunedGrid(
+            "cpp",
+            grid_cpp,
+            tuple(code.co_varnames[: code.co_argcount]),
+            grid_code.extras,
+        )
+    return TunedGrid("dims")
 
 
 class _Shim:
@@ -339,15 +540,13 @@ class TunedCompileState:
         knob_values: Mapping[str, object],
         dynamic: Sequence[str] = (),
     ) -> None:
-        from .backend import current_target
         from .launcher import (
-            Param,
             _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
         self.plan = plan
         self.jit_func = plan.jit_func
-        self.target = current_target()
+        self.target = backends.current_target()
         self.backend = _imports.make_backend(self.target)
         self.options = options
         self.grid = grid
@@ -379,14 +578,13 @@ class TunedCompileState:
         self, values: dict[str, Any], config_options: dict[str, Any]
     ) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
-        from .backend import canonical_options, current_device
         from .launcher import (
             _checked_compile,  # pyright: ignore[reportPrivateUsage]  # launcher internals
             _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
             _knob_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
-        canonical = canonical_options(
+        canonical = backends.canonical_options(
             self.target,
             _knob_options(
                 self.jit_func,
@@ -405,7 +603,7 @@ class TunedCompileState:
             compiler_input,
             canonical.hash(),
             tuple(sorted(self.call_knobs.items())),
-            current_device(),
+            backends.current_device(),
         )
         kernel = self.compiled.get(key)
         if kernel is None:
@@ -445,14 +643,13 @@ class TunedCompileState:
         args: tuple[Any, ...],
     ) -> tuple[Any, ...]:
         """Runs the private chain on `stream` and returns the record for C."""
-        from .backend import current_device
         from .launcher import (
             _check_live_knobs,  # pyright: ignore[reportPrivateUsage]  # launcher internals
             _split_dynamic,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
         _imports.ensure_torch_imported()
-        current = current_device()
+        current = backends.current_device()
         if device != current:
             raise UnsupportedKernel(
                 f"intj: launching on device {device} while device {current} is current; "

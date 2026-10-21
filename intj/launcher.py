@@ -56,7 +56,7 @@ from .render.build import (
     runtime_headers,
 )
 from .render.context import ENTRY_TEMPLATE
-from .render.key import DynamicSlot, Param, RenderKey, TuningRender
+from .render.key import DynamicSlot, Param, RenderKey
 from .torch_intf.torch_abi import (
     TensorABI,
     TorchAccessMode,
@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from typing_extensions import Unpack
 
     from .grid import GridCode
-    from .tuning import TunedCompileState
+    from .tuning import Tuned, TunedCompileState
 
 
 class UnsupportedKernel(NotImplementedError):
@@ -150,7 +150,7 @@ class _BuildOptions:
     """
 
     jit_func: JitFunction  # the chain unwrapped, checked
-    tuned: _Tuned | None
+    tuned: Tuned | None
     params: tuple[ResolvedParam, ...]  # bound tensors' types resolved
     torch_access_mode: TorchAccessMode
     grid_code: GridCode | None  # `grid_cpp` compiled
@@ -338,19 +338,12 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     kernel = _check_kernel(kernel, options, assume_constant_globals)
     global_values = _global_values(kernel) if assume_constant_globals else ()
     resolved = _resolve_annotations(kernel, extra_annotation)
-    tuned: _Tuned | None = None
+    tuned: Tuned | None = None
     if chain is not kernel:
-        tuned = _plan_tuning(chain, resolved, extra_annotation, options, no_gpu)
-        resolved = tuple(
-            dataclasses.replace(
-                p,
-                annotation=dataclasses.replace(
-                    p.annotation,
-                    tuned=p.name in tuned.plan.tuned,
-                    exact_key=p.name in tuned.plan.exact_keys,
-                ),
-            )
-            for p in resolved
+        from .tuning import plan_tuning
+
+        tuned, resolved = plan_tuning(
+            chain, resolved, extra_annotation, options, no_gpu
         )
     for p in kernel.params:
         kind = p._param.kind
@@ -374,7 +367,9 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         )
     deps: Mapping[str, int] | None = None
     if tuned is not None:
-        render = _tuning_render(tuned.plan, resolved, grid_cpp, grid_py)
+        from .tuning import tuning_render
+
+        render = tuning_render(tuned.plan, resolved, grid_cpp, grid_py)
         tuned = dataclasses.replace(tuned, render=render)
         deps = {n: i for i, n in enumerate(render.dep_names)}
     compiled_grid: GridCode | None = None
@@ -789,33 +784,23 @@ class Launcher:
         if _imports.knobs.runtime.interpret:
             raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
         if b.tuned is not None:
-            assert b.knob_values is not None, "_plan_tuning refuses no_gpu"
-            _check_tuned_configs(
+            from .tuning import check_tuned_configs
+
+            assert b.knob_values is not None, "plan_tuning refuses no_gpu"
+            check_tuned_configs(
                 b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
             )
         module = _materialize_module(b)
         compile_state = _CompileState()
         if b.tuned is not None:
-            from .tuning import TunedCompileState, TunedGrid
+            from .tuning import TunedCompileState, tuned_grid
 
             assert b.tuned.render is not None and b.knob_values is not None
-            if b.grid_py is not None:
-                grid = TunedGrid("py", b.grid_py)
-            elif b.grid_code is not None:
-                code = getattr(b.grid_cpp_fn, "__code__")
-                grid = TunedGrid(
-                    "cpp",
-                    b.grid_cpp_fn,
-                    tuple(code.co_varnames[: code.co_argcount]),
-                    b.grid_code.extras,
-                )
-            else:
-                grid = TunedGrid("dims")
             compile_state.tuned = TunedCompileState(
                 b.tuned.plan,
                 b.params,
                 dict(b.compile_options),
-                grid,
+                tuned_grid(b.grid_py, b.grid_cpp_fn, b.grid_code),
                 b.tuned.render,
                 b.knob_values,
                 b.dynamic,
@@ -1327,7 +1312,7 @@ def _check_dynamic(
     dynamic: tuple[str, ...],
     options: Mapping[str, Any],
     kernel: JitFunction,
-    tuned: _Tuned | None,
+    tuned: Tuned | None,
 ) -> None:
     """Refuses bad `dynamic_options` without touching a GPU.
 
@@ -1669,167 +1654,6 @@ def _global_values(
             ) from None
         values.append((name, str(scope.get("__name__", "")), canonical))
     return tuple(sorted(values, key=lambda item: (item[0], item[1])))
-
-
-@dataclasses.dataclass(frozen=True)
-class _Tuned:
-    """An autotune/heuristics chain's plan, and its render once the grid is known."""
-
-    plan: Any  # tuning.TuningPlan
-    render: TuningRender | None = None  # filled once the grid is known
-
-
-def _plan_tuning(
-    chain: Any,
-    resolved: tuple[ResolvedParam, ...],
-    extra_annotation: Mapping[str, object] | None,
-    options: Mapping[str, Any],
-    no_gpu: bool,
-) -> _Tuned:
-    """Analyzes an autotune/heuristics `chain` into a `_Tuned`, not yet rendered.
-
-    GPU-free; config options are checked against the target on the first call.
-
-    Raises:
-        UnsupportedKernel: `no_gpu`, a bound parameter, `extra_annotation` or
-            `options` naming a tuned value, or a config with `num_ctas > 1`.
-    """
-    from .tuning import analyze
-
-    if no_gpu:
-        raise UnsupportedKernel(
-            "intj: autotune/heuristics launchers need a GPU; no_gpu=True is not supported"
-        )
-    plan = analyze(chain, fixed=[p.name for p in resolved if p.annotation.baked_value])
-    for p in resolved:
-        if p.annotation.bind_value is not None:
-            raise UnsupportedKernel(
-                f"intj: bound parameter {p.name!r} cannot be tuned over"
-            )
-    clash = sorted(set(extra_annotation or {}) & plan.tuned)
-    if clash:
-        raise UnsupportedKernel(f"intj: extra_annotation names tuned value(s) {clash}")
-    owned = sorted(set(options) & plan.tuned)
-    if owned:
-        raise UnsupportedKernel(
-            f"intj: options {owned} are set by the autotune configs"
-        )
-    for config_options in _config_options(plan, resolved):
-        if config_options.get("num_ctas", 1) != 1:
-            raise UnsupportedKernel("intj: num_ctas > 1 is not supported")
-    return _Tuned(plan)
-
-
-def _config_options(
-    plan: Any, resolved: tuple[ResolvedParam, ...]
-) -> Iterable[dict[str, Any]]:
-    """Yields each autotune config's compile options: its kwargs naming no parameter."""
-    _imports.ensure_triton_imported()
-    names = {p.name for p in resolved}
-    for layer in plan.layers:
-        if type(layer) is _imports.Autotuner:
-            for config in layer.configs:
-                yield {
-                    str(k): v for k, v in config.all_kwargs().items() if k not in names
-                }
-
-
-def _check_tuned_configs(
-    plan: Any,
-    resolved: tuple[ResolvedParam, ...],
-    options: Mapping[str, Any],
-    knob_values: Mapping[str, object],
-) -> None:
-    """Runs every config's options through the target's `parse_options`.
-
-    Called on the first call, because the target is a GPU query.
-    """
-    target = backends.current_target()
-    for config_options in _config_options(plan, resolved):
-        backends.canonical_options(
-            target,
-            _knob_options(plan.jit_func, {**options, **config_options}, knob_values),
-        )
-
-
-def _tuning_render(
-    plan: Any,
-    resolved: tuple[ResolvedParam, ...],
-    grid_cpp: object | None,
-    grid_py: object | None,
-) -> TuningRender:
-    """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
-
-    `computed_fields` is left empty: `_materialize_module` places it."""
-    from .heuristic import HeuristicError, Source, lower
-    from .tuning import c_scalar
-
-    _imports.ensure_triton_imported()
-    by_name = {p.name: p for p in _render_params(resolved, DeviceBinding.NOT_FIXED)[0]}
-    grid_code = getattr(grid_cpp, "__code__", None)
-    grid_reads: tuple[str, ...] = (
-        grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()
-    )
-    levels: int = plan.levels
-    dependent_level: dict[str, int] = {d.name: d.level for d in plan.dependent}
-    computed = tuple(sorted(plan.computed, key=lambda c: c.level))
-    # A lowered read of a dependent value comes from a record walked before
-    # its level's key is computed; `analyze` levels it so.
-    for c in computed:
-        for n in c.heuristic.inputs:
-            if n in dependent_level and dependent_level[n] >= c.level:
-                raise UnsupportedKernel(
-                    f"intj: heuristic {c.name!r} reads {n!r} before it is known; "
-                    "this is an intj bug"
-                )
-    wanted = [n for c in computed for n in c.heuristic.inputs if n in dependent_level]
-    computed_reads = sorted({c.name for c in computed} & set(grid_reads))
-    if computed_reads:
-        raise UnsupportedKernel(
-            f"intj: grid_cpp reads computed heuristic key(s) {computed_reads}; "
-            "use grid_py or compute them in the grid"
-        )
-    wanted += [n for n in grid_reads if n in plan.tuned]
-    # stable: level-major, first use within a level
-    dep_names = tuple(sorted(dict.fromkeys(wanted), key=lambda n: dependent_level[n]))
-    # C reads these; config values are static, so check them now, not on a miss
-    for layer in plan.layers:
-        if type(layer) is _imports.Autotuner:
-            for config in layer.configs:
-                for name, value in config.all_kwargs().items():
-                    if name in dep_names:
-                        c_scalar(str(name), value)
-    sources: dict[str, Source] = {}
-    for p in resolved:
-        if p.annotation.baked_value:
-            sources[p.name] = Source("fixed", value=p.baked)
-        elif not p.annotation.tuned:
-            sources[p.name] = Source("arg", by_name[p.name].call_index or 0)
-    for slot, name in enumerate(dep_names):
-        sources[name] = Source("dep", slot)
-    for slot, c in enumerate(computed):
-        sources[c.name] = Source("comp", slot)
-    try:
-        source = lower([(c.heuristic, c.level) for c in computed], sources, levels)
-    except HeuristicError as error:
-        raise UnsupportedKernel(f"intj: {error}") from error
-    return TuningRender(
-        levels=levels,
-        computed=tuple(
-            sum(c.level == level for c in computed) for level in range(levels)
-        ),
-        computed_fields=(),
-        computed_names=tuple(c.name for c in computed),
-        deps=tuple(
-            sum(dependent_level[n] == level for n in dep_names)
-            for level in range(levels)
-        ),
-        dep_names=dep_names,
-        meta_names=tuple(p.name for p in resolved if p.annotation.tuned)
-        if grid_py is not None
-        else (),
-        source=source,
-    )
 
 
 def _spec_key_layout(
