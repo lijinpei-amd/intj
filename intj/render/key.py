@@ -51,7 +51,7 @@ class RenderKey:
     """Everything the rendered `.so` depends on, hashed into its digest.
 
     Anything that changes the generated code, the compiled binary, or which
-    kernel the module's callback compiles has to appear here: two launchers
+    kernel its launchers compile has to appear here: two launchers
     whose keys match share one `.so`, so a missing field means a stale module.
     `RenderContext.from_key` derives what `entry.c.jinja` renders from it.
     """
@@ -73,7 +73,7 @@ class RenderKey:
     #: `assume_constant_globals=True`: the globals the kernel reads, by value.
     #: triton's `cache_key` hashes only the `tl.constexpr` ones; a plain global
     #: (a tuple read by a `constexpr_function`) would otherwise let two
-    #: different values share a module -- and its compile callback's kernel.
+    #: different values share a module despite describing different globals.
     global_values: tuple[tuple[str, str, tuple[object, ...]], ...]
 
     # What the render reads, through `RenderContext`.

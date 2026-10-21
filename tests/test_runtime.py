@@ -254,11 +254,6 @@ def built(request, stub, stub_module, tmp_path_factory):
 
     compiles = []
 
-    def compile_cb(_key, nparams, _device, *args):
-        compiles.append(args[-1])
-        return (0xBAD if args[-1] == 999 else 0x1000 + nparams, 128, 0, nparams)
-
-    launcher.override_compile(module, compile_cb)
     layout = layout_for().as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
     # every torch code its own 5-bit index; the real one comes from triton
     module._set_torch_version(
@@ -855,6 +850,17 @@ def _built(address, options=None):
     return address, options, b""
 
 
+def _compile_state(compiles):
+    state = launcher._KernelCompiler(None)
+
+    def compile_cb(_key, nparams, _device, *args):
+        compiles.append(args[-1])
+        return (0xBAD if args[-1] == 999 else 0x1000 + nparams, 128, 0, nparams)
+
+    state.override = compile_cb
+    return state
+
+
 def _init_launcher(module, holder, state, interner):
     address = module._init(holder, interner)
     holder._compile_state = state
@@ -881,7 +887,7 @@ def launch(built, stub_module):
             _init_launcher(
                 module,
                 header,
-                launcher._CompileState(module._intj_compiler),
+                _compile_state(built[2]),
                 _interner(),
             )
         ),
@@ -900,9 +906,7 @@ def test_compile_method_is_called_only_on_misses(built, stub_module, monkeypatch
         stub_module,
         None,
         lambda h: _built(
-            _init_launcher(
-                module, h, launcher._CompileState(module._intj_compiler), _interner()
-            )
+            _init_launcher(module, h, _compile_state(built[2]), _interner())
         ),
     )
     args = _args()
@@ -934,7 +938,8 @@ def test_compile_state_referent_cycle_is_collected(built, stub_module):
         launch: Callable[..., object]
 
     owner = Owner()
-    state = launcher._CompileState(module._intj_compiler, seen={b"owner": owner})
+    state = _compile_state(built[2])
+    state.seen[b"owner"] = owner
     launch = _new_launcher(
         stub_module,
         None,
@@ -965,7 +970,7 @@ def test_first_call_builds_and_swaps_for_old_references(built, stub_module):
             _init_launcher(
                 module,
                 header,
-                launcher._CompileState(module._intj_compiler),
+                _compile_state(built[2]),
                 _interner(),
             )
         )
@@ -1013,7 +1018,7 @@ def test_failed_build_raises_and_the_next_call_retries(built, stub_module):
             _init_launcher(
                 module,
                 header,
-                launcher._CompileState(module._intj_compiler),
+                _compile_state(built[2]),
                 _interner(),
             )
         )
@@ -1035,7 +1040,7 @@ def test_concurrent_first_calls_build_once(built, stub_module):
             _init_launcher(
                 module,
                 header,
-                launcher._CompileState(module._intj_compiler),
+                _compile_state(built[2]),
                 _interner(),
             )
         )
@@ -1071,7 +1076,7 @@ def test_call_during_build_is_refused(built, stub_module):
             _init_launcher(
                 module,
                 header,
-                launcher._CompileState(module._intj_compiler),
+                _compile_state(built[2]),
                 _interner(),
             )
         )
@@ -1099,7 +1104,7 @@ def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass)
                 _init_launcher(
                     module,
                     header,
-                    launcher._CompileState(module._intj_compiler),
+                    _compile_state(built[2]),
                     _interner(),
                 ),
                 header._C_options,
@@ -1137,7 +1142,7 @@ def test_memo_referent_cycle_is_collected(built, stub_module):
             _init_launcher(
                 module,
                 h,
-                launcher._CompileState(module._intj_compiler),
+                _compile_state(built[2]),
                 lambda v: 0 if type(v) is Value else None,
             )
         ),
@@ -1156,9 +1161,7 @@ def test_str_constexpr_keys_by_value(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            _init_launcher(
-                module, h, launcher._CompileState(module._intj_compiler), _interner()
-            )
+            _init_launcher(module, h, _compile_state(built[2]), _interner())
         ),
     )
     launch(*_args())
@@ -1177,9 +1180,7 @@ def test_memo_holds_its_object_until_replaced(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            _init_launcher(
-                module, h, launcher._CompileState(module._intj_compiler), _interner()
-            )
+            _init_launcher(module, h, _compile_state(built[2]), _interner())
         ),
     )
     first, second = "".join(["o", "n", "e"]), "".join(["t", "w", "o"])
@@ -1218,9 +1219,7 @@ def test_launcher_subclass_fields_survive_build_and_are_collected(
 
     def build_body(self):
         return _built(
-            _init_launcher(
-                module, self, launcher._CompileState(module._intj_compiler), _interner()
-            )
+            _init_launcher(module, self, _compile_state(built[2]), _interner())
         )
 
     namespace: dict[str, object] = {"_build_body": build_body}
@@ -1322,9 +1321,7 @@ def test_build_publishes_options_and_signature_and_refuses_edits(built, stub_mod
         stub_module,
         "unbuilt",
         lambda h: (
-            _init_launcher(
-                module, h, launcher._CompileState(module._intj_compiler), _interner()
-            ),
+            _init_launcher(module, h, _compile_state(built[2]), _interner()),
             "resolved",
             b"launch(a, /)\n--\n\n",
         ),
@@ -1386,9 +1383,7 @@ def test_ordinary_miss_gets_stream_and_grid_controls(built, stub_module):
         stub_module,
         None,
         lambda h: _built(
-            _init_launcher(
-                module, h, launcher._CompileState(module._intj_compiler), _interner()
-            )
+            _init_launcher(module, h, _compile_state(built[2]), _interner())
         ),
         compile_miss=compile_miss,
     )

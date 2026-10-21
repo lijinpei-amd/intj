@@ -167,7 +167,7 @@ def test_block_dim_zero_is_refused():
     launch = make_launcher(
         keyed_store, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
     )
-    override_compile(module_of(launch), lambda key, nparams, *_: (0, 0, 0, nparams))
+    override_compile(launch, lambda key, nparams, *_: (0, 0, 0, nparams))
     with pytest.raises(ValueError, match="block_dim 0"):
         launch(0, 0, 1, 0, 1)
 
@@ -187,7 +187,7 @@ def test_records_survive_rehash(cache):
         compiled.append(k)
         return 0, 1, 0, nparams
 
-    override_compile(module_of(launch), compile_key)
+    override_compile(launch, compile_key)
     for _ in range(2):
         for k in range(100):
             launch(0, 0, 1, 0, k)
@@ -218,7 +218,7 @@ def test_one_word_map_survives_rehash(cache):
         compiled.append(k)
         return 0, 1, 0, nparams
 
-    override_compile(module_of(launch), compile_key)
+    override_compile(launch, compile_key)
     for _ in range(2):
         for k in range(20):
             launch(0, 0, 1, 0, k)

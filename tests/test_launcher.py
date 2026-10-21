@@ -267,12 +267,12 @@ def _launcher_module(launcher):
 
 def _launcher_over(module):
     """A built, binding-free launcher of `module`, for its `_C_spec_key`."""
-    from intj.launcher import Launcher, _CompileState, _Interner, _stub
+    from intj.launcher import Launcher, _KernelCompiler, _Interner, _stub
 
     stub = _stub()
 
     def build(h):
-        state = _CompileState(module._intj_compiler)
+        state = _KernelCompiler(None)
         address = module._init(h, _Interner())
         h._compile_state = state
         return (
@@ -358,6 +358,8 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
     from intj.annotation import DeviceBinding
     from intj.launcher import _LOADED
 
+    launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
+
     def forbidden(*args, **kwargs):
         pytest.fail("fixed host binding reached a GPU path")
 
@@ -365,7 +367,7 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
         "intj.backend.current_target",
         "intj.backend.current_device",
         "intj.backend.canonical_options",
-        "intj.launcher._make_compile_callback",
+        "intj._imports.make_backend",
     ):
         monkeypatch.setattr(name, forbidden)
     factory = make_launcher(
@@ -388,7 +390,8 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
         calls.append((bytes(key), device))
         return 0, 1, 0, nparams
 
-    override_compile(module, compile_for_ordinal)
+    for handle in handles:
+        override_compile(handle, compile_for_ordinal)
     for handle in handles:
         assert handle(0, 1, 7) is None
     assert calls == [(b"", 0), (b"", 255), (b"", 256), (b"", 2**31 - 1)]
@@ -463,7 +466,8 @@ def test_fixed_device_handles_own_independent_caches(device_kernel):
         calls.append((bytes(key), device))
         return 0, 1, 0, nparams
 
-    override_compile(module_of(first), compile_once_per_handle)
+    override_compile(first, compile_once_per_handle)
+    override_compile(second, compile_once_per_handle)
     first(0, 1, 7)
     first(0, 1, 7)
     second(0, 1, 7)
@@ -485,7 +489,8 @@ def test_bind_device_dynamic_constexpr_uses_each_handles_map(device_kernel):
         calls.append((bytes(key), nparams, device, value))
         return 0, 1, 0, nparams
 
-    override_compile(module_of(first), compile_each_constant)
+    override_compile(first, compile_each_constant)
+    override_compile(second, compile_each_constant)
     for handle, value in ((first, 7), (first, 9), (first, 7), (second, 7), (second, 7)):
         handle(0, 1, value)
     assert calls == [(struct.pack("<Q", value), 0, 0, value) for value in (7, 9, 7)], (
@@ -516,7 +521,7 @@ def test_repeated_key_uses_last_lookup_before_hash(device_kernel, bind_device):
         compiled.append(value)
         return 0, 1, 0, nparams
 
-    override_compile(module, compile_key)
+    override_compile(launch, compile_key)
     for value in (7, 7, 9, 9, 7):
         if bind_device:
             launch(0, 1, value)
@@ -566,11 +571,12 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(
         calls.append((bytes(key), nparams, device, value))
         return 0, 1, 0, nparams
 
-    override_compile(module_of(launch), compile_once)
+    override_compile(launch, compile_once)
     launch(0, 1, 7)
     launch(0, 1, 9)
     assert calls == [(b"", 1, 0, 7)]
     other = factory.__self__.bind_device(0)
+    override_compile(other, compile_once)
     other(0, 1, 9)
     assert calls == [(b"", 1, 0, 7), (b"", 1, 0, 9)], (
         "each no-map handle must own its fixed kernel"
@@ -622,7 +628,7 @@ def test_bind_device_retry_and_reentrant_miss(device_kernel, has_key):
             launch(0, 1, value)
         return 0, 1, 0, nparams
 
-    override_compile(module_of(launch), compile_reentrant)
+    override_compile(launch, compile_reentrant)
     assert launch(0, 0, 7) is None
     assert calls == []
     with pytest.raises(ValueError, match="compile failed"):
@@ -654,7 +660,8 @@ def test_bound_handles_each_own_a_cache(pointer_kernel):
         calls.append((bytes(key), device))
         return 0, 1, 0, nparams
 
-    override_compile(module_of(first), compile_for_device)
+    override_compile(first, compile_for_device)
+    override_compile(second, compile_for_device)
     first(0, 0, 1)
     second(0, 0, 1)  # its own cache: a miss on a key `first` has
     second(1, 0, 1)
@@ -1269,7 +1276,7 @@ def test_bind_tensor_rechecks_storage_after_set(
             calls.append(key)
             return 0, 1, 0, slots
 
-        override_compile(module_of(bound), record)
+        override_compile(bound, record)
     controls = (0, 1) if bind_device else (0, 0, 1)
     assert bound(*controls) is None
     tensor.set_(torch.empty(8, device=device).untyped_storage(), 1, (7,), (1,))
@@ -1566,7 +1573,7 @@ def test_checked_failures_precede_cold_and_hot_lookup(
         calls.append(key)
         return 0, 1, 0, slots
 
-    override_compile(_launcher_module(bound), record)
+    override_compile(bound, record)
     controls = (0, 1) if bind_device else (0, 0, 1)
     good = 16 if constraint == "aligned_16" else 1
     for warm in (False, True):
@@ -1766,6 +1773,8 @@ def test_bind_mixed_and_baked_values_follow_declaration_order_on_gpu():
 
 
 def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkeypatch):
+    launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
+
     def forbidden(*args, **kwargs):
         pytest.fail("binding reached a GPU path")
 
@@ -1773,7 +1782,7 @@ def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkey
         "intj.backend.current_target",
         "intj.backend.current_device",
         "intj.backend.canonical_options",
-        "intj.launcher._make_compile_callback",
+        "intj._imports.make_backend",
     ):
         monkeypatch.setattr(name, forbidden)
     factory = make_launcher(
@@ -2260,14 +2269,13 @@ def test_constexpr_callback_receives_original_objects(power_kernel):
         extra_annotation={"N": Constexpr(type=(tl.int8, tl.int64, tl.float64))},
         no_gpu=True,
     )
-    module = module_of(launch)
     seen = []
 
     def capture(key, slots, device, value):
         seen.append(value)
         return 0, 1, 0, slots
 
-    override_compile(module, capture)
+    override_compile(launch, capture)
     for value in (int("10000000000"), float("1.0000000000000002"), -0.0):
         assert launch(0, 0, 1, value) is None
         assert seen[-1] is value
@@ -2422,7 +2430,7 @@ def test_ordinary_unannotated_none_and_never(scalar_kernel):
 
 
 def test_ordinary_never_omits_pointer_range(pointer_kernel):
-    from intj.launcher import _LOADED, _loaded_module, _make_host_compile_callback
+    from intj.launcher import _LOADED, _loaded_module
 
     # CPU storage is virtual: exercise both sides of the threshold without
     # touching the bytes or requiring a GPU/backend initialization.
@@ -2439,9 +2447,7 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
         assert launch.__self__.spec_key(0, small) == launch.__self__.spec_key(0, large)
         key = next(key for key, module in _LOADED.items() if module is baseline)
         ranged_key = dataclasses.replace(key, spec_pointer_range=1)
-        ranged = _loaded_module(
-            ranged_key, pointer_kernel.__module__, None, _make_host_compile_callback
-        )
+        ranged = _loaded_module(ranged_key, pointer_kernel.__module__, None)
         ranged_launch = _launcher_over(ranged)
         small_key = ranged_launch.__self__._C_spec_key(0, small)
         large_key = ranged_launch.__self__._C_spec_key(0, large)
@@ -2616,13 +2622,15 @@ def test_checked_source_has_one_predicted_branch_per_argument(scalar_kernel, mod
 def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     import intj.launcher as launcher
 
+    launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
+
     def forbidden(*args, **kwargs):
         raise AssertionError("GPU path was reached")
 
     monkeypatch.setattr("intj.backend.current_target", forbidden)
     monkeypatch.setattr("intj.backend.current_device", forbidden)
     monkeypatch.setattr("intj.backend.canonical_options", forbidden)
-    monkeypatch.setattr(launcher, "_make_compile_callback", forbidden)
+    monkeypatch.setattr(launcher._imports, "make_backend", forbidden)
     host = make_launcher(
         scale, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
     )
@@ -3085,12 +3093,7 @@ def test_annotated_effective_compile_options_and_identity(
         captured.update(options)
         raise CompilationCaptured
 
-    def capture_module(key, kernel_module, layout, compile_function):
-        callback = compile_function()
-        with pytest.raises(CompilationCaptured):
-            callback({}, b"\x00" * 8, 1, torch.cuda.current_device(), 7)
-        assert captured["debug"] is expected_debug
-        assert captured["instrumentation_mode"] == instrumentation
+    def capture_module(key, kernel_module, layout):
         expected_values = {
             "debug": expected_debug,
             "instrumentation_mode": instrumentation,
@@ -3105,10 +3108,23 @@ def test_annotated_effective_compile_options_and_identity(
         assert (key.options != baseline_key.options) == (
             expected_debug or bool(instrumentation)
         )
+        return loaded_module(key, kernel_module, layout)
+
+    original_state = launcher.Launcher._new_compile_state
+    loaded_module = launcher._loaded_module
+
+    def capture_state(self, b):
+        state = original_state(self, b)
+        assert isinstance(state, launcher._KernelCompiler)
+        with pytest.raises(CompilationCaptured):
+            state.compile_miss(b"\x00" * 8, 1, torch.cuda.current_device(), 7)
+        assert captured["debug"] is expected_debug
+        assert captured["instrumentation_mode"] == instrumentation
         raise Captured
 
     monkeypatch.setattr(triton.compiler, "compile", capture_compile)
     monkeypatch.setattr(launcher, "_loaded_module", capture_module)
+    monkeypatch.setattr(launcher.Launcher, "_new_compile_state", capture_state)
     with pytest.raises(Captured):
         module_of(
             make_launcher(
@@ -3172,20 +3188,19 @@ def test_launchers_of_one_kernel_stay_independent(compiled_kernels):
 
 
 def test_one_module_per_key():
-    """A repeat `make_launcher` reuses the module and its shared compiler.
-
-    Replacing the shared compiler would free kernels whose function handles
-    launcher caches still hold.
-    """
+    """A repeat `make_launcher` reuses C code with private Python compile state."""
     first = make_launcher(scale, options={"num_stages": 3})
     second = make_launcher(scale, options={"num_stages": 3})
-    compiler = module_of(first)._intj_compiler
     assert module_of(first) is module_of(second)
-    assert module_of(second)._intj_compiler is compiler
+    first_state = first.__self__._compile_state
+    second_state = second.__self__._compile_state
+    assert isinstance(first_state, launcher._KernelCompiler)
+    assert isinstance(second_state, launcher._KernelCompiler)
+    assert first_state is not second_state
     assert first is not second  # each launcher owns its cache
 
 
-def test_compile_override_restores_built_siblings(power_kernel):
+def test_compile_override_is_private_and_restores_built_launcher(power_kernel):
     first = make_launcher(
         power_kernel, no_gpu=True, extra_annotation={"N": Constexpr()}
     )
@@ -3200,14 +3215,14 @@ def test_compile_override_restores_built_siblings(power_kernel):
         calls.append(value)
         return 0, 1, 0, nparams
 
-    restore = override_compile(module, record)
+    restore = override_compile(first, record)
     first(0, 0, 1, 2)
     second(0, 0, 1, 3)
-    assert calls == [2, 3]
+    assert calls == [2]
     restore()
     first(0, 0, 1, 4)
     second(0, 0, 1, 5)
-    assert calls == [2, 3]
+    assert calls == [2]
 
 
 def test_cached_build_is_reused_without_rendering(monkeypatch):
@@ -4037,7 +4052,7 @@ def test_sibling_launchers_intern_independently(monkeypatch):
     """Sibling launchers of one module intern object constexprs independently.
 
     Id 0 is "neg" in one launcher and "pos" in the other; each launches right,
-    and the module's compile cache compiles each variant once.
+    and each launcher's compiler cache compiles each variant once.
     """
     monkeypatch.setattr(launcher, "_LOADED", {})
     real, compiles = launcher._checked_compile, []
@@ -4061,8 +4076,8 @@ def test_sibling_launchers_intern_independently(monkeypatch):
         torch.cuda.synchronize()
         assert o.item() == want, (act, want)
     assert (
-        module_of(first) is module_of(second) and len(compiles) == 2
-    )  # one per variant
+        module_of(first) is module_of(second) and len(compiles) == 4
+    )  # One per variant in each launcher.
 
 
 def test_unsupported_object_constexpr_names_the_parameter():
@@ -4500,26 +4515,24 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 @pytest.mark.parametrize("key", [b"", b"\x00" * 8])
 def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.launcher import _make_compile_callback, _render_params
+    from intj.launcher import _KernelCompiler, _render_params
 
     params, _, _ = _render_params(
         _resolve_annotations(power_kernel, {"N": Constexpr()}), DeviceBinding.FIXED
     )
-    callback = _make_compile_callback(
-        power_kernel, params, {}, knob_values=launcher._live_knobs()
-    )
+    state = _KernelCompiler(power_kernel, {}, launcher._live_knobs(), params=params)
     device = torch.cuda.current_device()
-    seen = {}  # one launcher's map: the check runs per launcher
-    callback(seen, key, 0, device, 1)
-    callback(seen, key, 0, device, 1)
+    state.compile_miss(key, 0, device, 1)
+    state.compile_miss(key, 0, device, 1)
     with pytest.raises(RuntimeError, match="two annotated ASTSource inputs"):
-        callback(seen, key, 0, device, True)
-    callback({}, key, 0, device, True)  # another launcher's map is its own
-    objects = {}
-    callback(objects, key, 0, device, "a")  # object values included
-    callback(objects, key, 0, device, "a")
+        state.compile_miss(key, 0, device, True)
+    state.seen.clear()
+    state.compile_miss(key, 0, device, True)
+    state.seen.clear()
+    state.compile_miss(key, 0, device, "a")  # Object values enter the identity too.
+    state.compile_miss(key, 0, device, "a")
     with pytest.raises(RuntimeError, match="two annotated ASTSource inputs"):
-        callback(objects, key, 0, device, "b")
+        state.compile_miss(key, 0, device, "b")
 
 
 def _recording_input_launcher(
@@ -4537,7 +4550,7 @@ def _recording_input_launcher(
         their ASTSource, and the list of recorded misses.
     """
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _make_compile_callback
+    from intj.launcher import _compiler_input, _KernelCompiler
     from triton.backends.compiler import GPUTarget
     from triton.compiler import make_backend
 
@@ -4558,30 +4571,21 @@ def _recording_input_launcher(
     backend = make_backend(
         GPUTarget("hip", "gfx942", 64) if no_gpu else current_target()
     )
-    real_compile = (
-        None
-        if no_gpu
-        else _make_compile_callback(
-            kernel, params, {}, knob_values=launcher._live_knobs()
-        )
-    )
+    state = native.__self__._compile_state
+    assert isinstance(state, _KernelCompiler)
+    real_compile = state.compile_miss
     calls = []
-    seen = {}  # the launcher's key -> input self-check map
 
     def compiler_input(*args):
         return _compiler_input(kernel, params, args, backend)
 
     def record(key, slots, device, *args):
         source = compiler_input(*args)
-        result = (
-            real_compile(seen, key, slots, device, *args)
-            if real_compile
-            else (0, 1, 0, slots)
-        )
+        result = real_compile(key, slots, device, *args)
         calls.append((key, source))
         return result
 
-    override_compile(module, record)
+    override_compile(native, record)
     return native, compiler_input, calls
 
 
@@ -6475,13 +6479,10 @@ def test_bindings_share_a_launcher_type_with_private_state(bound_kernel, device_
     assert two.__self__._compile_state is not none.__self__._compile_state
 
 
-def test_sibling_launchers_compile_once(monkeypatch):
-    """Each launcher owns its cache; the module's compile cache shares kernels."""
+def test_sibling_launchers_compile_once_each(monkeypatch):
+    """Sibling launchers reuse C code and own separate compiled-kernel caches."""
     import intj.launcher as launcher
 
-    monkeypatch.setattr(
-        launcher, "_LOADED", {}
-    )  # a fresh module: an empty compile cache
     real, compiles = launcher._checked_compile, []
 
     def counted(*args, **kwargs):
@@ -6498,10 +6499,14 @@ def test_sibling_launchers_compile_once(monkeypatch):
         torch.cuda.current_stream().cuda_stream,
     )
     first(device, stream, 1, x, o, 64, 2.0, 64)
-    second(device, stream, 1, x, o, 64, 3.0, 64)  # its own miss: a record, no compile
+    second(device, stream, 1, x, o, 64, 3.0, 64)
     torch.cuda.synchronize()
     assert o[0].item() == 3.0
-    assert module_of(first) is module_of(second) and len(compiles) == 1
+    assert module_of(first) is module_of(second) and len(compiles) == 2
+    first(device, stream, 1, x, o, 64, 4.0, 64)
+    second(device, stream, 1, x, o, 64, 5.0, 64)
+    assert o[0].item() == 5.0
+    assert len(compiles) == 2
 
 
 def test_decoration_needs_no_gpu(monkeypatch):

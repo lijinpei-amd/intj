@@ -168,7 +168,7 @@ def test_reentrant_cache_miss_returns_winning_record(monkeypatch):
 def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
     """A reentrant miss keeps the kernel its nested miss recorded alive.
 
-    Without return_compiled the module's compile cache is the kernel's only owner.
+    Without return_compiled the launcher's compiler cache is the kernel's owner.
     A nested miss records its kernel first; the outer compile must not replace it
     in that cache, or the record's function handle is freed.
     """
@@ -222,12 +222,46 @@ def test_compile_override_keeps_cached_kernel_alive(monkeypatch):
     def refuse(*args):
         pytest.fail("a cached launch reached the compile override")
 
-    override_compile(module_of(launch), refuse)
+    override_compile(launch, refuse)
     gc.collect()
     assert len(kernels) == 1 and kernels[0]() is not None
     launch(device, stream, (1,), x, 7)
     torch.cuda.synchronize()
     assert x.item() == 7
+
+
+def test_ordinary_compiler_cache_dies_with_its_launcher(monkeypatch):
+    import intj.launcher as launcher_module
+
+    real_compile = launcher_module._checked_compile
+    kernels = []
+
+    def compile_kernel(*args, **kwargs):
+        kernel = real_compile(*args, **kwargs)
+        kernels.append(weakref.ref(kernel))
+        return kernel
+
+    monkeypatch.setattr(launcher_module, "_checked_compile", compile_kernel)
+    x = torch.zeros(1, device="cuda", dtype=torch.int32)
+    first = make_launcher(reentrant_store)
+    second = make_launcher(reentrant_store)
+    module = module_of(first)
+    assert module_of(second) is module
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    first(device, stream, (1,), x, 5)
+    second(device, stream, (1,), x, 5)
+    assert len(kernels) == 2
+    assert kernels[0]() is not kernels[1]()
+    del first
+    gc.collect()
+    assert kernels[0]() is None
+    assert kernels[1]() is not None
+    second(device, stream, (1,), x, 7)
+    assert x.item() == 7
+    del second
+    gc.collect()
+    assert kernels[1]() is None
 
 
 @pytest.mark.parametrize("cache", list(KernelCache), ids=lambda cache: cache.value)
@@ -249,13 +283,13 @@ def test_launcher_cache_compiled_reference_is_gc_traversed(monkeypatch, cache):
     def compile_fake(_key, nparams, _device, *_args):
         return 0, 1, 0, nparams, owner
 
-    override_compile(module, compile_fake)
+    override_compile(launch, compile_fake)
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     result = launch(
         torch.cuda.current_device(), torch.cuda.current_stream().cuda_stream, (0,), x, 9
     )
     assert result is owner
-    override_compile(module, lambda *_args: None)
+    override_compile(launch, lambda *_args: None)
     launcher_module._LOADED.clear()
     del result, owner, compile_fake, launch, module
 
@@ -367,15 +401,15 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
     )
     if fixed_device:
         bound = factory.__self__.bind_device(device, x=x)
+        native = bound
         owner = bound.__self__
-        module = module_of(bound)
 
         def launch(value):
             return bound(stream, (0,), value)
 
     else:
+        native = factory
         owner = factory.__self__
-        module = module_of(factory)
 
         def launch(value):
             return factory(device, stream, (0,), x, value)
@@ -390,7 +424,7 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
         owners.append(owner)
         return 0, 1, 0, nparams, owner
 
-    override_compile(module, compile_fake)
+    override_compile(native, compile_fake)
     for value in range(8):
         assert launch(value) is owners[-1]
     assert sum(type(ref) is Owner for ref in gc.get_referents(owner)) == 8
@@ -440,10 +474,10 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
     def compile_fake(_key, nparams, _device, *_args):
         return 0, 1, 0, nparams, owner
 
-    override_compile(module, compile_fake)
+    override_compile(bound, compile_fake)
     result = bound(torch.cuda.current_stream().cuda_stream, (0,), 9)
     assert result is owner
-    override_compile(module, lambda *_args: None)
+    override_compile(bound, lambda *_args: None)
     del result, owner, compile_fake, bound
 
     gc.collect()
@@ -484,7 +518,7 @@ def test_return_compiled_record_carries_its_kernel(monkeypatch):
 
     monkeypatch.setattr(launcher_module, "_LOADED", {})
     launch = make_launcher(store_value, return_compiled=True)
-    override_compile(module_of(launch), lambda _key, nparams, *_: (0, 1, 0, nparams))
+    override_compile(launch, lambda _key, nparams, *_: (0, 1, 0, nparams))
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream

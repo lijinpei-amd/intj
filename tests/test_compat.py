@@ -252,11 +252,14 @@ def host_bridge(monkeypatch):
     from intj import TorchAccessMode, _imports, make_launcher
 
     real_make_launcher = make_launcher
+    natives = []
 
     def host_launcher(kernel, **kwargs):
-        return real_make_launcher(
+        native = real_make_launcher(
             kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER, **kwargs
         )
+        natives.append(native)
+        return native
 
     monkeypatch.setattr(compat, "make_launcher", host_launcher)
     _imports.ensure_triton_imported()  # a first import would overwrite the patch
@@ -275,35 +278,34 @@ def host_bridge(monkeypatch):
     )
     monkeypatch.setattr(launcher_module, "_LOADED", {})
     compat._cached_grid_py.cache_clear()
-    yield compat
+    yield compat, natives
     compat._cached_grid_py.cache_clear()
 
 
-def _count_misses(module):
+def _count_misses(native):
     misses = []
 
     def compile_once(key, nparams, device, *args):
         misses.append(bytes(key))
         return 0, 1, 0, nparams
 
-    override_compile(module, compile_once)
+    override_compile(native, compile_once)
     return misses
 
 
 def test_callable_grid_bridge_reuses_kernel_cache(host_bridge):
-    import intj.launcher as launcher_module
-
+    compat, natives = host_bridge
     dimensions = [0]
 
     def grid(meta):
         return (dimensions[0],)
 
-    host_bridge.launch(unused_pointer, grid, 7)
-    (module,) = launcher_module._LOADED.values()
-    misses = _count_misses(module)
+    compat.launch(unused_pointer, grid, 7)
+    (native,) = natives
+    misses = _count_misses(native)
     dimensions[0] = 1
-    host_bridge.launch(unused_pointer, grid, 7)
-    host_bridge.launch(unused_pointer, grid, 7)
+    compat.launch(unused_pointer, grid, 7)
+    compat.launch(unused_pointer, grid, 7)
     assert len(misses) == 1
 
 
@@ -312,20 +314,19 @@ def test_per_call_grid_lambda_hits_and_is_not_retained(host_bridge):
     import gc
     import weakref
 
-    import intj.launcher as launcher_module
-
-    host_bridge.launch(unused_pointer, lambda meta: (0,), 7)
-    (module,) = launcher_module._LOADED.values()
-    misses = _count_misses(module)
+    compat, natives = host_bridge
+    compat.launch(unused_pointer, lambda meta: (0,), 7)
+    (native,) = natives
+    misses = _count_misses(native)
     refs = []
     for _ in range(3):
         captured = torch.empty(4)
         refs.append(weakref.ref(captured))
-        host_bridge.launch(unused_pointer, lambda meta: (captured.numel() // 4,), 7)
+        compat.launch(unused_pointer, lambda meta: (captured.numel() // 4,), 7)
         del captured
     gc.collect()
     assert len(misses) == 1
-    assert host_bridge._cached_grid_py.cache_info().currsize == 1
+    assert compat._cached_grid_py.cache_info().currsize == 1
     assert all(ref() is None for ref in refs)
 
 

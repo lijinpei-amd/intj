@@ -255,9 +255,9 @@ under that value.
 Do not change a declared knob while a miss for its launcher is running: the
 check and the compile read the knob at different times, so a change in
 between compiles under the new value and records it under the old key. The
-check runs per launcher, before the module's compile cache: a sibling
-launcher's first call with an old value raises even when that cache already
-holds the kernel compiled under it.
+check runs per launcher, before its private compiler cache: a sibling
+launcher's first call with an old value raises even if another launcher has
+already compiled the kernel under it.
 
 Refused at `check()` with `UnsupportedKernel`: an unknown knob path, a
 repeated name, a name also given in `options=` (for knobs, the option the knob
@@ -802,8 +802,7 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
    hashing or a map.
 4. On a miss, call back into Python: build the annotated `CompilerInput`, compare
    it with any input this launcher previously recorded for that key, and, unless
-   the module's compile cache already holds that kernel (a sibling launcher
-   missed first), pass its
+   the launcher's Python compiler cache already holds that kernel, pass its
    `triton.compiler.ASTSource` (or `GluonASTSource`) and canonical options to
    `triton.compiler.compile`.
    `_init_handles` loads the GPU module; the entry records the function handle,
@@ -811,7 +810,7 @@ backends are present, and skips without `$INTJ_BENCHMARK_ROOT`.
 5. Pack the param array (plus the two mandatory trailing scratch slots) and call
    `hipModuleLaunchKernel` / `cuLaunchKernel` (identical argument lists).
 
-Each cached `CompiledKernel` is kept alive by the module's compile cache (with
+Each cached `CompiledKernel` is kept alive by the launcher's compiler cache (with
 `return_compiled=True`, by the launcher records that return it), so its GPU
 module stays loaded for as long as that owner lives.
 
@@ -863,7 +862,7 @@ PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py --no-gpu --iters 
 PYTHONPATH=$PWD /tmp/gb2/bin/python benchmarks/bench_launch.py --iters 20000 --batches 7
 ```
 
-The first command uses CPU tensors and intj's existing host compile callback;
+The first command uses CPU tensors and intj's existing host compile state;
 it measures decoding, key/cache work, and vectorcall overhead only. It does
 not query a GPU target or driver, compile a GPU kernel, or launch one. The
 second uses GPU tensors and includes driver launch overhead. Each row warms
@@ -891,9 +890,11 @@ is just the kernel's, a label rather than a lookup key — two builds of one ker
 it and are told apart by `__file__`.
 
 `make_launcher` looks for its module in three places, in order: the process-level
-`RenderKey` dict (same module, so the same compile cache), the `.so` on disk (loaded
-as-is, nothing rendered or compiled), and only then renders and builds. A warm
-process takes ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build.
+`RenderKey` dict (C code is shared; Python compiler caches are per launcher),
+the `.so` on disk (loaded as-is, nothing rendered or compiled), and only then
+renders and builds. Before compiler caches moved into launchers, a warm process
+took ~0.2 ms, a warm disk ~0.6 ms, against ~250 ms for a build. Those timings
+are untested with per-launcher compiler construction.
 
 The digest covers the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,

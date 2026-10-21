@@ -149,7 +149,8 @@ def test_grid_py_receives_current_meta_on_every_call_and_owns_callback():
         compiled.append(bytes(key))
         return 0, 1, 0, nparams
 
-    override_compile(module_of(first_launch), compile_once)
+    override_compile(first_launch, compile_once)
+    override_compile(second_launch, compile_once)
     for x in (3, 4):
         assert first_launch(0, 0, 0, x, 2) is None
     misses = len(compiled)
@@ -340,7 +341,7 @@ def test_grid_controls_do_not_change_kernel_specialization():
             misses.append(bytes(key))
             return 0, 1, 0, nparams
 
-        override_compile(module_of(launcher), compile_once)
+        override_compile(launcher, compile_once)
         for value in calls:
             assert launcher(0, 0, value, 0, 3, 2) is None
         assert len(misses) == 1

@@ -501,30 +501,6 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     )
 
 
-@dataclasses.dataclass
-class _SharedCompiler:
-    """An ordinary module's compile cache and replaceable miss override."""
-
-    callback: Callable[..., Any] | None
-    override: Callable[..., Any] | None = None
-
-    def compile(self, seen: dict[bytes, object], *call: Any) -> Any:
-        """Returns a kernel record, using the current override when installed."""
-        override = self.override
-        if override is not None:
-            return override(*call)
-        assert self.callback is not None, "the module has no kernel compiler"
-        return self.callback(seen, *call)
-
-
-@dataclasses.dataclass
-class _CompileState:
-    """One ordinary launcher's identity checks and shared kernel compiler."""
-
-    compiler: _SharedCompiler
-    seen: dict[bytes, object] = dataclasses.field(default_factory=dict)
-
-
 class Launcher:
     """A launcher's object: `k.__self__` for `k = make_launcher(...)`.
 
@@ -765,7 +741,7 @@ class Launcher:
         self._check_target(b)
         module = render_module._build_module(b)  # pyright: ignore[reportPrivateUsage]  # renderer's build entry
         grid_py = () if b.grid_py is None else (b.grid_py, b.hidden)
-        state = self._new_compile_state(b, module)
+        state = self._new_compile_state(b)
         address = module._init(self, _Interner(), *grid_py, *b.args)
         self._compile_state = state
         return address, option, b.doc
@@ -774,10 +750,24 @@ class Launcher:
         """Runs the build's checks that need the target, after every GPU-free one."""
         assert b.tuned is None, "make_launcher gives a chain a TunedLauncher"
 
-    def _new_compile_state(self, b: _BuildOptions, module: types.ModuleType) -> object:
+    def _new_compile_state(self, b: _BuildOptions) -> object:
         """Returns the Python compile state stored after initialization succeeds."""
-        del b
-        return _CompileState(cast(_SharedCompiler, module._intj_compiler))
+        _, target = backends.select(b.no_gpu)
+        if target is None:
+            return _KernelCompiler(None)
+        assert b.knob_values is not None, "GPU builds read knobs at the first call"
+        params, _, _ = _render_params(b.params, b.device_binding)
+        return _KernelCompiler(
+            b.jit_func,
+            dict(b.compile_options),
+            b.knob_values,
+            return_compiled=b.return_compiled,
+            params=params,
+            baked_values={
+                p.index: p.baked for p in b.params if p.annotation.baked_value
+            },
+            dynamic=b.dynamic,
+        )
 
     def _compile_miss(
         self,
@@ -794,8 +784,11 @@ class Launcher:
         `args` are the dynamic values, then the public kernel arguments.
         """
         del stream, controls
-        state = cast(_CompileState, self._compile_state)
-        return state.compiler.compile(state.seen, keyblob, nparams, device, *args)
+        state = cast(_KernelCompiler, self._compile_state)
+        override = state.override
+        if override is not None:
+            return override(keyblob, nparams, device, *args)
+        return state.compile_miss(keyblob, nparams, device, *args)
 
 
 class LaunchFunction(Protocol):
@@ -1359,17 +1352,11 @@ def _loaded_module(  # pyright: ignore[reportUnusedFunction]  # consumed by rend
     key: RenderKey,
     kernel_module: str,
     layout: TensorABI | None,
-    compile_function: Callable[[], Callable[..., Any]] | None,
 ) -> types.ModuleType:
     """Returns the one module for `key`, loading it once per process.
 
-    Ordinary launchers share the compiler created by `compile_function()`.
-    Its cache owns the `CompiledKernel`s their records point into, so a
-    repeat load leaves it untouched. Tuned launchers own their compilers
-    privately and pass no factory.
-
     The lock matters: without it two threads both compile and both load, and the
-    loser's module (with its own kernel cache) is silently dropped.
+    loser's module is silently dropped.
     """
     with _LOAD_LOCK:
         module = _LOADED.get(key)
@@ -1382,9 +1369,6 @@ def _loaded_module(  # pyright: ignore[reportUnusedFunction]  # consumed by rend
                     "header; it was built by another intj -- delete it to rebuild"
                 )
             module._set_launcher_type(stub.Launcher)
-            if compile_function is not None:
-                # Python state shared by ordinary launchers, never read by C.
-                setattr(module, "_intj_compiler", _SharedCompiler(compile_function()))
             # Pass relative cdata; the compiled setter saves the absolute offset
             # for the torch running now before exposing the module.
             module._set_torch_version(
@@ -1842,31 +1826,68 @@ class _Identity:
 class _KernelCompiler:
     """Compiles `jit_func` for cache misses, once per identity and device.
 
-    A module's ordinary launchers share one through its `_SharedCompiler`; each
-    tuned launcher owns one for its candidates.
+    An ordinary launcher stores it directly in `_compile_state`; a tuned
+    launcher owns one for its candidates. It holds the compiled kernels,
+    lock, and ordinary miss metadata, including identity checks and overrides.
     """
 
     def __init__(
         self,
         jit_func: JitFunction,
-        options: Mapping[str, Any],
-        knob_values: Mapping[str, object],
+        options: Mapping[str, Any] | None = None,
+        knob_values: Mapping[str, object] | None = None,
         *,
-        weak: bool,
+        return_compiled: bool = False,
+        params: Sequence[Param] = (),
+        baked_values: Mapping[int, object] | None = None,
+        dynamic: Sequence[str] = (),
     ) -> None:
         self.jit_func = jit_func
-        self.target = backends.current_target()
-        self.backend = _imports.make_backend(self.target)
-        self._options = dict(options)
-        self._knob_values = dict(knob_values)
+        self.target = backends.current_target() if jit_func is not None else None
+        self.backend = (
+            _imports.make_backend(self.target)
+            if self.target is not None
+            else backends.HOST
+        )
+        self._options = dict(options or {})
+        self._knob_values = dict(knob_values or {})
         # weak where the records own their CompiledKernel (return_compiled):
         # the cache must not keep it alive past them
         self._compiled: MutableMapping[tuple[object, ...], CompiledKernel] = (
-            weakref.WeakValueDictionary() if weak else {}
+            weakref.WeakValueDictionary() if return_compiled else {}
         )
         # Reentrant: a compile can launch this kernel again (a nested miss on
         # the same thread).
         self._lock = threading.RLock()
+        self.seen: dict[bytes, object] = {}
+        self.override: Callable[..., Any] | None = None
+        self._params = params
+        self._baked_values = baked_values
+        self._return_compiled = return_compiled
+        self._dynamic = dynamic
+        fed = (
+            {
+                p.name: p
+                for p in params
+                if p.name in _parameter_options(self.backend, params)
+            }
+            if self.target is not None
+            else {}
+        )
+        self._fixed = {
+            n: (baked_values or {})[p.index]
+            for n, p in fed.items()
+            if p.call_index is None
+        }
+        self._per_call = {
+            n: p.call_index for n, p in fed.items() if p.call_index is not None
+        }
+        # Without per-call values every record has the same options.
+        self._fixed_options = (
+            self.canonical(self._fixed, {})
+            if self.target is not None and not (dynamic or self._per_call)
+            else None
+        )
 
     def canonical(self, options: Mapping[str, Any], knobs: Mapping[str, object]) -> Any:
         """Returns the target's options: `options` over the base ones, then knobs."""
@@ -1893,6 +1914,43 @@ class _KernelCompiler:
                 kernel = self._compiled.setdefault(key, fresh)
         return kernel
 
+    def compile_miss(
+        self, keyblob: bytes, nparams: int, device: int, *args: Any
+    ) -> Any:
+        """Compiles or reuses the kernel for one miss and returns its record."""
+        if self.target is None:
+            return 0, 1, 0, nparams
+        _check_device(device)
+        dyn_options, dyn_knobs, args = _split_call(self._dynamic, args)
+        canonical = (
+            self._fixed_options
+            if self._fixed_options is not None
+            else self.canonical(
+                {
+                    **self._fixed,
+                    **dyn_options,
+                    **{n: args[i] for n, i in self._per_call.items()},
+                },
+                dyn_knobs,
+            )
+        )
+        compiler_input = _compiler_input(
+            self.jit_func,
+            self._params,
+            args,
+            self.backend,
+            baked_values=self._baked_values,
+        )
+        identity = _Identity.of(compiler_input, canonical, dyn_knobs)
+        # b"" is a keyless launcher's one key; seen is per launcher.
+        if self.seen.setdefault(keyblob, identity) != identity:
+            raise RuntimeError(
+                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
+            )
+        kernel = self.compile(identity, canonical)
+        result = _record(kernel, nparams)
+        return (*result, kernel) if self._return_compiled else result
+
 
 def _record(kernel: CompiledKernel, nparams: int) -> tuple[int, int, int, int]:
     """Returns `kernel`'s record for C: function, block_dim, shared, nparams.
@@ -1911,105 +1969,33 @@ def _record(kernel: CompiledKernel, nparams: int) -> tuple[int, int, int, int]:
 
 
 def override_compile(
-    module: types.ModuleType, fn: Callable[..., Any]
+    launcher: LaunchFunction, fn: Callable[..., Any]
 ) -> Callable[[], None]:
-    """Overrides ordinary compile misses; returns a function restoring the override.
+    """Overrides one ordinary launcher's misses and returns a restore function.
 
-    For tests and benchmarks. `fn` is called as
-    `fn(keyblob, nparams, device, *args)`. Already built launchers see the
-    override on their next miss. The original compiler remains alive so its
+    For tests and benchmarks. Builds `launcher` if needed. `fn` is called as
+    `fn(keyblob, nparams, device, *args)` on subsequent cache misses. Sibling
+    launchers are unaffected. The original compiler remains alive so its
     cached kernels' function handles stay valid.
 
     Returns:
         A function taking no arguments that restores the previous override.
+
+    Raises:
+        TypeError: The launcher owns a tuning chain.
     """
-    compiler = cast("_SharedCompiler | None", getattr(module, "_intj_compiler", None))
-    if compiler is None:
-        compiler = _SharedCompiler(None)
-        setattr(module, "_intj_compiler", compiler)
-    previous = compiler.override
-    compiler.override = fn
+    holder = launcher.__self__
+    holder.build()
+    state = holder._compile_state  # pyright: ignore[reportPrivateUsage]  # launcher internals
+    if not isinstance(state, _KernelCompiler):
+        raise TypeError("intj: compile overrides require an ordinary launcher")
+    previous = state.override
+    state.override = fn
 
     def restore() -> None:
-        compiler.override = previous
+        state.override = previous
 
     return restore
-
-
-def _make_compile_callback(  # pyright: ignore[reportUnusedFunction]  # consumed by render.module
-    jit_func: JitFunction,
-    params: Sequence[Param],
-    options: Mapping[str, Any],
-    baked_values: Mapping[int, object] | None = None,
-    *,
-    return_compiled: bool = False,
-    knob_values: Mapping[str, object],
-    dynamic: Sequence[str] = (),
-) -> Callable[
-    ..., tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]
-]:
-    """Returns the module's compile function.
-
-    It is called on a spec-key miss through the missing launcher's
-    `_compile_miss`: `(seen, keyblob, nparams, device, *args)`, `args` being the
-    dynamic values, then the public arguments.
-    """
-    # The module's compile cache: a sibling launcher's miss reuses the kernel
-    # and only builds its own C record.
-    compiler = _KernelCompiler(jit_func, options, knob_values, weak=return_compiled)
-    fed = {
-        p.name: p
-        for p in params
-        if p.name in _parameter_options(compiler.backend, params)
-    }
-    fixed = {
-        n: (baked_values or {})[p.index] for n, p in fed.items() if p.call_index is None
-    }
-    per_call = {n: p.call_index for n, p in fed.items() if p.call_index is not None}
-    # without per-call values every record has the same options
-    fixed_options = None if dynamic or per_call else compiler.canonical(fixed, {})
-
-    def compile_callback(
-        seen: dict[bytes, object], keyblob: bytes, nparams: int, device: int, *args: Any
-    ) -> tuple[int, int, int, int] | tuple[int, int, int, int, CompiledKernel]:
-        """Compiles, or reuses, the kernel for one miss.
-
-        `seen` is the calling launcher's own key -> identity map.
-        """
-        _check_device(device)
-        dyn_options, dyn_knobs, args = _split_call(dynamic, args)
-        canonical = (
-            fixed_options
-            if fixed_options is not None
-            else compiler.canonical(
-                {**fixed, **dyn_options, **{n: args[i] for n, i in per_call.items()}},
-                dyn_knobs,
-            )
-        )
-        compiler_input = _compiler_input(
-            jit_func, params, args, compiler.backend, baked_values=baked_values
-        )
-        identity = _Identity.of(compiler_input, canonical, dyn_knobs)
-        # b"" is a keyless launcher's one key; seen is per launcher, so that is exact
-        if seen.setdefault(keyblob, identity) != identity:
-            raise RuntimeError(
-                "intj: one spec key maps to two annotated ASTSource inputs; this is an intj bug"
-            )
-        kernel = compiler.compile(identity, canonical)
-        result = _record(kernel, nparams)
-        return (*result, kernel) if return_compiled else result
-
-    return compile_callback
-
-
-def _make_host_compile_callback() -> Callable[..., tuple[int, int, int, int]]:  # pyright: ignore[reportUnusedFunction]  # consumed by render.module
-    def compile_callback(
-        seen: dict[bytes, object], keyblob: bytes, nparams: int, device: int, *args: Any
-    ) -> tuple[int, int, int, int]:
-        del seen, keyblob, device, args
-        return 0, 1, 0, nparams
-
-    return compile_callback
 
 
 def triton_specialization(

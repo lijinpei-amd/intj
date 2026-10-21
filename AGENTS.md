@@ -103,16 +103,18 @@ the same call from every module, and reads back `(function, block_dim, shared,
 nparams[, compiled[, deps, computed[, meta]]])`. `_build_body` stores the Python
 compile state in the launcher's `_compile_state` slot after `_init` succeeds,
 before C publishes the rendered entry: a
-`_CompileState` (the per-launcher specialization check map and a reference to
-the module's `_SharedCompiler`) or, for a `TunedLauncher`, its private
-`TunedCompileState`. `Launcher._compile_miss` uses the ordinary state's shared
+`_KernelCompiler` (the private compiled-kernel cache, specialization check map,
+compile options, and miss override) or, for a `TunedLauncher`, its private
+`TunedCompileState`. `Launcher._compile_miss` uses the ordinary state's private
 compiled kernel cache and current compile override, and C launches the returned
 record. `TunedLauncher._compile_miss` overrides it to run the private chain,
 including the final launch; C stores the record without launching it again.
 Both compile through `_KernelCompiler`. C neither stores nor exposes Python
 compile state; Python's slot traversal and clearing manage its lifetime.
-`override_compile(module, fn)` returns a no-argument function restoring the
-previous override; replacing an override keeps the shared compiler alive.
+`override_compile(launcher, fn)` builds the ordinary launcher if needed and
+returns a no-argument function restoring its previous override. Siblings are
+unaffected; replacing an override keeps the private compiler alive. Rendered
+modules hold no Python compiler or compiled-kernel cache.
 An ordinary launcher is the one-level case of the tuned
 walk, so `key_chain` works on both. A cache hit skips this method.
 

@@ -27,7 +27,7 @@ from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper  # pyright: ignore[
 from tvm_ffi.utils.unpack_dataclass import unpack_dataclass_to_tuple  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-ffi, benchmarks only
 
 from intj import make_launcher
-from intj.launcher import module_of, override_compile
+from intj.launcher import override_compile
 
 
 @triton.jit
@@ -88,7 +88,6 @@ def callback(iters: int, batches: int) -> None:
     """
     tensors = tuple(torch.zeros(1, device="cuda") for _ in range(3))
     launch = make_launcher(callback_kernel, no_gpu=True).__self__.bind_device(0)
-    module = module_of(launch)
     count = 0
 
     def compile_callback(_key, nparams, _device, *_args):
@@ -96,7 +95,7 @@ def callback(iters: int, batches: int) -> None:
         count += 1
         return 0, 1, 0, nparams  # fake handle: the host driver launches nothing
 
-    override_compile(module, compile_callback)
+    override_compile(launch, compile_callback)
     for i in range(100):
         launch(0, 1, *tensors, -(i + 1))
     samples = []

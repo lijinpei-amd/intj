@@ -86,7 +86,7 @@ def test_compile_state_is_published_only_after_initialization(monkeypatch):
     assert h._C_module is None
     monkeypatch.undo()
     h.build()
-    assert type(h._compile_state) is launcher_mod._CompileState
+    assert type(h._compile_state) is launcher_mod._KernelCompiler
 
 
 @pytest.fixture

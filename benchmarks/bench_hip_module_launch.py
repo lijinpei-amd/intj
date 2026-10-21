@@ -23,7 +23,7 @@ import tvm_ffi  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-
 import tvm_ffi.cpp  # pyright: ignore[reportMissingImports]  # optional: apache-tvm-ffi, benchmarks only
 
 from intj import make_launcher
-from intj.launcher import module_of, override_compile
+from intj.launcher import override_compile
 from bench_launch import bench
 
 
@@ -113,7 +113,7 @@ def main(iters: int, batches: int) -> None:
         assert ordinal == device and nparams == 4
         return compiled.function, block_threads, compiled.metadata.shared, nparams
 
-    override_compile(module_of(bound), compiled_function)
+    override_compile(bound, compiled_function)
     cases = [
         ("TVM FFI HIP HSACO", mod.launch_empty, ffi_args),
         ("Triton same HSACO", native, (*tensors, 128, 128)),

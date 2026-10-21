@@ -1,6 +1,6 @@
 """Builds a kernel's RenderKey and loads its rendered module.
 
-The launcher owns the module cache and compile callbacks. Shared launcher
+The launcher owns the module cache and Python compile state. Shared launcher
 checks are imported when building, after its module has initialized.
 """
 
@@ -10,7 +10,7 @@ import dataclasses
 import functools
 import sysconfig
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -55,8 +55,6 @@ def _build_module(b: _BuildOptions) -> types.ModuleType:  # pyright: ignore[repo
         get_full_name,
         _knob_options,  # pyright: ignore[reportPrivateUsage]  # shared compile options
         _loaded_module,  # pyright: ignore[reportPrivateUsage]  # launcher's module cache
-        _make_compile_callback,  # pyright: ignore[reportPrivateUsage]  # shared compiler
-        _make_host_compile_callback,  # pyright: ignore[reportPrivateUsage]  # host compiler
         _provision,  # pyright: ignore[reportPrivateUsage]  # checked toolchain
         _resolve_torch_access_mode,  # pyright: ignore[reportPrivateUsage]  # shared checks
         _spec_key_layout,  # pyright: ignore[reportPrivateUsage]  # shared key layout
@@ -153,20 +151,6 @@ def _build_module(b: _BuildOptions) -> types.ModuleType:  # pyright: ignore[repo
         intj_version=_cache_version(),
         global_values=b.global_values,
     )
-    baked_values = {p.index: p.baked for p in b.params if p.annotation.baked_value}
-
-    def compile_function() -> Callable[..., Any]:
-        if target is None:
-            return _make_host_compile_callback()
-        return _make_compile_callback(
-            b.jit_func,
-            params,
-            options,
-            baked_values,
-            return_compiled=b.return_compiled,
-            knob_values=knob_values or {},
-            dynamic=b.dynamic,
-        )
 
     def loaded(mode: TorchAccessMode) -> types.ModuleType:
         # the c++ mode gets it too, not to read from but to check its own
@@ -180,7 +164,6 @@ def _build_module(b: _BuildOptions) -> types.ModuleType:  # pyright: ignore[repo
             _for_access(key, mode),
             b.jit_func.__module__,
             layout,
-            compile_function if tuning is None else None,
         )
 
     try:

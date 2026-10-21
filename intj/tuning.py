@@ -15,7 +15,6 @@ import copy
 import dataclasses
 import inspect
 import threading
-import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -553,7 +552,7 @@ class TunedCompileState:
         self.jit_func = plan.jit_func
         # its own, strong: a CompiledKernel is loaded on one device, and
         # records point into candidates no module sees
-        self.compiler = _KernelCompiler(self.jit_func, options, knob_values, weak=False)
+        self.compiler = _KernelCompiler(self.jit_func, options, knob_values)
         self.grid = grid
         self.render = render
         self.dynamic = dynamic
@@ -713,11 +712,8 @@ class TunedLauncher(Launcher):
             b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
         )
 
-    def _new_compile_state(
-        self, b: _BuildOptions, module: types.ModuleType
-    ) -> TunedCompileState:
+    def _new_compile_state(self, b: _BuildOptions) -> TunedCompileState:
         """Returns this launcher's private tuning state."""
-        del module
         assert (
             b.tuned is not None
             and b.tuned.render is not None
