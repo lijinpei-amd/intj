@@ -912,13 +912,13 @@ def test_tuned_key_chain_is_never_coarser_than_triton():
 def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
     from intj import annotation
 
-    original = annotation._key_fields
+    original = annotation._cache_key_fields
 
     def without_exact(a):
         return tuple(f for f in original(a) if f.kind not in ("exact", "exact_kind"))
 
-    monkeypatch.setattr(annotation, "_key_fields", without_exact)
-    monkeypatch.setattr("intj.render.module._key_fields", without_exact)
+    monkeypatch.setattr(annotation, "_cache_key_fields", without_exact)
+    monkeypatch.setattr("intj.render.module._cache_key_fields", without_exact)
     with pytest.raises(AssertionError, match="collides"):
         check_tuned_invariant(_invariant_kernel, _invariant_cases())
 

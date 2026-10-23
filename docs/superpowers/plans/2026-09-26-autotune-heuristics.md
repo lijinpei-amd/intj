@@ -1506,7 +1506,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 About 1.5 days. This covers autotune, plus heuristics whose inputs are all exact: one lookup, with dependent values in the record. Computed keys are refused here, and Task 4 lifts that refusal.
 
 **Files:**
-- Modify: `intj/annotation.py` (`CanonicalAnnotation`, `_key_fields`)
+- Modify: `intj/annotation.py` (`CanonicalAnnotation`, `_cache_key_fields`)
 - Modify: `intj/launcher.py`: `TuningRender`, `RenderContext.tuning`, `LauncherFactory.tuned`, `_render_params`, `make_launcher`, `_materialize_module`, `_loaded_module`, `_check_kernel`, `_checked_compile`
 - Modify: `intj/grid.py` (`compile_grid(..., deps=...)`)
 - Modify: `intj/tuning.py` (private chain, shim, callback)
@@ -1518,7 +1518,7 @@ About 1.5 days. This covers autotune, plus heuristics whose inputs are all exact
 - Consumes: `analyze`, `TuningPlan` (Task 2); `INTJ_DEFINE_CACHE`, `intj_final`, `intj_launch`, `INTJ_V0_*` (Task 1)
 - Produces:
   - `CanonicalAnnotation.tuned: bool = False`, `CanonicalAnnotation.exact_key: bool = False`
-  - `KeyField` kinds `"exact_kind"` (width 1) and `"exact"` (width 8)
+  - `CacheKeyField` kinds `"exact_kind"` (width 1) and `"exact"` (width 8)
   - `launcher.TuningRender(levels, computed, computed_fields, computed_names, deps, dep_names, meta_names, source)`
   - `launcher._checked_compile(jit_func, compiler_input, target, canonical_options) -> CompiledKernel`
   - `tuning.make_tuned_callback(plan, resolved: tuple[ResolvedParam, ...], options: Mapping[str, Any], grid: TunedGrid, render: TuningRender, return_compiled: bool) -> Callable`
@@ -1851,7 +1851,7 @@ In `intj/annotation.py`, add two fields to `CanonicalAnnotation` after `key_fiel
     exact_key: bool = False
 ```
 
-In `_key_fields`, make the first lines:
+In `_cache_key_fields`, make the first lines:
 
 ```python
     if annotation.tuned or annotation.baked_value or annotation.bind_value is not None:
@@ -1861,9 +1861,9 @@ In `_key_fields`, make the first lines:
 Wrap its final `return` so exact keys add their fields. The kind byte tells `1` from `True` from `1.0`, and the 8 bytes hold int64/uint64 bits or fp64 bits:
 
 ```python
-    fields = (KeyField("descriptor", 1),) if descriptor else ()
+    fields = (CacheKeyField("descriptor", 1),) if descriptor else ()
     if annotation.exact_key:
-        fields += (KeyField("exact_kind", 1), KeyField("exact", 8))
+        fields += (CacheKeyField("exact_kind", 1), CacheKeyField("exact", 8))
     return fields
 ```
 
@@ -1981,7 +1981,7 @@ def _checked_compile(
 
 (d) `_check_kernel`: change the non-JIT message to `"intj: expected a @triton.jit function, optionally wrapped in @triton.autotune / @triton.heuristics, got {type}"`.
 
-(e) In `make_launcher`, replace `jit_func = _check_kernel(jit_func, options)` / `resolved = _resolve_annotations(...)` with:
+(e) In `make_launcher`, replace `jit_func = _check_kernel(jit_func, options)` / `resolved = _merge_annotations(...)` with:
 
 ```python
     from triton.runtime.autotuner import Autotuner, Heuristics
@@ -1990,7 +1990,7 @@ def _checked_compile(
     while type(jit_func) in (Autotuner, Heuristics):
         jit_func = jit_func.fn
     jit_func = _check_kernel(jit_func, options)
-    resolved = _resolve_annotations(jit_func, extra_annotation)
+    resolved = _merge_annotations(jit_func, extra_annotation)
     tuned: _Tuned | None = None
     if chain is not jit_func:
         tuned = _plan_tuning(chain, resolved, extra_annotation, options, no_gpu)
@@ -3195,9 +3195,9 @@ def _render_key(
     resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding, computed0: int = 0
 ) -> tuple[tuple[Param, ...], int | None, int, tuple[tuple[int, int], ...]]:
     """Place key fields, level-0 computed keys included, and number the call."""
-    fields = tuple((p.index, field) for p in resolved for field in _key_fields(p.annotation))
+    fields = tuple((p.index, field) for p in resolved for field in _cache_key_fields(p.annotation))
     fields += tuple(
-        (-1 - j, KeyField(kind, width))
+        (-1 - j, CacheKeyField(kind, width))
         for j in range(computed0)
         for kind, width in (("payload", 8), ("descriptor", 1))
     )
@@ -3236,7 +3236,7 @@ def _render_params(
     return params, device_offset, nwords
 ```
 
-Import `KeyField` from `.annotation`. `_materialize_module` calls `_render_key(resolved, device_binding, tuning.computed[0] if tuning else 0)`. When `tuning` is set, it replaces `tuning.computed_fields` with the placed offsets: `tuning = dataclasses.replace(tuning, computed_fields=computed_fields)`. The render is only final once placement is known, which is why placement happens here.
+Import `CacheKeyField` from `.annotation`. `_materialize_module` calls `_render_key(resolved, device_binding, tuning.computed[0] if tuning else 0)`. When `tuning` is set, it replaces `tuning.computed_fields` with the placed offsets: `tuning = dataclasses.replace(tuning, computed_fields=computed_fields)`. The render is only final once placement is known, which is why placement happens here.
 
 (b) In `_plan_tuning`, delete the `if plan.computed:` refusal.
 
@@ -3670,13 +3670,13 @@ def test_tuned_key_chain_is_never_coarser_than_triton():
 def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
     from intj import annotation
 
-    original = annotation._key_fields
+    original = annotation._cache_key_fields
 
     def without_exact(a):
         return tuple(f for f in original(a) if f.kind not in ("exact", "exact_kind"))
 
-    monkeypatch.setattr(annotation, "_key_fields", without_exact)
-    monkeypatch.setattr("intj.launcher._key_fields", without_exact)
+    monkeypatch.setattr(annotation, "_cache_key_fields", without_exact)
+    monkeypatch.setattr("intj.launcher._cache_key_fields", without_exact)
     with pytest.raises(AssertionError, match="collides"):
         check_tuned_invariant(_invariant_kernel, _invariant_cases())
 ```

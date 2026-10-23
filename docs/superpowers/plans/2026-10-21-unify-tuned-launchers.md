@@ -17,7 +17,7 @@
 - `import intj` imports neither triton nor torch; `launcher.py` imports `intj.tuning` only inside functions (tuning imports launcher at its top).
 - `RenderContext` computes, the template writes C: the template branches on a boolean, a `none` test, or one field against a literal (AGENTS.md).
 - No new docstrings on simple private helpers under ~10 lines; public and overridable methods get one.
-- Tests monkeypatch `intj.launcher._checked_compile`, `_parameter_options`, `_make_compile_callback`, `_loaded_module`, `_key_fields`: keep these names, and keep `tuning.py` reading launcher internals at call time (`from .launcher import ...` inside the function).
+- Tests monkeypatch `intj.launcher._checked_compile`, `_parameter_options`, `_make_compile_callback`, `_loaded_module`, `_cache_key_fields`: keep these names, and keep `tuning.py` reading launcher internals at call time (`from .launcher import ...` inside the function).
 - Every command uses the project venv:
 
 ```bash

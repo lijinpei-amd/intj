@@ -20,12 +20,12 @@ from .. import backend as backends
 from .. import kernel_cache as kernel_caches
 from .._version import __version__
 from ..annotation import (
+    CacheKeyField,
     CanonicalAnnotation,
     DeviceBinding,
-    KeyField,
+    KeyLayout,
     ResolvedParam,
-    _key_fields,  # pyright: ignore[reportPrivateUsage]  # canonical key fields
-    _layout_fields,  # pyright: ignore[reportPrivateUsage]  # shared key layout
+    _cache_key_fields,  # pyright: ignore[reportPrivateUsage]  # canonical key fields
 )
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
@@ -335,6 +335,27 @@ _LOADED: dict[RenderKey, types.ModuleType] = {}
 _LOAD_LOCK = threading.Lock()
 
 
+def _layout_fields(
+    fields: tuple[tuple[int, CacheKeyField], ...], device_binding: DeviceBinding
+) -> KeyLayout:
+    """Places `fields` in the key, widest first, then the device slot if keyed."""
+    ordered = sorted(enumerate(fields), key=lambda item: -item[1][1].width)
+    offsets: dict[int, int] = {}
+    offset = 0
+    for source_index, (_, field) in ordered:
+        offsets[source_index] = offset
+        offset += field.width
+    device_offset = None
+    if device_binding is DeviceBinding.NOT_FIXED:
+        device_offset = offset
+        offset += 1
+    placed = tuple(
+        (param_index, dataclasses.replace(field, offset=offsets[source_index]))
+        for source_index, (param_index, field) in enumerate(fields)
+    )
+    return KeyLayout(placed, device_offset, (offset + 7) // 8)
+
+
 def _spec_key_layout(
     resolved: tuple[ResolvedParam, ...],
     device_binding: DeviceBinding,
@@ -356,10 +377,10 @@ def _spec_key_layout(
     like an exact key, and its memo follows the parameters'.
     """
     fields = tuple(
-        (p.index, field) for p in resolved for field in _key_fields(p.annotation)
+        (p.index, field) for p in resolved for field in _cache_key_fields(p.annotation)
     )
     fields += tuple(
-        (-1 - j, KeyField(kind, width))
+        (-1 - j, CacheKeyField(kind, width))
         for j in range(computed0)
         for kind, width in (("payload", 8), ("descriptor", 1))
     )
@@ -420,14 +441,14 @@ def _spec_key_layout(
     )
 
 
-def _dynamic_key_fields(name: str) -> tuple[KeyField, ...]:
+def _dynamic_key_fields(name: str) -> tuple[CacheKeyField, ...]:
     """Returns one dynamic value's key fields: a kind byte and 8 value bytes.
 
     Laid out like an exact key.  `name` picks nothing here; the invariant
     tests' mutation checks drop one value's fields by name.
     """
     del name
-    return (KeyField("exact_kind", 1), KeyField("exact", 8))
+    return (CacheKeyField("exact_kind", 1), CacheKeyField("exact", 8))
 
 
 def _object_capable(annotation: CanonicalAnnotation) -> bool:

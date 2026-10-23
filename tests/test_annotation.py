@@ -108,14 +108,14 @@ def test_annotation_constructor_errors(build, error, match):
 
 
 def test_annotation_sources_merge_field_by_field(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(
         tmp_path,
         "x: intj.Argument(type=tl.int32), y",
         "@triton.jit(do_not_specialize_on_alignment=['x'])",
     )
-    params = _resolve_annotations(kernel, {"x": intj.Argument(specialize=intj.NEVER)})
+    params = _merge_annotations(kernel, {"x": intj.Argument(specialize=intj.NEVER)})
     x = params[0].annotation
     assert x.types == ("i32",)
     assert (x.equal_to_one, x.aligned_16, x.pointer_range_32) == (
@@ -126,35 +126,35 @@ def test_annotation_sources_merge_field_by_field(tmp_path):
 
 
 def test_annotation_sources_merge_equivalent_type_sets(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(
         tmp_path, "x: intj.Argument(type=[tl.int64, tl.int32, tl.int64])"
     )
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         kernel, {"x": intj.Argument(type=[tl.int32, tl.int64])}
     )
     assert resolved[0].annotation.types == ("i32", "i64")
 
 
 def test_none_and_unset_remain_distinct_after_merge(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x, y")
-    params = _resolve_annotations(kernel, {"x": None, "y": intj.Argument()})
+    params = _merge_annotations(kernel, {"x": None, "y": intj.Argument()})
     assert params[0].annotation.types == (None,)
     assert params[1].annotation.types is None
 
 
 def test_raw_inline_shorthands_and_decorator_modes(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(
         tmp_path,
         "x: tl.int32, y: tl.constexpr, z: None",
         "@triton.jit(do_not_specialize=['x'], do_not_specialize_on_alignment=['z'])",
     )
-    x, y, z = (param.annotation for param in _resolve_annotations(kernel, None))
+    x, y, z = (param.annotation for param in _merge_annotations(kernel, None))
     assert (x.kind, x.types) == ("argument", ("i32",))
     assert (x.equal_to_one, x.aligned_16, x.pointer_range_32) == (
         "never",
@@ -200,7 +200,7 @@ def test_do_not_specialize_pointer_keeps_large_offset():
     ids=["evaluated", "postponed"],
 )
 def test_make_launcher_accepts_legacy_constexpr_annotations(tmp_path, future):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_from_source(
         tmp_path,
@@ -208,7 +208,7 @@ def test_make_launcher_accepts_legacy_constexpr_annotations(tmp_path, future):
         "@triton.jit\ndef kernel(x, BLOCK: tl.constexpr):\n    pass\n",
     )
     assert kernel.params[1].is_constexpr
-    params = _resolve_annotations(kernel, None)
+    params = _merge_annotations(kernel, None)
     assert params[0].annotation.kind == "argument"
     assert params[1].annotation.kind == "constexpr"
     assert params[1].annotation.types is None
@@ -226,14 +226,14 @@ def test_tensor_annotations_resolve_as_unannotated_but_tensor_only(tmp_path, fut
     Triton ignores `torch.Tensor` / `tl.tensor` (its `annotation_type` is empty),
     so the canonical form is the unannotated one plus `tensor_only`.
     """
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_from_source(
         tmp_path,
         future + "import torch\nimport triton\nimport triton.language as tl\n\n"
         "@triton.jit\ndef kernel(x: torch.Tensor, y: tl.tensor, z):\n    pass\n",
     )
-    x, y, z = (p.annotation for p in _resolve_annotations(kernel, None))
+    x, y, z = (p.annotation for p in _merge_annotations(kernel, None))
     assert x.tensor_only and y.tensor_only and not z.tensor_only
     assert dataclasses.replace(x, tensor_only=False) == z
     assert dataclasses.replace(y, tensor_only=False) == z
@@ -241,11 +241,11 @@ def test_tensor_annotations_resolve_as_unannotated_but_tensor_only(tmp_path, fut
 
     (extra_z,) = [
         p.annotation
-        for p in _resolve_annotations(kernel, {"z": torch.Tensor})
+        for p in _merge_annotations(kernel, {"z": torch.Tensor})
         if p.name == "z"
     ]
     assert extra_z.tensor_only
-    pointer = _resolve_annotations(kernel, {"x": tl.pointer_type(tl.float32)})[
+    pointer = _merge_annotations(kernel, {"x": tl.pointer_type(tl.float32)})[
         0
     ].annotation
     assert pointer.tensor_only and pointer.types == ("*fp32",)
@@ -264,7 +264,7 @@ def test_optional_tensor_annotations_resolve_as_unannotated_but_none_ok(
     `T | None`, `Optional[T]` and `Union[T, None]` for either tensor class resolve
     to the unannotated form plus `tensor_only` and `none_ok`.
     """
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     forms = (
         "torch.Tensor | None",
@@ -281,7 +281,7 @@ def test_optional_tensor_annotations_resolve_as_unannotated_but_none_ok(
         "import torch\nimport triton\nimport triton.language as tl\n\n"
         f"@triton.jit\ndef kernel({params}, t: torch.Tensor, z):\n    pass\n",
     )
-    *optional, t, z = (p.annotation for p in _resolve_annotations(kernel, None))
+    *optional, t, z = (p.annotation for p in _merge_annotations(kernel, None))
     for a in optional:
         assert a.tensor_only and a.none_ok
         assert dataclasses.replace(a, tensor_only=False, none_ok=False) == z
@@ -290,15 +290,15 @@ def test_optional_tensor_annotations_resolve_as_unannotated_but_none_ok(
 
     (extra_z,) = [
         p.annotation
-        for p in _resolve_annotations(kernel, {"z": typing.Optional[torch.Tensor]})
+        for p in _merge_annotations(kernel, {"z": typing.Optional[torch.Tensor]})
         if p.name == "z"
     ]
     assert extra_z.tensor_only and extra_z.none_ok
     with pytest.raises(ValueError, match="conflicting tensor annotations"):
-        _resolve_annotations(kernel, {"t": "torch.Tensor | None"})
+        _merge_annotations(kernel, {"t": "torch.Tensor | None"})
     # a union with anything else is still unsupported
     with pytest.raises(ValueError, match="unsupported annotation"):
-        _resolve_annotations(kernel, {"z": typing.Union[torch.Tensor, int]})
+        _merge_annotations(kernel, {"z": typing.Union[torch.Tensor, int]})
 
 
 @pytest.mark.parametrize(
@@ -313,7 +313,7 @@ def test_optional_tensor_annotations_resolve_as_unannotated_but_none_ok(
     ids=["constexpr", "scalar", "none", "baked", "bound"],
 )
 def test_tensor_annotation_rejects_non_tensor_declarations(tmp_path, extra):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_from_source(
         tmp_path,
@@ -321,18 +321,18 @@ def test_tensor_annotation_rejects_non_tensor_declarations(tmp_path, extra):
         "@triton.jit\ndef kernel(x: torch.Tensor):\n    pass\n",
     )
     with pytest.raises(ValueError, match="(annotated as a tensor|conflicting kind)"):
-        _resolve_annotations(kernel, {"x": extra})
+        _merge_annotations(kernel, {"x": extra})
 
 
 def test_assumptions_merge_independently_and_types_sort(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(
         tmp_path,
         "x: intj.Argument(type=[tl.pointer_type(tl.float32), None, tl.pointer_type(tl.int32)], "
         "specialize=intj.Assume(intj.Aligned(16)))",
     )
-    annotation = _resolve_annotations(
+    annotation = _merge_annotations(
         kernel, {"x": intj.Argument(specialize=intj.Assume(intj.PointerRange(32)))}
     )[0].annotation
     assert annotation.types == (None, "*fp32", "*i32")
@@ -345,10 +345,10 @@ def test_assumptions_merge_independently_and_types_sort(tmp_path):
 
 
 def test_equivalent_inputs_have_one_canonical_form(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x")
-    one = _resolve_annotations(
+    one = _merge_annotations(
         kernel,
         {
             "x": intj.Argument(
@@ -361,7 +361,7 @@ def test_equivalent_inputs_have_one_canonical_form(tmp_path):
             )
         },
     )
-    two = _resolve_annotations(
+    two = _merge_annotations(
         kernel,
         {
             "x": intj.Argument(
@@ -376,7 +376,7 @@ def test_equivalent_inputs_have_one_canonical_form(tmp_path):
 
 
 def test_canonical_baked_values_preserve_python_kind_and_bits(tmp_path):
-    from intj.annotation import _canonical_value, _resolve_annotations
+    from intj.annotation import _canonical_value, _merge_annotations
 
     assert _canonical_value(None) == ("none",)
     assert _canonical_value(False) == ("bool", False)
@@ -384,8 +384,8 @@ def test_canonical_baked_values_preserve_python_kind_and_bits(tmp_path):
     assert _canonical_value(-0.0) == ("float64", "8000000000000000")
     assert _canonical_value(0.0) == ("float64", "0000000000000000")
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
-    no_value = _resolve_annotations(kernel, None)[0].annotation
-    baked_none = _resolve_annotations(kernel, {"x": intj.Constexpr(value=None)})[0]
+    no_value = _merge_annotations(kernel, None)[0].annotation
+    baked_none = _merge_annotations(kernel, {"x": intj.Constexpr(value=None)})[0]
     assert no_value.baked_value == ()
     assert baked_none.annotation.baked_value == ("none",)
     assert baked_none.baked is None
@@ -412,11 +412,11 @@ def test_canonical_baked_values_preserve_python_kind_and_bits(tmp_path):
     ],
 )
 def test_annotation_sources_reject_conflicts(tmp_path, params, extra, decorator, field):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, params, decorator)
     with pytest.raises(ValueError, match=field):
-        _resolve_annotations(kernel, extra)
+        _merge_annotations(kernel, extra)
 
 
 @pytest.mark.parametrize(
@@ -502,15 +502,15 @@ def test_annotation_sources_reject_conflicts(tmp_path, params, extra, decorator,
     ],
 )
 def test_annotations_reject_invalid_inputs(tmp_path, params, extra, match):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, params)
     with pytest.raises(ValueError, match=match):
-        _resolve_annotations(kernel, extra)
+        _merge_annotations(kernel, extra)
 
 
 def test_external_fact_subclass_is_rejected(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     class ExternalFact(intj.Fact):
         pass
@@ -520,14 +520,14 @@ def test_external_fact_subclass_is_rejected(tmp_path):
         forged = object.__new__(specialization)
         object.__setattr__(forged, "facts", (ExternalFact(),))
         with pytest.raises(TypeError, match=f"{specialization.__name__} accepts"):
-            _resolve_annotations(kernel, {"x": intj.Argument(specialize=forged)})
+            _merge_annotations(kernel, {"x": intj.Argument(specialize=forged)})
 
 
 def test_baked_values_resolve_exact_types_and_reject_bad_facts(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x, y: tl.constexpr")
-    x, y = _resolve_annotations(
+    x, y = _merge_annotations(
         kernel,
         {
             "x": intj.Argument(
@@ -539,7 +539,7 @@ def test_baked_values_resolve_exact_types_and_reject_bad_facts(tmp_path):
     assert (x.annotation.types, x.annotation.baked_value) == (("i32",), ("int", "17"))
     assert (y.annotation.types, y.annotation.baked_value) == (("i64",), ("int", "17"))
     with pytest.raises(ValueError, match="violates aligned_16"):
-        _resolve_annotations(
+        _merge_annotations(
             kernel,
             {
                 "x": intj.Argument(
@@ -600,13 +600,13 @@ def test_baked_values_resolve_exact_types_and_reject_bad_facts(tmp_path):
 def test_baked_ints_resolve_auto_facts_from_their_value(
     tmp_path, params, decorator, specialize, value, expected
 ):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
     baked = intj.Argument(
         value=value, specialize=UNSET if specialize is None else specialize
     )
-    annotation = _resolve_annotations(kernel, {"x": baked})[0].annotation
+    annotation = _merge_annotations(kernel, {"x": baked})[0].annotation
     types, equal_to_one, aligned_16 = expected
     assert (annotation.types, annotation.equal_to_one, annotation.aligned_16) == (
         types,
@@ -631,22 +631,22 @@ def test_baked_ints_resolve_auto_facts_from_their_value(
     ],
 )
 def test_baked_ints_refuse_facts_their_value_breaks(tmp_path, specialize, value, match):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x")
     with pytest.raises(ValueError, match=match):
-        _resolve_annotations(
+        _merge_annotations(
             kernel, {"x": intj.Argument(value=value, specialize=specialize)}
         )
 
 
 def test_bound_values_still_refuse_auto_specialization(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x")
     tensor = intj.Argument(bind_value=intj.BindValue.TENSOR)
     with pytest.raises(ValueError, match="AUTO specialization with a bound value"):
-        _resolve_annotations(kernel, {"x": tensor})
+        _merge_annotations(kernel, {"x": tensor})
 
 
 def _modes(annotation):
@@ -706,10 +706,10 @@ def _modes(annotation):
 def test_exactly_assumes_its_facts_and_never_the_rest(
     tmp_path, params, decorator, extra, modes
 ):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
-    annotation = _resolve_annotations(kernel, {"x": extra})[0].annotation
+    annotation = _merge_annotations(kernel, {"x": extra})[0].annotation
     assert _modes(annotation) == modes
     assert annotation.facts == tuple(
         (field, amount)
@@ -758,11 +758,11 @@ def test_exactly_assumes_its_facts_and_never_the_rest(
 def test_exactly_conflicts_like_never_and_assume(
     tmp_path, params, decorator, extra, field
 ):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
     with pytest.raises(ValueError, match=f"conflicting {field}"):
-        _resolve_annotations(kernel, {"x": extra})
+        _merge_annotations(kernel, {"x": extra})
 
 
 @pytest.mark.parametrize(
@@ -778,12 +778,12 @@ def test_exactly_conflicts_like_never_and_assume(
     ],
 )
 def test_exactly_without_facts_is_never(tmp_path, params, decorator, extra):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
 
     def resolved(specialize):
-        return _resolve_annotations(
+        return _merge_annotations(
             kernel, {"x": intj.Argument(specialize=specialize, **extra)}
         )
 
@@ -806,13 +806,13 @@ def test_exactly_adds_no_key_bytes(tmp_path, ty, exactly, assume):
 
     The `Assume` of the same facts measures the others, in one descriptor byte.
     """
-    from intj.annotation import _key_fields, _resolve_annotations
+    from intj.annotation import _cache_key_fields, _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x")
 
     def key_fields(specialize):
         extra = {"x": intj.Argument(type=ty, specialize=specialize)}
-        return _key_fields(_resolve_annotations(kernel, extra)[0].annotation)
+        return _cache_key_fields(_merge_annotations(kernel, extra)[0].annotation)
 
     assert key_fields(exactly) == key_fields(intj.NEVER) == ()
     assert [field.kind for field in key_fields(assume)] == ["descriptor"]
@@ -825,10 +825,10 @@ def test_exactly_is_exported():
 
 
 def test_baked_constexpr_chooses_narrowest_matching_type(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         kernel, {"x": intj.Constexpr(type=[tl.int64, tl.int32], value=17)}
     )[0]
     assert resolved.annotation.types == ("i32",)
@@ -856,11 +856,13 @@ def test_make_launcher_resolves_before_target_discovery(tmp_path, monkeypatch):
 def test_layout_key_fields_are_grouped_by_descending_alignment(
     widths, fixed_device, expected_offsets, device_offset, nwords
 ):
-    from intj.annotation import DeviceBinding, KeyField, _layout_fields
+    from intj.annotation import CacheKeyField, DeviceBinding
+    from intj.render.module import _layout_fields
 
     layout = _layout_fields(
         tuple(
-            (index, KeyField("payload", width)) for index, width in enumerate(widths)
+            (index, CacheKeyField("payload", width))
+            for index, width in enumerate(widths)
         ),
         DeviceBinding.FIXED if fixed_device else DeviceBinding.NOT_FIXED,
     )
@@ -870,7 +872,7 @@ def test_layout_key_fields_are_grouped_by_descending_alignment(
 
 
 def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(
@@ -878,7 +880,7 @@ def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path
         "raw: tl.constexpr, typed: tl.constexpr, power: tl.constexpr, "
         "nothing: tl.constexpr, fixed: tl.int32, changing: tl.int32, bound, baked",
     )
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         kernel,
         {
             "typed": intj.Constexpr(type=[tl.int16, tl.int32]),
@@ -929,12 +931,12 @@ class CompilerBackendStub:
 
 
 def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "x, n, BLOCK")
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         kernel,
         {
             "x": intj.Argument(
@@ -1054,13 +1056,13 @@ def test_global_pointer_annotation_accepts_both_triton_address_space_abis():
 def test_compiler_input_canonical_overrides(
     monkeypatch, tmp_path, annotation, value, inferred, signature, constant, attrs
 ):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "x")
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(kernel, {"x": annotation}), DeviceBinding.NOT_FIXED
+        _merge_annotations(kernel, {"x": annotation}), DeviceBinding.NOT_FIXED
     )
 
     def specialize(value, **kwargs):
@@ -1081,13 +1083,13 @@ def test_compiler_input_canonical_overrides(
 
 
 def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_path):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "a, b, c, d")
     original = float("-0.0")
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         kernel,
         {
             "a": intj.Argument(type=tl.int32, specialize=intj.NEVER),
@@ -1122,13 +1124,13 @@ def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_p
 
 
 def test_compiler_input_compares_tagged_constants_not_python_equality(tmp_path):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(kernel, None), DeviceBinding.NOT_FIXED
+        _merge_annotations(kernel, None), DeviceBinding.NOT_FIXED
     )
     values = (None, False, 0, 0.0, -0.0, float("nan"), float("nan"))
     sources = [

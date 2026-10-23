@@ -438,7 +438,7 @@ hook-sensitive launches on Triton.
 
 Import `Argument`, `Constexpr`, `AUTO`, `NEVER`, `Assume`, `Exactly`, `EqualTo`,
 `Aligned`, `PointerRange`, `BindValue`, `INT_TYPES`, and `FLOAT_TYPES` from `intj`.
-`Annotation`, `Specialization`, and `Fact` are their public base classes.
+`Annotation`, `SpecializationPolicy`, and `Fact` are their public base classes.
 `Argument(type=..., specialize=..., value=..., bind_value=...)` describes an
 ordinary parameter. `Constexpr(type=..., power_of_two_or_zero=False,
 value=...)` describes a constexpr parameter. Every field is optional.

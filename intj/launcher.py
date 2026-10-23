@@ -29,7 +29,7 @@ from .annotation import (
     ResolvedParam,
     _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
-    _resolve_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
+    _merge_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
 from . import kernel_cache as kernel_caches
 from .errors import UnsupportedKernel as UnsupportedKernel
@@ -301,7 +301,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
     kernel = _check_kernel(kernel, options, assume_constant_globals)
     global_values = _global_values(kernel) if assume_constant_globals else ()
-    resolved = _resolve_annotations(kernel, extra_annotation)
+    resolved = _merge_annotations(kernel, extra_annotation)
     tuned: Tuned | None = None
     if chain is not kernel:
         from .tuning import plan_tuning

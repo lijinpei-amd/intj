@@ -708,7 +708,7 @@ def test_bind_device_releases_selected_state_and_owners(bound_kernel, has_key, m
 def test_bind_device_cuda_template_backend_branches_compile(
     tmp_path, device_kernel, backend_name, return_compiled
 ):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import BACKENDS, HOST
     from intj.render.module import _spec_key_layout
 
@@ -722,7 +722,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
         }[backend_name]
     )
     params, offset, nwords, _, _ = _spec_key_layout(
-        _resolve_annotations(
+        _merge_annotations(
             device_kernel,
             {
                 "x": Argument(type=tl.int32, specialize=NEVER),
@@ -3355,18 +3355,18 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
             else make_launcher(jit, extra_annotation=extra)
         )
     module = module_of(launch)
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
     from triton.compiler import make_backend
 
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(jit, extra),
+        _merge_annotations(jit, extra),
         DeviceBinding.FIXED if bind_device else DeviceBinding.NOT_FIXED,
     )
     plain_params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(axpy, extra), DeviceBinding.NOT_FIXED
+        _merge_annotations(axpy, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
     base = torch.randn(4096, device="cuda")
@@ -3430,7 +3430,7 @@ def test_python_annotated_params_compile_like_triton():
     divisibility survives), `float`/`bool` are never specialized, and the
     unannotated `m` still folds 1 -- intj must hand the compiler exactly that.
     """
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
@@ -3439,7 +3439,7 @@ def test_python_annotated_params_compile_like_triton():
     launch = make_launcher(python_annotated)
     module = module_of(launch)
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(python_annotated, None), DeviceBinding.NOT_FIXED
+        _merge_annotations(python_annotated, None), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
     o = torch.zeros(1, device="cuda")
@@ -3560,7 +3560,7 @@ def test_ast_source_hashes_as_triton_launch(kernel):
     """
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
@@ -3570,7 +3570,7 @@ def test_ast_source_hashes_as_triton_launch(kernel):
     for args in _parity_calls():
         for extra in _parity_annotations(_triton_facts(jit, args)):
             params, _, _, _, _ = _spec_key_layout(
-                _resolve_annotations(jit, extra), DeviceBinding.NOT_FIXED
+                _merge_annotations(jit, extra), DeviceBinding.NOT_FIXED
             )
             source = _compiler_input(jit, params, args, backend)
             check_same_ast_source(jit, source, args)
@@ -3659,7 +3659,7 @@ def test_baked_int_specializes_like_triton(kernel):
     """
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
@@ -3671,7 +3671,7 @@ def test_baked_int_specializes_like_triton(kernel):
         args = (o, x, value, 1.5, 4)
         for annotation in _baked_annotations(jit, args):
             params, _, _, _, _ = _spec_key_layout(
-                _resolve_annotations(jit, {"s": annotation}), DeviceBinding.NOT_FIXED
+                _merge_annotations(jit, {"s": annotation}), DeviceBinding.NOT_FIXED
             )
             source = _compiler_input(
                 jit, params, (o, x, 1.5, 4), backend, baked_values={2: value}
@@ -3832,7 +3832,7 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
 
     This is the invariant for interned values, whichever object carries them.
     """
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
@@ -3841,7 +3841,7 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     launch = make_launcher(act_store)
     module = module_of(launch)
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(act_store, None), DeviceBinding.NOT_FIXED
+        _merge_annotations(act_store, None), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
     o = torch.zeros(1, device="cuda")
@@ -4230,14 +4230,14 @@ def annotated_baked(x, BLOCK, o, bias):
 
 
 def test_annotated_cuda_compile_only():
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
     from triton.backends.compiler import GPUTarget
     from triton.compiler import compile as triton_compile, make_backend
 
     target = GPUTarget("cuda", 80, 32)
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         annotated_baked,
         {
             "x": Argument(type=tl.float64, value=2.5, specialize=NEVER),
@@ -4423,7 +4423,7 @@ def test_annotated_baked_arguments_compile_without_jit_state(monkeypatch):
 def test_annotated_spec_key_is_never_coarser_than_triton(
     scalar_kernel, annotation, values
 ):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
@@ -4431,7 +4431,7 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
 
     extra = {"x": annotation}
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED
+        _merge_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
     launch = make_launcher(
@@ -4465,7 +4465,7 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
 def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     pointer_kernel, specialize
 ):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
     from intj.render.module import _spec_key_layout
@@ -4475,7 +4475,7 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     large = torch.empty(2**29 + 8, device="cuda")
     extra = {"x": Argument(type=tl.pointer_type(tl.float32), specialize=specialize)}
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED
+        _merge_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
     launch = make_launcher(
@@ -4496,12 +4496,12 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 
 @pytest.mark.parametrize("key", [b"", b"\x00" * 8])
 def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _KernelCompiler
     from intj.render.module import _spec_key_layout
 
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(power_kernel, {"N": Constexpr()}), DeviceBinding.FIXED
+        _merge_annotations(power_kernel, {"N": Constexpr()}), DeviceBinding.FIXED
     )
     state = _KernelCompiler(power_kernel, {}, launcher._live_knobs(), params=params)
     device = torch.cuda.current_device()
@@ -4799,7 +4799,7 @@ def test_spec_key_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     """The 7/8 parameter cases straddle the device byte's word boundary."""
     import importlib.util
 
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.render.module import _spec_key_layout
 
     names = [f"p{i}" for i in range(nparams)]
@@ -4816,7 +4816,7 @@ def test_spec_key_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
     params, device_offset, nwords, _, _ = _spec_key_layout(
-        _resolve_annotations(module.k, None), DeviceBinding.NOT_FIXED
+        _merge_annotations(module.k, None), DeviceBinding.NOT_FIXED
     )
 
     assert [p.name for p in params] == names + cxnames
@@ -6721,7 +6721,7 @@ def check_dynamic_invariant():
 
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import canonical_options, current_target
     from intj.launcher import _compiler_input, _live_knobs, _split_dynamic
     from intj.backend import _knob_options
@@ -6730,7 +6730,7 @@ def check_dynamic_invariant():
     launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
     module, device = module_of(launch), torch.cuda.current_device()
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED
+        _merge_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED
     )
     target = current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
@@ -6856,7 +6856,7 @@ def check_option_parameter_invariant():
     """
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import canonical_options, current_target
     from intj.launcher import _compiler_input, _live_knobs
     from intj.backend import _knob_options
@@ -6865,7 +6865,7 @@ def check_option_parameter_invariant():
     launch = make_launcher(option_axpy, return_compiled=True)
     module, device = module_of(launch), torch.cuda.current_device()
     params, _, _, _, _ = _spec_key_layout(
-        _resolve_annotations(option_axpy, None), DeviceBinding.NOT_FIXED
+        _merge_annotations(option_axpy, None), DeviceBinding.NOT_FIXED
     )
     target = current_target()
     backend, knobs_now = make_backend(target), _live_knobs()

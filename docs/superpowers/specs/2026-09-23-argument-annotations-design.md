@@ -72,11 +72,11 @@ class Annotation: ...
 
 
 @dataclass(frozen=True)
-class Specialization: ...
+class SpecializationPolicy: ...
 
 
 @dataclass(frozen=True)
-class Auto(Specialization): ...
+class Auto(SpecializationPolicy): ...
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,7 @@ class BindValue(enum.Enum):
 @dataclass(frozen=True)
 class Argument(Annotation):
     type: tl.dtype | Sequence[tl.dtype | None] | None | Auto | _Unset = UNSET
-    specialize: Specialization | _Unset = UNSET
+    specialize: SpecializationPolicy | _Unset = UNSET
     value: object = UNSET
     bind_value: BindValue | None = None
 
@@ -126,8 +126,8 @@ NEVER
 Assume(EqualTo(1), Aligned(16), PointerRange(32))
 ```
 
-`AUTO` and `NEVER` are immutable singleton `Specialization` values. `Assume` is
-an immutable `Specialization` containing a canonical tuple of intj-owned `Fact`
+`AUTO` and `NEVER` are immutable singleton `SpecializationPolicy` values. `Assume` is
+an immutable `SpecializationPolicy` containing a canonical tuple of intj-owned `Fact`
 instances. `EqualTo`, `Aligned`, and `PointerRange` are immutable `Fact`
 subclasses.
 

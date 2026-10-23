@@ -19,30 +19,6 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass(frozen=True)
-class Annotation:
-    """A per-parameter annotation: the public base of `Argument` and `Constexpr`."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Specialization:
-    """A specialization policy for an `Argument`: `AUTO`, `NEVER`, `Assume` or `Exactly`."""
-
-
-@dataclasses.dataclass(frozen=True)
-class _Auto(Specialization):
-    """The type of `AUTO`: retain the applicable Triton specialization."""
-
-
-@dataclasses.dataclass(frozen=True)
-class _Never(Specialization):
-    """The type of `NEVER`: omit every specialization fact."""
-
-
-AUTO = _Auto()
-NEVER = _Never()
-
-
-@dataclasses.dataclass(frozen=True)
 class Fact:
     """A specialization fact a caller promises in `Assume` or `Exactly`."""
 
@@ -88,8 +64,23 @@ def _checked_facts(facts: tuple[Fact, ...], owner: str) -> tuple[Fact, ...]:
     return facts
 
 
+@dataclasses.dataclass(frozen=True)
+class SpecializationPolicy:
+    """A specialization policy for an `Argument`: `AUTO`, `NEVER`, `Assume` or `Exactly`."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Auto(SpecializationPolicy):
+    """The type of `AUTO`: retain the applicable Triton specialization."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Never(SpecializationPolicy):
+    """The type of `NEVER`: omit every specialization fact."""
+
+
 @dataclasses.dataclass(frozen=True, init=False)
-class Assume(Specialization):
+class Assume(SpecializationPolicy):
     """A specialization that fixes selected facts as caller promises.
 
     Facts omitted from `Assume` stay `AUTO`.
@@ -113,7 +104,7 @@ class Assume(Specialization):
 
 
 @dataclasses.dataclass(frozen=True, init=False)
-class Exactly(Specialization):
+class Exactly(SpecializationPolicy):
     """A specialization that holds exactly the listed facts, as caller promises.
 
     Listed facts are assumed, as in `Assume`; every other fact is `NEVER`. This
@@ -136,6 +127,10 @@ class Exactly(Specialization):
                 `Aligned(16)`, `PointerRange(32)`).
         """
         object.__setattr__(self, "facts", _checked_facts(facts, "Exactly"))
+
+
+AUTO = _Auto()
+NEVER = _Never()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,6 +162,11 @@ def _normalize_type_field(value: object) -> object:
 
 
 @dataclasses.dataclass(frozen=True)
+class Annotation:
+    """A per-parameter annotation: the public base of `Argument` and `Constexpr`."""
+
+
+@dataclasses.dataclass(frozen=True)
 class Argument(Annotation):
     """An annotation of an ordinary (non-constexpr) kernel parameter.
 
@@ -190,13 +190,15 @@ class Argument(Annotation):
     """
 
     type: Any = UNSET
-    specialize: Specialization | _Unset = UNSET
+    specialize: SpecializationPolicy | _Unset = UNSET
     value: object = UNSET
     bind_value: BindValue | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "type", _normalize_type_field(self.type))
-        if not isinstance(cast(object, self.specialize), (Specialization, _Unset)):
+        if not isinstance(
+            cast(object, self.specialize), (SpecializationPolicy, _Unset)
+        ):
             raise TypeError(
                 "intj: specialize must be AUTO, NEVER, Assume(...) or Exactly(...)"
             )
@@ -252,7 +254,7 @@ def __getattr__(name: str) -> Any:
 
 
 @dataclasses.dataclass(frozen=True)
-class KeyField:
+class CacheKeyField:
     """One field of a parameter's spec key.
 
     Attributes:
@@ -285,30 +287,9 @@ class KeyLayout:
         nwords: The spec-key length, in uint64 words.
     """
 
-    fields: tuple[tuple[int, KeyField], ...]
+    fields: tuple[tuple[int, CacheKeyField], ...]
     device_offset: int | None
     nwords: int
-
-
-def _layout_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
-    fields: tuple[tuple[int, KeyField], ...], device_binding: DeviceBinding
-) -> KeyLayout:
-    """Places `fields` in the key, widest first, then the device slot if keyed."""
-    ordered = sorted(enumerate(fields), key=lambda item: -item[1][1].width)
-    offsets: dict[int, int] = {}
-    offset = 0
-    for source_index, (_, field) in ordered:
-        offsets[source_index] = offset
-        offset += field.width
-    device_offset = None
-    if device_binding is DeviceBinding.NOT_FIXED:
-        device_offset = offset
-        offset += 1
-    placed = tuple(
-        (param_index, dataclasses.replace(field, offset=offsets[source_index]))
-        for source_index, (param_index, field) in enumerate(fields)
-    )
-    return KeyLayout(placed, device_offset, (offset + 7) // 8)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -328,7 +309,7 @@ class CanonicalAnnotation:
     power_of_two_or_zero: bool
     bind_value: str | None
     baked_value: tuple[object, ...]
-    key_fields: tuple[KeyField, ...] = ()
+    key_fields: tuple[CacheKeyField, ...] = ()
     #: assigned by an autotune/heuristics layer: never passed, never keyed
     tuned: bool = False
     #: a caller var an autotune layer keys on: keyed by its exact value
@@ -616,31 +597,16 @@ def _applicable(name: str | None, field: str) -> bool:
     return name.startswith("*") or (name.startswith(("i", "u")) and name != "u1")
 
 
-def _baked_modes(
-    value: object, ty: str | None, modes: Sequence[object]
-) -> tuple[object, ...]:
-    # As Triton specializes a passed int: 1 folds into a constexpr, and a
-    # multiple of 16 (0 and negatives too) is divisible by 16. What the
-    # decorator flags or a Triton type annotation turn off is NEVER already.
-    one, aligned, pointer_range = modes
-    if one == "auto" and _applicable(ty, "equal_to_one"):
-        one = "assume" if value == 1 else "never"
-    if aligned == "auto" and _applicable(ty, "aligned_16"):
-        divisible = one != "assume" and cast(int, value) % 16 == 0
-        aligned = "assume" if divisible else "never"
-    return (one, aligned, pointer_range)
-
-
-def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
+def _cache_key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     annotation: CanonicalAnnotation,
-) -> tuple[KeyField, ...]:
+) -> tuple[CacheKeyField, ...]:
     """Returns the unplaced key fields `annotation` contributes to the spec key."""
     if annotation.tuned or annotation.baked_value or annotation.bind_value is not None:
         return ()
     types = annotation.types
     if annotation.kind == "constexpr":
         if annotation.power_of_two_or_zero:
-            return (KeyField("payload", 1),)
+            return (CacheKeyField("payload", 1),)
         if types == (None,):
             return ()
         descriptor = types is None or len(types) > 1
@@ -658,8 +624,8 @@ def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launche
                 for ty in types
             )
         )
-        return ((KeyField("descriptor", 1),) if descriptor else ()) + (
-            (KeyField("payload", width),) if width else ()
+        return ((CacheKeyField("descriptor", 1),) if descriptor else ()) + (
+            (CacheKeyField("payload", width),) if width else ()
         )
     descriptor = (
         types is None
@@ -676,13 +642,13 @@ def _key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launche
             )
         )
     )
-    fields = (KeyField("descriptor", 1),) if descriptor else ()
+    fields = (CacheKeyField("descriptor", 1),) if descriptor else ()
     if annotation.exact_key:
-        fields += (KeyField("exact_kind", 1), KeyField("exact", 8))
+        fields += (CacheKeyField("exact_kind", 1), CacheKeyField("exact", 8))
     return fields
 
 
-def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
+def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     jit_func: Any, extra_annotation: Mapping[str, object] | None
 ) -> tuple[ResolvedParam, ...]:
     """Merges each parameter's inline and extra annotations and validates them.
@@ -939,7 +905,16 @@ def _resolve_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed b
                     )
             if baked is not UNSET:
                 assert types is not None
-                modes = _baked_modes(baked, types[0], modes)
+                # As Triton specializes a passed int: 1 folds into a constexpr, and a
+                # multiple of 16 (0 and negatives too) is divisible by 16. What the
+                # decorator flags or a Triton type annotation turn off is NEVER already.
+                one, aligned, pointer_range = modes
+                if one == "auto" and _applicable(types[0], "equal_to_one"):
+                    one = "assume" if baked == 1 else "never"
+                if aligned == "auto" and _applicable(types[0], "aligned_16"):
+                    divisible = one != "assume" and cast(int, baked) % 16 == 0
+                    aligned = "assume" if divisible else "never"
+                modes = (one, aligned, pointer_range)
                 assumed = tuple(
                     (field, expected)
                     for field, expected in _FACT_CLASSES.values()

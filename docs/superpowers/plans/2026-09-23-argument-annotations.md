@@ -159,7 +159,7 @@ Expected: tests PASS and pyright reports `0 errors`.
 - Modify: `intj/__init__.py`
 
 **Interfaces:**
-- Produces: `Annotation`, `Argument`, `Constexpr`, `Specialization`, `AUTO`, `NEVER`, `Assume`
+- Produces: `Annotation`, `Argument`, `Constexpr`, `SpecializationPolicy`, `AUTO`, `NEVER`, `Assume`
 - Produces: `Fact`, `EqualTo`, `Aligned`, `PointerRange`, `BindValue`
 - Produces: `INT_TYPES` and `FLOAT_TYPES`
 - Keeps private: `_Unset`, `UNSET`, `_Auto`, and `_Never`
@@ -242,17 +242,17 @@ class Annotation:
 
 
 @dataclasses.dataclass(frozen=True)
-class Specialization:
+class SpecializationPolicy:
     pass
 
 
 @dataclasses.dataclass(frozen=True)
-class _Auto(Specialization):
+class _Auto(SpecializationPolicy):
     pass
 
 
 @dataclasses.dataclass(frozen=True)
-class _Never(Specialization):
+class _Never(SpecializationPolicy):
     pass
 
 
@@ -281,7 +281,7 @@ class PointerRange(Fact):
 
 
 @dataclasses.dataclass(frozen=True, init=False)
-class Assume(Specialization):
+class Assume(SpecializationPolicy):
     facts: tuple[Fact, ...]
 
     def __init__(self, *facts: Fact) -> None:
@@ -321,13 +321,13 @@ def _normalize_type_field(value: object) -> object:
 @dataclasses.dataclass(frozen=True)
 class Argument(Annotation):
     type: Any = UNSET
-    specialize: Specialization | _Unset = UNSET
+    specialize: SpecializationPolicy | _Unset = UNSET
     value: object = UNSET
     bind_value: BindValue | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "type", _normalize_type_field(self.type))
-        if not isinstance(self.specialize, (Specialization, _Unset)):
+        if not isinstance(self.specialize, (SpecializationPolicy, _Unset)):
             raise TypeError("intj: specialize must be AUTO, NEVER, or Assume(...)")
         if self.bind_value is not None and not isinstance(self.bind_value, BindValue):
             raise TypeError("intj: bind_value must be a BindValue or None")
@@ -356,7 +356,7 @@ FLOAT_TYPES = (tl.float32,)
 Add these names to `intj.__all__`:
 
 ```python
-"Annotation", "Argument", "Constexpr", "Specialization", "AUTO", "NEVER",
+"Annotation", "Argument", "Constexpr", "SpecializationPolicy", "AUTO", "NEVER",
 "Assume", "Fact", "EqualTo", "Aligned", "PointerRange", "BindValue",
 "INT_TYPES", "FLOAT_TYPES", "__version__"
 ```
@@ -387,7 +387,7 @@ Expected: tests PASS and pyright reports `0 errors`.
 
 **Interfaces:**
 - Produces: private frozen `CanonicalAnnotation` and `ResolvedParam`
-- Produces: `_resolve_annotations(jit_func, extra_annotation) -> tuple[ResolvedParam, ...]`
+- Produces: `_merge_annotations(jit_func, extra_annotation) -> tuple[ResolvedParam, ...]`
 - Produces: `_canonical_value(value) -> tuple[object, ...]`
 
 - [ ] **Step 1: Add a file-backed JIT helper and merge tests**
@@ -411,7 +411,7 @@ def kernel_from_source(tmp_path, source):
 
 
 def test_annotation_sources_merge_field_by_field(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_from_source(
         tmp_path,
@@ -422,7 +422,7 @@ def test_annotation_sources_merge_field_by_field(tmp_path):
         "def kernel(x: Argument(type=tl.int32), y):\\n"
         "    pass\\n",
     )
-    params = _resolve_annotations(
+    params = _merge_annotations(
         kernel, {"x": intj.Argument(specialize=intj.NEVER)}
     )
     x = params[0].annotation
@@ -433,32 +433,32 @@ def test_annotation_sources_merge_field_by_field(tmp_path):
 
 
 def test_none_and_unset_remain_distinct_after_merge(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_from_source(
         tmp_path,
         "import triton\\n\\n@triton.jit\\ndef kernel(x, y):\\n    pass\\n",
     )
-    params = _resolve_annotations(kernel, {"x": None, "y": intj.Argument()})
+    params = _merge_annotations(kernel, {"x": None, "y": intj.Argument()})
     assert params[0].annotation.types == (None,)
     assert params[1].annotation.types is None
 
 
 def test_equivalent_inputs_have_one_canonical_form(tmp_path):
-    from intj.annotation import _resolve_annotations
+    from intj.annotation import _merge_annotations
 
     kernel = kernel_from_source(
         tmp_path,
         "import triton\\n\\n@triton.jit\\ndef kernel(x):\\n    pass\\n",
     )
-    one = _resolve_annotations(
+    one = _merge_annotations(
         kernel,
         {"x": intj.Argument(
             type=[tl.int64, tl.int32, tl.int64],
             specialize=intj.Assume(intj.Aligned(16), intj.EqualTo(1)),
         )},
     )
-    two = _resolve_annotations(
+    two = _merge_annotations(
         kernel,
         {"x": intj.Argument(
             type=[tl.int32, tl.int64],
@@ -499,7 +499,7 @@ Add:
 
 ```python
 @dataclasses.dataclass(frozen=True)
-class KeyField:
+class CacheKeyField:
     kind: str
     width: int
     offset: int = -1
@@ -516,7 +516,7 @@ class CanonicalAnnotation:
     power_of_two_or_zero: bool
     bind_value: str | None
     baked_value: tuple[object, ...]
-    key_fields: tuple[KeyField, ...] = ()
+    key_fields: tuple[CacheKeyField, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -550,7 +550,7 @@ Canonicalize Triton dtypes through their compiler spellings (`i32`, `u64`, `fp32
 
 - [ ] **Step 5: Implement field-wise merging**
 
-Implement `_resolve_annotations()` in this order:
+Implement `_merge_annotations()` in this order:
 
 1. Read the raw `inspect.Parameter.annotation`, not Triton's normalized string. Accept exact intj annotations, Triton dtypes, bare `tl.constexpr`, bare `None`, and omission.
 2. Merge `extra_annotation[name]` per field. Equal duplicates pass; unequal specified values raise `ValueError` naming the parameter and field.
@@ -590,7 +590,7 @@ Expected: tests PASS and pyright reports `0 errors`.
 
 **Interfaces:**
 - Produces: private `DeviceBinding` with `FIXED="fixed"` and `NOT_FIXED="not_fixed"`
-- Produces: `_layout_fields(fields, device_binding) -> KeyLayout`
+- Produces: `intj.render.module._layout_fields(fields, device_binding) -> KeyLayout`
 - Produces: `_render_params(resolved, device_binding) -> tuple[tuple[Param, ...], int | None, int]`
 - Changes: `Param` stores `name`, original `index`, public `call_index`, and `CanonicalAnnotation`
 - Changes: `RenderContext` stores `device_binding`, `device_offset`, `verify_annotation`, and `no_gpu`
@@ -612,10 +612,11 @@ Add:
 def test_key_fields_are_grouped_by_descending_alignment(
     widths, fixed_device, expected_offsets, device_offset, nwords
 ):
-    from intj.annotation import DeviceBinding, KeyField, _layout_fields
+    from intj.annotation import CacheKeyField, DeviceBinding
+    from intj.render.module import _layout_fields
 
     layout = _layout_fields(
-        tuple((index, KeyField("payload", width)) for index, width in enumerate(widths)),
+        tuple((index, CacheKeyField("payload", width)) for index, width in enumerate(widths)),
         DeviceBinding.FIXED if fixed_device else DeviceBinding.NOT_FIXED,
     )
     assert tuple(field.offset for _, field in layout.fields) == expected_offsets
@@ -645,7 +646,7 @@ Expected: FAIL because `DeviceBinding` and `_layout_fields()` do not exist.
 
 - [ ] **Step 3: Implement the stable descending-width layout**
 
-Add:
+Add `DeviceBinding` and `KeyLayout` in `intj/annotation.py`:
 
 ```python
 class DeviceBinding(enum.StrEnum):
@@ -655,17 +656,22 @@ class DeviceBinding(enum.StrEnum):
 
 @dataclasses.dataclass(frozen=True)
 class KeyLayout:
-    fields: tuple[tuple[int, KeyField], ...]
+    fields: tuple[tuple[int, CacheKeyField], ...]
     device_offset: int | None
     nwords: int
+```
 
+Add `_layout_fields` in `intj/render/module.py`:
+
+```python
+from ..annotation import CacheKeyField, DeviceBinding, KeyLayout
 
 def _layout_fields(
-    fields: tuple[tuple[int, KeyField], ...],
+    fields: tuple[tuple[int, CacheKeyField], ...],
     device_binding: DeviceBinding,
 ) -> KeyLayout:
     ordered = sorted(fields, key=lambda item: -item[1].width)
-    placed: list[tuple[int, KeyField]] = []
+    placed: list[tuple[int, CacheKeyField]] = []
     offset = 0
     for param_index, field in ordered:
         placed.append((param_index, dataclasses.replace(field, offset=offset)))
@@ -1208,7 +1214,7 @@ Add a pure helper test using a fake specialization callback:
 
 ```python
 def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path):
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import _compiler_input, _render_params
 
     class BackendStub:
@@ -1225,7 +1231,7 @@ def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path
         tmp_path,
         "import triton\\n\\n@triton.jit\\ndef kernel(x, n, BLOCK):\\n    pass\\n",
     )
-    resolved = _resolve_annotations(
+    resolved = _merge_annotations(
         kernel,
         {
             "x": Argument(
@@ -1939,7 +1945,7 @@ PYTHONPATH=$PWD /tmp/gb2/bin/python - <<'PY'
 import intj
 assert "UNSET" not in intj.__all__
 for name in (
-    "Annotation", "Argument", "Constexpr", "Specialization", "AUTO", "NEVER",
+    "Annotation", "Argument", "Constexpr", "SpecializationPolicy", "AUTO", "NEVER",
     "Assume", "Fact", "EqualTo", "Aligned", "PointerRange", "BindValue",
     "INT_TYPES", "FLOAT_TYPES", "__version__",
 ):

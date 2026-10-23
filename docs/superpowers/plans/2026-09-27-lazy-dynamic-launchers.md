@@ -2241,7 +2241,7 @@ About 1 day.
 - Produces, Python:
   - `DynamicSlot(name: str, value_offset: int | None, kind_offset: int | None, memo: int)`
   - `RenderContext.dynamic: tuple[DynamicSlot, ...] = ()`, `LauncherFactory.dynamic: tuple[str, ...] = ()`
-  - `_dynamic_key_fields(name: str) -> tuple[KeyField, ...]`
+  - `_dynamic_key_fields(name: str) -> tuple[CacheKeyField, ...]`
   - `_split_dynamic(names, values) -> tuple[dict[str, object], dict[str, object]]`
   - `_knob_scope(values: Mapping[str, object]) -> ContextManager[None]`
   - `_render_key(...) -> (params, device_offset, nwords, computed_fields, dynamic_slots)`
@@ -2385,12 +2385,12 @@ class DynamicSlot:
 Add:
 
 ```python
-def _dynamic_key_fields(name: str) -> tuple[KeyField, ...]:
+def _dynamic_key_fields(name: str) -> tuple[CacheKeyField, ...]:
     """One dynamic value's key: a kind byte and 8 value bytes, like an exact
     key.  `name` picks nothing here; the invariant tests' mutation checks drop
     one value's fields by name."""
     del name
-    return (KeyField("exact_kind", 1), KeyField("exact", 8))
+    return (CacheKeyField("exact_kind", 1), CacheKeyField("exact", 8))
 
 
 def _check_dynamic(
@@ -2728,7 +2728,7 @@ def check_dynamic_invariant():
     """Same key => same annotated ASTSource, same canonical options, same knobs."""
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _resolve_annotations
+    from intj.annotation import DeviceBinding, _merge_annotations
     from intj.launcher import (
         _canonical_options, _compiler_input, _current_target, _knob_options, _live_knobs,
         _render_params,
@@ -2736,7 +2736,7 @@ def check_dynamic_invariant():
 
     launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
     module, device = module_of(launch), torch.cuda.current_device()
-    params, _, _ = _render_params(_resolve_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED)
+    params, _, _ = _render_params(_merge_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED)
     target = _current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
     x = torch.randn(64, device="cuda")

@@ -12,7 +12,7 @@ import dataclasses
 from collections.abc import Mapping
 from pathlib import Path
 
-from ..annotation import CanonicalAnnotation, DeviceBinding, KeyField
+from ..annotation import CacheKeyField, CanonicalAnnotation, DeviceBinding
 from .key import DynamicSlot, Param, RenderKey, TuningRender
 
 ENTRY_TEMPLATE = Path(__file__).parent / "entry.c.jinja"
@@ -534,7 +534,7 @@ def _param_view(
     meta_slot: int | None,
 ) -> ParamView:
     a = p.annotation
-    fields: dict[str, KeyField] = {}
+    fields: dict[str, CacheKeyField] = {}
     for field in a.key_fields:
         fields.setdefault(field.kind, field)
     constexpr = a.kind == "constexpr"
@@ -618,7 +618,7 @@ def _param_view(
     )
 
 
-def _write(field: KeyField | None) -> KeyWrite | None:
+def _write(field: CacheKeyField | None) -> KeyWrite | None:
     return KeyWrite.into_word(field.offset, field.width) if field is not None else None
 
 
