@@ -8,7 +8,7 @@
 # numbers independently, from torch's C++ headers.
 #
 #   cdata: byte offset from the end of PyObject_HEAD to the TensorImpl* slot;
-#          _set_torch_version adds its compiled sizeof(PyObject) at module load
+#          _set_torch_abi adds its compiled sizeof(PyObject) at module load
 #   storage .. s_nbytes: byte offsets into TensorImpl / StorageImpl
 #   dtypes: [torch's spelling, element size], indexed by at::ScalarType code
 #

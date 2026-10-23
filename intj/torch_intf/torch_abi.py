@@ -59,7 +59,7 @@ class TensorABI:
     itemsize: bytes  # dtype code -> element size, NDTYPES long
 
     def as_args(self) -> tuple[Any, ...]:
-        """Returns the tuple `_set_torch_version` parses."""
+        """Returns the tuple `_set_torch_abi` parses."""
         return (
             self.cdata,
             self.storage,

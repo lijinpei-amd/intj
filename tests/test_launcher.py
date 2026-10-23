@@ -6275,24 +6275,24 @@ def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
 
 
 def test_unconfigured_module_refuses_to_launch():
-    """`entry` is unreachable before _set_torch_version; prove the guard exists."""
+    """`entry` is unreachable before _set_torch_abi; prove the guard exists."""
     module = module_of(
         make_launcher(scale, torch_access_mode=TorchAccessMode.RUNTIME_SHIM)
     )
-    assert hasattr(module, "_set_torch_version")
+    assert hasattr(module, "_set_torch_abi")
     index = dtype_index_table()
     with pytest.raises(ValueError, match="needs a tensor layout"):
-        module._set_torch_version((2, 14), None, index)
+        module._set_torch_abi(None, index)
     layout = layout_for()
     assert layout is not None
     interpreter = module_of(
         make_launcher(scale, torch_access_mode=TorchAccessMode.INTERPRETER)
     )
     with pytest.raises(ValueError, match="takes no tensor layout"):
-        interpreter._set_torch_version((2, 14), layout.as_args(), index)
+        interpreter._set_torch_abi(layout.as_args(), index)
 
 
-def test_a_failed_set_torch_version_changes_nothing():
+def test_a_failed_set_torch_abi_changes_nothing():
     """A rejected call must not leave a half-installed table behind.
 
     The method is reachable from python on a module that is already configured
@@ -6327,13 +6327,13 @@ def test_a_failed_set_torch_version_changes_nothing():
         (good.as_args(), bytes([32]) + index[1:]),  # an index past five bits
     ):
         with pytest.raises(ValueError):
-            module._set_torch_version((2, 14), layout, table)
+            module._set_torch_abi(layout, table)
         # per case, not once at the end: each rejection has its own way of
         # committing early, and one masks the next
         assert keys() == before
 
 
-def test_set_torch_version_needs_the_dtype_index_in_every_mode():
+def test_set_torch_abi_needs_the_dtype_index_in_every_mode():
     """The dtype table is not a RUNTIME_SHIM detail: all three readers key on it.
 
     Installed in only some modes, the others would see an all-zero table and key
@@ -6346,9 +6346,9 @@ def test_set_torch_version_needs_the_dtype_index_in_every_mode():
         module = module_of(make_launcher(scale, torch_access_mode=mode))
         args = layout.as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None
         with pytest.raises(TypeError, match="dtype_index"):
-            module._set_torch_version((2, 14), args)
+            module._set_torch_abi(args)
         with pytest.raises(ValueError, match="dtype index table"):
-            module._set_torch_version((2, 14), args, b"\xff" * (NDTYPES - 1))
+            module._set_torch_abi(args, b"\xff" * (NDTYPES - 1))
 
 
 def test_modes_agree_on_rejecting_a_storageless_tensor():

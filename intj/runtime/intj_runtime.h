@@ -300,7 +300,7 @@ typedef struct {
    * dtype.  Unlike itemsize, every access mode reads this: it is what the key
    * encodes, not how a pointer is computed. */
   uint8_t dtype_index[INTJ_NDTYPES];
-  int ready; /* _set_torch_version has run */
+  int ready; /* _set_torch_abi has run */
 } intj_torch_abi;
 
 #ifdef INTJ_TORCH_ACCESS_STATIC_COMPILE

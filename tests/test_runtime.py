@@ -256,9 +256,7 @@ def built(request, stub, stub_module, tmp_path_factory):
 
     layout = layout_for().as_args() if mode is TorchAccessMode.RUNTIME_SHIM else None  # pyright: ignore[reportOptionalMemberAccess]
     # every torch code its own 5-bit index; the real one comes from triton
-    module._set_torch_version(
-        torch_version(), layout, bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
-    )
+    module._set_torch_abi(layout, bytes(c if c < 32 else 0xFF for c in range(NDTYPES)))
     return module, Stub(lib), compiles
 
 
@@ -475,7 +473,7 @@ def test_runtime_shim_rejects_rebased_cdata_overflow(built, launch):
     bad = (relative, *layout.as_args()[1:])
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(ValueError, match="16-bit"):
-        module._set_torch_version(torch_version(), bad, index)
+        module._set_torch_abi(bad, index)
 
     launch(*args)
     assert stub.last(5)[3][0] == x.data_ptr()
@@ -486,9 +484,7 @@ def test_torch_abi_is_installed_once(built):
     layout = layout_for() if module.__name__ == "rt_runtime_shim" else None
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(RuntimeError, match="already installed"):
-        module._set_torch_version(
-            torch_version(), layout.as_args() if layout else None, index
-        )
+        module._set_torch_abi(layout.as_args() if layout else None, index)
 
 
 @pytest.mark.parametrize("oversized_offset", [65536, 2**32])
@@ -501,7 +497,7 @@ def test_runtime_shim_rejects_offset_truncation(built, oversized_offset):
     oversized = (oversized_offset, *layout.as_args()[1:])
     index = bytes(c if c < 32 else 0xFF for c in range(NDTYPES))
     with pytest.raises(ValueError, match="16-bit"):
-        module._set_torch_version(torch_version(), oversized, index)
+        module._set_torch_abi(oversized, index)
 
 
 def test_gil_stays_off_on_a_free_threaded_build(built):
@@ -618,7 +614,7 @@ import torch
 spec = importlib.util.spec_from_file_location({module.__name__!r}, {module.__file__!r})
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-module._set_torch_version({torch_version()!r}, {layout.as_args() if layout else None!r},
+module._set_torch_abi({layout.as_args() if layout else None!r},
                          {bytes(c if c < 32 else 0xFF for c in range(NDTYPES))!r})
 spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
 lazy = importlib.util.module_from_spec(spec)

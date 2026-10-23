@@ -200,8 +200,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
                 module._set_launcher_type(stub.Launcher)
                 # Pass relative cdata; the compiled setter saves the absolute offset
                 # for the torch running now before exposing the module.
-                module._set_torch_version(
-                    torch_version(),
+                module._set_torch_abi(
                     layout.as_args() if layout else None,
                     dtype_index_table(),
                 )

@@ -28,5 +28,5 @@ extension still targets a compatible CPython ABI.
 
 For `RUNTIME_SHIM`, `torch_abi.toml` stores `cdata` relative to the end of
 `PyObject_HEAD`. `layout_for()` selects the verified Torch row, and the
-generated module's `_set_torch_version()` adds its compiled `sizeof(PyObject)`
+generated module's `_set_torch_abi()` adds its compiled `sizeof(PyObject)`
 and saves the absolute offset before the first launch.

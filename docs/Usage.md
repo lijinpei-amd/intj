@@ -703,7 +703,7 @@ call instead of by `check()`.
 No mode dlopens `libtorch_cpu.so` or calls an `aoti_torch_*` shim.
 
 `RUNTIME_SHIM` reads offsets from a table of verified torch versions
-(`intj/torch_intf/torch_abi.toml`), installed at load by `_set_torch_version`.
+(`intj/torch_intf/torch_abi.toml`), installed at load by `_set_torch_abi`.
 The recorded `cdata` starts after `PyObject_HEAD`; the generated module adds
 its compiled `sizeof(PyObject)` once and saves the absolute offset before any
 launch.

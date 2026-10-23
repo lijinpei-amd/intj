@@ -975,7 +975,7 @@ static INTJ_ALWAYS_INLINE int intj_parse_call(intj_state *st,
                                               int64_t *device, uint64_t *stream) {
   if (INTJ_UNLIKELY(!st->abi.ready)) {
     PyErr_SetString(PyExc_RuntimeError,
-                    "intj: _set_torch_version has not been called");
+                    "intj: _set_torch_abi has not been called");
     return -1;
   }
   if (INTJ_UNLIKELY(nargs != {{ ncontrols }} + INTJ_NDYN + INTJ_NPARAMS)) {
@@ -1298,7 +1298,7 @@ static PyObject *intj_init(PyObject *self, PyObject *const *args, Py_ssize_t nar
   }
   args += 2;
   if (!st->abi.ready) {
-    PyErr_SetString(PyExc_RuntimeError, "intj: _set_torch_version has not been called");
+    PyErr_SetString(PyExc_RuntimeError, "intj: _set_torch_abi has not been called");
     return NULL;
   }
 {% if grid_py_mode %}
@@ -1517,7 +1517,7 @@ static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t n
   return Py_BuildValue("(NO)", keys, kernel ? Py_True : Py_False);
 }
 
-/* _set_torch_version((major, minor), layout, dtype_index) -- install the torch ABI.
+/* _set_torch_abi(layout, dtype_index) -- install the torch ABI.
  *
  * RUNTIME_SHIM installs offsets from the torch running now. STATIC_COMPILE can
  * check its compiled cdata offset against that layout when one is verified;
@@ -1531,23 +1531,23 @@ static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t n
  * race one.  The launcher calls it once, under its load lock, before the module
  * is reachable.
  */
-static PyObject *intj_set_torch_version(PyObject *self, PyObject *const *args,
+static PyObject *intj_set_torch_abi(PyObject *self, PyObject *const *args,
                                    Py_ssize_t nargs) {
   intj_state *st = (intj_state *)PyModule_GetState(self);
   PyObject *layout;
-  if (nargs != 3) {
+  if (nargs != 2) {
     PyErr_SetString(
         PyExc_TypeError,
-        "intj: _set_torch_version takes (version, layout, dtype_index)");
+        "intj: _set_torch_abi takes (layout, dtype_index)");
     return NULL;
   }
-  layout = args[1];
+  layout = args[0];
 
   /* Every mode reads this table -- it is what the key encodes, not how a
    * pointer is computed -- so it is validated here rather than in a branch. */
   const uint8_t *index;
   {
-    Py_ssize_t n = PyBytes_Size(args[2]);
+    Py_ssize_t n = PyBytes_Size(args[1]);
     if (n < 0)
       return NULL;
     if (n != INTJ_NDTYPES) {
@@ -1556,7 +1556,7 @@ static PyObject *intj_set_torch_version(PyObject *self, PyObject *const *args,
                    INTJ_NDTYPES, n);
       return NULL;
     }
-    index = (const uint8_t *)PyBytes_AS_STRING(args[2]);
+    index = (const uint8_t *)PyBytes_AS_STRING(args[1]);
     /* The key gives the index five bits.  A larger one would not overflow into
      * the next parameter's byte -- it would shift the pointer code past 127 and
      * alias a scalar tag, so a float32 pointer could key as a 16-divisible
@@ -1763,7 +1763,7 @@ static PyMethodDef intj_methods[] = {
     {"_init", (PyCFunction)(void (*)(void))intj_init, METH_FASTCALL, NULL},
     {"_header_size", header_size, METH_NOARGS, NULL},
     {"_set_launcher_type", intj_set_launcher_type, METH_O, NULL},
-    {"_set_torch_version", (PyCFunction)(void (*)(void))intj_set_torch_version,
+    {"_set_torch_abi", (PyCFunction)(void (*)(void))intj_set_torch_abi,
      METH_FASTCALL, NULL},
     {NULL, NULL, 0, NULL}};
 
