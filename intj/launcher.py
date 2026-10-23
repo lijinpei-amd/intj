@@ -31,9 +31,9 @@ from .annotation import (
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
     _merge_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
-from . import kernel_cache as kernel_caches
 from .errors import UnsupportedKernel as UnsupportedKernel
 from .kernel_cache import KernelCache
+from .render import deps as render_deps
 from .options import OPTION_FIELDS, MakeLauncherKwargs, MakeLauncherOption
 from .render import module as render_module
 from .render.build import compiler_path
@@ -451,7 +451,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         None if no_gpu else {k: v for k, v in _live_knobs().items() if k not in dynamic}
     )
     # GPU-free but may reach the network: after every refusal above, never on a build
-    kernel_caches._provision(kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
+    render_deps._provision(kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
     return _BuildOptions(
         jit_func=kernel,
         tuned=tuned,

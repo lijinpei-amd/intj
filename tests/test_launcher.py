@@ -42,7 +42,6 @@ import intj
 import intj.backend
 from intj import launcher, make_launcher
 from intj import backend as backends
-from intj import kernel_cache as kernel_cache_module
 from intj import (
     AUTO,
     NEVER,
@@ -69,9 +68,11 @@ from knob_helpers import (
     needs_hip,
     needs_pointer_range,
 )
-from intj.kernel_cache import INSTALL_ERRORS, KernelCache, install
+from intj.kernel_cache import KernelCache
 from intj.python_intf import cpython_abi
+from intj.render import deps as render_deps
 from intj.render import module as render_module
+from intj.render.deps import INSTALL_ERRORS, install
 from intj.render.build import build, compiler_identity
 from intj.render.key import DynamicSlot, RenderKey
 from intj.torch_intf.abi_detect import probe_layout
@@ -2629,7 +2630,7 @@ def test_no_gpu_rejects_real_backend_options(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning was reached")
 
-    monkeypatch.setattr(kernel_cache_module, "_provision", forbidden)
+    monkeypatch.setattr(render_deps, "_provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="no_gpu.*options"):
         make_launcher(scale, no_gpu=True, options={"num_warps": 8}).__self__.check()
 
@@ -2639,7 +2640,7 @@ def test_binding_refusals_come_before_provisioning(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning was reached before a GPU-free refusal")
 
-    monkeypatch.setattr(kernel_cache_module, "_provision", forbidden)
+    monkeypatch.setattr(render_deps, "_provision", forbidden)
     k = make_launcher(scale, bind_device=-1)  # pyright: ignore[reportArgumentType]
     with pytest.raises(TypeError, match="device ordinal"):
         k.__self__.check()
@@ -4921,7 +4922,7 @@ def test_render_key_tracks_cache_compiler_language(
 
     keys = []
     monkeypatch.setattr(
-        kernel_cache_module,
+        render_deps,
         "_provision",
         lambda _: {"include_dirs": (), "archives": ()},
     )
@@ -5131,10 +5132,10 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
     }
     # installed once calls is non-empty, like the real complete-tree check
     monkeypatch.setattr(
-        "intj.kernel_cache.toolchain_for", lambda cache: toolchain if calls else None
+        "intj.render.deps.toolchain_for", lambda cache: toolchain if calls else None
     )
     monkeypatch.setattr(
-        "intj.kernel_cache.install", lambda c: calls.append(c) or toolchain
+        "intj.render.deps.install", lambda c: calls.append(c) or toolchain
     )
 
     # stop before the real build: the point is what reaches it, not that a
@@ -5172,9 +5173,9 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
         attempts.append(cache)
         raise OSError("no network")
 
-    monkeypatch.setattr("intj.kernel_cache.toolchain_for", lambda cache: None)
-    monkeypatch.setattr("intj.kernel_cache.install", explode)
-    monkeypatch.setattr("intj.kernel_cache._INSTALL_FAILED", {})
+    monkeypatch.setattr("intj.render.deps.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.render.deps.install", explode)
+    monkeypatch.setattr("intj.render.deps._INSTALL_FAILED", {})
     for _ in range(3):
         with pytest.raises(
             UnsupportedKernel,
@@ -5186,10 +5187,10 @@ def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
 
 
 def test_kernel_cache_install_bug_is_not_dressed_up_as_a_download_failure(monkeypatch):
-    monkeypatch.setattr("intj.kernel_cache.toolchain_for", lambda cache: None)
-    monkeypatch.setattr("intj.kernel_cache._INSTALL_FAILED", {})
+    monkeypatch.setattr("intj.render.deps.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.render.deps._INSTALL_FAILED", {})
     monkeypatch.setattr(
-        "intj.kernel_cache.install", lambda cache: cache.no_such_attribute
+        "intj.render.deps.install", lambda cache: cache.no_such_attribute
     )
     with pytest.raises(AttributeError):
         make_launcher(scale, kernel_cache=KernelCache.TSL).__self__.check()
@@ -5200,12 +5201,12 @@ def test_kernel_cache_install_is_the_last_refusal(monkeypatch):
 
     Only GPU-free refusals can precede it: an unknown `options=` name needs the
     target, so it raises on the first call, after make_launcher provisioned."""
-    monkeypatch.setattr("intj.kernel_cache.toolchain_for", lambda cache: None)
+    monkeypatch.setattr("intj.render.deps.toolchain_for", lambda cache: None)
 
     def explode(cache):
         raise AssertionError("installed before refusing a global-reading kernel")
 
-    monkeypatch.setattr("intj.kernel_cache.install", explode)
+    monkeypatch.setattr("intj.render.deps.install", explode)
     with pytest.raises(UnsupportedKernel, match="global variable"):
         make_launcher(uses_global, kernel_cache=KernelCache.ABSL).__self__.check()
 

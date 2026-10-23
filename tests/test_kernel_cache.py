@@ -25,7 +25,8 @@ import triton
 import triton.language as tl
 
 from intj import Constexpr, TorchAccessMode, make_launcher
-from intj.kernel_cache import KernelCache, toolchain_for
+from intj.kernel_cache import KernelCache
+from intj.render.deps import toolchain_for
 from intj.launcher import module_of, override_compile
 from intj.python_intf import cpython_abi
 

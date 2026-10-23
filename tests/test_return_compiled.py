@@ -95,7 +95,7 @@ def test_return_compiled_refuses_host_mode_before_provision(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("host return mode reached provisioning")
 
-    monkeypatch.setattr("intj.kernel_cache._provision", forbidden)
+    monkeypatch.setattr("intj.render.deps._provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="return_compiled.*GPU"):
         make_launcher(store_value, no_gpu=True, return_compiled=True).__self__.check()
 

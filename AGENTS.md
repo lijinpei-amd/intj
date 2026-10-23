@@ -23,14 +23,17 @@ included by every rendered module.
 - `context.py`: `RenderContext.from_key(key)`, what the template renders from.
 - `entry.c.jinja`: the rendered entry point.
 - `build.py`: build flags, compiling, and loading the `.so`.
+- `deps.py`: pinned kernel-cache dependencies, provisioning, and installer CLI.
 - `module.py`: assembling the key, shared parameter layout and ABI checks, and
   the per-process loaded-module cache.
 
 `launcher.py` checks launcher options and owns the compile callback and Python
 compile state; it passes its C stub to `module.py` for module initialization.
 Shared compile-option merging lives in `backend.py`, checked dependency
-provisioning in `kernel_cache.py`, and `UnsupportedKernel` in `errors.py`
+provisioning in `render/deps.py`, and `UnsupportedKernel` in `errors.py`
 (re-exported by `launcher.py`).
+`kernel_cache.py` holds the public `KernelCache` enum and delegates its CLI to
+`render/deps.py`.
 
 **`RenderContext` computes, the template writes C.** Every count, offset, slot, flag
 and choice (which decoder, which checks, the order of type tests) is a

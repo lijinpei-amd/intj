@@ -763,6 +763,9 @@ a hang. To get it over with ahead of time, or before going offline:
     python -m intj.kernel_cache all
     python -m intj.kernel_cache --force absl   # discard a half-written tree
 
+The public enum and command live in `intj/kernel_cache.py`; dependency
+provisioning is implemented in `intj/render/deps.py`.
+
 One installer at a time, machine-wide, so the ranks of a torchrun job that all
 miss together do not build into one tree. If the install fails, the error
 carries that command and the reason, and the failure is remembered rather than

@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 
 from .. import _imports
 from .. import backend as backends
-from .. import kernel_cache as kernel_caches
 from .._version import __version__
 from ..annotation import (
     CacheKeyField,
@@ -37,6 +36,7 @@ from ..torch_intf.torch_abi import (
     supported_versions,
     torch_version,
 )
+from . import deps
 from .build import (
     CppExtensionUnavailable,
     compiler_identity,
@@ -97,7 +97,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
     nwords = max(nwords, 1) if tuning is not None else nwords
     # check() provisioned already: this is the idempotent, no-network
     # lookup of the toolchain it installed
-    cache_toolchain = kernel_caches._provision(b.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
+    cache_toolchain = deps._provision(b.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
     # the kernel's own name, unless python allows something C does not
     module_name = b.jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
