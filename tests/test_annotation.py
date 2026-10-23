@@ -871,7 +871,7 @@ def test_layout_key_fields_are_grouped_by_descending_alignment(
 
 def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(
         tmp_path,
@@ -893,7 +893,9 @@ def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path
             "baked": intj.Argument(type=tl.int32, specialize=intj.NEVER, value=4),
         },
     )
-    params, device_offset, nwords = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    params, device_offset, nwords, _, _ = _spec_key_layout(
+        resolved, DeviceBinding.NOT_FIXED
+    )
     fields = [
         tuple((f.kind, f.width, f.offset) for f in p.annotation.key_fields)
         for p in params
@@ -929,7 +931,7 @@ class CompilerBackendStub:
 def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "x, n, BLOCK")
     resolved = _resolve_annotations(
@@ -943,7 +945,7 @@ def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path
             "BLOCK": intj.Constexpr(type=tl.int32),
         },
     )
-    params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    params, _, _, _, _ = _spec_key_layout(resolved, DeviceBinding.NOT_FIXED)
     monkeypatch.setattr(
         "intj.launcher._triton_specialize",
         lambda *args, **kwargs: pytest.fail("fixed input was specialized"),
@@ -1054,10 +1056,10 @@ def test_compiler_input_canonical_overrides(
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "x")
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(kernel, {"x": annotation}), DeviceBinding.NOT_FIXED
     )
 
@@ -1081,7 +1083,7 @@ def test_compiler_input_canonical_overrides(
 def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "a, b, c, d")
     original = float("-0.0")
@@ -1094,7 +1096,7 @@ def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_p
             "d": intj.Constexpr(type=tl.int16),
         },
     )
-    params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    params, _, _, _, _ = _spec_key_layout(resolved, DeviceBinding.NOT_FIXED)
     monkeypatch.setattr(
         "intj.launcher._triton_specialize",
         lambda *args, **kwargs: pytest.fail("fixed input was specialized"),
@@ -1122,10 +1124,10 @@ def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_p
 def test_compiler_input_compares_tagged_constants_not_python_equality(tmp_path):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(kernel, None), DeviceBinding.NOT_FIXED
     )
     values = (None, False, 0, 0.0, -0.0, float("nan"), float("nan"))

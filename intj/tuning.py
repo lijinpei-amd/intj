@@ -311,7 +311,7 @@ def tuning_render(
     _imports.ensure_triton_imported()
     by_name = {
         p.name: p
-        for p in render_module._render_params(resolved, DeviceBinding.NOT_FIXED)[0]  # pyright: ignore[reportPrivateUsage]  # shared key layout
+        for p in render_module._spec_key_layout(resolved, DeviceBinding.NOT_FIXED)[0]  # pyright: ignore[reportPrivateUsage]  # shared key layout
     }
     grid_code = getattr(grid_cpp, "__code__", None)
     grid_reads: tuple[str, ...] = (

@@ -736,7 +736,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
 ):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import BACKENDS, HOST
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     backend = BACKENDS.get(backend_name, HOST)
     assert (
@@ -747,7 +747,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
             "host": "intj_host_device_get",
         }[backend_name]
     )
-    params, offset, nwords = _render_params(
+    params, offset, nwords, _, _ = _spec_key_layout(
         _resolve_annotations(
             device_kernel,
             {
@@ -3384,14 +3384,14 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
     from triton.compiler import make_backend
 
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(jit, extra),
         DeviceBinding.FIXED if bind_device else DeviceBinding.NOT_FIXED,
     )
-    plain_params, _, _ = _render_params(
+    plain_params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(axpy, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
@@ -3459,12 +3459,12 @@ def test_python_annotated_params_compile_like_triton():
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
     from triton.compiler import make_backend
 
     launch = make_launcher(python_annotated)
     module = module_of(launch)
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(python_annotated, None), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
@@ -3589,13 +3589,13 @@ def test_ast_source_hashes_as_triton_launch(kernel):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     jit = PARITY_KERNELS[kernel]
     backend = make_backend(current_target())
     for args in _parity_calls():
         for extra in _parity_annotations(_triton_facts(jit, args)):
-            params, _, _ = _render_params(
+            params, _, _, _, _ = _spec_key_layout(
                 _resolve_annotations(jit, extra), DeviceBinding.NOT_FIXED
             )
             source = _compiler_input(jit, params, args, backend)
@@ -3688,7 +3688,7 @@ def test_baked_int_specializes_like_triton(kernel):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     jit = {**PARITY_KERNELS, "i64": parity_i64, "u8": parity_u8}[kernel]
     backend = make_backend(current_target())
@@ -3696,7 +3696,7 @@ def test_baked_int_specializes_like_triton(kernel):
     for value in BAKED_VALUES[kernel]:
         args = (o, x, value, 1.5, 4)
         for annotation in _baked_annotations(jit, args):
-            params, _, _ = _render_params(
+            params, _, _, _, _ = _spec_key_layout(
                 _resolve_annotations(jit, {"s": annotation}), DeviceBinding.NOT_FIXED
             )
             source = _compiler_input(
@@ -3861,12 +3861,12 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
     from triton.compiler import make_backend
 
     launch = make_launcher(act_store)
     module = module_of(launch)
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(act_store, None), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
@@ -4258,7 +4258,7 @@ def annotated_baked(x, BLOCK, o, bias):
 def test_annotated_cuda_compile_only():
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
     from triton.backends.compiler import GPUTarget
     from triton.compiler import compile as triton_compile, make_backend
 
@@ -4274,7 +4274,7 @@ def test_annotated_cuda_compile_only():
             "bias": Argument(type=tl.int32, specialize=NEVER),
         },
     )
-    params, _, _ = _render_params(resolved, DeviceBinding.NOT_FIXED)
+    params, _, _, _, _ = _spec_key_layout(resolved, DeviceBinding.NOT_FIXED)
     source = _compiler_input(
         annotated_baked,
         params,
@@ -4452,11 +4452,11 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
     from triton.compiler import make_backend
 
     extra = {"x": annotation}
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
@@ -4494,13 +4494,13 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.backend import current_target
     from intj.launcher import _compiler_input
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
     from triton.compiler import make_backend
 
     base = torch.empty(16, device="cuda")
     large = torch.empty(2**29 + 8, device="cuda")
     extra = {"x": Argument(type=tl.pointer_type(tl.float32), specialize=specialize)}
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED
     )
     backend = make_backend(current_target())
@@ -4524,9 +4524,9 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
     from intj.annotation import DeviceBinding, _resolve_annotations
     from intj.launcher import _KernelCompiler
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(power_kernel, {"N": Constexpr()}), DeviceBinding.FIXED
     )
     state = _KernelCompiler(power_kernel, {}, launcher._live_knobs(), params=params)
@@ -4821,12 +4821,12 @@ def test_no_map_compiler_input_invariant(
 @pytest.mark.parametrize(
     "nparams,nconstexpr", [(1, 0), (1, 1), (6, 0), (7, 0), (8, 0), (7, 2), (8, 3)]
 )
-def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
+def test_spec_key_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     """The 7/8 parameter cases straddle the device byte's word boundary."""
     import importlib.util
 
     from intj.annotation import DeviceBinding, _resolve_annotations
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     names = [f"p{i}" for i in range(nparams)]
     cxnames = [f"C{i}" for i in range(nconstexpr)]
@@ -4841,7 +4841,7 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
-    params, device_offset, nwords = _render_params(
+    params, device_offset, nwords, _, _ = _spec_key_layout(
         _resolve_annotations(module.k, None), DeviceBinding.NOT_FIXED
     )
 
@@ -4862,7 +4862,7 @@ def test_render_params_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
 def _make_render_key(**overrides):
     """Returns a valid two-parameter `RenderKey` with `overrides` applied."""
     from intj.annotation import DeviceBinding, ResolvedParam
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     ordinary = CanonicalAnnotation(
         "argument", None, "auto", "auto", "auto", (), False, None, ()
@@ -4870,7 +4870,7 @@ def _make_render_key(**overrides):
     constexpr = CanonicalAnnotation(
         "constexpr", None, "auto", "auto", "auto", (), False, None, ()
     )
-    params, device_offset, nwords = _render_params(
+    params, device_offset, nwords, _, _ = _spec_key_layout(
         (ResolvedParam("x", 0, ordinary), ResolvedParam("BLOCK", 1, constexpr)),
         DeviceBinding.NOT_FIXED,
     )
@@ -6749,11 +6749,11 @@ def check_dynamic_invariant():
     from intj.backend import canonical_options, current_target
     from intj.launcher import _compiler_input, _live_knobs, _split_dynamic
     from intj.backend import _knob_options
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
     module, device = module_of(launch), torch.cuda.current_device()
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED
     )
     target = current_target()
@@ -6884,11 +6884,11 @@ def check_option_parameter_invariant():
     from intj.backend import canonical_options, current_target
     from intj.launcher import _compiler_input, _live_knobs
     from intj.backend import _knob_options
-    from intj.render.module import _render_params
+    from intj.render.module import _spec_key_layout
 
     launch = make_launcher(option_axpy, return_compiled=True)
     module, device = module_of(launch), torch.cuda.current_device()
-    params, _, _ = _render_params(
+    params, _, _, _, _ = _spec_key_layout(
         _resolve_annotations(option_axpy, None), DeviceBinding.NOT_FIXED
     )
     target = current_target()

@@ -340,7 +340,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     if grid_cpp is not None:
         from .grid import GridError, compile_grid
 
-        grid_params, _, _ = render_module._render_params(  # pyright: ignore[reportPrivateUsage]  # shared key layout
+        grid_params, _, _, _, _ = render_module._spec_key_layout(  # pyright: ignore[reportPrivateUsage]  # shared key layout
             resolved, DeviceBinding.NOT_FIXED
         )
         try:
@@ -436,7 +436,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     )
     device_binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
     args = (*(() if device is None else (device,)), *bound_values)
-    rendered, _, _ = render_module._render_params(params, device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
+    rendered, _, _, _, _ = render_module._spec_key_layout(params, device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
     doc = _launch_doc(
         rendered,
         device is not None,
@@ -734,7 +734,7 @@ class Launcher:
         if target is None:
             return _KernelCompiler(None)
         assert b.knob_values is not None, "GPU builds read knobs at the first call"
-        params, _, _ = render_module._render_params(b.params, b.device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
+        params, _, _, _, _ = render_module._spec_key_layout(b.params, b.device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
         return _KernelCompiler(
             b.jit_func,
             dict(b.compile_options),

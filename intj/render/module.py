@@ -441,14 +441,6 @@ def _spec_key_layout(
     )
 
 
-def _render_params(  # pyright: ignore[reportUnusedFunction]  # shared with launcher and tuning
-    resolved: tuple[ResolvedParam, ...], device_binding: DeviceBinding
-) -> tuple[tuple[Param, ...], int | None, int]:
-    """Places canonical key fields and numbers the arguments in the public call."""
-    params, device_offset, nwords, _, _ = _spec_key_layout(resolved, device_binding)
-    return params, device_offset, nwords
-
-
 def _dynamic_key_fields(name: str) -> tuple[KeyField, ...]:
     """Returns one dynamic value's key fields: a kind byte and 8 value bytes.
 
