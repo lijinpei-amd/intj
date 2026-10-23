@@ -46,8 +46,8 @@ target as separate invocations.
   packages, change any file in `ci/dockerfiles/` (e.g. bump a comment). The
   workflows start an image job only for unpublished tags.
 - `matrix.json`'s `torch` pins one version per minor in
-  `intj/torch_intf/torch_abi.toml`, with the pythons that have a CPU wheel for
-  it; `image.py matrix` refuses a mismatch. Adding a toml row means adding a
+  `intj/torch_intf/torch_abi/`, with the pythons that have a CPU wheel for
+  it; `image.py matrix` refuses a mismatch. Adding a version file means adding a
   pin. `torch_skip_modes` drops Torch access modes for one torch and python;
   each entry needs its reason here. 2.9.1 on 3.14t skips INTERPRETER: from
   several threads, `tensor.untyped_storage()` crashes it in

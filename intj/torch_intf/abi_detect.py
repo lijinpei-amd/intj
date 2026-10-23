@@ -4,7 +4,7 @@ Every offset is found by matching field values against what torch's own python
 accessors report, so an entry generated this way is verified by construction.
 Needs no compiler; `cpp_detect` is the independent check that does.
 
-    python -m intj.torch_intf.abi_detect   # prints a torch_abi.toml entry
+    python -m intj.torch_intf.abi_detect   # prints a versioned ABI entry
 """
 
 from __future__ import annotations
@@ -213,7 +213,7 @@ def _expected(t: Any) -> tuple[int, int, int]:
 
 
 def _main() -> None:
-    """Prints the entry for the running torch, to paste into `torch_abi.toml`."""
+    """Prints the running Torch entry for its `torch_abi/<major>.<minor>.toml`."""
     _imports.ensure_torch_imported()
     torch = _imports.torch
 

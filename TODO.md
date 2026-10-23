@@ -4,7 +4,7 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Correctness
 
-- **Support non-x86-64 hosts.** `torch_abi.toml` contains x86-64 tensor offsets,
+- **Support non-x86-64 hosts.** `torch_abi/` contains x86-64 tensor offsets,
   but `layout_for()` selects them by torch version and `PyObject` size on every
   host. Refuse RUNTIME_SHIM on other host ABIs until their offsets are measured and
   independently checked; add ARM64 layouts and run launcher tests there.

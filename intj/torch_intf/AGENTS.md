@@ -24,10 +24,11 @@ drags in pybind11, and does not check that at load. `cpp_detect` compiles it bes
 torch's own and refuses a torch where they differ. Any new layout assumption in C++
 code gets the same treatment: checked in `cpp_detect`, not at load.
 
-## The ABI table is a trust boundary
+## The ABI version files are a trust boundary
 
-It is pasted by hand, so its parser rejects malformed input with a `ValueError`
-naming the file, never skips it.
+Each `torch_abi/<major>.<minor>.toml` contains exactly the matching version
+table, with its measured offsets and dtypes together. The parser rejects malformed
+input with a `ValueError` naming the file, never skips it.
 
 ## Import torch and triton lazily
 

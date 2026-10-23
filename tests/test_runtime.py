@@ -74,6 +74,59 @@ int32_t stub_launch(void *f, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t bx,
 const char *stub_error(int32_t status) { return "stub failure"; }
 """
 
+_ABI_ENTRY = """["2.9"]
+cdata = 8
+storage = 16
+storage_offset = 152
+numel = 160
+data_type = 168
+s_data = 16
+s_nbytes = 48
+dtypes = [["uint8", 1], ["int8", 1]]
+"""
+
+
+def test_versioned_abi_files_are_loaded_together(tmp_path):
+    from intj.torch_intf.torch_abi import _load_abi
+
+    (tmp_path / "2.9.toml").write_text(_ABI_ENTRY)
+    (tmp_path / "2.10.toml").write_text(_ABI_ENTRY.replace('"2.9"', '"2.10"'))
+    offsets = {
+        "cdata": 8,
+        "storage": 16,
+        "storage_offset": 152,
+        "numel": 160,
+        "data_type": 168,
+        "s_data": 16,
+        "s_nbytes": 48,
+    }
+    assert _load_abi(tmp_path) == {
+        (2, 9): (offsets, {0: ("uint8", 1), 1: ("int8", 1)}),
+        (2, 10): (offsets, {0: ("uint8", 1), 1: ("int8", 1)}),
+    }
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {},
+        {"2.9.toml": ""},
+        {"2.9.toml": "["},
+        {"2.10.toml": _ABI_ENTRY},
+        {"02.9.toml": _ABI_ENTRY},
+        {"2.9.toml": _ABI_ENTRY.replace('"2.9"', '"02.9"')},
+        {"2.9.toml": _ABI_ENTRY + _ABI_ENTRY.replace('"2.9"', '"2.10"')},
+    ],
+)
+def test_versioned_abi_files_refuse_bad_layout_data(tmp_path, files):
+    from intj.torch_intf.torch_abi import _load_abi
+
+    for name, content in files.items():
+        (tmp_path / name).write_text(content)
+    with pytest.raises(ValueError, match=str(tmp_path)):
+        _load_abi(tmp_path)
+
+
 #: x: tensor, n: int, m: do_not_specialize int, f: float, flag: bool, BLOCK: constexpr
 _AUTO = CanonicalAnnotation(
     "argument", None, "auto", "auto", "auto", (), False, None, ()

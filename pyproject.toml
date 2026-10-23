@@ -19,7 +19,7 @@ include = ["intj*"]
 version = {attr = "intj._version.__version__"}
 
 [tool.setuptools.package-data]
-intj = ["runtime/*", "render/*.jinja", "python_intf/*.h", "torch_intf/torch_abi.toml"]
+intj = ["runtime/*", "render/*.jinja", "python_intf/*.h", "torch_intf/torch_abi/*.toml"]
 
 [tool.pyright]
 pythonVersion = "3.8"

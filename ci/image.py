@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 CI = pathlib.Path(__file__).resolve().parent
-TORCH_ABI = CI.parent / "intj" / "torch_intf" / "torch_abi.toml"
+TORCH_ABI = CI.parent / "intj" / "torch_intf" / "torch_abi"
 DOCKERFILES = CI / "dockerfiles"
 REPO = os.environ.get("INTJ_IMAGE_REPO", "ghcr.io/lijinpei-amd/intj-ci")
 PINS = {
@@ -108,13 +108,17 @@ def tests(data):
     less the ones `torch_skip_modes` lists for that torch and python.
 
     The pins must cover exactly the torch versions intj has verified layouts
-    for, so a new torch_abi.toml row cannot go untested.
+    for, so a new ABI version file cannot go untested.
     """
     pinned = {".".join(v.split(".")[:2]) for v in data["torch"]}
-    verified = set(re.findall(r'^\["(\d+\.\d+)"\]', TORCH_ABI.read_text(), re.M))
+    verified = {
+        version
+        for path in TORCH_ABI.glob("*.toml")
+        for version in re.findall(r'^\["(\d+\.\d+)"\]', path.read_text(), re.M)
+    }
     if pinned != verified:
         die(
-            "matrix.json pins torch %s, torch_abi.toml verifies %s"
+            "matrix.json pins torch %s, torch_abi/ verifies %s"
             % (sorted(pinned), sorted(verified))
         )
     out = []

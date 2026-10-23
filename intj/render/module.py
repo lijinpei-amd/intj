@@ -320,7 +320,7 @@ def _unverified_torch_message() -> str:
         f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
         "dtypes no longer match the recorded entry, or CPython's object header "
         "makes the tensor offset unrepresentable; pass "
-        "torch_access_mode=TorchAccessMode.INTERPRETER, or add an entry to intj/torch_intf/torch_abi.toml "
+        "torch_access_mode=TorchAccessMode.INTERPRETER, or add a version file to intj/torch_intf/torch_abi/ "
         "with `python -m intj.torch_intf.abi_detect` on this torch version"
     )
 

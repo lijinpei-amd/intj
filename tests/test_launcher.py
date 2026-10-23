@@ -5766,17 +5766,17 @@ def test_recorded_dtypes_match_this_torch():
     recorded = _DTYPES.get(torch_version())
     assert recorded is not None, "no stanza for the torch the suite is running against"
     assert recorded == live_dtypes(), (
-        "intj/torch_intf/torch_abi.toml is stale; regenerate with `python -m intj.torch_intf.abi_detect`"
+        "intj/torch_intf/torch_abi/ is stale; regenerate with `python -m intj.torch_intf.abi_detect`"
     )
 
 
 def test_abi_file_parses_and_refuses_broken_entries():
-    """`torch_abi.toml` is pasted by hand, so its parser is a trust boundary."""
+    """ABI entries are pasted by hand, so their parser is a trust boundary."""
     from intj.torch_intf.torch_abi import OFFSETS, _parse_abi
 
     offsets = "".join(f"{f} = {i}\n" for i, f in enumerate(OFFSETS))
     good = '["2.9"]\n' + offsets + 'dtypes = [["uint8", 1], ["int8", 1]]\n'
-    assert _parse_abi(good) == {
+    assert _parse_abi(good, "2.9.toml") == {
         (2, 9): (
             {f: i for i, f in enumerate(OFFSETS)},
             {0: ("uint8", 1), 1: ("int8", 1)},
@@ -5793,8 +5793,8 @@ def test_abi_file_parses_and_refuses_broken_entries():
         good.replace('["int8", 1]', '["int8", "1"]'),
         good.replace('["int8", 1]', '["int8", 1, 2]'),
     ):
-        with pytest.raises(ValueError, match="torch_abi.toml"):
-            _parse_abi(broken)
+        with pytest.raises(ValueError, match=r"2\.9\.toml"):
+            _parse_abi(broken, "2.9.toml")
 
 
 def test_drifted_dtypes_refuse_the_whole_stanza(monkeypatch):
