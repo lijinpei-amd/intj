@@ -275,7 +275,7 @@ def _verified_cpython_header() -> str:
         raise UnsupportedKernel(
             f"intj: no verified CPython layer for python {'%d.%d.%d' % cpython_abi.python_version()} "
             f"(have {', '.join('%d.%d' % v for v in cpython_abi.supported_versions())}); "
-            "run `python -m intj.python_intf.check` on it and add it to intj/python_intf/cpython_abi.py"
+            "run `python -m intj.tools.check` on it and add it to intj/python_intf/cpython_abi.py"
         )
     return header
 
@@ -321,7 +321,7 @@ def _unverified_torch_message() -> str:
         "dtypes no longer match the recorded entry, or CPython's object header "
         "makes the tensor offset unrepresentable; pass "
         "torch_access_mode=TorchAccessMode.INTERPRETER, or add a version file to intj/torch_intf/torch_abi/ "
-        "with `python -m intj.torch_intf.abi_detect` on this torch version"
+        "with `python -m intj.tools.abi_detect` on this torch version"
     )
 
 

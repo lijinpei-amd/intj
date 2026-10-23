@@ -20,7 +20,9 @@ the launcher is compiled as C++.
 | --- | --- |
 | [cpython_abi.py](cpython_abi.py) | Records supported Python versions, selects the header, and reads the interpreter's object header size. |
 | [cpython_abi.h](cpython_abi.h) | Implements scalar readers, compatibility shims, and the module mutex. |
-| [check.py](check.py) | Compiles the header and compares its results with the running interpreter. |
+
+The checker, [tools/check.py](../tools/check.py), compiles the header and
+compares its results with the running interpreter.
 
 ## Every CPython internal lives here
 
@@ -147,7 +149,7 @@ per-launch CPython size query.
 From the repository root, check the active interpreter:
 
 ```sh
-python -m intj.python_intf.check
+python -m intj.tools.check
 ```
 
 The command needs a C compiler (`CC`, defaulting to `cc`) and the
@@ -182,7 +184,7 @@ those interpreters.
 
 ## Adding a Python version
 
-1. Run `python -m intj.python_intf.check cpython_abi.h` on the candidate
+1. Run `python -m intj.tools.check cpython_abi.h` on the candidate
    interpreter. Naming the header allows testing before it is in `_HEADERS`.
 2. Check both regular and free-threaded builds when the version provides both
    (for example, `uv run --no-project --python cpython-3.Nt ...`). Inspect

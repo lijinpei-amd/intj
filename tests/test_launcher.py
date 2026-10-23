@@ -75,7 +75,7 @@ from intj.render import module as render_module
 from intj.render.deps import INSTALL_ERRORS, install
 from intj.render.build import build, compiler_identity
 from intj.render.key import DynamicSlot, RenderKey
-from intj.torch_intf.abi_detect import probe_layout
+from intj.tools.abi_detect import probe_layout
 from intj.torch_intf.torch_abi import (
     NDTYPES,
     TorchAccessMode,
@@ -5220,7 +5220,7 @@ def test_importing_intj_imports_neither_triton_nor_torch():
     """Every module reaches them through `intj._imports`, on first use."""
     code = (
         "import sys, intj, intj.compat, intj.grid, intj.heuristic, intj.tuning, "
-        "intj.torch_intf.abi_detect, intj.torch_intf.cpp_detect; "
+        "intj.tools.check, intj.tools.abi_detect, intj.tools.cpp_detect; "
         "print(sorted({'triton', 'torch'} & set(sys.modules)))"
     )
     run = subprocess.run(
@@ -5766,7 +5766,7 @@ def test_recorded_dtypes_match_this_torch():
     recorded = _DTYPES.get(torch_version())
     assert recorded is not None, "no stanza for the torch the suite is running against"
     assert recorded == live_dtypes(), (
-        "intj/torch_intf/torch_abi/ is stale; regenerate with `python -m intj.torch_intf.abi_detect`"
+        "intj/torch_intf/torch_abi/ is stale; regenerate with `python -m intj.tools.abi_detect`"
     )
 
 
@@ -6197,7 +6197,7 @@ def test_hardcoded_layout_matches_this_torch():
 
     `probe_layout` finds each offset by matching field values against torch's own
     accessors, so it is an independent oracle for the hardcoded row -- and the
-    thing that generates entries in the first place (`python -m intj.torch_intf.abi_detect`).
+    thing that generates entries in the first place (`python -m intj.tools.abi_detect`).
     """
     table, probed = layout_for(), probe_layout(cpython_abi.pyobject_size())
     assert table is not None, "no entry for the torch the suite is running against"
@@ -6213,7 +6213,7 @@ def test_hardcoded_layout_matches_torch_headers():
     must be sizeless placeholders, or the table is missing a dtype.
     """
     from intj.render.build import cxx_toolchain
-    from intj.torch_intf.cpp_detect import detect
+    from intj.tools.cpp_detect import detect
     from intj.torch_intf.torch_abi import OFFSETS
 
     if cxx_toolchain() is None:
@@ -6413,7 +6413,7 @@ def test_custom_sizes_policy_tensors_are_a_known_limitation():
     This pins the behaviour so that a torch change, or a decision to start
     detecting these, shows up here instead of silently.
     """
-    from intj.torch_intf.abi_detect import _read
+    from intj.tools.abi_detect import _read
 
     layout = layout_for()
     assert layout is not None

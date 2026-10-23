@@ -2,7 +2,7 @@
 
 Start with the five-file reading path below, then use the file sections to inspect a symbol’s inputs, dependencies and users.
 
-**Reviewed baseline:** `a2a6c51984a315330cfd64a691bb8ecf11fe4e7e`, on 2026-10-23. This source-level map includes the launcher-base rename based on that revision; affected source anchors have been refreshed. Future code edits can invalidate signatures, line anchors and dependency relationships.
+**Reviewed baseline:** `0fa6f75f145555569ca0bec6b1defb16ccdd8111`, on 2026-10-23. This source-level map includes the move of ABI maintenance scripts into `intj/tools/` based on that revision; affected source anchors have been refreshed. Future code edits can invalidate signatures, line anchors and dependency relationships.
 
 ## Start here
 
@@ -82,7 +82,7 @@ Native sections include C/C++ functions, record/struct types, compatibility shim
 
 **“Depends on”** names direct substantive helpers, imports, fields, emitted C helpers and external APIs; file imports also provide shared context for that file’s definitions. **“Used by”** includes callers and non-call uses such as inheritance, type annotations, re-exports, registration tables, C slots, fixture injection and callback passing. Test references can be grouped by concrete file. The relationships are source-derived and conservative: Python dynamic receiver types, arbitrary user callbacks, `getattr`, copied Triton objects and runtime driver symbols cannot be exhaustively resolved by static inspection. “No resolved named reference” does not mean an API is unused.
 
-**Validation:** verified coverage of all 51 `intj/` files (including the 13 versioned ABI files), 337/337 named Python definitions and 14/14 lambdas; checked 911 source links, navigation, table structure and document whitespace. For the ABI data split, `PYTHON=/tmp/gb2/bin/python ninja -C ci` passed lint, formatting and Pyright (0 errors), with 179 CPU tests passed and 14 skipped. `PYTHON=/tmp/gb2/bin/python ninja -C ci test-gpu` passed the full suite: 1134 passed, 15 skipped and 2 Torch warnings in 52.99 seconds. Parsed offsets and dtype maps for all 13 versions exactly match the baseline. The wheel built through `ninja -C ci wheel` contains all 13 data files and loads the identical ABI map in an isolated import without Torch/Triton. CI coverage still includes all 13 versions across 149 jobs. These results cover this checkout and environment; skipped cases and other Torch/Python CI environments remain **untested** here. No separate launch benchmark was run, so no performance change is established.
+**Validation:** verified file sections for all 52 `intj/` files (including four ABI-tool files and 13 versioned ABI files), a census of 337 named Python definitions and 14 lambdas, and 911 valid source links. For the tools move, `PYTHON=/tmp/gb2/bin/python ninja -C ci` passed formatting and Pyright (0 errors), with 179 CPU tests passed and 14 skipped. Four focused launcher tests passed for import isolation, both ABI detectors, and tensor-reader behavior, with one Torch warning. All three new CLI commands passed, including the CPython checker's explicit-header option; Torch 2.14 runtime and C++ results match the recorded version file. Parsed offsets and dtype maps for all 13 versions are unchanged. The wheel built successfully; isolated imports and all three CLI commands passed from its extracted contents, with both Torch detectors matching the packaged ABI data. The full GPU suite was not rerun for this tools move; other Torch/Python CI environments remain **untested** here. No launch benchmark was run, so no performance change is established.
 
 ## Navigation
 
@@ -99,9 +99,10 @@ Native sections include C/C++ functions, record/struct types, compatibility shim
 | Package root | 14 | 230 |
 | Rendering and build | 7 | 74 |
 | Native runtime | 5 | 0 |
-| CPython interface | 6 | 6 |
-| Torch interface | 19 | 27 |
-| **Total** | **51** | **337** |
+| CPython interface | 5 | 4 |
+| Torch interface | 17 | 14 |
+| ABI tools | 4 | 15 |
+| **Total** | **52** | **337** |
 
 The Python census contains 271 functions/methods and 66 classes, plus 14 anonymous lambdas. Native functions/types, macro-generated families, Jinja helpers and embedded ABI-checker C add further rows.
 
@@ -113,7 +114,7 @@ Public package exports: launcher factory, option and annotation values, backend 
 
 **File dependencies:** `intj._version`, `intj.annotation`, `intj.kernel_cache`, `intj.launcher`, `intj.options`, `intj.torch_intf.torch_abi`, `typing`. Public API names come from annotation.py, launcher.py, options.py, kernel_cache.py, torch_intf/torch_abi.py, and _version.py; scalar tuples load through annotation.__getattr__.
 
-**Used by:** `benchmarks/bench_ffi_compare.py`, `benchmarks/bench_hip_module_launch.py`, `benchmarks/bench_intj_ffi_paths.py`, `benchmarks/bench_launch.py`, `benchmarks/bench_mix.py`, `intj/annotation.py`, `intj/backend.py`, `intj/compat.py`, `intj/grid.py`, `intj/heuristic.py`, `intj/render/deps.py`, `intj/launcher.py`, `intj/render/build.py`, `intj/render/module.py`, `intj/torch_intf/abi_detect.py`, `intj/torch_intf/cpp_detect.py`, `intj/torch_intf/torch_abi.py`, `intj/tuning.py`, `tests/test_annotation.py`, `tests/test_compat.py`, `tests/test_delayed.py`, `tests/test_grid.py`, `tests/test_kernel_cache.py`, `tests/test_launcher.py`, `tests/test_launcher_object.py`, `tests/test_python_compat.py`, `tests/test_return_compiled.py`, `tests/test_runtime.py`, `tests/test_tuned.py`.
+**Used by:** `benchmarks/bench_ffi_compare.py`, `benchmarks/bench_hip_module_launch.py`, `benchmarks/bench_intj_ffi_paths.py`, `benchmarks/bench_launch.py`, `benchmarks/bench_mix.py`, `intj/annotation.py`, `intj/backend.py`, `intj/compat.py`, `intj/grid.py`, `intj/heuristic.py`, `intj/render/deps.py`, `intj/launcher.py`, `intj/render/build.py`, `intj/render/module.py`, `intj/tools/abi_detect.py`, `intj/tools/cpp_detect.py`, `intj/torch_intf/torch_abi.py`, `intj/tuning.py`, `tests/test_annotation.py`, `tests/test_compat.py`, `tests/test_delayed.py`, `tests/test_grid.py`, `tests/test_kernel_cache.py`, `tests/test_launcher.py`, `tests/test_launcher_object.py`, `tests/test_python_compat.py`, `tests/test_return_compiled.py`, `tests/test_runtime.py`, `tests/test_tuned.py`.
 
 | Symbol and parameters | Responsibility | Depends on | Used by |
 | --- | --- | --- | --- |
@@ -125,7 +126,7 @@ The process-wide deferred-import gate. Caches Triton/Torch modules and the exact
 
 **File dependencies:** `functools`, `intj.errors`, `sys`, `torch`, `triton`, `triton._C.libtriton`, `triton._compile_warmup_state`, `triton._utils`, `triton.compiler`, `triton.language`, `triton.runtime`, `triton.runtime.autotuner`, `triton.runtime.driver`, `triton.runtime.jit`, `types`, `typing`. Triton and Torch imports are deferred inside functions; optional triton._compile_warmup_state is accepted when available. The interpreter class is inspected through sys.modules rather than imported.
 
-**Used by:** `intj/annotation.py`, `intj/backend.py`, `intj/compat.py`, `intj/grid.py`, `intj/heuristic.py`, `intj/render/deps.py`, `intj/launcher.py`, `intj/render/build.py`, `intj/render/module.py`, `intj/torch_intf/abi_detect.py`, `intj/torch_intf/cpp_detect.py`, `intj/torch_intf/torch_abi.py`, `intj/tuning.py`, `tests/test_compat.py`.
+**Used by:** `intj/annotation.py`, `intj/backend.py`, `intj/compat.py`, `intj/grid.py`, `intj/heuristic.py`, `intj/render/deps.py`, `intj/launcher.py`, `intj/render/build.py`, `intj/render/module.py`, `intj/tools/abi_detect.py`, `intj/tools/cpp_detect.py`, `intj/torch_intf/torch_abi.py`, `intj/tuning.py`, `tests/test_compat.py`.
 
 | Symbol and parameters | Responsibility | Depends on | Used by |
 | --- | --- | --- | --- |
@@ -133,7 +134,7 @@ The process-wide deferred-import gate. Caches Triton/Torch modules and the exact
 | [_find_triton](../intj/_imports.py#L81)<br>`_find_triton() -> types.ModuleType &#124; ModuleNotFoundError &#124; str` | Return the imported module, a missing-module error, or an unsupported version string; lru_cache remembers refusals without caching raised exceptions. | `tuple`, `map`, `version.split`, `functools.lru_cache` | `intj/_imports.py`: `ensure_triton_imported`; tests/bench/CI: `tests/test_launcher.py` |
 | [interpreted_function](../intj/_imports.py#L105)<br>`interpreted_function() -> Any` | Look up InterpretedFunction only if triton.runtime.interpreter is already in sys.modules. | `sys.modules.get`, `getattr` | `intj/launcher.py`: `_check_options` |
 | [_triton_required](../intj/_imports.py#L116)<br>`_triton_required(found: str) -> Exception` | Construct the install/version refusal exception with the discovered version suffix. | `UnsupportedKernel` | `intj/_imports.py`: `ensure_triton_imported` |
-| [ensure_torch_imported](../intj/_imports.py#L122)<br>`ensure_torch_imported() -> None` | Import Torch on first demand and retain it in the process-wide torch name. | deferred torch import; module-global torch cache | Torch ABI detection/builds, launch compilation/validation, compatibility calls and tensor type checks; `intj/compat.py`: `launch`; `intj/launcher.py`: `_check_options`; `intj/render/build.py`: `_lib_dirs_without_cpp_extension`; `intj/render/module.py`: `_cxx_abi`, `_torch_version_string`; `intj/torch_intf/abi_detect.py`: `_main`, `_probes`, `_selfcheck`; `intj/torch_intf/cpp_detect.py`: `measure`; `intj/torch_intf/torch_abi.py`: `dtype_index_table`, `live_dtypes`, `torch_version`; `intj/tuning.py`: `TunedCompileState._tune` |
+| [ensure_torch_imported](../intj/_imports.py#L122)<br>`ensure_torch_imported() -> None` | Import Torch on first demand and retain it in the process-wide torch name. | deferred torch import; module-global torch cache | Torch ABI detection/builds, launch compilation/validation, compatibility calls and tensor type checks; `intj/compat.py`: `launch`; `intj/launcher.py`: `_check_options`; `intj/render/build.py`: `_lib_dirs_without_cpp_extension`; `intj/render/module.py`: `_cxx_abi`, `_torch_version_string`; `intj/tools/abi_detect.py`: `_main`, `_probes`, `_selfcheck`; `intj/tools/cpp_detect.py`: `measure`; `intj/torch_intf/torch_abi.py`: `dtype_index_table`, `live_dtypes`, `torch_version`; `intj/tuning.py`: `TunedCompileState._tune` |
 
 ## `intj/_version.py`
 
@@ -563,7 +564,7 @@ Coverage: **35 / 35 source definitions**, including nested definitions.
 
 ## `intj/torch_intf/__init__.py`
 
-**Responsibility:** Describe Torch access modes and independent ABI detectors.
+**Responsibility:** Describe Torch access modes and point to independent ABI tools.
 
 **File dependencies:** No imports.
 
@@ -727,31 +728,10 @@ The template receives no Python calculation helpers: counts/offsets/test orderin
 
 | Symbol and parameters | Responsibility | Depends on | Used by |
 | --- | --- | --- | --- |
-| [python_version](../intj/python_intf/cpython_abi.py#L27)<br>`python_version() -> tuple[int, int, int]` | Return exact running (major, minor, micro) version. | sys.version_info | [(module initialization)](../intj/python_intf/check.py#L140); [header_for](../intj/python_intf/cpython_abi.py#L39); [_build_module](../intj/render/module.py#L133); [_verified_cpython_header](../intj/render/module.py#L276); [_make_render_key](../tests/test_launcher.py#L4873); [test_render_rejects_mismatched_free_threaded_headers](../tests/test_launcher.py#L5001); [_key](../tests/test_runtime.py#L239) |
+| [python_version](../intj/python_intf/cpython_abi.py#L27)<br>`python_version() -> tuple[int, int, int]` | Return exact running (major, minor, micro) version. | sys.version_info | [(module initialization)](../intj/tools/check.py#L140); [header_for](../intj/python_intf/cpython_abi.py#L39); [_build_module](../intj/render/module.py#L133); [_verified_cpython_header](../intj/render/module.py#L276); [_make_render_key](../tests/test_launcher.py#L4873); [test_render_rejects_mismatched_free_threaded_headers](../tests/test_launcher.py#L5001); [_key](../tests/test_runtime.py#L239) |
 | [supported_versions](../intj/python_intf/cpython_abi.py#L32)<br>`supported_versions() -> list[tuple[int, int]]` | Return sorted major/minor allowlist entries. | _HEADERS | [_verified_cpython_header](../intj/render/module.py#L277) |
-| [header_for](../intj/python_intf/cpython_abi.py#L37)<br>`header_for(version: tuple[int, ...] &#124; None=None) -> str &#124; None` | Select header by explicit or running major/minor; return None for an unverified version. | python_version; _HEADERS | [check](../intj/python_intf/check.py#L100); [_verified_cpython_header](../intj/render/module.py#L273); [_build](../tests/test_kernel_cache.py#L89); [_make_render_key](../tests/test_launcher.py#L4875); [test_render_rejects_mismatched_free_threaded_headers](../tests/test_launcher.py#L5002); [test_integer_decoder_matches_python_on_this_interpreter](../tests/test_python_compat.py#L59); [_key](../tests/test_runtime.py#L241); [test_verified_python_versions_share_one_header](../tests/test_runtime.py#L772) |
-| [pyobject_size](../intj/python_intf/cpython_abi.py#L43)<br>`pyobject_size() -> int` | Read object.__basicsize__ as interpreter-reported sizeof(PyObject), including free-threaded object headers. | Built-in object type | [check](../intj/python_intf/check.py#L106); [check](../intj/python_intf/check.py#L108); [_main](../intj/torch_intf/abi_detect.py#L220); [dtype_code](../intj/torch_intf/torch_abi.py#L82); [layout_for](../intj/torch_intf/torch_abi.py#L319); [tests/test_launcher.py (4 source references)](../tests/test_launcher.py#L6023); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L379); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L381); [test_runtime_shim_rejects_rebased_cdata_overflow](../tests/test_runtime.py#L524) |
-
-## `intj/python_intf/check.py`
-
-**Responsibility:** Compile a temporary ABI probe and compare exact integer/float/header/exception reads with the active interpreter.
-
-**File dependencies:** Local cpython_abi header_for/pyobject_size/python_version; stdlib ctypes/os/pathlib/subprocess/sys/sysconfig/tempfile; external CC (default cc), Python.h and selected cpython_abi.h. No Torch/Triton/GPU.
-
-**Used by:** CLI python -m intj.python_intf.check; runtime checker tests.
-
-Module `__main__` chooses optional header argument, prints mismatch details plus Python/build status, and exits 1 for mismatch. Embedded C probe functions follow; they are exported through ctypes, not Python module methods.
-
-| Symbol and parameters | Responsibility | Depends on | Used by |
-| --- | --- | --- | --- |
-| [_build](../intj/python_intf/check.py#L57)<br>`_build(header: str, out: pathlib.Path) -> ctypes.PyDLL` | Write C probe, compile shared object with selected header and interpreter includes, load with PyDLL and install ctypes signatures. | _SOURCE; CC/subprocess; sysconfig include; ctypes.PyDLL | [check](../intj/python_intf/check.py#L105) |
-| [check](../intj/python_intf/check.py#L91)<br>`check(header: str &#124; None=None) -> list[str]` | Select header and collect all disagreements for object size, signed/unsigned width boundaries, exception roundtrip and exact float hex values. | header_for; pyobject_size; _build; _INTS/_FLOATS; ctypes; tempfile | [(module initialization)](../intj/python_intf/check.py#L136); [test_cpython_layer_matches_this_python](../tests/test_runtime.py#L768) |
-
-| [check_int](../intj/python_intf/check.py#L32)<br>`check_int(PyObject *o, uint64_t *out)` | Expose decoded integer width category and bits. | intj_as_int | check via configured ctypes.PyDLL export |
-| [check_i64](../intj/python_intf/check.py#L33)<br>`check_i64(PyObject *o, int64_t *out)` | Expose signed 64-bit reader success/failure. | intj_as_i64 | check via configured ctypes.PyDLL export |
-| [check_float](../intj/python_intf/check.py#L34)<br>`check_float(PyObject *o)` | Expose stored float double. | INTJ_FLOAT_VALUE | check via configured ctypes.PyDLL export |
-| [check_pyobject_size](../intj/python_intf/check.py#L35)<br>`check_pyobject_size(void)` | Expose compiler sizeof(PyObject). | Python.h | check via configured ctypes.PyDLL export |
-| [check_reraise](../intj/python_intf/check.py#L37)<br>`check_reraise(void)` | Set ValueError(inner), fetch/restore raised exception and return NULL to ctypes. | PyErr_GetRaisedException/PyErr_SetRaisedException | check via configured ctypes.PyDLL export |
+| [header_for](../intj/python_intf/cpython_abi.py#L37)<br>`header_for(version: tuple[int, ...] &#124; None=None) -> str &#124; None` | Select header by explicit or running major/minor; return None for an unverified version. | python_version; _HEADERS | [check](../intj/tools/check.py#L100); [_verified_cpython_header](../intj/render/module.py#L273); [_build](../tests/test_kernel_cache.py#L89); [_make_render_key](../tests/test_launcher.py#L4875); [test_render_rejects_mismatched_free_threaded_headers](../tests/test_launcher.py#L5002); [test_integer_decoder_matches_python_on_this_interpreter](../tests/test_python_compat.py#L59); [_key](../tests/test_runtime.py#L241); [test_verified_python_versions_share_one_header](../tests/test_runtime.py#L772) |
+| [pyobject_size](../intj/python_intf/cpython_abi.py#L43)<br>`pyobject_size() -> int` | Read object.__basicsize__ as interpreter-reported sizeof(PyObject), including free-threaded object headers. | Built-in object type | [check](../intj/tools/check.py#L106); [check](../intj/tools/check.py#L108); [_main](../intj/tools/abi_detect.py#L220); [dtype_code](../intj/torch_intf/torch_abi.py#L82); [layout_for](../intj/torch_intf/torch_abi.py#L319); [tests/test_launcher.py (4 source references)](../tests/test_launcher.py#L6023); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L379); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L381); [test_runtime_shim_rejects_rebased_cdata_overflow](../tests/test_runtime.py#L524) |
 
 ## `intj/torch_intf/torch_abi.py`
 
@@ -766,11 +746,11 @@ Module `__main__` chooses optional header argument, prints mismatch details plus
 | Symbol and parameters | Responsibility | Depends on | Used by |
 | --- | --- | --- | --- |
 | [TorchAccessMode](../intj/torch_intf/torch_abi.py#L31)<br>`TorchAccessMode(enum.Enum)` | Enum choosing interpreter calls, verified runtime offsets, or compiler-resolved C++ field reads; inherits Enum value constructor, no custom methods. Values INTERPRETER=interpreter, RUNTIME_SHIM=runtime_shim, STATIC_COMPILE=static_compile. | enum.Enum | [_BuildOptions](../intj/launcher.py#L119); [_BuildOptions](../intj/launcher.py#L132); [_check_options](../intj/launcher.py#L253); [MakeLauncherKwargs](../intj/options.py#L65); [MakeLauncherOption](../intj/options.py#L31); [build_flags](../intj/render/build.py#L276); [digest_flags](../intj/render/build.py#L316); [_build_module.loaded](../intj/render/module.py#L162); [_build_module.loaded](../intj/render/module.py#L168); [_build_module.loaded](../intj/render/module.py#L171); [_resolve_torch_access_mode](../intj/render/module.py#L284); [_resolve_torch_access_mode](../intj/render/module.py#L285); [_resolve_torch_access_mode](../intj/render/module.py#L301); [_resolve_torch_access_mode](../intj/render/module.py#L303); [_resolve_torch_access_mode](../intj/render/module.py#L311); [_resolve_torch_access_mode](../intj/render/module.py#L313); [_resolve_torch_access_mode](../intj/render/module.py#L314); [(module initialization)](../tests/test_delayed.py#L27); [tests/test_launcher.py (123 source references)](../tests/test_launcher.py#L322); [(module initialization)](../tests/test_launcher_object.py#L32); [tests/test_runtime.py (10 source references)](../tests/test_runtime.py#L171) |
-| [TensorABI](../intj/torch_intf/torch_abi.py#L43)<br>`TensorABI(cdata: int, storage: int, storage_offset: int, numel: int, data_type: int, s_data: int, s_nbytes: int, itemsize: bytes)` | Record seven verified pointer/field offsets plus 64-byte dtype itemsize table; cdata is relative to PyObject_HEAD end. Fields are the constructor parameters shown; frozen dataclass generates __init__, __repr__, __eq__, __hash__, __setattr__, and __delattr__. | dataclasses; bytes | [_read](../intj/torch_intf/abi_detect.py#L195); [_selfcheck](../intj/torch_intf/abi_detect.py#L173); [probe_layout](../intj/torch_intf/abi_detect.py#L100); [probe_layout](../intj/torch_intf/abi_detect.py#L169); [(module initialization)](../intj/torch_intf/torch_abi.py#L206); [layout_for](../intj/torch_intf/torch_abi.py#L300); [layout_for](../intj/torch_intf/torch_abi.py#L322) |
+| [TensorABI](../intj/torch_intf/torch_abi.py#L43)<br>`TensorABI(cdata: int, storage: int, storage_offset: int, numel: int, data_type: int, s_data: int, s_nbytes: int, itemsize: bytes)` | Record seven verified pointer/field offsets plus 64-byte dtype itemsize table; cdata is relative to PyObject_HEAD end. Fields are the constructor parameters shown; frozen dataclass generates __init__, __repr__, __eq__, __hash__, __setattr__, and __delattr__. | dataclasses; bytes | [_read](../intj/tools/abi_detect.py#L195); [_selfcheck](../intj/tools/abi_detect.py#L173); [probe_layout](../intj/tools/abi_detect.py#L100); [probe_layout](../intj/tools/abi_detect.py#L169); [(module initialization)](../intj/torch_intf/torch_abi.py#L206); [layout_for](../intj/torch_intf/torch_abi.py#L300); [layout_for](../intj/torch_intf/torch_abi.py#L322) |
 | [TensorABI.as_args](../intj/torch_intf/torch_abi.py#L60)<br>`as_args(self) -> tuple[Any, ...]` | Return offsets in fixed C setter order followed by itemsize bytes. | TensorABI fields | [render.module._build_module.loaded](../intj/render/module.py#L162) calls layout.as_args(); runtime/launcher tests configure extension ABI. |
-| [dtype_code](../intj/torch_intf/torch_abi.py#L74)<br>`dtype_code(dtype: Any) -> int` | Read signed ScalarType byte directly after dtype singleton PyObject header. | ctypes.c_int8.from_address; pyobject_size | [_expected](../intj/torch_intf/abi_detect.py#L212); [probe_layout](../intj/torch_intf/abi_detect.py#L139); [dtype_index_table](../intj/torch_intf/torch_abi.py#L172); [live_dtypes](../intj/torch_intf/torch_abi.py#L105); [tests/test_launcher.py (6 source references)](../tests/test_launcher.py#L5749) |
-| [live_dtypes](../intj/torch_intf/torch_abi.py#L86)<br>`live_dtypes() -> dict[int, tuple[str, int]]` | Enumerate Torch namespace dtype singletons, canonical spelling and itemsize by valid code; memoized and avoids tensor allocation/GPU initialization. | _imports.ensure_torch_imported; dtype_code; torch.dtype/itemsize; NDTYPES | [_pointer_types](../intj/render/module.py#L253); [_main](../intj/torch_intf/abi_detect.py#L225); [probe_layout](../intj/torch_intf/abi_detect.py#L169); [itemsize_table](../intj/torch_intf/torch_abi.py#L136); [test_drifted_dtypes_refuse_the_whole_stanza](../tests/test_launcher.py#L5804); [test_live_dtypes_have_no_holes](../tests/test_launcher.py#L5828); [test_recorded_dtypes_match_this_torch](../tests/test_launcher.py#L5768) |
-| [itemsize_bytes](../intj/torch_intf/torch_abi.py#L111)<br>`itemsize_bytes(dtypes: dict[int, tuple[str, int]]) -> bytes` | Build zero-filled 64-byte element-size table from dtype map; zero remains absence sentinel. | NDTYPES; bytearray | [probe_layout](../intj/torch_intf/abi_detect.py#L169); [itemsize_table](../intj/torch_intf/torch_abi.py#L138) |
+| [dtype_code](../intj/torch_intf/torch_abi.py#L74)<br>`dtype_code(dtype: Any) -> int` | Read signed ScalarType byte directly after dtype singleton PyObject header. | ctypes.c_int8.from_address; pyobject_size | [_expected](../intj/tools/abi_detect.py#L212); [probe_layout](../intj/tools/abi_detect.py#L139); [dtype_index_table](../intj/torch_intf/torch_abi.py#L172); [live_dtypes](../intj/torch_intf/torch_abi.py#L105); [tests/test_launcher.py (6 source references)](../tests/test_launcher.py#L5749) |
+| [live_dtypes](../intj/torch_intf/torch_abi.py#L86)<br>`live_dtypes() -> dict[int, tuple[str, int]]` | Enumerate Torch namespace dtype singletons, canonical spelling and itemsize by valid code; memoized and avoids tensor allocation/GPU initialization. | _imports.ensure_torch_imported; dtype_code; torch.dtype/itemsize; NDTYPES | [_pointer_types](../intj/render/module.py#L253); [_main](../intj/tools/abi_detect.py#L225); [probe_layout](../intj/tools/abi_detect.py#L169); [itemsize_table](../intj/torch_intf/torch_abi.py#L136); [test_drifted_dtypes_refuse_the_whole_stanza](../tests/test_launcher.py#L5804); [test_live_dtypes_have_no_holes](../tests/test_launcher.py#L5828); [test_recorded_dtypes_match_this_torch](../tests/test_launcher.py#L5768) |
+| [itemsize_bytes](../intj/torch_intf/torch_abi.py#L111)<br>`itemsize_bytes(dtypes: dict[int, tuple[str, int]]) -> bytes` | Build zero-filled 64-byte element-size table from dtype map; zero remains absence sentinel. | NDTYPES; bytearray | [probe_layout](../intj/tools/abi_detect.py#L169); [itemsize_table](../intj/torch_intf/torch_abi.py#L138) |
 | [itemsize_table](../intj/torch_intf/torch_abi.py#L124)<br>`itemsize_table(version: tuple[int, int] &#124; None=None) -> bytes &#124; None` | Return recorded dtype size table only when selected version has exact dtype map equality with running Torch; memoized. | _DTYPES; torch_version; live_dtypes; itemsize_bytes | [layout_for](../intj/torch_intf/torch_abi.py#L314); [tests/test_launcher.py (4 source references)](../tests/test_launcher.py#L5750) |
 | [dtype_index_table](../intj/torch_intf/torch_abi.py#L142)<br>`dtype_index_table() -> bytes` | Map live Torch ScalarType codes to deterministic 5-bit indices of Triton canonical element types; unsupported sentinel ff, refuse more than 32 types. | _imports.ensure_torch_imported/ensure_triton_imported; dtype_code; type_canonicalisation_dict; NDTYPES | [_build_module.loaded](../intj/render/module.py#L205); [tests/test_launcher.py (7 source references)](../tests/test_launcher.py#L5981) |
 | [_parse_abi](../intj/torch_intf/torch_abi.py#L209)<br>`_parse_abi(text: str, source: str) -> dict[tuple[int, int], tuple[dict[str, int], dict[int, tuple[str, int]]]]` | Strictly parse canonical version/offset/dtype schema, naming source in errors; require uint16 offsets and positive byte-sized item sizes, rejecting malformed pasted data with named ValueError. | tomllib.loads; OFFSETS; NDTYPES; nested bad | [_load_abi](../intj/torch_intf/torch_abi.py#L280); [test_abi_file_parses_and_refuses_broken_entries](../tests/test_launcher.py#L5779); [test_abi_file_parses_and_refuses_broken_entries](../tests/test_launcher.py#L5797) |
@@ -778,31 +758,64 @@ Module `__main__` chooses optional header argument, prints mismatch details plus
 | [_load_abi](../intj/torch_intf/torch_abi.py#L271)<br>`_load_abi(directory: pathlib.Path) -> dict[tuple[int, int], tuple[dict[str, int], dict[int, tuple[str, int]]]]` | Load all version files, refuse an empty directory or a file with zero/multiple/mismatched version tables, and combine validated data. | pathlib.Path.glob/read_text; _parse_abi; canonical version filename | [(module initialization)](../intj/torch_intf/torch_abi.py#L289); [test_versioned_abi_files_are_loaded_together](../tests/test_runtime.py#L89); [test_versioned_abi_files_refuse_bad_layout_data](../tests/test_runtime.py#L121) |
 | [supported_versions](../intj/torch_intf/torch_abi.py#L294)<br>`supported_versions() -> list[tuple[int, int]]` | Return sorted major/minor keys with measured layouts. | _LAYOUTS | [_unverified_torch_message](../intj/render/module.py#L320) |
 | [layout_for](../intj/torch_intf/torch_abi.py#L300)<br>`layout_for(version: tuple[int, int] &#124; None=None) -> TensorABI &#124; None` | Require 64-bit pointers, recorded offsets, exact dtype match and representable relative cdata plus interpreter header before constructing TensorABI. | ctypes.sizeof; torch_version; itemsize_table; _LAYOUTS; pyobject_size; TensorABI | [_build_module.loaded](../intj/render/module.py#L167); [_resolve_torch_access_mode](../intj/render/module.py#L301); [_resolve_torch_access_mode](../intj/render/module.py#L312); [tests/test_launcher.py (10 source references)](../tests/test_launcher.py#L5808); [tests/test_runtime.py (13 source references)](../tests/test_runtime.py#L173) |
-| [torch_version](../intj/torch_intf/torch_abi.py#L326)<br>`torch_version() -> tuple[int, int]` | Return memoized running Torch major/minor from complete version string. | _imports.ensure_torch_imported; torch.__version__ | [_build_module.loaded](../intj/render/module.py#L179); [_main](../intj/torch_intf/abi_detect.py#L237); [itemsize_table](../intj/torch_intf/torch_abi.py#L135); [layout_for](../intj/torch_intf/torch_abi.py#L312); [test_recorded_dtypes_match_this_torch](../tests/test_launcher.py#L5766); [_key](../tests/test_runtime.py#L237) |
+| [torch_version](../intj/torch_intf/torch_abi.py#L326)<br>`torch_version() -> tuple[int, int]` | Return memoized running Torch major/minor from complete version string. | _imports.ensure_torch_imported; torch.__version__ | [_build_module.loaded](../intj/render/module.py#L179); [_main](../intj/tools/abi_detect.py#L237); [itemsize_table](../intj/torch_intf/torch_abi.py#L135); [layout_for](../intj/torch_intf/torch_abi.py#L312); [test_recorded_dtypes_match_this_torch](../tests/test_launcher.py#L5766); [_key](../tests/test_runtime.py#L237) |
 
-## `intj/torch_intf/abi_detect.py`
+## `intj/tools/__init__.py`
+
+**Responsibility:** Describe the ABI checking and generation tools and their CLI entry points.
+
+**File dependencies:** No imports; package docstring only. Tools read definitions from `python_intf/` and `torch_intf/` when imported or run.
+
+**Used by:** ABI-tool imports, CLI module execution and maintainers; launcher code does not import tools.
+
+| Symbol and parameters | Responsibility | Depends on | Used by |
+| --- | --- | --- | --- |
+| — | No executable definitions; package docstring only. | — | Package imports and readers. |
+
+## `intj/tools/check.py`
+
+**Responsibility:** Compile a temporary ABI probe and compare exact integer/float/header/exception reads with the active interpreter.
+
+**File dependencies:** Local python_intf.cpython_abi header_for/pyobject_size/python_version; stdlib ctypes/os/pathlib/subprocess/sys/sysconfig/tempfile; external CC (default cc), Python.h and selected cpython_abi.h. No Torch/Triton/GPU.
+
+**Used by:** CLI python -m intj.tools.check; runtime checker tests.
+
+Module `__main__` chooses optional header argument, prints mismatch details plus Python/build status, and exits 1 for mismatch. Embedded C probe functions follow; they are exported through ctypes, not Python module methods.
+
+| Symbol and parameters | Responsibility | Depends on | Used by |
+| --- | --- | --- | --- |
+| [_build](../intj/tools/check.py#L57)<br>`_build(header: str, out: pathlib.Path) -> ctypes.PyDLL` | Write C probe, compile shared object with selected header and interpreter includes, load with PyDLL and install ctypes signatures. | _SOURCE; CC/subprocess; sysconfig include; _PYTHON_INTF header directory; ctypes.PyDLL | [check](../intj/tools/check.py#L105) |
+| [check](../intj/tools/check.py#L91)<br>`check(header: str &#124; None=None) -> list[str]` | Select header and collect all disagreements for object size, signed/unsigned width boundaries, exception roundtrip and exact float hex values. | header_for; pyobject_size; _build; _INTS/_FLOATS; ctypes; tempfile | [(module initialization)](../intj/tools/check.py#L136); [test_cpython_layer_matches_this_python](../tests/test_runtime.py#L768) |
+
+| [check_int](../intj/tools/check.py#L32)<br>`check_int(PyObject *o, uint64_t *out)` | Expose decoded integer width category and bits. | intj_as_int | check via configured ctypes.PyDLL export |
+| [check_i64](../intj/tools/check.py#L33)<br>`check_i64(PyObject *o, int64_t *out)` | Expose signed 64-bit reader success/failure. | intj_as_i64 | check via configured ctypes.PyDLL export |
+| [check_float](../intj/tools/check.py#L34)<br>`check_float(PyObject *o)` | Expose stored float double. | INTJ_FLOAT_VALUE | check via configured ctypes.PyDLL export |
+| [check_pyobject_size](../intj/tools/check.py#L35)<br>`check_pyobject_size(void)` | Expose compiler sizeof(PyObject). | Python.h | check via configured ctypes.PyDLL export |
+| [check_reraise](../intj/tools/check.py#L37)<br>`check_reraise(void)` | Set ValueError(inner), fetch/restore raised exception and return NULL to ctypes. | PyErr_GetRaisedException/PyErr_SetRaisedException | check via configured ctypes.PyDLL export |
+
+## `intj/tools/abi_detect.py`
 
 **Responsibility:** Generate verified runtime Torch layouts by intersecting observed field positions across diverse CPU tensors and self-checking address arithmetic.
 
-**File dependencies:** Local _imports; cpython_abi.pyobject_size; torch_abi OFFSETS/TensorABI/dtype_code/itemsize_bytes/live_dtypes/torch_version. Standard ctypes/functools/typing; deferred Torch; libc malloc_usable_size. No compiler/Triton required.
+**File dependencies:** Local _imports; python_intf.cpython_abi.pyobject_size; torch_intf.torch_abi OFFSETS/TensorABI/dtype_code/itemsize_bytes/live_dtypes/torch_version. Standard ctypes/functools/typing; deferred Torch; libc malloc_usable_size. No compiler/Triton required.
 
 **Used by:** CLI to generate torch_abi/*.toml entries; launcher/runtime ABI tests; never used on launch hot path.
 
 | Symbol and parameters | Responsibility | Depends on | Used by |
 | --- | --- | --- | --- |
-| [_probes](../intj/torch_intf/abi_detect.py#L37)<br>`_probes() -> list[Any]` | Construct diverse tensors/views including frombuffer storage with data/context pointer separation, nonzero offsets and differing numel/dtypes. | _imports.ensure_torch_imported; Torch CPU constructors | [_selfcheck](../intj/torch_intf/abi_detect.py#L183); [probe_layout](../intj/torch_intf/abi_detect.py#L124); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L368) |
-| [_malloc_usable_size](../intj/torch_intf/abi_detect.py#L72)<br>`_malloc_usable_size() -> Any` | Load/memoize libc allocation-size function and configure pointer/size ctypes signature. | ctypes.CDLL(None).malloc_usable_size | [_heap_window](../intj/torch_intf/abi_detect.py#L83) |
-| [_heap_window](../intj/torch_intf/abi_detect.py#L78)<br>`_heap_window(address: int, size: int) -> bytes` | Read at most requested bytes or actual new allocation size, preventing detector overreads. | _malloc_usable_size; _window | [probe_layout](../intj/torch_intf/abi_detect.py#L132); [probe_layout](../intj/torch_intf/abi_detect.py#L133) |
-| [_window](../intj/torch_intf/abi_detect.py#L86)<br>`_window(address: int, size: int) -> bytes` | Copy raw memory at given address/size into bytes. | ctypes.string_at | [_heap_window](../intj/torch_intf/abi_detect.py#L83); [probe_layout](../intj/torch_intf/abi_detect.py#L131); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L370) |
-| [_find_u64](../intj/torch_intf/abi_detect.py#L90)<br>`_find_u64(blob: bytes, want: int, align: int=8) -> set[int]` | Find aligned byte offsets matching signed/unsigned little-endian 8-byte target. | int.to_bytes; blob slices | [probe_layout](../intj/torch_intf/abi_detect.py#L136); [probe_layout](../intj/torch_intf/abi_detect.py#L137); [probe_layout](../intj/torch_intf/abi_detect.py#L138); [probe_layout](../intj/torch_intf/abi_detect.py#L142); [probe_layout](../intj/torch_intf/abi_detect.py#L143); [probe_layout](../intj/torch_intf/abi_detect.py#L145) |
-| [_find_u8](../intj/torch_intf/abi_detect.py#L96)<br>`_find_u8(blob: bytes, want: int) -> set[int]` | Find all single-byte offsets matching dtype code. | byte comparison | [probe_layout](../intj/torch_intf/abi_detect.py#L139) |
-| [probe_layout](../intj/torch_intf/abi_detect.py#L100)<br>`probe_layout(header_size: int) -> TensorABI &#124; None` | Intersect object/TensorImpl/StorageImpl match sets across probes, require one candidate per field, convert absolute cdata to relative and self-check new TensorABI. | _probes; _window/_heap_window; _find_u64/_find_u8; dtype_code; itemsize_bytes/live_dtypes; TensorABI; _selfcheck | [_main](../intj/torch_intf/abi_detect.py#L221); [test_hardcoded_layout_matches_this_torch](../tests/test_launcher.py#L6202); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L379); [test_runtime_shim_probe_refuses_slot_before_header](../tests/test_runtime.py#L388) |
-| [_selfcheck](../intj/torch_intf/abi_detect.py#L173)<br>`_selfcheck(layout: TensorABI, header_size: int) -> bool` | Compare reconstructed pointer/dtype/storage-size tuple against Torch accessors on normal/views/empty/sliced cases; add GPU tensors only if GPU already initialized. | _probes; _read; _expected; torch.cuda.is_initialized | [probe_layout](../intj/torch_intf/abi_detect.py#L170) |
-| [_read](../intj/torch_intf/abi_detect.py#L195)<br>`_read(layout: TensorABI, t: Any, header_size: int) -> tuple[int, int, int]` | Reproduce runtime-offset tensor reading and zero-numel NULL pointer rule in Python; refuse absent storage. | ctypes memory loads; TensorABI offsets/itemsize | [_selfcheck](../intj/torch_intf/abi_detect.py#L192); [test_custom_sizes_policy_tensors_are_a_known_limitation](../tests/test_launcher.py#L6422); [test_custom_sizes_policy_tensors_are_a_known_limitation](../tests/test_launcher.py#L6429) |
-| [_expected](../intj/torch_intf/abi_detect.py#L211)<br>`_expected(t: Any) -> tuple[int, int, int]` | Read authoritative data_ptr, dtype ScalarType and untyped-storage byte size. | Torch accessors; dtype_code | [_selfcheck](../intj/torch_intf/abi_detect.py#L192) |
-| [_main](../intj/torch_intf/abi_detect.py#L215)<br>`_main() -> None` | Generate selected version table text with all measured offsets and dense dtype pairs; refuse ambiguous layout or missing dtype codes. | pyobject_size; probe_layout; live_dtypes; OFFSETS; torch_version; print/SystemExit | [(module initialization)](../intj/torch_intf/abi_detect.py#L247) |
+| [_probes](../intj/tools/abi_detect.py#L37)<br>`_probes() -> list[Any]` | Construct diverse tensors/views including frombuffer storage with data/context pointer separation, nonzero offsets and differing numel/dtypes. | _imports.ensure_torch_imported; Torch CPU constructors | [_selfcheck](../intj/tools/abi_detect.py#L183); [probe_layout](../intj/tools/abi_detect.py#L124); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L368) |
+| [_malloc_usable_size](../intj/tools/abi_detect.py#L72)<br>`_malloc_usable_size() -> Any` | Load/memoize libc allocation-size function and configure pointer/size ctypes signature. | ctypes.CDLL(None).malloc_usable_size | [_heap_window](../intj/tools/abi_detect.py#L83) |
+| [_heap_window](../intj/tools/abi_detect.py#L78)<br>`_heap_window(address: int, size: int) -> bytes` | Read at most requested bytes or actual new allocation size, preventing detector overreads. | _malloc_usable_size; _window | [probe_layout](../intj/tools/abi_detect.py#L132); [probe_layout](../intj/tools/abi_detect.py#L133) |
+| [_window](../intj/tools/abi_detect.py#L86)<br>`_window(address: int, size: int) -> bytes` | Copy raw memory at given address/size into bytes. | ctypes.string_at | [_heap_window](../intj/tools/abi_detect.py#L83); [probe_layout](../intj/tools/abi_detect.py#L131); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L370) |
+| [_find_u64](../intj/tools/abi_detect.py#L90)<br>`_find_u64(blob: bytes, want: int, align: int=8) -> set[int]` | Find aligned byte offsets matching signed/unsigned little-endian 8-byte target. | int.to_bytes; blob slices | [probe_layout](../intj/tools/abi_detect.py#L136); [probe_layout](../intj/tools/abi_detect.py#L137); [probe_layout](../intj/tools/abi_detect.py#L138); [probe_layout](../intj/tools/abi_detect.py#L142); [probe_layout](../intj/tools/abi_detect.py#L143); [probe_layout](../intj/tools/abi_detect.py#L145) |
+| [_find_u8](../intj/tools/abi_detect.py#L96)<br>`_find_u8(blob: bytes, want: int) -> set[int]` | Find all single-byte offsets matching dtype code. | byte comparison | [probe_layout](../intj/tools/abi_detect.py#L139) |
+| [probe_layout](../intj/tools/abi_detect.py#L100)<br>`probe_layout(header_size: int) -> TensorABI &#124; None` | Intersect object/TensorImpl/StorageImpl match sets across probes, require one candidate per field, convert absolute cdata to relative and self-check new TensorABI. | _probes; _window/_heap_window; _find_u64/_find_u8; dtype_code; itemsize_bytes/live_dtypes; TensorABI; _selfcheck | [_main](../intj/tools/abi_detect.py#L221); [test_hardcoded_layout_matches_this_torch](../tests/test_launcher.py#L6202); [test_runtime_shim_layout_matches_live_torch](../tests/test_runtime.py#L379); [test_runtime_shim_probe_refuses_slot_before_header](../tests/test_runtime.py#L388) |
+| [_selfcheck](../intj/tools/abi_detect.py#L173)<br>`_selfcheck(layout: TensorABI, header_size: int) -> bool` | Compare reconstructed pointer/dtype/storage-size tuple against Torch accessors on normal/views/empty/sliced cases; add GPU tensors only if GPU already initialized. | _probes; _read; _expected; torch.cuda.is_initialized | [probe_layout](../intj/tools/abi_detect.py#L170) |
+| [_read](../intj/tools/abi_detect.py#L195)<br>`_read(layout: TensorABI, t: Any, header_size: int) -> tuple[int, int, int]` | Reproduce runtime-offset tensor reading and zero-numel NULL pointer rule in Python; refuse absent storage. | ctypes memory loads; TensorABI offsets/itemsize | [_selfcheck](../intj/tools/abi_detect.py#L192); [test_custom_sizes_policy_tensors_are_a_known_limitation](../tests/test_launcher.py#L6422); [test_custom_sizes_policy_tensors_are_a_known_limitation](../tests/test_launcher.py#L6429) |
+| [_expected](../intj/tools/abi_detect.py#L211)<br>`_expected(t: Any) -> tuple[int, int, int]` | Read authoritative data_ptr, dtype ScalarType and untyped-storage byte size. | Torch accessors; dtype_code | [_selfcheck](../intj/tools/abi_detect.py#L192) |
+| [_main](../intj/tools/abi_detect.py#L215)<br>`_main() -> None` | Generate selected version table text with all measured offsets and dense dtype pairs; refuse ambiguous layout or missing dtype codes. | pyobject_size; probe_layout; live_dtypes; OFFSETS; torch_version; print/SystemExit | [(module initialization)](../intj/tools/abi_detect.py#L247) |
 
-## `intj/torch_intf/cpp_detect.py`
+## `intj/tools/cpp_detect.py`
 
 **Responsibility:** Independently measure Torch C++ field layout and verify intj_THPVariable declaration against real Torch headers.
 
@@ -814,16 +827,16 @@ Embedded C++ definitions are listed below. The probe takes private member pointe
 
 | Symbol and parameters | Responsibility | Depends on | Used by |
 | --- | --- | --- | --- |
-| [measure](../intj/torch_intf/cpp_detect.py#L125)<br>`measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]` | Compile embedded C++ shared probe using running Torch C++ ABI/paths, call intj_detect via ctypes and parse three output lines into facts, absolute offsets and dtype sizes. | _imports.ensure_torch_imported; torch.utils.cpp_extension; _SOURCE; subprocess; ctypes.CDLL | [detect](../intj/torch_intf/cpp_detect.py#L198) |
-| [detect](../intj/torch_intf/cpp_detect.py#L184)<br>`detect() -> tuple[dict[str, int], dict[int, int]]` | Require own THPVariable declaration/type/offset matches and cdata not before PyObject_HEAD; subtract compiled header size and return relative offsets/sizes. | measure; RuntimeError | [(module initialization)](../intj/torch_intf/cpp_detect.py#L212); [test_hardcoded_layout_matches_torch_headers](../tests/test_launcher.py#L6223) |
+| [measure](../intj/tools/cpp_detect.py#L125)<br>`measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]` | Compile embedded C++ shared probe using running Torch C++ ABI/paths, call intj_detect via ctypes and parse three output lines into facts, absolute offsets and dtype sizes. | _imports.ensure_torch_imported; torch.utils.cpp_extension; _SOURCE; subprocess; ctypes.CDLL | [detect](../intj/tools/cpp_detect.py#L198) |
+| [detect](../intj/tools/cpp_detect.py#L184)<br>`detect() -> tuple[dict[str, int], dict[int, int]]` | Require own THPVariable declaration/type/offset matches and cdata not before PyObject_HEAD; subtract compiled header size and return relative offsets/sizes. | measure; RuntimeError | [(module initialization)](../intj/tools/cpp_detect.py#L212); [test_hardcoded_layout_matches_torch_headers](../tests/test_launcher.py#L6223) |
 
-| [Member<Tag>](../intj/torch_intf/cpp_detect.py#L44)<br>`template<class Tag> struct Member { static Tag::type ptr; }` | Hold member pointer selected by explicit instantiation. | Tag::type | Steal; OFF macro |
-| [Steal<Tag, M>](../intj/torch_intf/cpp_detect.py#L45)<br>`template<class Tag, Tag::type M> struct Steal` | Static initialization assigns private member pointer M into Member<Tag>::ptr. | Member<Tag> | STEAL macro explicit instantiations |
-| [STEAL(name, Class, Type, field)](../intj/torch_intf/cpp_detect.py#L48)<br>`macro tag type + Steal<name, &Class::field>` | Generate typed tags and legal private-member instantiations. Tags: MO_own, TB_impl, TP_target, TI_storage, TI_storage_offset, TI_numel, TI_data_type, TM_index, S_impl, SP_target, SI_data_ptr, DP_ptr, UVP_data, SI_size_bytes, SYM_data. | Torch classes/member-pointer types; Steal | OFF; tensor_in_cdata; intj_detect |
-| [off<C,T>](../intj/torch_intf/cpp_detect.py#L72)<br>`off<C,T>(T C::*m)` | Compute field byte offset by member pointer in aligned static storage without object construction. | reinterpret_cast/address subtraction | OFF(tag) -> off(Member<tag>::ptr) |
-| [tensor_in_cdata](../intj/torch_intf/cpp_detect.py#L82)<br>`tensor_in_cdata()` | Return zero for plain Tensor cdata or MaybeOwned owned-Tensor union offset for older Torch. | cdata_is_tensor; OFF(MO_own) | intj_detect |
-| [intj_detect](../intj/torch_intf/cpp_detect.py#L91)<br>`intj_detect()` | Emit facts, composite offsets through nested pointer/storage classes, and all ScalarType item sizes; verify intj_THPVariable cdata layout/type. | emit; OFF/off; tensor_in_cdata; sizeof/offsetof; TypeMeta; intj_cdata | measure via ctypes.CDLL export |
-| [intj_detect.emit](../intj/torch_intf/cpp_detect.py#L94)<br>`lambda(auto... a)` | Format each output chunk with snprintf and append to static output string. | captured buf/out; std::snprintf | intj_detect |
+| [Member<Tag>](../intj/tools/cpp_detect.py#L44)<br>`template<class Tag> struct Member { static Tag::type ptr; }` | Hold member pointer selected by explicit instantiation. | Tag::type | Steal; OFF macro |
+| [Steal<Tag, M>](../intj/tools/cpp_detect.py#L45)<br>`template<class Tag, Tag::type M> struct Steal` | Static initialization assigns private member pointer M into Member<Tag>::ptr. | Member<Tag> | STEAL macro explicit instantiations |
+| [STEAL(name, Class, Type, field)](../intj/tools/cpp_detect.py#L48)<br>`macro tag type + Steal<name, &Class::field>` | Generate typed tags and legal private-member instantiations. Tags: MO_own, TB_impl, TP_target, TI_storage, TI_storage_offset, TI_numel, TI_data_type, TM_index, S_impl, SP_target, SI_data_ptr, DP_ptr, UVP_data, SI_size_bytes, SYM_data. | Torch classes/member-pointer types; Steal | OFF; tensor_in_cdata; intj_detect |
+| [off<C,T>](../intj/tools/cpp_detect.py#L72)<br>`off<C,T>(T C::*m)` | Compute field byte offset by member pointer in aligned static storage without object construction. | reinterpret_cast/address subtraction | OFF(tag) -> off(Member<tag>::ptr) |
+| [tensor_in_cdata](../intj/tools/cpp_detect.py#L82)<br>`tensor_in_cdata()` | Return zero for plain Tensor cdata or MaybeOwned owned-Tensor union offset for older Torch. | cdata_is_tensor; OFF(MO_own) | intj_detect |
+| [intj_detect](../intj/tools/cpp_detect.py#L91)<br>`intj_detect()` | Emit facts, composite offsets through nested pointer/storage classes, and all ScalarType item sizes; verify intj_THPVariable cdata layout/type. | emit; OFF/off; tensor_in_cdata; sizeof/offsetof; TypeMeta; intj_cdata | measure via ctypes.CDLL export |
+| [intj_detect.emit](../intj/tools/cpp_detect.py#L94)<br>`lambda(auto... a)` | Format each output chunk with snprintf and append to static output string. | captured buf/out; std::snprintf | intj_detect |
 
 ## `intj/python_intf/cpython_abi.h`
 
@@ -831,7 +844,7 @@ Embedded C++ definitions are listed below. The probe takes private member pointe
 
 **File dependencies:** Python.h/stdint; pre-3.11 longintrepr.h; caller-defined INTJ_ALWAYS_INLINE/LIKELY/UNLIKELY. CPython >=3.8; version guards distinguish pre-3.12 ob_size and 3.12+ lv_tag.
 
-**Used by:** intj_runtime.h in every generated module; python_intf/check.py embedded probe.
+**Used by:** intj_runtime.h in every generated module; tools/check.py embedded probe.
 
 Readers require correct live built-in object types, borrow references, and do not set exceptions on width overflow. Callers supply Python error policy. Same-named conditional implementations are grouped below. No Py_LIMITED_API/stable ABI is used.
 
@@ -916,7 +929,7 @@ Module state owns the heap base type. Each launcher owns one embedded PyMethodDe
 
 **File dependencies:** Python.h, ATen/core/Tensor.h, c10/util/MaybeOwned.h, torch/version.h.
 
-**Used by:** intj_runtime.h STATIC_COMPILE branch; torch_intf/cpp_detect.py compares declaration/accessor against real Torch headers.
+**Used by:** intj_runtime.h STATIC_COMPILE branch; tools/cpp_detect.py compares declaration/accessor against real Torch headers.
 
 `INTJ_CDATA_IS_MAYBE_OWNED` selects MaybeOwned<Tensor> for Torch 2.x before 2.10, plain Tensor after. This declaration is trusted by STATIC_COMPILE; cpp_detect checks type/offset, and generated _set_torch_abi checks cdata offset when a verified layout is available.
 
@@ -1135,7 +1148,7 @@ No functions/classes. Current Free-threaded Builds paragraph says PyMutex and co
 
 **Responsibility:** Scoped implementation contract for CPython internals, scalar-reader overflow/type/ownership rules, version validation, no stable ABI, free-threaded ownership/locking and verification workflow.
 
-**File dependencies:** README; cpython_abi.h/.py/check.py; runtime/launcher_base/render; tests/run_python_matrix.sh and tests/test_runtime.py.
+**File dependencies:** README; cpython_abi.h/.py; tools/check.py; runtime/launcher_base/render; tests/run_python_matrix.sh and tests/test_runtime.py.
 
 **Used by:** Contributors/agents changing this interface.
 
@@ -1161,7 +1174,7 @@ No functions/classes; advertised supported Torch >=2.2 and Python compatibility 
 
 ## `intj/torch_intf/AGENTS.md`
 
-**Responsibility:** Scoped trust-boundary rules: measure offsets, verify layout/dtypes jointly, reject malformed tables/no silent guesses, check minimal STATIC_COMPILE declaration independently, import lazily.
+**Responsibility:** Scoped trust-boundary rules: measure offsets, verify layout/dtypes jointly, reject malformed tables/no silent guesses, check minimal STATIC_COMPILE declaration independently, import on demand.
 
 **File dependencies:** README; detectors; torch_abi/*.toml; intj_thpvariable.h; _imports.
 

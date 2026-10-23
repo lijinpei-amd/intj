@@ -7,7 +7,7 @@ table entry both agree on has been checked twice, independently.
 Needs a C++ compiler (`$CXX`, else `c++`) and torch's headers, but not triton:
 it runs in an environment with nothing but the torch whose entry it checks.
 
-    python -m intj.torch_intf.cpp_detect
+    python -m intj.tools.cpp_detect
 """
 
 from __future__ import annotations

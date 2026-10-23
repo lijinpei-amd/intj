@@ -356,7 +356,7 @@ def test_runtime_shim_refuses_32_bit_pointer_layout(monkeypatch):
 
 
 def test_runtime_shim_layout_matches_live_torch(monkeypatch):
-    from intj.torch_intf import abi_detect
+    from intj.tools import abi_detect
 
     layout = layout_for()
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
@@ -383,7 +383,7 @@ def test_runtime_shim_layout_matches_live_torch(monkeypatch):
 
 
 def test_runtime_shim_probe_refuses_slot_before_header():
-    from intj.torch_intf.abi_detect import probe_layout
+    from intj.tools.abi_detect import probe_layout
 
     assert probe_layout(torch.Tensor.__basicsize__ + 1) is None
 
@@ -761,9 +761,9 @@ def test_cpython_layer_matches_this_python():
     """The header `cpython_abi` selects reads what python itself reports.
 
     The table in `cpython_abi` lists versions this check passed on; this keeps the
-    running one honest.  Other versions: `python -m intj.python_intf.check`.
+    running one honest.  Other versions: `python -m intj.tools.check`.
     """
-    from intj.python_intf.check import check
+    from intj.tools.check import check
 
     assert check() == []
 

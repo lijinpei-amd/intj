@@ -197,7 +197,7 @@ def dtype_index_table() -> bytes:
 #: The verified torch ABIs, as one data file per version beside this module.
 #:
 #: Every number in them must be *measured*, never reasoned about: run
-#: `python -m intj.torch_intf.abi_detect` on the target torch and paste what it
+#: `python -m intj.tools.abi_detect` on the target torch and paste what it
 #: prints.  `test_hardcoded_layout_matches_this_torch` re-checks the entry for
 #: whatever torch the suite runs against, with both detectors.
 _ABI_DIR = pathlib.Path(__file__).with_name("torch_abi")

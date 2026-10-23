@@ -724,10 +724,10 @@ headers. It declares the head of `THPVariable` itself instead of including it
 `Tensor` since); `cpp_detect` below refuses a torch where that declaration is wrong.
 On torch older than 2.10 the `STATIC_COMPILE` mode is compile-checked only.
 
-To add a version, run `python -m intj.torch_intf.abi_detect` on a supported
+To add a version, run `python -m intj.tools.abi_detect` on a supported
 GIL or free-threaded CPython build with that Torch and paste the entry it
 prints. The detector subtracts that interpreter's reported header size from
-the measured pointer-slot offset. `python -m intj.torch_intf.cpp_detect`
+the measured pointer-slot offset. `python -m intj.tools.cpp_detect`
 derives the relative offset independently from Torch's C++ headers.
 The test suite compares the table entry with both detectors on the Torch
 version it runs against.

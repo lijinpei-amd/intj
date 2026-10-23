@@ -20,9 +20,10 @@ kernel a pointer built from it. So:
 
 STATIC_COMPILE mode needs no table, but it declares `intj_THPVariable` itself
 (`intj/runtime/intj_thpvariable.h`) instead of including `python_variable.h`, which
-drags in pybind11, and does not check that at load. `cpp_detect` compiles it beside
-torch's own and refuses a torch where they differ. Any new layout assumption in C++
-code gets the same treatment: checked in `cpp_detect`, not at load.
+drags in pybind11, and does not check that at load.
+[tools/cpp_detect.py](../tools/cpp_detect.py) compiles it beside torch's own and
+refuses a torch where they differ. Any new layout assumption in C++ code gets
+the same treatment: checked in `intj.tools.cpp_detect`, not at load.
 
 ## The ABI version files are a trust boundary
 
@@ -30,7 +31,7 @@ Each `torch_abi/<major>.<minor>.toml` contains exactly the matching version
 table, with its measured offsets and dtypes together. The parser rejects malformed
 input with a `ValueError` naming the file, never skips it.
 
-## Import torch and triton lazily
+## Import torch and triton on demand
 
 Through `intj/_imports.py`, inside the function that needs them, never at module
 top (see the root `AGENTS.md`): importing `intj` must not import torch, and probing

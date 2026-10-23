@@ -4,7 +4,7 @@ Every offset is found by matching field values against what torch's own python
 accessors report, so an entry generated this way is verified by construction.
 Needs no compiler; `cpp_detect` is the independent check that does.
 
-    python -m intj.torch_intf.abi_detect   # prints a versioned ABI entry
+    python -m intj.tools.abi_detect   # prints a versioned ABI entry
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any
 
 from .. import _imports
 from ..python_intf.cpython_abi import pyobject_size
-from .torch_abi import (
+from ..torch_intf.torch_abi import (
     OFFSETS,
     TensorABI,
     dtype_code,
@@ -102,7 +102,7 @@ def probe_layout(header_size: int) -> TensorABI | None:
 
     Not used when launching: `_LAYOUTS` is consulted instead, so a torch intj has
     not been verified against is refused rather than read at guessed offsets.
-    This is what *generates* those entries (`python -m intj.torch_intf.abi_detect`)
+    This is what *generates* those entries (`python -m intj.tools.abi_detect`)
     and what the test suite checks them against.
 
     Each offset is the intersection, over every probe tensor, of the positions

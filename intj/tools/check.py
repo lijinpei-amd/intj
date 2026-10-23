@@ -5,7 +5,7 @@ header `cpython_abi` selects (or one named on the command line) against this
 interpreter's `Python.h`, and compares every read with python's own answer.
 Needs a C compiler and nothing else: no torch, no triton.
 
-    python -m intj.python_intf.check [header]   # exits non-zero on a mismatch
+    python -m intj.tools.check [header]   # exits non-zero on a mismatch
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ import sys
 import sysconfig
 import tempfile
 
-from .cpython_abi import header_for, pyobject_size, python_version
+from ..python_intf.cpython_abi import header_for, pyobject_size, python_version
 
-_HERE = pathlib.Path(__file__).parent
+_PYTHON_INTF = pathlib.Path(__file__).parent.parent / "python_intf"
 
 _SOURCE = """
 #include <Python.h>
@@ -70,7 +70,7 @@ def _build(header: str, out: pathlib.Path) -> ctypes.PyDLL:
             "-O2",
             f'-DINTJ_CPYTHON_STATIC_COMPILE_HEADER="{header}"',
             f"-I{sysconfig.get_paths()['include']}",
-            f"-I{_HERE}",
+            f"-I{_PYTHON_INTF}",
             str(src),
             "-o",
             str(out),

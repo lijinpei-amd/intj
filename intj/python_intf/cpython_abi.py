@@ -3,7 +3,7 @@
 Also reports the values python itself reads: its version and `sizeof(PyObject)`.
 
 The C header selects its int layout at compile time.  A version maps to it only
-once `python -m intj.python_intf.check` has passed on both the default and
+once `python -m intj.tools.check` has passed on both the default and
 free-threaded builds.
 """
 

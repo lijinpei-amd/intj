@@ -6,7 +6,7 @@
  * the 11 s build.
  *
  * The module checks the cdata offset at load when a verified runtime layout is
- * available. intj/torch_intf/cpp_detect.py also compiles this declaration beside
+ * available. intj/tools/cpp_detect.py also compiles this declaration beside
  * torch's own for every torch in the ABI table.
  */
 #pragma once

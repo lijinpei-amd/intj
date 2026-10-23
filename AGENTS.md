@@ -17,6 +17,11 @@ first thing that actually needs sharing.
 `intj/runtime/` also holds the launcher runtime itself: `intj_runtime.h`, the helpers
 included by every rendered module.
 
+ABI checking and generation tools live in `intj/tools/`: `check.py` checks the
+CPython layer, `abi_detect.py` probes Torch layouts, and `cpp_detect.py` checks
+them against Torch's C++ headers. ABI definitions and measured version data
+stay in `python_intf/` and `torch_intf/`. Run tools with `python -m intj.tools.<name>`.
+
 ## Rendering lives in `intj/render/`
 
 - `key.py`: `RenderKey`, everything a module depends on, and the values it holds.

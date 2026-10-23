@@ -119,7 +119,7 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   tensor counts.
 - **Measure compact-int decoding.** Compare the existing inline CPython helpers
   with a direct `lv_tag`/`ob_digit[0]` path on supported builds; use custom
-  decoding only if it is faster and passes `check.py`.
+  decoding only if it is faster and passes `intj/tools/check.py`.
 - Single-entry inline cache in front of the hash map (~2-3 ns, ~100% hit in a
   steady-state loop).
 - Annotated fast paths: pinning a parameter's type skips the generic classifier

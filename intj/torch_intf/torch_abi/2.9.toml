@@ -1,10 +1,10 @@
 # Verified torch ABIs, one table per torch major.minor.
 #
-# Never write an entry by hand.  Run `python -m intj.torch_intf.abi_detect` on
+# Never write an entry by hand.  Run `python -m intj.tools.abi_detect` on
 # the target torch and paste what it prints: every number is measured against
 # torch's own accessors, so a pasted entry is verified by construction, while an
 # edited one is a guess -- and a wrong offset cannot raise, it reads whatever
-# lies at that address.  `python -m intj.torch_intf.cpp_detect` checks the same
+# lies at that address.  `python -m intj.tools.cpp_detect` checks the same
 # numbers independently, from torch's C++ headers.
 #
 #   cdata: byte offset from the end of PyObject_HEAD to the TensorImpl* slot;
