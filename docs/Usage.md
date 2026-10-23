@@ -33,14 +33,14 @@ unbuilt launcher; the same names with a leading underscore (`_bind()`, ...)
 change this launcher in place and raise `RuntimeError` once it is built. It
 also has `check()`. Call `make_launcher` once, outside any hot loop.
 
-### Lazy build
+### Build on first call
 
 `make_launcher` returns a launcher at once and does not analyze the kernel or
 its options: it records its keywords as a `MakeLauncherOption`
 (`launcher.__self__.options`, with dicts and lists copied). It raises
 `TypeError` for an unknown keyword, a None kernel or a `delayed` that is not
 callable. Until one call succeeds in the process, it also imports triton and
-loads `_intj_lazy`, the C stub every launcher starts as, which can raise:
+loads `_intj_launcher_base`, the C base every launcher uses, which can raise:
 
 - `UnsupportedKernel` when Triton is missing or older than 3.7. The check runs
   once per process: every later `make_launcher` raises the same refusal
@@ -51,8 +51,8 @@ loads `_intj_lazy`, the C stub every launcher starts as, which can raise:
   `clang` on `PATH`), even with the stub already built.
 - `UnsupportedKernel` when that compiler fails to build the stub, built once
   per interpreter, intj version and compiler under
-  `$TRITON_HOME/.triton/intj/lazy`; `OSError` when that directory cannot be
-  created.
+  `$TRITON_HOME/.triton/intj/launcher_base`; `OSError` when that directory
+  cannot be created.
 
 Only the Triton refusal is cached: after any other of these failures, the
 next `make_launcher` tries again.

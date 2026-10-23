@@ -335,7 +335,7 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
     from intj.annotation import DeviceBinding
     from intj.render.module import _LOADED
 
-    launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
+    launcher._imports.ensure_triton_imported()  # Initialize before patching on-demand imports.
 
     def forbidden(*args, **kwargs):
         pytest.fail("fixed host binding reached a GPU path")
@@ -1751,7 +1751,7 @@ def test_bind_mixed_and_baked_values_follow_declaration_order_on_gpu():
 
 
 def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkeypatch):
-    launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
+    launcher._imports.ensure_triton_imported()  # Initialize before patching on-demand imports.
 
     def forbidden(*args, **kwargs):
         pytest.fail("binding reached a GPU path")
@@ -2601,7 +2601,7 @@ def test_checked_source_has_one_predicted_branch_per_argument(scalar_kernel, mod
 def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     import intj.launcher as launcher
 
-    launcher._imports.ensure_triton_imported()  # Initialize before patching lazy names.
+    launcher._imports.ensure_triton_imported()  # Initialize before patching on-demand imports.
 
     def forbidden(*args, **kwargs):
         raise AssertionError("GPU path was reached")
@@ -2618,7 +2618,7 @@ def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
     assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
     assert host(0, 0, (1,), x, out, 8, 2.0, 8) is None
     assert torch.count_nonzero(out) == 0
-    # launched like any backend, through the fake driver _intj_lazy exports
+    # launched like any backend, through the fake driver _intj_launcher_base exports
     module = module_of(host)
     key = next(key for key, loaded in render_module._LOADED.items() if loaded is module)
     assert key.driver_path == launcher._stub().__file__
@@ -3230,7 +3230,7 @@ def test_modules_stay_out_of_the_import_system():
     before = set(sys.modules)
     first = module_of(make_launcher(scale, options={"num_stages": 6}))
     assert first.__spec__ is not None and first.__spec__.name not in sys.modules
-    assert "_intj_lazy" not in sys.modules  # the stub every launcher starts as
+    assert "_intj_launcher_base" not in sys.modules  # the stub every launcher starts as
 
     render_module._LOADED.clear()
     second = module_of(make_launcher(scale, options={"num_stages": 6}))
@@ -5643,7 +5643,7 @@ def test_launcher_built_with_interpret_off_keeps_launching_if_turned_on_later(
     torch.testing.assert_close(o, x * 2.0)
 
 
-def test_accepts_kernel_with_lazy_launch_metadata():
+def test_accepts_kernel_with_launch_metadata():
     module_of(make_launcher(uses_launch_metadata, no_gpu=True))
 
 

@@ -194,7 +194,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
                 module = load(access_key, b.jit_func.__module__)
                 if module._header_size() != stub._header_size():
                     raise ImportError(
-                        f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
+                        f"intj: {module.__file__} disagrees with _intj_launcher_base on the launcher "
                         "header; it was built by another intj -- delete it to rebuild"
                     )
                 module._set_launcher_type(stub.Launcher)

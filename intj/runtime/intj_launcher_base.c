@@ -1,5 +1,5 @@
-/* `_intj_lazy`: the type every launcher's object comes from, and the shim its
- * PyCFunction starts on.  Generic -- no kernel code, no GPU -- so a launcher
+/* `_intj_launcher_base`: the type every launcher's object comes from, and
+ * the shim its PyCFunction starts on. No kernel code or GPU, so a launcher
  * exists before its module is rendered.  The first call builds: the
  * subclass's `_build_body` renders and loads the module, whose `_init`
  * allocates and fills the launcher's state block and returns its entry; the
@@ -11,26 +11,26 @@
 #include <Python.h>
 #include <string.h>
 
-#include "intj_lazy.h"
+#include "intj_launcher_base.h"
 
 typedef struct {
   PyTypeObject *type;
-} intj_lazy_state;
+} intj_launcher_base_state;
 
-static PyObject *intj_lazy_call(PyObject *self, PyObject *const *args,
-                                Py_ssize_t nargs);
-#define INTJ_SHIM ((PyCFunction)(void (*)(void))intj_lazy_call)
+static PyObject *intj_launcher_base_call(PyObject *self, PyObject *const *args,
+                                         Py_ssize_t nargs);
+#define INTJ_SHIM ((PyCFunction)(void (*)(void))intj_launcher_base_call)
 
 /* Build locks this thread holds: a build (`delayed`) runs Python under one,
  * and may reach another launcher. */
-static _Thread_local int intj_lazy_held;
+static _Thread_local int intj_launcher_base_held;
 
 /* Take the build lock: 0, or -1 with an error set.  Two refusals, never a
  * wait that could deadlock: the thread holding this lock (a launcher called or
  * checked from its own build), and a thread already holding another launcher's
  * lock when this one is taken (two threads each holding one and waiting on the
  * other's would wait forever).  A thread holding none waits. */
-static int intj_lazy_lock(intj_launcher *h) {
+static int intj_launcher_base_lock(intj_launcher *h) {
   unsigned long me = PyThread_get_thread_ident();
   if (__atomic_load_n(&h->build_thread, __ATOMIC_RELAXED) == me) {
     PyErr_SetString(PyExc_RuntimeError,
@@ -38,7 +38,7 @@ static int intj_lazy_lock(intj_launcher *h) {
     return -1;
   }
   if (!PyThread_acquire_lock(h->build_lock, NOWAIT_LOCK)) {
-    if (intj_lazy_held > 0) {
+    if (intj_launcher_base_held > 0) {
       PyErr_SetString(PyExc_RuntimeError,
                       "intj: a launcher was called while it was being built");
       return -1;
@@ -51,13 +51,13 @@ static int intj_lazy_lock(intj_launcher *h) {
     Py_END_ALLOW_THREADS
     // clang-format on
   }
-  intj_lazy_held++;
+  intj_launcher_base_held++;
   __atomic_store_n(&h->build_thread, me, __ATOMIC_RELAXED);
   return 0;
 }
 
-static void intj_lazy_unlock(intj_launcher *h) {
-  intj_lazy_held--;
+static void intj_launcher_base_unlock(intj_launcher *h) {
+  intj_launcher_base_held--;
   __atomic_store_n(&h->build_thread, 0UL, __ATOMIC_RELAXED);
   PyThread_release_lock(h->build_lock);
 }
@@ -66,10 +66,10 @@ static void intj_lazy_unlock(intj_launcher *h) {
  * (entry address, resolved options, doc); they are published, then the entry
  * swapped in.  A failure publishes nothing and leaves the shim, so the next
  * call retries. */
-static int intj_lazy_build(intj_launcher *h) {
+static int intj_launcher_base_build(intj_launcher *h) {
   if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) != INTJ_SHIM)
     return 0;
-  if (intj_lazy_lock(h) != 0)
+  if (intj_launcher_base_lock(h) != 0)
     return -1;
   int rc = 0;
   PyObject *old = NULL;
@@ -113,15 +113,15 @@ static int intj_lazy_build(intj_launcher *h) {
       Py_XDECREF(result);
     }
   }
-  intj_lazy_unlock(h);
+  intj_launcher_base_unlock(h);
   Py_XDECREF(old); /* outside the lock: finalizers run Python */
   return rc;
 }
 
-static PyObject *intj_lazy_call(PyObject *self, PyObject *const *args,
-                                Py_ssize_t nargs) {
+static PyObject *intj_launcher_base_call(PyObject *self, PyObject *const *args,
+                                         Py_ssize_t nargs) {
   intj_launcher *h = (intj_launcher *)self;
-  if (intj_lazy_build(h) != 0)
+  if (intj_launcher_base_build(h) != 0)
     return NULL;
   PyCFunction entry = __atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE);
   return ((intj_fast_fn)(void (*)(void))entry)(self, args, nargs);
@@ -131,9 +131,9 @@ static PyObject *intj_lazy_call(PyObject *self, PyObject *const *args,
  * under; fn's result or error.  The lock refuses fn reaching this launcher's
  * own _C_locked or first call.  fn's result is released after the unlock, so
  * returning what it replaced keeps finalizers outside the lock. */
-static PyObject *intj_lazy_locked(PyObject *self, PyObject *fn) {
+static PyObject *intj_launcher_base_locked(PyObject *self, PyObject *fn) {
   intj_launcher *h = (intj_launcher *)self;
-  if (intj_lazy_lock(h) != 0)
+  if (intj_launcher_base_lock(h) != 0)
     return NULL;
   PyObject *result;
   if (!h->options) {
@@ -142,14 +142,15 @@ static PyObject *intj_lazy_locked(PyObject *self, PyObject *fn) {
   } else {
     result = PyObject_CallFunctionObjArgs(fn, NULL);
   }
-  intj_lazy_unlock(h);
+  intj_launcher_base_unlock(h);
   return result;
 }
 
-static PyObject *intj_lazy_build_method(PyObject *self, PyObject *unused) {
+static PyObject *intj_launcher_base_build_method(PyObject *self,
+                                                 PyObject *unused) {
   (void)unused;
   intj_launcher *h = (intj_launcher *)self;
-  if (intj_lazy_build(h) != 0)
+  if (intj_launcher_base_build(h) != 0)
     return NULL;
   PyObject *module;
   Py_BEGIN_CRITICAL_SECTION(self);
@@ -162,8 +163,8 @@ static PyObject *intj_lazy_build_method(PyObject *self, PyObject *unused) {
 }
 
 /* The built launcher's state block, or NULL with an error set. */
-static void *intj_lazy_built_state(intj_launcher *h) {
-  if (intj_lazy_build(h) != 0)
+static void *intj_launcher_base_built_state(intj_launcher *h) {
+  if (intj_launcher_base_build(h) != 0)
     return NULL;
   void *state = __atomic_load_n(&h->state, __ATOMIC_ACQUIRE);
   if (!state)
@@ -171,23 +172,26 @@ static void *intj_lazy_built_state(intj_launcher *h) {
   return state;
 }
 
-static PyObject *intj_lazy_spec_key(PyObject *self, PyObject *const *args,
-                                    Py_ssize_t nargs) {
+static PyObject *intj_launcher_base_spec_key(PyObject *self,
+                                             PyObject *const *args,
+                                             Py_ssize_t nargs) {
   intj_launcher *h = (intj_launcher *)self;
-  void *state = intj_lazy_built_state(h);
+  void *state = intj_launcher_base_built_state(h);
   return state ? h->ops->spec_key(state, args, nargs) : NULL;
 }
 
-static PyObject *intj_lazy_key_chain(PyObject *self, PyObject *const *args,
-                                     Py_ssize_t nargs) {
+static PyObject *intj_launcher_base_key_chain(PyObject *self,
+                                              PyObject *const *args,
+                                              Py_ssize_t nargs) {
   intj_launcher *h = (intj_launcher *)self;
-  void *state = intj_lazy_built_state(h);
+  void *state = intj_launcher_base_built_state(h);
   return state ? h->ops->key_chain(state, args, nargs) : NULL;
 }
 
 /* _C_set_options(options): only from inside _C_locked on this thread, so
  * edits and a first call are ordered; refused once built. */
-static PyObject *intj_lazy_set_options(PyObject *self, PyObject *options) {
+static PyObject *intj_launcher_base_set_options(PyObject *self,
+                                                PyObject *options) {
   intj_launcher *h = (intj_launcher *)self;
   if (__atomic_load_n(&h->build_thread, __ATOMIC_RELAXED) !=
       PyThread_get_thread_ident()) {
@@ -212,7 +216,7 @@ static PyObject *intj_lazy_set_options(PyObject *self, PyObject *options) {
 }
 
 /* _C_built: whether the first call has swapped the entry in. */
-static PyObject *intj_lazy_built(PyObject *self, void *closure) {
+static PyObject *intj_launcher_base_built(PyObject *self, void *closure) {
   (void)closure;
   intj_launcher *h = (intj_launcher *)self;
   return PyBool_FromLong(__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) !=
@@ -222,7 +226,7 @@ static PyObject *intj_lazy_built(PyObject *self, void *closure) {
 #define INTJ_MEMBER(field) ((void *)offsetof(intj_launcher, field))
 
 /* An object member, or None while it is NULL. */
-static PyObject *intj_lazy_member(PyObject *self, void *closure) {
+static PyObject *intj_launcher_base_member(PyObject *self, void *closure) {
   PyObject *value;
   Py_BEGIN_CRITICAL_SECTION(self);
   value = *(PyObject **)((char *)self + (uintptr_t)closure);
@@ -232,11 +236,12 @@ static PyObject *intj_lazy_member(PyObject *self, void *closure) {
   return value;
 }
 
-static int intj_lazy_traverse(PyObject *self, visitproc visit, void *arg) {
+static int intj_launcher_base_traverse(PyObject *self, visitproc visit,
+                                       void *arg) {
   intj_launcher *h = (intj_launcher *)self;
 #if PY_VERSION_HEX < 0x03090000
   /* 3.8's subtype_traverse visits a Python subclass's type itself */
-  if (Py_TYPE(self)->tp_traverse == intj_lazy_traverse)
+  if (Py_TYPE(self)->tp_traverse == intj_launcher_base_traverse)
 #endif
     Py_VISIT(Py_TYPE(self));
   Py_VISIT(h->options);
@@ -245,7 +250,7 @@ static int intj_lazy_traverse(PyObject *self, visitproc visit, void *arg) {
   return h->state ? h->ops->traverse(h->state, visit, arg) : 0;
 }
 
-static int intj_lazy_clear(PyObject *self) {
+static int intj_launcher_base_clear(PyObject *self) {
   intj_launcher *h = (intj_launcher *)self;
   /* unpublish first: release drops owners whose finalizers can reenter Python */
   void *state = h->state;
@@ -257,11 +262,11 @@ static int intj_lazy_clear(PyObject *self) {
   return 0;
 }
 
-static void intj_lazy_dealloc(PyObject *self) {
+static void intj_launcher_base_dealloc(PyObject *self) {
   intj_launcher *h = (intj_launcher *)self;
   PyTypeObject *type = Py_TYPE(self);
   PyObject_GC_UnTrack(self);
-  intj_lazy_clear(self);
+  intj_launcher_base_clear(self);
   Py_CLEAR(h->doc); /* only here: a live PyCFunction may still read ml_doc */
   if (h->build_lock)
     PyThread_free_lock(h->build_lock);
@@ -269,8 +274,8 @@ static void intj_lazy_dealloc(PyObject *self) {
   Py_DECREF(type);
 }
 
-static PyObject *intj_lazy_new(PyTypeObject *type, PyObject *args,
-                               PyObject *kwargs) {
+static PyObject *intj_launcher_base_new(PyTypeObject *type, PyObject *args,
+                                        PyObject *kwargs) {
   (void)type;
   (void)args;
   (void)kwargs;
@@ -282,46 +287,49 @@ static PyObject *intj_lazy_new(PyTypeObject *type, PyObject *args,
  * intj.launcher.Launcher exposes the public ones as `options`, `build()`,
  * `spec_key()` and `key_chain()`, and runs `check()` and its `_foo` edits
  * under `_C_locked`.  It defines `_build_body`, which the first call runs. */
-static PyGetSetDef intj_lazy_getset[] = {
-    {(char *)"_C_options", intj_lazy_member, NULL, NULL, INTJ_MEMBER(options)},
-    {(char *)"_C_module", intj_lazy_member, NULL, NULL, INTJ_MEMBER(module)},
-    {(char *)"_C_built", intj_lazy_built, NULL, NULL, NULL},
+static PyGetSetDef intj_launcher_base_getset[] = {
+    {(char *)"_C_options", intj_launcher_base_member, NULL, NULL,
+     INTJ_MEMBER(options)},
+    {(char *)"_C_module", intj_launcher_base_member, NULL, NULL,
+     INTJ_MEMBER(module)},
+    {(char *)"_C_built", intj_launcher_base_built, NULL, NULL, NULL},
     {NULL, NULL, NULL, NULL, NULL}};
 
-static PyMethodDef intj_lazy_type_methods[] = {
-    {"_C_build", intj_lazy_build_method, METH_NOARGS, NULL},
-    {"_C_spec_key", (PyCFunction)(void (*)(void))intj_lazy_spec_key,
+static PyMethodDef intj_launcher_base_type_methods[] = {
+    {"_C_build", intj_launcher_base_build_method, METH_NOARGS, NULL},
+    {"_C_spec_key", (PyCFunction)(void (*)(void))intj_launcher_base_spec_key,
      METH_FASTCALL, NULL},
-    {"_C_key_chain", (PyCFunction)(void (*)(void))intj_lazy_key_chain,
+    {"_C_key_chain", (PyCFunction)(void (*)(void))intj_launcher_base_key_chain,
      METH_FASTCALL, NULL},
-    {"_C_locked", intj_lazy_locked, METH_O, NULL},
-    {"_C_set_options", intj_lazy_set_options, METH_O, NULL},
+    {"_C_locked", intj_launcher_base_locked, METH_O, NULL},
+    {"_C_set_options", intj_launcher_base_set_options, METH_O, NULL},
     {NULL, NULL, 0, NULL}};
 
-static PyType_Slot intj_lazy_slots[] = {
-    {Py_tp_new, (void *)intj_lazy_new},
-    {Py_tp_traverse, (void *)intj_lazy_traverse},
-    {Py_tp_clear, (void *)intj_lazy_clear},
-    {Py_tp_dealloc, (void *)intj_lazy_dealloc},
-    {Py_tp_getset, (void *)intj_lazy_getset},
-    {Py_tp_methods, (void *)intj_lazy_type_methods},
+static PyType_Slot intj_launcher_base_slots[] = {
+    {Py_tp_new, (void *)intj_launcher_base_new},
+    {Py_tp_traverse, (void *)intj_launcher_base_traverse},
+    {Py_tp_clear, (void *)intj_launcher_base_clear},
+    {Py_tp_dealloc, (void *)intj_launcher_base_dealloc},
+    {Py_tp_getset, (void *)intj_launcher_base_getset},
+    {Py_tp_methods, (void *)intj_launcher_base_type_methods},
     {0, NULL}};
 
-static PyType_Spec intj_lazy_spec = {
-    "_intj_lazy.Launcher", sizeof(intj_launcher), 0,
+static PyType_Spec intj_launcher_base_spec = {
+    "_intj_launcher_base.Launcher", sizeof(intj_launcher), 0,
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_BASETYPE
 #ifdef Py_TPFLAGS_IMMUTABLETYPE
         | Py_TPFLAGS_IMMUTABLETYPE
 #endif
     ,
-    intj_lazy_slots};
+    intj_launcher_base_slots};
 
 /* new_launcher(cls, options) -> an unbuilt launcher: a PyCFunction over a
  * `cls` instance, with intj_launcher as its C base; Python subclasses may add
  * storage.  The first call runs its `_build_body`. */
 static PyObject *new_launcher(PyObject *m, PyObject *const *args,
                               Py_ssize_t nargs) {
-  intj_lazy_state *st = (intj_lazy_state *)PyModule_GetState(m);
+  intj_launcher_base_state *st =
+      (intj_launcher_base_state *)PyModule_GetState(m);
   PyTypeObject *cls =
       nargs == 2 && PyType_Check(args[0]) ? (PyTypeObject *)args[0] : NULL;
   if (!cls || !PyType_IsSubtype(cls, st->type) || cls->tp_itemsize != 0) {
@@ -377,12 +385,14 @@ static PyObject *header_size(PyObject *m, PyObject *unused) {
   return PyLong_FromSize_t(sizeof(intj_launcher));
 }
 
-static int intj_lazy_exec(PyObject *m) {
-  intj_lazy_state *st = (intj_lazy_state *)PyModule_GetState(m);
+static int intj_launcher_base_exec(PyObject *m) {
+  intj_launcher_base_state *st =
+      (intj_launcher_base_state *)PyModule_GetState(m);
 #if PY_VERSION_HEX >= 0x03090000
-  st->type = (PyTypeObject *)PyType_FromModuleAndSpec(m, &intj_lazy_spec, NULL);
+  st->type = (PyTypeObject *)PyType_FromModuleAndSpec(
+      m, &intj_launcher_base_spec, NULL);
 #else
-  st->type = (PyTypeObject *)PyType_FromSpec(&intj_lazy_spec);
+  st->type = (PyTypeObject *)PyType_FromSpec(&intj_launcher_base_spec);
 #endif
   if (!st->type)
     return -1;
@@ -394,24 +404,25 @@ static int intj_lazy_exec(PyObject *m) {
   return 0;
 }
 
-static int intj_lazy_module_traverse(PyObject *m, visitproc visit, void *arg) {
-  Py_VISIT(((intj_lazy_state *)PyModule_GetState(m))->type);
+static int intj_launcher_base_module_traverse(PyObject *m, visitproc visit,
+                                              void *arg) {
+  Py_VISIT(((intj_launcher_base_state *)PyModule_GetState(m))->type);
   return 0;
 }
 
-static int intj_lazy_module_clear(PyObject *m) {
-  Py_CLEAR(((intj_lazy_state *)PyModule_GetState(m))->type);
+static int intj_launcher_base_module_clear(PyObject *m) {
+  Py_CLEAR(((intj_launcher_base_state *)PyModule_GetState(m))->type);
   return 0;
 }
 
-static PyMethodDef intj_lazy_methods[] = {
+static PyMethodDef intj_launcher_base_methods[] = {
     {"new_launcher", (PyCFunction)(void (*)(void))new_launcher, METH_FASTCALL,
      "new_launcher(cls, options) -> launcher"},
     {"_header_size", header_size, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 
-static PyModuleDef_Slot intj_lazy_module_slots[] = {
-    {Py_mod_exec, (void *)intj_lazy_exec},
+static PyModuleDef_Slot intj_launcher_base_module_slots[] = {
+    {Py_mod_exec, (void *)intj_launcher_base_exec},
 #ifdef Py_mod_multiple_interpreters
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
 #endif
@@ -420,11 +431,17 @@ static PyModuleDef_Slot intj_lazy_module_slots[] = {
 #endif
     {0, NULL}};
 
-static struct PyModuleDef intj_lazy_module_def = {
-    PyModuleDef_HEAD_INIT,     "_intj_lazy",           NULL,
-    sizeof(intj_lazy_state),   intj_lazy_methods,      intj_lazy_module_slots,
-    intj_lazy_module_traverse, intj_lazy_module_clear, NULL};
+static struct PyModuleDef intj_launcher_base_module_def = {
+    PyModuleDef_HEAD_INIT,
+    "_intj_launcher_base",
+    NULL,
+    sizeof(intj_launcher_base_state),
+    intj_launcher_base_methods,
+    intj_launcher_base_module_slots,
+    intj_launcher_base_module_traverse,
+    intj_launcher_base_module_clear,
+    NULL};
 
-PyMODINIT_FUNC PyInit__intj_lazy(void) {
-  return PyModuleDef_Init(&intj_lazy_module_def);
+PyMODINIT_FUNC PyInit__intj_launcher_base(void) {
+  return PyModuleDef_Init(&intj_launcher_base_module_def);
 }

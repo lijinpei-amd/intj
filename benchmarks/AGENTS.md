@@ -14,7 +14,7 @@ before timing when the benchmark writes data.
   cache work; default for GPU launches), `--readme` for Triton versus INTJ, and
   `--sweep` for 4, 16, and 32 integer or tensor arguments.
   `--tuned` compares a warmed autotuned launcher with the same kernel baked.
-  `--dynamic` times warmed lazy launchers: plain, with two `dynamic_options`,
+  `--dynamic` times warmed launchers: plain, with two `dynamic_options`,
   and with an `int` or a `str` constexpr, each as a full launch and as a
   host-only `spec_key` (decode + key).
 - `bench_mix.py`: host-only launches with 4, 16 or 32 arguments, 0-100 %

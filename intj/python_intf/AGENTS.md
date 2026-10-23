@@ -106,10 +106,10 @@ vectorcall, `PyObject_VectorcallMethod` and `PyObject_CallMethodNoArgs` before
 3.12. This keeps version branches out of callers. Guard each shim by the
 version that added its call.
 
-Lazy launchers rely on CPython reading `PyCFunctionObject.m_ml->ml_meth` at
-every call, including from specialized call sites (3.11
+Launcher entry swapping relies on CPython reading
+`PyCFunctionObject.m_ml->ml_meth` at every call, including from specialized call sites (3.11
 `PRECALL_NO_KW_BUILTIN_FAST`, 3.12 `CALL_NO_KW_BUILTIN_FAST`, 3.13+
-`CALL_BUILTIN_FAST`; 3.13t does not specialize). They also rely on
+`CALL_BUILTIN_FAST`; 3.13t does not specialize). It also relies on
 `meth_dealloc` not reading `m_ml` after dropping `m_self`.
 `test_first_call_builds_and_swaps_for_old_references` pins the swap on the
 matrix; the dealloc order was checked by a throwaway probe (3.8 to 3.14t,
@@ -120,8 +120,8 @@ first when adding a Python version.
 
 Generated modules declare `Py_MOD_GIL_NOT_USED` on Python 3.13+, so loading them
 does not require CPython to enable the GIL. `intj_rwlock` (in
-`runtime/intj_lazy.h`), held in each launcher's state block that the module's
-`_init` allocates, is a pthread rwlock on free-threaded builds and a no-op
+`runtime/intj_launcher_base.h`), held in each launcher's state block that
+the module's `_init` allocates, is a pthread rwlock on free-threaded builds and a no-op
 otherwise. Launches take it shared
 (`INTJ_RDLOCK`) across their lookups and the GPU launch, because cache records
 live in the map and a put can move them; puts take it exclusive

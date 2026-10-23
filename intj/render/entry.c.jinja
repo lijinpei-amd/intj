@@ -1201,7 +1201,7 @@ static PyObject *intj_bound_entry(PyObject *self, PyObject *const *args,
 
 static int intj_traverse_state(void *state, visitproc visit, void *arg) {
   intj_bound_launcher *bound = (intj_bound_launcher *)state;
-  /* `_intj_lazy` visits the type and the object's members; never twice */
+  /* `_intj_launcher_base` visits the type and the object's members; never twice */
   Py_VISIT(bound->grid_py);
   Py_VISIT(bound->grid_hidden);
   Py_VISIT(bound->intern);

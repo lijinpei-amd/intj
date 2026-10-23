@@ -21,7 +21,7 @@ from collections.abc import (
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
-from . import _imports, lazy
+from . import _imports, launcher_base
 from . import backend as backends
 from .annotation import (
     CanonicalAnnotation,
@@ -485,9 +485,9 @@ class Launcher:
     `k` is a C function whose entry is a build shim until its first call
     succeeds, then the rendered launch.  This object holds that entry, the
     options and, once built, the module's per-launcher state.  The C base
-    (`_intj_lazy.Launcher`) defines the `_C_*` attributes and methods, and
-    runs `_build_body` on the first call; `check()` and the in-place edits run
-    under its build lock through `_C_locked`.  Every edit comes in two forms:
+    (`_intj_launcher_base.Launcher`) defines the `_C_*` attributes and methods,
+    and runs `_build_body` on the first call; `check()` and the in-place edits
+    run under its build lock through `_C_locked`. Every edit comes in two forms:
     `foo` returns a new, unbuilt launcher and `_foo` changes this one in place
     until it is built.
     """
@@ -695,14 +695,14 @@ class Launcher:
         self._C_locked(body)
 
     def _build_body(self) -> tuple[int, MakeLauncherOption, bytes]:
-        """Builds this launcher on its first call and returns what `_intj_lazy` publishes.
+        """Builds this launcher and returns the entry, options and doc to publish.
 
-        `_intj_lazy` calls it by name, under the build lock.
+        `_intj_launcher_base` calls it by name, under the build lock.
 
         Resolves `delayed`, checks, then queries the target, renders, compiles,
         loads, and fills this launcher's state block. Returns the rendered
         entry's address, the resolved options and the `__text_signature__`,
-        for `_intj_lazy` to publish and swap in.
+        for `_intj_launcher_base` to publish and swap in.
 
         `TRITON_INTERPRET=1` is refused here, on the first call: decoration
         never runs a kernel, so a module-level decorator does not make its
@@ -834,11 +834,11 @@ def make_launcher(
 
     Decoration only records a `MakeLauncherOption`: no kernel check, no GPU,
     no torch import.  Until one succeeds in this process, a call also imports
-    triton and loads `_intj_lazy`, the C stub every launcher starts as, which
-    can fail (see Raises); only the Triton refusal is remembered, and any
+    triton and loads `_intj_launcher_base`, the C base every launcher uses,
+    which can fail (see Raises); only the Triton refusal is remembered, and any
     other failure there is retried on the next call.  `k.__self__.check()`
     runs every other check now; otherwise the first call does, then builds the
-    module (see docs/Usage.md, "Lazy build").
+    module (see docs/Usage.md, "Build on first call").
 
     The returned callable is a C function:
 
@@ -907,11 +907,11 @@ def make_launcher(
             not callable.
         UnsupportedKernel: Triton is missing or older than 3.7, checked once
             per process: every later call raises the same refusal.  Or the
-            host compiler failed to build `_intj_lazy`.
+            host compiler failed to build `_intj_launcher_base`.
         ImportError: Importing an installed triton failed: a broken install,
             such as a missing dependency or extension module.
         RuntimeError: Triton finds no host C compiler.
-        OSError: The directory `_intj_lazy` is built in cannot be created.
+        OSError: The C launcher base's build directory cannot be created.
     """
     unknown = kwargs.keys() - OPTION_FIELDS
     if unknown:
@@ -947,11 +947,11 @@ def _over_stub(base: type[Launcher], stub: types.ModuleType) -> type[Launcher]:
 
 
 def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
-    """Returns the process's one `_intj_lazy` and the `Launcher` type over it.
+    """Returns the process's C launcher base and the `Launcher` type over it.
 
     Loaded beside the modules intj renders, once, under a lock: a second load
-    has its own `_intj_lazy.Launcher`, and `new_launcher` refuses a type over
-    another load's.
+    has its own `_intj_launcher_base.Launcher`, and `new_launcher` refuses a
+    type over another load's.
     """
     global _stub_loaded
     loaded = _stub_loaded
@@ -960,8 +960,8 @@ def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
             loaded = _stub_loaded
             if loaded is None:
                 _imports.ensure_triton_imported()
-                stub = lazy.load_stub(
-                    Path(_imports.knobs.cache.get_triton_dir("intj")) / "lazy",
+                stub = launcher_base.load_stub(
+                    Path(_imports.knobs.cache.get_triton_dir("intj")) / "launcher_base",
                     compiler_path("c"),
                 )
                 loaded = _stub_loaded = (stub, _over_stub(Launcher, stub))
@@ -969,7 +969,7 @@ def _stub_and_type() -> tuple[types.ModuleType, type[Launcher]]:
 
 
 def _tuned_type() -> type[Launcher]:
-    """Returns `TunedLauncher` over the process's `_intj_lazy`, built on first use."""
+    """Returns `TunedLauncher` over the process's C base, built on first use."""
     global _tuned_loaded
     tuned = _tuned_loaded
     if tuned is None:

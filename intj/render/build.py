@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .. import _imports, lazy
+from .. import _imports, launcher_base
 from ..kernel_cache import KernelCache
 from ..errors import UnsupportedKernel
 from ..torch_intf.torch_abi import TorchAccessMode
@@ -226,7 +226,7 @@ def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
         includes = [
             *flags.get("include_dirs", ()),
             directory,
-            lazy.python_include(),
+            launcher_base.python_include(),
             *_imports.knobs.build.backend_dirs,
         ]
         command = [

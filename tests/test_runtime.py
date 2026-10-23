@@ -35,7 +35,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from intj import launcher, lazy
+from intj import launcher, launcher_base
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
 from intj.render import build
 from intj.render import module as render_module
@@ -669,12 +669,12 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module._set_torch_abi({layout.as_args() if layout else None!r},
                          {bytes(c if c < 32 else 0xFF for c in range(NDTYPES))!r})
-spec = importlib.util.spec_from_file_location("_intj_lazy", {stub_module.__file__!r})
-lazy = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(lazy)
-module._set_launcher_type(lazy.Launcher)
+spec = importlib.util.spec_from_file_location("_intj_launcher_base", {stub_module.__file__!r})
+launcher_base = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher_base)
+module._set_launcher_type(launcher_base.Launcher)
 build = lambda header: (module._init(header, print), None, b"")
-launch = lazy.new_launcher(type("L", (lazy.Launcher,), {{"__slots__": (), "_build_body": build}}), None)
+launch = launcher_base.new_launcher(type("L", (launcher_base.Launcher,), {{"__slots__": (), "_build_body": build}}), None)
 assert not sys._is_gil_enabled()
 grid = [0, 1000, 1000]
 stop = threading.Event()
@@ -779,9 +779,9 @@ def test_load_stub_reports_a_missing_compiler_as_unsupported(tmp_path_factory):
     Final review minor 3: a decoration-time build must never raise a bare
     subprocess error -- refusals are loud, per AGENTS.md.
     """
-    root = tmp_path_factory.mktemp("lazy_missing_cc")
+    root = tmp_path_factory.mktemp("launcher_base_missing_cc")
     with pytest.raises(launcher.UnsupportedKernel, match="host compiler") as excinfo:
-        lazy.load_stub(root, "intj-test-nonexistent-cc")
+        launcher_base.load_stub(root, "intj-test-nonexistent-cc")
     assert isinstance(excinfo.value.__cause__, OSError)
 
 
@@ -790,13 +790,13 @@ def test_load_stub_reports_a_compile_failure_as_unsupported(
 ):
     def fail(args, **kwargs):
         return subprocess.CompletedProcess(
-            args, 1, stdout=b"", stderr=b"intj_lazy.c:1:1: error: bad token\n"
+            args, 1, stdout=b"", stderr=b"intj_launcher_base.c:1:1: error: bad token\n"
         )
 
     monkeypatch.setattr(subprocess, "run", fail)
-    root = tmp_path_factory.mktemp("lazy_failing_cc")
+    root = tmp_path_factory.mktemp("launcher_base_failing_cc")
     with pytest.raises(launcher.UnsupportedKernel, match="bad token") as excinfo:
-        lazy.load_stub(root, _cc("c"))
+        launcher_base.load_stub(root, _cc("c"))
     assert isinstance(excinfo.value.__cause__, subprocess.CalledProcessError)
 
 
@@ -883,7 +883,7 @@ print(json.dumps([refusals, checks()]))
 
 @pytest.fixture(scope="module")
 def stub_module(tmp_path_factory):
-    return lazy.load_stub(tmp_path_factory.mktemp("lazy"), _cc("c"))
+    return launcher_base.load_stub(tmp_path_factory.mktemp("launcher_base"), _cc("c"))
 
 
 _CALL = (0, 0, 1)  # device, stream, grid
@@ -1005,7 +1005,7 @@ def test_compile_state_referent_cycle_is_collected(built, stub_module):
 
 def test_stub_stays_out_of_sys_modules_and_matches_the_header(built, stub_module):
     module, _, _ = built
-    assert "_intj_lazy" not in sys.modules
+    assert "_intj_launcher_base" not in sys.modules
     assert stub_module._header_size() == module._header_size()
 
 
@@ -1311,14 +1311,14 @@ def test_init_rejects_objects_with_unrelated_c_layouts(built, stub_module):
 
 def test_launcher_type_cannot_be_replaced(built, tmp_path):
     module, _, _ = built
-    other = lazy.load_stub(tmp_path, _cc("c"))
+    other = launcher_base.load_stub(tmp_path, _cc("c"))
     with pytest.raises(RuntimeError, match="launcher type already installed"):
         module._set_launcher_type(other.Launcher)
 
 
 def test_init_rejects_a_launcher_from_another_stub(built, tmp_path):
     module, _, _ = built
-    other = lazy.load_stub(tmp_path, _cc("c"))
+    other = launcher_base.load_stub(tmp_path, _cc("c"))
     cls = type("Other", (other.Launcher,), {"__slots__": ()})
     launch = other.new_launcher(cls, None)
     with pytest.raises(TypeError, match="unbuilt launcher"):

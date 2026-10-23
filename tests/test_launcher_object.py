@@ -226,13 +226,13 @@ def test_concurrent_first_decorations_share_one_stub(kern_dir):
     probe = f"""
 import sys, threading, time
 sys.path.insert(0, {str(kern_dir)!r})
-import intj.lazy as lazy
-real, loads = lazy.load_stub, []
+from intj import launcher_base
+real, loads = launcher_base.load_stub, []
 def slow(*args):
     loads.append(1)
     time.sleep(0.2)  # every thread misses the stub before any load returns
     return real(*args)
-lazy.load_stub = slow
+launcher_base.load_stub = slow
 import intj, kern
 barrier, errors = threading.Barrier(8), []
 def decorate():
@@ -349,7 +349,7 @@ def test_resolve_delayed_is_a_no_op_when_built_between_its_check_and_its_edit(
     stale = _option(k)
     assert stale.delayed is not None
     k.__self__.build()  # the other thread's build, landing after the check below
-    cls = type(k.__self__)  # the process's `Launcher` over `_intj_lazy.Launcher`
+    cls = type(k.__self__)  # the process's `Launcher` over the C base
     real = cls._C_options  # the C member's descriptor
     reads = []
 

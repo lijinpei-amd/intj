@@ -63,7 +63,7 @@ a subclass plus `register()`.
 
 `no_gpu=True` is one more backend, not a mode: `HostBackend` (`HOST`, never
 registered) is a fake driver whose launch and device lookup are no-op exports of
-`_intj_lazy`, so a host module renders and runs the same C as a GPU one.
+`_intj_launcher_base`, so a host module renders and runs the same C as a GPU one.
 `backend.select` is the one place a build reads `no_gpu`; past it, "no triton
 target" is what says nothing compiles.
 
@@ -76,11 +76,12 @@ The template must stay multi-phase (`PyModuleDef_Init`): a single-phase `m_size 
 the interpreter per (name, path), and two launchers would then share one module's
 state. `test_modules_stay_out_of_the_import_system` guards both halves.
 
-`_intj_lazy` (`intj/lazy.py`, `runtime/intj_lazy.c`), the stub every launcher
-starts as, follows the same rule. Every launcher is a `PyCFunction` over a
-`PyMethodDef` embedded in its launcher object (`intj.launcher.Launcher`, a
-subclass of `_intj_lazy.Launcher` with a Python `_compile_state` slot). The
-Python behavior bases keep `__slots__ = ()`; `_over_stub` adds the slot to the
+`_intj_launcher_base` (`intj/launcher_base.py`, `runtime/intj_launcher_base.c`),
+the C base every launcher uses, follows the same rule. Every launcher is a
+`PyCFunction` over a `PyMethodDef` embedded in its launcher object
+(`intj.launcher.Launcher`, a subclass of `_intj_launcher_base.Launcher` with a
+Python `_compile_state` slot). The Python behavior bases keep `__slots__ = ()`;
+`_over_stub` adds the slot to the
 concrete class so the two bases remain layout-compatible. Subclasses may append
 Python instance storage while preserving the C base layout. An
 autotune/heuristics chain gets `intj.tuning.TunedLauncher`, a `Launcher` subclass

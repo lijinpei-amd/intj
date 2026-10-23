@@ -1,9 +1,9 @@
-"""Builds and loads `_intj_lazy`, the generic stub every launcher starts as.
+"""Builds and loads the C base shared by every launcher.
 
 Kernel-free, so it needs only the host C compiler and no GPU: `make_launcher`
-allocates launchers from it at decoration time (see runtime/intj_lazy.c).  It
-also exports the host backend's no-op driver, which `no_gpu=True` modules
-launch through.
+allocates launchers from `_intj_launcher_base` at decoration time (see
+runtime/intj_launcher_base.c). It also exports the host backend's no-op driver,
+which `no_gpu=True` modules launch through.
 Cached on disk per interpreter and intj version; loaded by hand, never
 imported, like every module intj builds.  No triton here: the Python-version
 matrix (tests/run_python_matrix.sh) loads it on interpreters triton skips.
@@ -25,8 +25,8 @@ from ._version import __version__
 from .errors import UnsupportedKernel
 
 _RUNTIME = Path(__file__).parent / "runtime"
-_SOURCE = _RUNTIME / "intj_lazy.c"
-_HEADER = _RUNTIME / "intj_lazy.h"
+_SOURCE = _RUNTIME / "intj_launcher_base.c"
+_HEADER = _RUNTIME / "intj_launcher_base.h"
 
 
 def python_include() -> str:
@@ -50,15 +50,16 @@ def _digest(cc: str) -> str:
 
 
 def load_stub(root: Path, cc: str) -> types.ModuleType:
-    """Returns `_intj_lazy`, compiled with `cc` into `root/<digest>/` on first use.
+    """Returns the C launcher base, compiled with `cc` on first use.
 
-    The module is loaded by hand, never imported.
+    `_intj_launcher_base` is cached under `root/<digest>/` and loaded by hand,
+    never imported.
 
     Raises:
         UnsupportedKernel: The host compiler failed to build the stub.
     """
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-    so = root / _digest(cc) / f"_intj_lazy{suffix}"
+    so = root / _digest(cc) / f"_intj_launcher_base{suffix}"
     if not so.exists():
         so.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=so.parent) as staging:
@@ -87,10 +88,10 @@ def load_stub(root: Path, cc: str) -> types.ModuleType:
                     else str(error)
                 )
                 raise UnsupportedKernel(
-                    f"intj: host compiler {cc!r} failed to build _intj_lazy: {stderr}"
+                    f"intj: host compiler {cc!r} failed to build _intj_launcher_base: {stderr}"
                 ) from error
             os.replace(built, so)  # atomic: a racing loader sees all of it or none
-    spec = importlib.util.spec_from_file_location("_intj_lazy", so)
+    spec = importlib.util.spec_from_file_location("_intj_launcher_base", so)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"intj: cannot load {so}")
     module = importlib.util.module_from_spec(spec)

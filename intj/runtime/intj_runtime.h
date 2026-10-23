@@ -34,7 +34,7 @@
     "define INTJ_CPYTHON_STATIC_COMPILE_HEADER to a header from intj/python_intf"
 #endif
 #include INTJ_CPYTHON_STATIC_COMPILE_HEADER
-#include "intj_lazy.h"
+#include "intj_launcher_base.h"
 
 #if defined(__clang__)
 #define INTJ_ASSUME(x) __builtin_assume(x)

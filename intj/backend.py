@@ -77,9 +77,9 @@ class CudaBackend(Backend):
 class HostBackend(Backend):
     """A fake driver on the CPU, for `no_gpu=True`: every launch does nothing.
 
-    Its symbols are `_intj_lazy`'s (runtime/intj_lazy.c), loaded before any
-    module is.  No triton target names it, so it is not registered: only
-    `select(no_gpu=True)` returns it.
+    Its symbols are `_intj_launcher_base`'s (runtime/intj_launcher_base.c),
+    loaded before any rendered module. No triton target names it, so it is
+    not registered: only `select(no_gpu=True)` returns it.
     """
 
     name = "host"
@@ -91,10 +91,10 @@ class HostBackend(Backend):
 
     def library_path(self) -> str:
         # deferred: launcher imports this module
-        from .launcher import _stub  # pyright: ignore[reportPrivateUsage]  # the process's one _intj_lazy
+        from .launcher import _stub  # pyright: ignore[reportPrivateUsage]  # the process's C launcher base
 
         path = _stub().__file__
-        assert path is not None, "_intj_lazy is loaded from a file"
+        assert path is not None, "_intj_launcher_base is loaded from a file"
         return path
 
 

@@ -16,7 +16,7 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   launching the old binary unless it is declared in `dynamic_options`. Same for
   `use_buffer_ops`, which is only stale-but-valid since the `S` bit is
   unconditionally keyed.
-- **Free-threaded lazy-launcher publication on non-TSO hosts.** CPython reads
+- **Free-threaded launcher entry publication on non-TSO hosts.** CPython reads
   `ml_meth` with a plain load; the build publishes `state` before a release store
   of `ml_meth`, which x86-64 orders. Recheck (or have the entry fall back to an
   acquire reload of `state`) when ARM64 is supported.
@@ -83,7 +83,7 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 ## Performance
 
 - **32-argument launches lost ~7-10 ns to code placement.** `last_key 32` and
-  `sweep 32 int` moved from 99-106 ns to 106-113 ns during the lazy-launcher
+  `sweep 32 int` moved from 99-106 ns to 106-113 ns during the launcher
   work with identical `intj_call` instructions: cold code grew ahead of it.
   Aligning `intj_call`/`intj_bound_entry` to 64 bytes wins that back but costs
   common shapes ~1.5 ns (journal `2026-09-28_lazy-task5_0_8d95e66.md`); the

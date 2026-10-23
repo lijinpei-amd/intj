@@ -377,7 +377,7 @@ def bench_tuned(iters, batches):
 
 
 def bench_dynamic(iters, batches):
-    """Prints launch and `spec_key` times for warmed lazy launchers.
+    """Prints launch and `spec_key` times for warmed launchers.
 
     Rows: plain, with two dynamic options, with a str constexpr (and an int one to
     compare it with). `launch` includes the ~3 us driver call; `spec_key` is the
@@ -389,7 +389,7 @@ def bench_dynamic(iters, batches):
     args = (x, x, x, 4096, 1.0, 128)
     act = make_launcher(act_noop)
     rows = (
-        ("lazy plain", make_launcher(noop), (), args),
+        ("plain", make_launcher(noop), (), args),
         (
             "2 dynamic options",
             make_launcher(noop, dynamic_options=("num_warps", "knobs.runtime.debug")),
@@ -437,7 +437,7 @@ if __name__ == "__main__":
     modes.add_argument(
         "--dynamic",
         action="store_true",
-        help="warmed lazy launchers: plain, 2 dynamic options, str constexpr",
+        help="warmed launchers: plain, 2 dynamic options, str constexpr",
     )
     parser.add_argument("--iters", type=int, default=20000)
     parser.add_argument("--batches", type=int, default=7)
