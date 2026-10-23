@@ -267,32 +267,6 @@ def _launcher_module(launcher):
     return module_of(launcher)
 
 
-def _launcher_over(module):
-    """A built, binding-free launcher of `module`, for its `_C_spec_key`."""
-    from intj.launcher import Launcher, _KernelCompiler, _Interner, _stub
-
-    stub = _stub()
-
-    def build(h):
-        state = _KernelCompiler(None)
-        address = module._init(h, _Interner())
-        h._compile_state = state
-        return (
-            address,
-            None,
-            b"",
-        )
-
-    cls = type(
-        "Over",
-        (Launcher, stub.Launcher),
-        {"__slots__": ("_compile_state",), "_build_body": build},
-    )
-    launch = stub.new_launcher(cls, None)
-    launch.__self__._C_build()
-    return launch
-
-
 @pytest.fixture
 def scalar_kernel(tmp_path):
     return _kernel_from_source(tmp_path, "scalar_kernel", "x")
@@ -943,7 +917,7 @@ def test_bind_validates_names_before_loading(bound_kernel, monkeypatch):
         no_gpu=True,
     )
     monkeypatch.setattr(
-        "intj.render.module._loaded_module",
+        "intj.render.module.load",
         lambda *args: pytest.fail("loaded before validating binding names"),
     )
     for values, error in [
@@ -2432,9 +2406,7 @@ def test_ordinary_unannotated_none_and_never(scalar_kernel):
     )
 
 
-def test_ordinary_never_omits_pointer_range(pointer_kernel):
-    from intj.render.module import _LOADED, _loaded_module
-
+def test_ordinary_never_omits_pointer_range(pointer_kernel, monkeypatch):
     # CPU storage is virtual: exercise both sides of the threshold without
     # touching the bytes or requiring a GPU/backend initialization.
     small = torch.empty(2**31 - 1, dtype=torch.uint8)
@@ -2446,16 +2418,17 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel):
             no_gpu=True,
             torch_access_mode=TorchAccessMode.INTERPRETER,
         )
-        baseline = module_of(launch)
         assert launch.__self__.spec_key(0, small) == launch.__self__.spec_key(0, large)
-        key = next(key for key, module in _LOADED.items() if module is baseline)
-        ranged_key = dataclasses.replace(key, spec_pointer_range=1)
-        ranged = _loaded_module(
-            ranged_key, pointer_kernel.__module__, None, launcher._stub()
-        )
-        ranged_launch = _launcher_over(ranged)
-        small_key = ranged_launch.__self__._C_spec_key(0, small)
-        large_key = ranged_launch.__self__._C_spec_key(0, large)
+        with monkeypatch.context() as ranged_backend:
+            ranged_backend.setattr(backends.HOST, "pointer_range", True)
+            ranged_launch = make_launcher(
+                pointer_kernel,
+                extra_annotation={"x": Argument(specialize=specialization)},
+                no_gpu=True,
+                torch_access_mode=TorchAccessMode.INTERPRETER,
+            )
+            small_key = ranged_launch.__self__.spec_key(0, small)
+            large_key = ranged_launch.__self__.spec_key(0, large)
         if specialization is AUTO:
             assert small_key != large_key
             assert large_key == launch.__self__.spec_key(0, large)
@@ -3096,7 +3069,7 @@ def test_annotated_effective_compile_options_and_identity(
         captured.update(options)
         raise CompilationCaptured
 
-    def capture_module(key, kernel_module, layout, stub):
+    def capture_module(key, kernel_module):
         expected_values = {
             "debug": expected_debug,
             "instrumentation_mode": instrumentation,
@@ -3111,10 +3084,11 @@ def test_annotated_effective_compile_options_and_identity(
         assert (key.options != baseline_key.options) == (
             expected_debug or bool(instrumentation)
         )
-        return loaded_module(key, kernel_module, layout, stub)
+        return original_load(key, kernel_module)
 
     original_state = launcher.Launcher._new_compile_state
-    loaded_module = render_module._loaded_module
+    original_load = render_module.load
+    monkeypatch.setattr(render_module, "_LOADED", {})
 
     def capture_state(self, b):
         state = original_state(self, b)
@@ -3126,7 +3100,7 @@ def test_annotated_effective_compile_options_and_identity(
         raise Captured
 
     monkeypatch.setattr(triton.compiler, "compile", capture_compile)
-    monkeypatch.setattr(render_module, "_loaded_module", capture_module)
+    monkeypatch.setattr(render_module, "load", capture_module)
     monkeypatch.setattr(launcher.Launcher, "_new_compile_state", capture_state)
     with pytest.raises(Captured):
         module_of(
@@ -4959,7 +4933,8 @@ def test_render_key_tracks_cache_compiler_language(
         keys.append(key)
         raise Captured
 
-    monkeypatch.setattr(render_module, "_loaded_module", capture)
+    monkeypatch.setattr(render_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "load", capture)
     with pytest.raises(Captured):
         module_of(
             make_launcher(
@@ -5173,7 +5148,8 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
         keys.append(key)
         raise Captured
 
-    monkeypatch.setattr("intj.render.module._loaded_module", capture)
+    monkeypatch.setattr(render_module, "_LOADED", {})
+    monkeypatch.setattr(render_module, "load", capture)
     launch = make_launcher(scale, kernel_cache=KernelCache.TSL)
     assert calls == []  # decoration provisions nothing
     launch.__self__.check()

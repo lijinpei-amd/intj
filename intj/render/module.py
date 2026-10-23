@@ -30,7 +30,6 @@ from ..annotation import (
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
 from ..torch_intf.torch_abi import (
-    TensorABI,
     TorchAccessMode,
     dtype_index_table,
     layout_for,
@@ -124,7 +123,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         device_symbol=backend.device_symbol,
         error_symbol=backend.error_symbol,
         error_style=backend.error_style,
-        # `_for_access` fills in these and `compiler`, `build_flags`
+        # `loaded` fills in these and `compiler`, `build_flags`
         torch_access_mode="",
         torch_version=None,
         cxx_abi=None,
@@ -161,6 +160,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
     )
 
     def loaded(mode: TorchAccessMode) -> types.ModuleType:
+        """Returns the initialized module for this access mode, cached once."""
         # the c++ mode gets it too, not to read from but to check its own
         # compiled-in offset against
         layout = (
@@ -168,12 +168,45 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
             if mode in (TorchAccessMode.RUNTIME_SHIM, TorchAccessMode.STATIC_COMPILE)
             else None
         )
-        return _loaded_module(
-            _for_access(key, mode),
-            b.jit_func.__module__,
-            layout,
-            stub,
+        static = mode is TorchAccessMode.STATIC_COMPILE
+        access_key = dataclasses.replace(
+            key,
+            torch_access_mode=mode.value,
+            # Only the c++ mode compiles anything torch-specific in, so only it has
+            # to be rebuilt when torch changes.  Leaving these None for the other
+            # two is what keeps their digest -- and so their cached `.so` -- stable
+            # across torch versions.
+            torch_version=torch_version() if static else None,
+            cxx_abi=_cxx_abi() if static else None,
         )
+        # `digest_flags` derives these from the fields above
+        flags = digest_flags(access_key)
+        access_key = dataclasses.replace(
+            access_key,
+            compiler=compiler_identity(flags["language"]),
+            build_flags=tuple(flags["ccflags"]),
+        )
+        # Without the lock two threads both compile and load, and the loser's
+        # module is silently dropped. Publish only after initialization succeeds.
+        with _LOAD_LOCK:
+            module = _LOADED.get(access_key)
+            if module is None:
+                module = load(access_key, b.jit_func.__module__)
+                if module._header_size() != stub._header_size():
+                    raise ImportError(
+                        f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
+                        "header; it was built by another intj -- delete it to rebuild"
+                    )
+                module._set_launcher_type(stub.Launcher)
+                # Pass relative cdata; the compiled setter saves the absolute offset
+                # for the torch running now before exposing the module.
+                module._set_torch_version(
+                    torch_version(),
+                    layout.as_args() if layout else None,
+                    dtype_index_table(),
+                )
+                _LOADED[access_key] = module
+            return module
 
     try:
         return loaded(b.torch_access_mode)
@@ -188,28 +221,6 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         except UnsupportedKernel as refusal:
             raise refusal from error
         return loaded(confirmed)
-
-
-def _for_access(key: RenderKey, access: TorchAccessMode) -> RenderKey:
-    """Returns `key` with the fields `access` decides filled in."""
-    static = access is TorchAccessMode.STATIC_COMPILE
-    key = dataclasses.replace(
-        key,
-        torch_access_mode=access.value,
-        # Only the c++ mode compiles anything torch-specific in, so only it has
-        # to be rebuilt when torch changes.  Leaving these None for the other
-        # two is what keeps their digest -- and so their cached `.so` -- stable
-        # across torch versions.
-        torch_version=torch_version() if static else None,
-        cxx_abi=_cxx_abi() if static else None,
-    )
-    # `digest_flags` derives these from the fields above
-    flags = digest_flags(key)
-    return dataclasses.replace(
-        key,
-        compiler=compiler_identity(flags["language"]),
-        build_flags=tuple(flags["ccflags"]),
-    )
 
 
 def _cache_version() -> tuple[int, int]:
@@ -322,38 +333,6 @@ def _torch_version_string() -> str:
 
 _LOADED: dict[RenderKey, types.ModuleType] = {}
 _LOAD_LOCK = threading.Lock()
-
-
-def _loaded_module(
-    key: RenderKey,
-    kernel_module: str,
-    layout: TensorABI | None,
-    stub: types.ModuleType,
-) -> types.ModuleType:
-    """Returns the one module for `key`, loading it once per process.
-
-    The lock matters: without it two threads both compile and both load, and the
-    loser's module is silently dropped.
-    """
-    with _LOAD_LOCK:
-        module = _LOADED.get(key)
-        if module is None:
-            module = load(key, kernel_module)
-            if module._header_size() != stub._header_size():
-                raise ImportError(
-                    f"intj: {module.__file__} disagrees with _intj_lazy on the launcher "
-                    "header; it was built by another intj -- delete it to rebuild"
-                )
-            module._set_launcher_type(stub.Launcher)
-            # Pass relative cdata; the compiled setter saves the absolute offset
-            # for the torch running now before exposing the module.
-            module._set_torch_version(
-                torch_version(),
-                layout.as_args() if layout else None,
-                dtype_index_table(),
-            )
-            _LOADED[key] = module
-        return module
 
 
 def _spec_key_layout(
