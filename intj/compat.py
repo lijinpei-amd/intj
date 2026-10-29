@@ -12,6 +12,7 @@ from typing import Any
 
 from . import _imports
 from .annotation import Argument, Constexpr
+from .compile_options import live_knobs
 from .errors import UnsupportedKernel
 from .launcher import make_launcher
 
@@ -298,15 +299,9 @@ def _target_key() -> tuple[str, str, int]:
     return (target.backend, repr(target.arch), target.warp_size)
 
 
-def _knob_key() -> tuple[object, object, object]:
+def _knob_key() -> tuple[object, ...]:
     """Returns the knobs a launcher reads at its first call; each value keys one."""
-    _imports.ensure_triton_imported()
-    knobs = _imports.knobs
-    return (
-        knobs.runtime.debug,
-        knobs.compilation.instrumentation_mode,
-        getattr(knobs.compilation, "fpsan_homomorphic_casts", None),
-    )
+    return tuple(live_knobs().values())
 
 
 def launch_or_interpret(

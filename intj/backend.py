@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 import abc
-import dataclasses
-from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from . import _imports
 from .errors import UnsupportedKernel
-
-if TYPE_CHECKING:
-    from .annotation import ResolvedParam
-    from .render.key import Param
 
 
 class Backend(abc.ABC):
@@ -159,74 +153,3 @@ def current_device() -> int:
     _imports.ensure_triton_imported()
     # get_current_device() is on every concrete driver, just not on DriverBase
     return _imports.driver.active.get_current_device()
-
-
-def canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
-    """Runs `options` through the triton compiler backend's `parse_options`.
-
-    That fills in defaults and normalizes the odd fields (`extern_libs`,
-    `llvm_fn_attrs`, `warp_size`), so `{}` and `{"num_warps": 4}` reach the same
-    rendered module instead of building it twice.  It also rejects what the
-    backend rejects when the module is built, not on the first kernel compile.
-
-    `parse_options` ignores keys it does not know, so unknown ones are caught
-    here -- otherwise a typo would silently compile with the default.
-    """
-    _imports.ensure_triton_imported()
-    parsed: Any = _imports.make_backend(target).parse_options(dict(options))
-    refuse_unknown_options(parsed, options)
-    return parsed
-
-
-#: options a launch fixes itself; never `options=` or `dynamic_options`
-FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
-
-
-def parameter_options(
-    backend: Any, params: Iterable[ResolvedParam | Param]
-) -> tuple[str, ...]:
-    """Returns the tl.constexpr parameters that double as compile options.
-
-    These are named like one of `backend`'s compile options (`num_warps`,
-    `num_stages`, `waves_per_eu`, ...), and every call's value also sets that
-    option, as Triton's `k[grid](..., num_warps=8)` does.  Not a key field:
-    the parameter's own exact key already tells every value apart.  Options a
-    launch fixes itself stay parameters only.
-    """
-    fields = {f.name for f in dataclasses.fields(backend.parse_options({}))}
-    return tuple(
-        p.name
-        for p in params
-        if p.annotation.kind == "constexpr"
-        and p.name in fields
-        and p.name not in FORBIDDEN_OPTIONS
-    )
-
-
-def refuse_unknown_options(parsed: Any, names: Iterable[str]) -> None:
-    """Refuses the names that are no field of `parsed` (triton's options)."""
-    unknown = set(names) - {f.name for f in dataclasses.fields(parsed)}
-    if unknown:
-        raise UnsupportedKernel(f"intj: unknown compile option(s) {sorted(unknown)}")
-
-
-def _knob_options(  # pyright: ignore[reportUnusedFunction]  # shared with module and kernel compilation
-    jit_func: Any, options: Mapping[str, Any], knob_values: Mapping[str, object]
-) -> dict[str, Any]:
-    """Returns `options` plus what triton derives from knobs.
-
-    An explicit `debug` overrides the kernel's default, and the runtime knob
-    can still enable it.  A knob missing from `knob_values` (a declared
-    dynamic one, outside its miss) takes triton's default.
-    """
-    merged = dict(options)
-    merged["debug"] = options.get("debug", jit_func.debug) or knob_values.get(
-        "knobs.runtime.debug", False
-    )
-    merged["instrumentation_mode"] = knob_values.get(
-        "knobs.compilation.instrumentation_mode", ""
-    )
-    casts = knob_values.get("knobs.compilation.fpsan_homomorphic_casts")
-    if casts is not None:
-        merged["fpsan_homomorphic_casts"] = casts
-    return merged

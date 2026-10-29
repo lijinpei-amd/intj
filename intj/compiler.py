@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import _imports
 from . import backend as backends
+from . import compile_options
 from .errors import UnsupportedKernel
 from .render.key import Param
 from .specialization import CompilerInput, compiler_input
@@ -197,7 +198,7 @@ class KernelCompiler:
             {
                 p.name: p
                 for p in params
-                if p.name in backends.parameter_options(self.backend, params)
+                if p.name in compile_options.parameter_options(self.backend, params)
             }
             if self.target is not None
             else {}
@@ -262,13 +263,12 @@ class KernelCompiler:
         self, options: Mapping[str, Any], knobs: Mapping[str, object]
     ) -> Any:
         """Returns the target's options: `options` over the base ones, then knobs."""
-        return backends.canonical_options(
+        return compile_options.resolve(
             self.target,
-            backends._knob_options(  # pyright: ignore[reportPrivateUsage]  # shared compile options
-                self.jit_func,
-                {**self._options, **options},
-                {**self._knob_values, **knobs},
-            ),
+            self.jit_func,
+            self._options,
+            options,
+            {**self._knob_values, **knobs},
         )
 
     def _compile(self, identity: _Identity, canonical: Any) -> CompiledKernel:

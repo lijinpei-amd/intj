@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 from . import _imports
 from . import backend as backends
 from .annotation import ResolvedParam
+from .compile_options import resolve
 from .compiler import KernelCompiler, record
 from .errors import UnsupportedKernel
 from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
@@ -291,12 +292,7 @@ def check_tuned_configs(
     """
     target = backends.current_target()
     for config_options in _config_options(plan, resolved):
-        backends.canonical_options(
-            target,
-            backends._knob_options(  # pyright: ignore[reportPrivateUsage]  # shared compile options
-                plan.jit_func, {**options, **config_options}, knob_values
-            ),
-        )
+        resolve(target, plan.jit_func, options, config_options, knob_values)
 
 
 def tuning_render(

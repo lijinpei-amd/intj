@@ -37,10 +37,13 @@ its C stub to `module.py` for module initialization. `compiler.py` turns a
 cache miss into the record C launches (`KernelCompiler`), and is the one place
 Triton compiles (`triton_load`, the port tests replace). Both sides of the
 invariant (key fields, call and key layout, compiler input) live in
-`specialization.py`. Shared compile-option merging, parameter-fed options
-included, lives in `backend.py`, checked dependency provisioning in
-`render/deps.py`, and `UnsupportedKernel` in `errors.py` (re-exported by
-`launcher.py`, as is `override_compile`).
+`specialization.py`. Compile options live in `compile_options.py`: the knob
+table (`KNOBS`, read by both launchers and compat's launcher key), parameter-fed
+and forbidden options, and `resolve`, the one merge (base, then a call's
+overlay, then knobs) and canonicalization every compile, module key and config
+check goes through. Checked dependency provisioning is in `render/deps.py`, and
+`UnsupportedKernel` in `errors.py` (re-exported by `launcher.py`, as is
+`override_compile`).
 `kernel_cache.py` holds the public `KernelCache` enum and delegates its CLI to
 `render/deps.py`.
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from .. import _imports
 from .. import backend as backends
 from .._version import __version__
+from ..compile_options import refuse_unknown_options, resolve
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
 from ..specialization import key_layout
@@ -67,12 +68,9 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
     canonical_options = None
     if target is not None:
         assert knob_values is not None, "GPU builds read knobs at the first call"
-        canonical_options = backends.canonical_options(
-            target,
-            backends._knob_options(b.jit_func, options, knob_values),  # pyright: ignore[reportPrivateUsage]  # shared compile options
-        )
+        canonical_options = resolve(target, b.jit_func, options, {}, knob_values)
         # the names only: each value is canonicalized on its own miss
-        backends.refuse_unknown_options(
+        refuse_unknown_options(
             canonical_options,
             [n for n in b.dynamic if not n.startswith("knobs.")]
             + list(b.declared_parameters),

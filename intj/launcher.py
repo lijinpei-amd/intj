@@ -27,6 +27,13 @@ from .annotation import (
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
     _merge_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
+from .compile_options import (
+    FORBIDDEN_OPTIONS,
+    KNOB_OVERWRITES,
+    KNOBS,
+    knob_options,
+    live_knobs,
+)
 from .compiler import KernelCompiler
 from .compiler import override_compile as override_compile
 from .errors import UnsupportedKernel as UnsupportedKernel
@@ -401,7 +408,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     # a declared knob is per call: leaving its live value out keeps it out
     # of the RenderKey, so it cannot build a module per value
     knob_values = (
-        None if no_gpu else {k: v for k, v in _live_knobs().items() if k not in dynamic}
+        None if no_gpu else {k: v for k, v in live_knobs().items() if k not in dynamic}
     )
     # GPU-free but may reach the network: after every refusal above, never on a build
     render_deps._provision(kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
@@ -965,35 +972,6 @@ def _launch_doc(
     )
 
 
-#: knob path -> the compile option triton derives from it
-_KNOB_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("knobs.runtime.debug", "debug"),
-    ("knobs.compilation.instrumentation_mode", "instrumentation_mode"),
-    ("knobs.compilation.fpsan_homomorphic_casts", "fpsan_homomorphic_casts"),
-)
-
-#: option name -> knob path, for options `_knob_options` replaces outright
-#: (unlike "debug", which only ORs a knob's value into a passed one, these
-#: overwrite whatever was passed; declaring them as `dynamic_options` would
-#: key a per-call value that never reaches the compile).
-_KNOB_OVERWRITES: dict[str, str] = {
-    option: path for path, option in _KNOB_OPTIONS if option != "debug"
-}
-
-
-def _live_knobs() -> dict[str, object]:
-    """Returns the knobs triton turns into compile options, as they are now.
-
-    Read at a launcher's first call and fixed for it.
-    """
-    _imports.ensure_triton_imported()
-    values: dict[str, object] = {}
-    for path, _ in _KNOB_OPTIONS:
-        _, group, name = path.split(".")
-        values[path] = getattr(getattr(_imports.knobs, group), name, None)
-    return values
-
-
 def _check_dynamic(
     dynamic: tuple[str, ...],
     options: Mapping[str, Any],
@@ -1032,12 +1010,12 @@ def _check_dynamic(
                     f"intj: unknown knob {name!r}; expected knobs.<group>.<name>, "
                     "e.g. knobs.runtime.debug"
                 )
-        elif name in backends.FORBIDDEN_OPTIONS:
+        elif name in FORBIDDEN_OPTIONS:
             raise UnsupportedKernel(f"intj: option {name!r} is not allowed")
-        elif name in _KNOB_OVERWRITES:
+        elif name in KNOB_OVERWRITES:
             raise UnsupportedKernel(
                 f"intj: dynamic option {name!r} is overwritten by "
-                f"{_KNOB_OVERWRITES[name]!r}; declare that knob path instead"
+                f"{KNOB_OVERWRITES[name]!r}; declare that knob path instead"
             )
         elif name in kernel.arg_names:
             if not kernel.params[kernel.arg_names.index(name)].is_constexpr:
@@ -1045,7 +1023,7 @@ def _check_dynamic(
                     f"intj: dynamic option {name!r} is a runtime kernel parameter; "
                     "only a tl.constexpr parameter can also be a compile option"
                 )
-    derived = dict(_KNOB_OPTIONS)
+    derived = {k.path: k.option for k in KNOBS}
     both = sorted(n for n in dynamic if n in options or derived.get(n) in options)
     if both:
         raise UnsupportedKernel(
@@ -1087,7 +1065,7 @@ def _check_kernel(
             "pass them as arguments instead, or promise they never change with "
             "assume_constant_globals=True"
         )
-    for key in backends.FORBIDDEN_OPTIONS:
+    for key in FORBIDDEN_OPTIONS:
         if key in options:
             raise UnsupportedKernel(f"intj: option {key!r} is not allowed")
     return jit_func
@@ -1206,5 +1184,5 @@ def triton_specialization(
 ) -> list[tuple[str, Any]]:
     """Returns the `list[(type_str, key)]` triton would compute for these arguments."""
     binder = jit_func.device_caches[backends.current_device()][4]
-    kwargs = backends._knob_options(jit_func, options or {}, _live_knobs())  # pyright: ignore[reportPrivateUsage]  # shared compile options
+    kwargs = knob_options(jit_func, options or {}, live_knobs())
     return binder(*args, **kwargs)[1]

@@ -40,7 +40,7 @@ from triton.experimental.gluon import language as gl
 
 import intj
 import intj.backend
-from intj import compiler, launcher, make_launcher
+from intj import compile_options, compiler, launcher, make_launcher
 from intj import backend as backends
 from intj import (
     AUTO,
@@ -344,7 +344,7 @@ def test_bind_device_host_ordinals_share_artifact_without_gpu_lookup(
     for name in (
         "intj.backend.current_target",
         "intj.backend.current_device",
-        "intj.backend.canonical_options",
+        "intj.compile_options.canonical_options",
         "intj._imports.make_backend",
     ):
         monkeypatch.setattr(name, forbidden)
@@ -1763,7 +1763,7 @@ def test_bind_no_gpu_never_uses_target_driver_or_compiler(pointer_kernel, monkey
     for name in (
         "intj.backend.current_target",
         "intj.backend.current_device",
-        "intj.backend.canonical_options",
+        "intj.compile_options.canonical_options",
         "intj._imports.make_backend",
     ):
         monkeypatch.setattr(name, forbidden)
@@ -2612,7 +2612,7 @@ def test_no_gpu_skips_target_driver_compile_and_launch(monkeypatch):
 
     monkeypatch.setattr("intj.backend.current_target", forbidden)
     monkeypatch.setattr("intj.backend.current_device", forbidden)
-    monkeypatch.setattr("intj.backend.canonical_options", forbidden)
+    monkeypatch.setattr("intj.compile_options.canonical_options", forbidden)
     monkeypatch.setattr(launcher._imports, "make_backend", forbidden)
     host = make_launcher(
         scale, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
@@ -2660,7 +2660,7 @@ def test_no_gpu_does_not_read_gpu_compilation_knobs(scalar_kernel, monkeypatch):
     monkeypatch.setattr(
         type(knobs.compilation), "instrumentation_mode", property(forbidden)
     )
-    monkeypatch.setattr("intj.backend.canonical_options", forbidden)
+    monkeypatch.setattr("intj.compile_options.canonical_options", forbidden)
     host = make_launcher(
         scalar_kernel, no_gpu=True, torch_access_mode=TorchAccessMode.INTERPRETER
     )
@@ -3127,7 +3127,9 @@ def test_newer_triton_fpsan_knob_is_baked_into_compile_options(
 
     def capture(b, stub):
         seen.update(
-            backends._knob_options(b.jit_func, dict(b.compile_options), b.knob_values)
+            compile_options.knob_options(
+                b.jit_func, dict(b.compile_options), b.knob_values
+            )
         )
         raise Captured
 
@@ -4493,7 +4495,7 @@ def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key)
 
     params = call_layout(_merge_annotations(power_kernel, {"N": Constexpr()}))
     state = KernelCompiler(
-        power_kernel, {}, launcher._live_knobs(), params=params, load=fake_load
+        power_kernel, {}, compile_options.live_knobs(), params=params, load=fake_load
     )
     device = torch.cuda.current_device()
     state.compile_miss(key, 0, device, 1)
@@ -6716,18 +6718,16 @@ def check_dynamic_invariant():
     from triton.compiler import make_backend
 
     from intj.annotation import _merge_annotations
-    from intj.backend import canonical_options, current_target
+    from intj.backend import current_target
+    from intj.compile_options import canonical_options, knob_options, live_knobs
     from intj.compiler import _split_dynamic
-    from intj.launcher import _live_knobs
-    from intj.specialization import compiler_input
-    from intj.backend import _knob_options
-    from intj.specialization import call_layout
+    from intj.specialization import call_layout, compiler_input
 
     launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
     module, device = module_of(launch), torch.cuda.current_device()
     params = call_layout(_merge_annotations(dyn_axpy, None))
     target = current_target()
-    backend, knobs_now = make_backend(target), _live_knobs()
+    backend, knobs_now = make_backend(target), live_knobs()
     x = torch.randn(64, device="cuda")
     o = torch.empty_like(x)
     seen = {}
@@ -6737,7 +6737,7 @@ def check_dynamic_invariant():
         knob_values = {**knobs_now, **dyn_knobs}
         with live_knob_values(dyn_knobs):
             canonical = canonical_options(
-                target, _knob_options(dyn_axpy, options, knob_values)
+                target, knob_options(dyn_axpy, options, knob_values)
             ).hash()
             for act in ("neg", "".join(["n", "e", "g"]), "pos"):
                 for dt in (tl.float32, tl.float16):
@@ -6851,17 +6851,15 @@ def check_option_parameter_invariant():
     from triton.compiler import make_backend
 
     from intj.annotation import _merge_annotations
-    from intj.backend import canonical_options, current_target
-    from intj.launcher import _live_knobs
-    from intj.specialization import compiler_input
-    from intj.backend import _knob_options
-    from intj.specialization import call_layout
+    from intj.backend import current_target
+    from intj.compile_options import canonical_options, knob_options, live_knobs
+    from intj.specialization import call_layout, compiler_input
 
     launch = make_launcher(option_axpy, return_compiled=True)
     module, device = module_of(launch), torch.cuda.current_device()
     params = call_layout(_merge_annotations(option_axpy, None))
     target = current_target()
-    backend, knobs_now = make_backend(target), _live_knobs()
+    backend, knobs_now = make_backend(target), live_knobs()
     x = torch.randn(64, device="cuda")
     o = torch.empty_like(x)
     seen = {}
@@ -6872,7 +6870,7 @@ def check_option_parameter_invariant():
         truth = (
             compiler_input(option_axpy, params, public, backend),
             canonical_options(
-                target, _knob_options(option_axpy, options, knobs_now)
+                target, knob_options(option_axpy, options, knobs_now)
             ).hash(),
         )
         assert seen.setdefault(key, truth) == truth, "intj key collides"
@@ -6888,6 +6886,8 @@ def test_option_parameter_invariant_catches_an_unfed_option(monkeypatch):
     # the key is unchanged, so a fresh module table keeps the loaded module's
     # compile function (built unmutated) out of the way
     monkeypatch.setattr(render_module, "_LOADED", {})
-    monkeypatch.setattr(backends, "parameter_options", lambda backend, params: ())
+    monkeypatch.setattr(
+        compile_options, "parameter_options", lambda backend, params: ()
+    )
     with pytest.raises(AssertionError, match="option not fed"):
         check_option_parameter_invariant()

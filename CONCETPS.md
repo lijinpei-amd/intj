@@ -51,3 +51,15 @@ and saves the absolute offset before the first launch.
 | record | What a miss returns for C to cache and launch: `(function, block_dim, shared, nparams[, compiled[, deps, computed[, meta]]])`. |
 | kernel compiler | `intj/compiler.py`'s `KernelCompiler`: turns a miss into a record, compiling each identity once per device through `triton_load`. |
 | compile override | A launcher's replacement for its kernel compiler's misses (`override_compile`), for tests and benchmarks. |
+
+# Compile options
+
+`intj/compile_options.py` holds where a compile's options come from and how
+they merge.
+
+| Term | Definition |
+| --- | --- |
+| base options | The launcher's `options=`, fixed for every compile. |
+| overlay | What one call or candidate sets over the base: parameter-fed, dynamic and autotune-config values. Validation keeps their names disjoint. |
+| knob | A Triton knob that sets a compile option (`KNOBS`). `debug` is ORed in; the others overwrite. Applied after the overlay. |
+| parameter-fed option | A `tl.constexpr` parameter named like a compile option: each call's value also sets that option. |
