@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, cast
 from . import _imports
 
 if TYPE_CHECKING:
-    from .launcher import Param
+    from .render.key import Param
 
 _BUILTIN_MIN = builtins.min
 

@@ -34,7 +34,8 @@ from .annotation import (
     SpecializationPolicy,
 )
 from .kernel_cache import KernelCache
-from .launcher import ClassGlobalWarning, make_launcher
+from .launcher import make_launcher
+from .plan import ClassGlobalWarning
 from .options import MakeLauncherOption
 from .torch_intf.torch_abi import TorchAccessMode
 

@@ -21,7 +21,6 @@ from .._version import __version__
 from ..compile_options import refuse_unknown_options, resolve
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
-from ..specialization import key_layout
 from ..torch_intf.torch_abi import (
     TorchAccessMode,
     dtype_index_table,
@@ -44,16 +43,17 @@ from .context import ENTRY_TEMPLATE
 from .key import Param, RenderKey
 
 if TYPE_CHECKING:
-    from ..launcher import _BuildOptions  # pyright: ignore[reportPrivateUsage]  # checked build inputs
+    from ..plan import BuildPlan
 
 
-def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
+def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
     """Returns the loaded module for this kernel and configuration.
 
     Selects the backend and its target (`no_gpu`'s is `HOST`, with none), and
     loads, building if needed, the module for its `RenderKey`.
-    `torch_access_request` is what `torch_access_mode` was resolved from, for
-    choosing again where a build finds STATIC_COMPILE unavailable after all.
+    `b.option.torch_access_mode` is what `b.torch_access_mode` was resolved
+    from, for choosing again where a build finds STATIC_COMPILE unavailable
+    after all.
     `stub` supplies the exact C launcher type the module must accept.
 
     Raises:
@@ -64,7 +64,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
     options = dict(b.compile_options)
     knob_values = b.knob_values
     tuning = b.tuned.render if b.tuned is not None else None
-    backend, target = backends.select(b.no_gpu)
+    backend, target = backends.select(b.option.no_gpu)
     canonical_options = None
     if target is not None:
         assert knob_values is not None, "GPU builds read knobs at the first call"
@@ -75,21 +75,13 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
             [n for n in b.dynamic if not n.startswith("knobs.")]
             + list(b.declared_parameters),
         )
-    layout = key_layout(
-        b.call,
-        b.device_binding,
-        tuning.computed[0] if tuning is not None else 0,
-        b.dynamic,
-    )
+    layout = b.layout
     params = layout.params
-    if tuning is not None:
-        # final only now: level-0 computed keys are placed with the spec fields
-        tuning = dataclasses.replace(tuning, computed_fields=layout.computed_fields)
     # tuned levels always use a map
     nwords = max(layout.nwords, 1) if tuning is not None else layout.nwords
     # check() provisioned already: this is the idempotent, no-network
     # lookup of the toolchain it installed
-    cache_toolchain = deps._provision(b.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
+    cache_toolchain = deps._provision(b.option.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
     # the kernel's own name, unless python allows something C does not
     module_name = b.jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
@@ -103,7 +95,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         nwords=nwords,
         device_binding=b.device_binding,
         device_offset=layout.device_offset,
-        verify_annotation=b.verify_annotation,
+        verify_annotation=b.option.verify_annotation,
         max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
         # the key, even when the knob that emits it is off: a key that cannot tell
@@ -119,19 +111,19 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         torch_access_mode="",
         torch_version=None,
         cxx_abi=None,
-        kernel_cache=b.kernel_cache.value,
+        kernel_cache=b.option.kernel_cache.value,
         cache_include_dirs=cache_toolchain["include_dirs"],
         cache_archives=cache_toolchain["archives"],
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=_verified_cpython_header(),
         pointer_types=_pointer_types(params),
-        grid_arg=b.grid_arg,
-        grid_py_mode=b.grid_py is not None,
-        grid_cpp_source=b.grid_code.source if b.grid_code else "",
-        grid_extra=b.grid_code.extras if b.grid_code else (),
-        return_compiled=b.return_compiled,
-        ndebug=b.ndebug,
+        grid_arg=b.grid.dims,
+        grid_py_mode=b.grid.mode == "py",
+        grid_cpp_source=b.grid.code.source if b.grid.code else "",
+        grid_extra=b.grid.code.extras if b.grid.code else (),
+        return_compiled=b.option.return_compiled,
+        ndebug=b.option.ndebug,
         tuning=tuning,
         dynamic=layout.dynamic,
         template=ENTRY_TEMPLATE.read_bytes().hex(),
@@ -207,7 +199,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         # cpp_extension itself.  An explicit request is refused.
         try:
             confirmed = _resolve_torch_access_mode(
-                b.torch_access_request, confirmed=True
+                b.option.torch_access_mode, confirmed=True
             )
         except UnsupportedKernel as refusal:
             raise refusal from error

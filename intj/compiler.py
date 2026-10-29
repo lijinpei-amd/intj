@@ -22,10 +22,8 @@ from .render.key import Param
 from .specialization import CompilerInput, compiler_input
 
 if TYPE_CHECKING:
-    from .launcher import (
-        LaunchFunction,
-        _BuildOptions,  # pyright: ignore[reportPrivateUsage]  # checked build inputs
-    )
+    from .launcher import LaunchFunction
+    from .plan import BuildPlan
 
 # triton ships no type information
 JitFunction = Any
@@ -224,9 +222,9 @@ class KernelCompiler:
         return cls(None)
 
     @classmethod
-    def for_build(cls, b: _BuildOptions) -> KernelCompiler:
+    def for_build(cls, b: BuildPlan) -> KernelCompiler:
         """Returns the compiler of an ordinary launcher's misses, for its checked build."""
-        _, target = backends.select(b.no_gpu)
+        _, target = backends.select(b.option.no_gpu)
         if target is None:
             return cls.host()
         assert b.knob_values is not None, "GPU builds read knobs at the first call"
@@ -234,8 +232,8 @@ class KernelCompiler:
             b.jit_func,
             dict(b.compile_options),
             b.knob_values,
-            return_compiled=b.return_compiled,
-            params=b.call,
+            return_compiled=b.option.return_compiled,
+            params=b.layout.params,
             baked_values={
                 p.index: p.baked for p in b.params if p.annotation.baked_value
             },

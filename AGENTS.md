@@ -32,8 +32,11 @@ stay in `python_intf/` and `torch_intf/`. Run tools with `python -m intj.tools.<
 - `module.py`: assembling the key, ABI checks, and the per-process
   loaded-module cache.
 
-`launcher.py` checks launcher options and owns the compile callback; it passes
-its C stub to `module.py` for module initialization. `compiler.py` turns a
+`plan.py` runs every GPU-free check, in a fixed refusal order with provisioning
+last, and returns the `BuildPlan` a build needs: the resolved option plus what
+is derived from it (key layout, complete tuning render, one `Grid`).
+`launcher.py` owns the launcher object, `make_launcher` and the compile
+callback; it passes its C stub to `module.py` for module initialization. `compiler.py` turns a
 cache miss into the record C launches (`KernelCompiler`), and is the one place
 Triton compiles (`triton_load`, the port tests replace). Both sides of the
 invariant (key fields, call and key layout, compiler input) live in
@@ -108,7 +111,7 @@ forms: `foo` returns a new, unbuilt launcher, and the public `_foo` edits this
 one in place (through `_C_locked`, under the build lock) until it is
 built. No other private helper is named `_` + a public name. The launcher holds
 one `MakeLauncherOption`, `delayed` included, and nothing derived from it: the
-build resolves `delayed`, checks (`_check_options` -> `_BuildOptions`, a
+build resolves `delayed`, checks (`build_plan` -> `BuildPlan`, a
 return value only), renders, and returns `(entry, resolved options, doc)` for
 C to publish before it swaps the entry in. The
 module's `_init` allocates the launcher's state block behind `state` and

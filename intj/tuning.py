@@ -29,8 +29,7 @@ from .launcher import Launcher
 from .render.key import Param, TuningRender
 
 if TYPE_CHECKING:
-    from .grid import GridCode
-    from .launcher import _BuildOptions  # pyright: ignore[reportPrivateUsage]  # launcher internals
+    from .plan import BuildPlan, Grid
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,12 +93,12 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             parameter tuned, a name assigned twice, a read of a value an inner
             layer assigns, or an unparseable heuristic).
     """
-    from .launcher import _is_chain  # pyright: ignore[reportPrivateUsage]  # launcher internals
+    from .plan import is_chain
 
     _imports.ensure_triton_imported()
     layers: list[Any] = []
     inner = kernel
-    while _is_chain(inner):
+    while is_chain(inner):
         layers.append(inner)
         inner = inner.fn
     if not layers:
@@ -305,7 +304,7 @@ def tuning_render(
     """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
 
     `call` is `resolved` numbered in the public call. `computed_fields` is left
-    empty: `render.module._build_module` places it."""
+    empty: `plan.build_plan` places it with the key layout."""
     _imports.ensure_triton_imported()
     by_name = {p.name: p for p in call}
     grid_code = getattr(grid_cpp, "__code__", None)
@@ -384,20 +383,16 @@ class TunedGrid:
     extras: tuple[str, ...] = ()
 
 
-def tuned_grid(
-    grid_py: Callable[[dict[str, object]], object] | None,
-    grid_cpp: object | None,
-    grid_code: GridCode | None,
-) -> TunedGrid:
-    if grid_py is not None:
-        return TunedGrid("py", grid_py)
-    if grid_code is not None:
-        code = getattr(grid_cpp, "__code__")
+def tuned_grid(grid: Grid) -> TunedGrid:
+    if grid.mode == "py":
+        return TunedGrid("py", grid.fn)
+    if grid.code is not None:
+        code = getattr(grid.fn, "__code__")
         return TunedGrid(
             "cpp",
-            grid_cpp,
+            grid.fn,
             tuple(code.co_varnames[: code.co_argcount]),
-            grid_code.extras,
+            grid.code.extras,
         )
     return TunedGrid("dims")
 
@@ -669,7 +664,7 @@ class TunedLauncher(Launcher):
 
     __slots__ = ()
 
-    def _check_target(self, b: _BuildOptions) -> None:
+    def _check_target(self, b: BuildPlan) -> None:
         assert b.tuned is not None and b.knob_values is not None, (
             "plan_tuning refuses no_gpu"
         )
@@ -677,7 +672,7 @@ class TunedLauncher(Launcher):
             b.tuned.plan, b.params, dict(b.compile_options), b.knob_values
         )
 
-    def _new_compile_state(self, b: _BuildOptions) -> TunedCompileState:
+    def _new_compile_state(self, b: BuildPlan) -> TunedCompileState:
         """Returns this launcher's private tuning state."""
         assert (
             b.tuned is not None
@@ -688,7 +683,7 @@ class TunedLauncher(Launcher):
             b.tuned.plan,
             b.params,
             dict(b.compile_options),
-            tuned_grid(b.grid_py, b.grid_cpp_fn, b.grid_code),
+            tuned_grid(b.grid),
             b.tuned.render,
             b.knob_values,
             b.dynamic,

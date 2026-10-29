@@ -5419,7 +5419,7 @@ def test_different_global_values_never_share_a_module(tmp_path, kind):
 def test_global_values_canonicalize_or_refuse(tmp_path):
     from triton._C.libtriton import ir
 
-    from intj.launcher import _canonical_global
+    from intj.plan import _canonical_global
 
     assert _canonical_global(tl.constexpr(ir.PROPAGATE_NAN.ALL)) == (
         "constexpr",

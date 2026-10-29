@@ -145,9 +145,9 @@ def test_each_launcher_checks_its_own_options(monkeypatch):
     import intj.launcher as launcher
 
     calls = []
-    real = launcher._check_options
+    real = launcher.build_plan
     monkeypatch.setattr(
-        launcher, "_check_options", lambda o: calls.append(o.bind_device) or real(o)
+        launcher, "build_plan", lambda o: calls.append(o.bind_device) or real(o)
     )
     base = make_launcher(store, extra_annotation={"x": _POINTER}, **_HOST)
     for k in (base.__self__.bind(x=0), base.__self__.bind_device(0, x=0)):
