@@ -2,6 +2,7 @@
 """Compile-option merging and the knob table, against Triton's parser, no GPU."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -72,7 +73,7 @@ def test_unknown_names_are_refused():
 
 
 def test_only_constexpr_parameters_named_like_options_feed_them():
-    def param(name, kind):
+    def param(name, kind) -> Any:  # a Param reduced to what parameter_options reads
         return SimpleNamespace(name=name, annotation=SimpleNamespace(kind=kind))
 
     params = [
