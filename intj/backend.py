@@ -5,10 +5,14 @@ from __future__ import annotations
 import abc
 import dataclasses
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import _imports
 from .errors import UnsupportedKernel
+
+if TYPE_CHECKING:
+    from .annotation import ResolvedParam
+    from .render.key import Param
 
 
 class Backend(abc.ABC):
@@ -172,6 +176,31 @@ def canonical_options(target: Any, options: Mapping[str, Any]) -> Any:
     parsed: Any = _imports.make_backend(target).parse_options(dict(options))
     refuse_unknown_options(parsed, options)
     return parsed
+
+
+#: options a launch fixes itself; never `options=` or `dynamic_options`
+FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
+
+
+def parameter_options(
+    backend: Any, params: Iterable[ResolvedParam | Param]
+) -> tuple[str, ...]:
+    """Returns the tl.constexpr parameters that double as compile options.
+
+    These are named like one of `backend`'s compile options (`num_warps`,
+    `num_stages`, `waves_per_eu`, ...), and every call's value also sets that
+    option, as Triton's `k[grid](..., num_warps=8)` does.  Not a key field:
+    the parameter's own exact key already tells every value apart.  Options a
+    launch fixes itself stay parameters only.
+    """
+    fields = {f.name for f in dataclasses.fields(backend.parse_options({}))}
+    return tuple(
+        p.name
+        for p in params
+        if p.annotation.kind == "constexpr"
+        and p.name in fields
+        and p.name not in FORBIDDEN_OPTIONS
+    )
 
 
 def refuse_unknown_options(parsed: Any, names: Iterable[str]) -> None:

@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 from triton.compiler import CompiledKernel
 
-from intj import Argument, BindValue, KernelCache, NEVER, make_launcher
+from intj import Argument, BindValue, KernelCache, NEVER, compiler, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, override_compile
 from intj.render import module as render_module
 
@@ -137,12 +137,10 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
 
 
 def test_reentrant_cache_miss_returns_winning_record(monkeypatch):
-    import triton.compiler
-
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream
-    real_compile = triton.compiler.compile
+    real_compile = compiler.triton_load
     compiled = []
     nested_result = []
     launch = None
@@ -155,7 +153,7 @@ def test_reentrant_cache_miss_returns_winning_record(monkeypatch):
             nested_result.append(launch(device, stream, (1,), x, 5))
         return kernel
 
-    monkeypatch.setattr(triton.compiler, "compile", compile_with_reentry)
+    monkeypatch.setattr(compiler, "triton_load", compile_with_reentry)
     launch = make_launcher(reentrant_store, return_compiled=True)
     result = launch(device, stream, (1,), x, 5)
 
@@ -172,13 +170,11 @@ def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
     A nested miss records its kernel first; the outer compile must not replace it
     in that cache, or the record's function handle is freed.
     """
-    import triton.compiler
-
     monkeypatch.setattr(render_module, "_LOADED", {})
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream().cuda_stream
-    real_compile = triton.compiler.compile
+    real_compile = compiler.triton_load
     compiled = []  # weak: the test must not keep a kernel alive itself
 
     def compile_with_reentry(*args, **kwargs):
@@ -188,7 +184,7 @@ def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
             launch(device, stream, (1,), x, 5)  # the nested miss records first
         return kernel
 
-    monkeypatch.setattr(triton.compiler, "compile", compile_with_reentry)
+    monkeypatch.setattr(compiler, "triton_load", compile_with_reentry)
     launch = make_launcher(reentrant_store)
     launch(device, stream, (1,), x, 5)
     gc.collect()
@@ -200,10 +196,9 @@ def test_reentrant_miss_keeps_the_recorded_kernel_alive(monkeypatch):
 
 
 def test_compile_override_keeps_cached_kernel_alive(monkeypatch):
-    import intj.launcher as launcher_module
 
     monkeypatch.setattr(render_module, "_LOADED", {})
-    real_compile = launcher_module._checked_compile
+    real_compile = compiler.triton_load
     kernels = []
 
     def compile_kernel(*args, **kwargs):
@@ -211,7 +206,7 @@ def test_compile_override_keeps_cached_kernel_alive(monkeypatch):
         kernels.append(weakref.ref(kernel))
         return kernel
 
-    monkeypatch.setattr(launcher_module, "_checked_compile", compile_kernel)
+    monkeypatch.setattr(compiler, "triton_load", compile_kernel)
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     launch = make_launcher(reentrant_store)
     device = torch.cuda.current_device()
@@ -230,9 +225,8 @@ def test_compile_override_keeps_cached_kernel_alive(monkeypatch):
 
 
 def test_ordinary_compiler_cache_dies_with_its_launcher(monkeypatch):
-    import intj.launcher as launcher_module
 
-    real_compile = launcher_module._checked_compile
+    real_compile = compiler.triton_load
     kernels = []
 
     def compile_kernel(*args, **kwargs):
@@ -240,7 +234,7 @@ def test_ordinary_compiler_cache_dies_with_its_launcher(monkeypatch):
         kernels.append(weakref.ref(kernel))
         return kernel
 
-    monkeypatch.setattr(launcher_module, "_checked_compile", compile_kernel)
+    monkeypatch.setattr(compiler, "triton_load", compile_kernel)
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     first = make_launcher(reentrant_store)
     second = make_launcher(reentrant_store)

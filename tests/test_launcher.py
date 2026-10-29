@@ -40,7 +40,7 @@ from triton.experimental.gluon import language as gl
 
 import intj
 import intj.backend
-from intj import launcher, make_launcher
+from intj import compiler, launcher, make_launcher
 from intj import backend as backends
 from intj import (
     AUTO,
@@ -2966,18 +2966,16 @@ def test_zero_volume_grid_does_not_launch(scale_launcher):
 
 @pytest.fixture
 def compiled_kernels(monkeypatch):
-    """Returns the list every `triton.compiler.compile` result is appended to."""
-    import triton.compiler
-
-    compile = triton.compiler.compile
+    """Returns the list every kernel `triton_load` compiles is appended to."""
+    load = compiler.triton_load
     kernels = []
 
-    def capture(*args, **kwargs):
-        kernel = compile(*args, **kwargs)
+    def capture(*args):
+        kernel = load(*args)
         kernels.append(kernel)
         return kernel
 
-    monkeypatch.setattr(triton.compiler, "compile", capture)
+    monkeypatch.setattr(compiler, "triton_load", capture)
     return kernels
 
 
@@ -3097,7 +3095,7 @@ def test_annotated_effective_compile_options_and_identity(
 
     def capture_state(self, b):
         state = original_state(self, b)
-        assert isinstance(state, launcher._KernelCompiler)
+        assert isinstance(state, compiler.KernelCompiler)
         with pytest.raises(CompilationCaptured):
             state.compile_miss(b"\x00" * 8, 1, torch.cuda.current_device(), 7)
         assert captured["debug"] is expected_debug
@@ -3176,8 +3174,8 @@ def test_one_module_per_key():
     assert module_of(first) is module_of(second)
     first_state = first.__self__._compile_state
     second_state = second.__self__._compile_state
-    assert isinstance(first_state, launcher._KernelCompiler)
-    assert isinstance(second_state, launcher._KernelCompiler)
+    assert isinstance(first_state, compiler.KernelCompiler)
+    assert isinstance(second_state, compiler.KernelCompiler)
     assert first_state is not second_state
     assert first is not second  # each launcher owns its cache
 
@@ -4021,13 +4019,13 @@ def test_sibling_launchers_intern_independently(monkeypatch):
     and each launcher's compiler cache compiles each variant once.
     """
     monkeypatch.setattr(render_module, "_LOADED", {})
-    real, compiles = launcher._checked_compile, []
+    real, compiles = compiler.triton_load, []
 
     def counted(*args, **kwargs):
         compiles.append(1)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(launcher, "_checked_compile", counted)
+    monkeypatch.setattr(compiler, "triton_load", counted)
     first, second = make_launcher(act_store), make_launcher(act_store)
     o = torch.zeros(1, device="cuda")
     second(*_gpu_controls(), o, 2.0, "neg")  # id 0 = "neg" in second
@@ -4477,11 +4475,26 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 @pytest.mark.parametrize("key", [b"", b"\x00" * 8])
 def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
     from intj.annotation import _merge_annotations
-    from intj.launcher import _KernelCompiler
+    from intj.compiler import KernelCompiler
     from intj.specialization import call_layout
 
+    def fake_load(jit_func, source, target, canonical_options):
+        # stands in for Triton: this test checks identities, not binaries
+        md = types.SimpleNamespace(
+            num_ctas=1,
+            launch_cooperative_grid=False,
+            profile_scratch_size=0,
+            warp_size=64,
+            num_warps=4,
+            shared=0,
+        )
+        src = types.SimpleNamespace(signature=dict(source.signature))
+        return types.SimpleNamespace(metadata=md, src=src, function=0)
+
     params = call_layout(_merge_annotations(power_kernel, {"N": Constexpr()}))
-    state = _KernelCompiler(power_kernel, {}, launcher._live_knobs(), params=params)
+    state = KernelCompiler(
+        power_kernel, {}, launcher._live_knobs(), params=params, load=fake_load
+    )
     device = torch.cuda.current_device()
     state.compile_miss(key, 0, device, 1)
     state.compile_miss(key, 0, device, 1)
@@ -4511,7 +4524,7 @@ def _recording_input_launcher(
         their ASTSource, and the list of recorded misses.
     """
     from intj.backend import current_target
-    from intj.launcher import _KernelCompiler
+    from intj.compiler import KernelCompiler
     from intj.specialization import compiler_input
     from triton.backends.compiler import GPUTarget
     from triton.compiler import make_backend
@@ -4534,7 +4547,7 @@ def _recording_input_launcher(
         GPUTarget("hip", "gfx942", 64) if no_gpu else current_target()
     )
     state = native.__self__._compile_state
-    assert isinstance(state, _KernelCompiler)
+    assert isinstance(state, KernelCompiler)
     real_compile = state.compile_miss
     calls = []
 
@@ -6444,15 +6457,14 @@ def test_bindings_share_a_launcher_type_with_private_state(bound_kernel, device_
 
 def test_sibling_launchers_compile_once_each(monkeypatch):
     """Sibling launchers reuse C code and own separate compiled-kernel caches."""
-    import intj.launcher as launcher
 
-    real, compiles = launcher._checked_compile, []
+    real, compiles = compiler.triton_load, []
 
     def counted(*args, **kwargs):
         compiles.append(1)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(launcher, "_checked_compile", counted)
+    monkeypatch.setattr(compiler, "triton_load", counted)
     first, second = make_launcher(scale), make_launcher(scale)
     assert first.__self__ is not second.__self__
     x = torch.ones(64, device="cuda")
@@ -6563,17 +6575,16 @@ def test_declared_knob_only_keys_and_must_match_the_live_value(monkeypatch):
     knob raises and records nothing; each live value compiles its own record,
     and an old value still hits its record after the knob changed.
     """
-    import intj.launcher as launcher
     from triton import knobs
 
     monkeypatch.setattr(knobs.runtime, "debug", False)
-    compiles, real = [], launcher._checked_compile
+    compiles, real = [], compiler.triton_load
 
     def spy(*args, **kwargs):
         compiles.append(knobs.runtime.debug)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(launcher, "_checked_compile", spy)
+    monkeypatch.setattr(compiler, "triton_load", spy)
     launch = make_launcher(
         act_store,
         dynamic_options=("knobs.runtime.debug",),
@@ -6706,7 +6717,8 @@ def check_dynamic_invariant():
 
     from intj.annotation import _merge_annotations
     from intj.backend import canonical_options, current_target
-    from intj.launcher import _live_knobs, _split_dynamic
+    from intj.compiler import _split_dynamic
+    from intj.launcher import _live_knobs
     from intj.specialization import compiler_input
     from intj.backend import _knob_options
     from intj.specialization import call_layout
@@ -6876,6 +6888,6 @@ def test_option_parameter_invariant_catches_an_unfed_option(monkeypatch):
     # the key is unchanged, so a fresh module table keeps the loaded module's
     # compile function (built unmutated) out of the way
     monkeypatch.setattr(render_module, "_LOADED", {})
-    monkeypatch.setattr(launcher, "_parameter_options", lambda backend, params: ())
+    monkeypatch.setattr(backends, "parameter_options", lambda backend, params: ())
     with pytest.raises(AssertionError, match="option not fed"):
         check_option_parameter_invariant()

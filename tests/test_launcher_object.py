@@ -14,7 +14,7 @@ import pytest
 import triton
 import triton.language as tl
 
-from intj import MakeLauncherOption, make_launcher
+from intj import MakeLauncherOption, compiler, make_launcher
 from intj.annotation import NEVER, Argument, BindValue, Constexpr
 from intj.launcher import Launcher
 from intj.options import OPTION_FIELDS, MakeLauncherKwargs
@@ -52,7 +52,6 @@ def test_unknown_keyword_fails_at_decoration():
 
 
 def test_compile_state_is_published_only_after_initialization(monkeypatch):
-    import intj.launcher as launcher_mod
     from intj.render import module as render_module
 
     launch = make_launcher(store, **_HOST)
@@ -86,7 +85,7 @@ def test_compile_state_is_published_only_after_initialization(monkeypatch):
     assert h._C_module is None
     monkeypatch.undo()
     h.build()
-    assert type(h._compile_state) is launcher_mod._KernelCompiler
+    assert type(h._compile_state) is compiler.KernelCompiler
 
 
 @pytest.fixture

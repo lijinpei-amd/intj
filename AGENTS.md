@@ -32,13 +32,15 @@ stay in `python_intf/` and `torch_intf/`. Run tools with `python -m intj.tools.<
 - `module.py`: assembling the key, ABI checks, and the per-process
   loaded-module cache.
 
-`launcher.py` checks launcher options and owns the compile callback and Python
-compile state; it passes its C stub to `module.py` for module initialization.
-Both sides of the invariant (key fields, call and key layout, compiler input)
-live in `specialization.py`. Shared compile-option merging lives in
-`backend.py`, checked dependency
-provisioning in `render/deps.py`, and `UnsupportedKernel` in `errors.py`
-(re-exported by `launcher.py`).
+`launcher.py` checks launcher options and owns the compile callback; it passes
+its C stub to `module.py` for module initialization. `compiler.py` turns a
+cache miss into the record C launches (`KernelCompiler`), and is the one place
+Triton compiles (`triton_load`, the port tests replace). Both sides of the
+invariant (key fields, call and key layout, compiler input) live in
+`specialization.py`. Shared compile-option merging, parameter-fed options
+included, lives in `backend.py`, checked dependency provisioning in
+`render/deps.py`, and `UnsupportedKernel` in `errors.py` (re-exported by
+`launcher.py`, as is `override_compile`).
 `kernel_cache.py` holds the public `KernelCache` enum and delegates its CLI to
 `render/deps.py`.
 
@@ -119,13 +121,13 @@ the same call from every module, and reads back `(function, block_dim, shared,
 nparams[, compiled[, deps, computed[, meta]]])`. `_build_body` stores the Python
 compile state in the launcher's `_compile_state` slot after `_init` succeeds,
 before C publishes the rendered entry: a
-`_KernelCompiler` (the private compiled-kernel cache, specialization check map,
+`KernelCompiler` (the private compiled-kernel cache, specialization check map,
 compile options, and miss override) or, for a `TunedLauncher`, its private
-`TunedCompileState`. `Launcher._compile_miss` uses the ordinary state's private
-compiled kernel cache and current compile override, and C launches the returned
-record. `TunedLauncher._compile_miss` overrides it to run the private chain,
+`TunedCompileState`. `Launcher._compile_miss` hands the miss to the ordinary
+state's `KernelCompiler.miss`, which applies the current compile override or
+compiles, and C launches the returned record. `TunedLauncher._compile_miss` overrides it to run the private chain,
 including the final launch; C stores the record without launching it again.
-Both compile through `_KernelCompiler`. C neither stores nor exposes Python
+Both compile through `KernelCompiler`. C neither stores nor exposes Python
 compile state; Python's slot traversal and clearing manage its lifetime.
 `override_compile(launcher, fn)` builds the ordinary launcher if needed and
 returns a no-argument function restoring its previous override. Siblings are

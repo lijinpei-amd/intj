@@ -43,3 +43,11 @@ and saves the absolute offset before the first launch.
 | call layout | Where each parameter sits in the public call (`call_index`, None when baked, bound or tuned) and which take objects (`memo`). Places no key field. |
 | key layout | Where every key field sits in the spec key, widest first, and how many 64-bit words the key takes. |
 | compiler input | What Triton is given for one call: signature, constants and attrs. The key must never be coarser than it. |
+
+# Compiling a miss
+
+| Term | Definition |
+| --- | --- |
+| record | What a miss returns for C to cache and launch: `(function, block_dim, shared, nparams[, compiled[, deps, computed[, meta]]])`. |
+| kernel compiler | `intj/compiler.py`'s `KernelCompiler`: turns a miss into a record, compiling each identity once per device through `triton_load`. |
+| compile override | A launcher's replacement for its kernel compiler's misses (`override_compile`), for tests and benchmarks. |

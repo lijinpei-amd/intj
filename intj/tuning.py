@@ -21,11 +21,11 @@ from typing import TYPE_CHECKING, Any, cast
 from . import _imports
 from . import backend as backends
 from .annotation import ResolvedParam
+from .compiler import KernelCompiler, record
 from .errors import UnsupportedKernel
 from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
 from .launcher import Launcher
 from .render.key import Param, TuningRender
-from .specialization import compiler_input
 
 if TYPE_CHECKING:
     from .grid import GridCode
@@ -541,25 +541,19 @@ class TunedCompileState:
         knob_values: Mapping[str, object],
         dynamic: Sequence[str] = (),
     ) -> None:
-        from .launcher import (
-            _KernelCompiler,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-            _parameter_options,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        )
-
         self.plan = plan
         self.jit_func = plan.jit_func
-        # its own, strong: a CompiledKernel is loaded on one device, and
-        # records point into candidates no module sees
-        self.compiler = _KernelCompiler(self.jit_func, options, knob_values)
+        # Every parameter is public: the shim sees the full Triton call.
+        self.compiler = KernelCompiler.for_candidates(
+            self.jit_func,
+            options,
+            knob_values,
+            tuple(Param(p.name, p.index, p.index, p.annotation) for p in resolved),
+            dynamic,
+        )
         self.grid = grid
         self.render = render
-        self.dynamic = dynamic
-        # Every parameter is public: the shim sees the full Triton call.
-        self.params = tuple(
-            Param(p.name, p.index, p.index, p.annotation) for p in resolved
-        )
         self.call_knobs: dict[str, object] = {}
-        self.fed = _parameter_options(self.compiler.backend, self.params)
         self.shim = _Shim(self.jit_func, self._compile_kernel)
         self.private = _private_chain(plan.layers, self.shim)
         self.public = [
@@ -575,22 +569,7 @@ class TunedCompileState:
         self, values: dict[str, Any], config_options: dict[str, Any]
     ) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
-        from .launcher import (
-            _Identity,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        )
-
-        canonical = self.compiler.canonical(
-            {**config_options, **{n: values[n] for n in self.fed}}, self.call_knobs
-        )
-        source = compiler_input(
-            self.jit_func,
-            self.params,
-            [values[p.name] for p in self.params],
-            self.compiler.backend,
-        )
-        return self.compiler.compile(
-            _Identity.of(source, canonical, self.call_knobs), canonical
-        )
+        return self.compiler.candidate(values, config_options, self.call_knobs)
 
     def run(
         self,
@@ -623,15 +602,8 @@ class TunedCompileState:
         args: tuple[Any, ...],
     ) -> tuple[Any, ...]:
         """Runs the private chain on `stream` and returns the record for C."""
-        from .launcher import (
-            _check_device,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-            _record,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-            _split_call,  # pyright: ignore[reportPrivateUsage]  # launcher internals
-        )
-
         _imports.ensure_torch_imported()
-        _check_device(device)
-        dyn_options, self.call_knobs, args = _split_call(self.dynamic, args)
+        dyn_options, self.call_knobs, args = self.compiler.split_call(device, args)
         named = {**dict(zip(self.public, args)), **self.baked}
         # Positional up to the first tuned parameter, as a Triton caller would
         # write it: prune functions read `named_args`, which is positional only.
@@ -666,7 +638,7 @@ class TunedCompileState:
             values, config_options, kernel = self.shim.final
             tuned_values = {**values, **config_options}
             return (
-                *_record(kernel, nparams),
+                *record(kernel, nparams),
                 kernel,
                 tuple(c_scalar(n, tuned_values[n]) for n in self.render.dep_names),
                 tuple(tuned_values[n] for n in self.render.computed_names),

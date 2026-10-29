@@ -12,7 +12,7 @@ import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, triton_specialization
-from intj import specialization
+from intj import compiler, specialization
 from knob_helpers import live_knob_values, needs_hip
 
 
@@ -568,16 +568,15 @@ def test_child_map_grows_past_four_slots(monkeypatch):
     5 distinct values so the child map must grow once, then check every value
     still reads back through both a fresh launch and key_chain.
     """
-    import intj.launcher as launcher_mod
 
     compiles = []
-    original = launcher_mod._checked_compile
+    original = compiler.triton_load
 
     def counted(*args, **kwargs):
         compiles.append(1)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(launcher_mod, "_checked_compile", counted)
+    monkeypatch.setattr(compiler, "triton_load", counted)
 
     out = torch.zeros(1, device="cuda", dtype=torch.int32)
 
@@ -803,7 +802,7 @@ def _reference(kernel, args_by_name, dynamic=None):
 
     from triton.runtime.autotuner import Autotuner
 
-    from intj.launcher import _split_dynamic
+    from intj.compiler import _split_dynamic
 
     dynamic = dynamic or {}
     run_options, run_knobs = _split_dynamic(tuple(dynamic), tuple(dynamic.values()))
@@ -857,7 +856,7 @@ def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
     Raises:
         AssertionError: If one key chain maps to two Triton decisions.
     """
-    from intj.launcher import _split_dynamic
+    from intj.compiler import _split_dynamic
 
     launch = make_launcher(make_kernel(), dynamic_options=dynamic)
     module = module_of(launch)
@@ -910,8 +909,6 @@ def test_tuned_key_chain_is_never_coarser_than_triton():
 
 
 def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
-    from intj import specialization
-
     original = specialization._cache_key_fields
 
     def without_exact(a):
@@ -1234,18 +1231,16 @@ def test_tuned_constexpr_option_parameter_feeds_the_option(layer):
         make_launcher(kernel, dynamic_options=("num_warps",)).__self__.check()
 
 
-def test_tuned_and_ordinary_misses_share_the_kernel_compiler(monkeypatch):
-    """Both miss paths reach Triton through `_KernelCompiler.compile`."""
-    import intj.launcher as launcher_mod
-
-    real = launcher_mod._KernelCompiler.compile
+def test_tuned_and_ordinary_misses_reach_triton_through_one_port(monkeypatch):
+    """Both miss paths compile through `triton_load`."""
+    real = compiler.triton_load
     calls = []
 
-    def counting(self, identity, canonical):
-        calls.append(identity)
-        return real(self, identity, canonical)
+    def counting(*args):
+        calls.append(args[1])
+        return real(*args)
 
-    monkeypatch.setattr(launcher_mod._KernelCompiler, "compile", counting)
+    monkeypatch.setattr(compiler, "triton_load", counting)
     x = torch.zeros(256, device="cuda", dtype=torch.int32)
     out = torch.zeros_like(x)
     bench = Bench(out, {16: {1: 1.0, 2: 2.0}})
@@ -1263,7 +1258,8 @@ def test_tuned_and_ordinary_misses_share_the_kernel_compiler(monkeypatch):
 
 
 def test_a_chain_gets_a_tuned_launcher_and_its_copies_keep_it():
-    from intj.launcher import Launcher, _KernelCompiler
+    from intj.compiler import KernelCompiler
+    from intj.launcher import Launcher
     from intj.tuning import TunedCompileState, TunedLauncher
 
     x = torch.zeros(256, device="cuda", dtype=torch.int32)
@@ -1283,4 +1279,4 @@ def test_a_chain_gets_a_tuned_launcher_and_its_copies_keep_it():
     launch(device, stream, x, out, 16)
     plain(device, stream, (1,), x, out, 16, 1, 32)
     assert type(launch.__self__._compile_state) is TunedCompileState
-    assert type(plain.__self__._compile_state) is _KernelCompiler
+    assert type(plain.__self__._compile_state) is KernelCompiler

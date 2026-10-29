@@ -35,7 +35,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from intj import launcher, launcher_base
+from intj import compiler, launcher, launcher_base
 from intj.annotation import CanonicalAnnotation, DeviceBinding, ResolvedParam
 from intj.render import build
 from intj.render import module as render_module
@@ -904,7 +904,7 @@ def _built(address, options=None):
 
 
 def _compile_state(compiles):
-    state = launcher._KernelCompiler(None)
+    state = compiler.KernelCompiler.host()
 
     def compile_cb(_key, nparams, _device, *args):
         compiles.append(args[-1])
