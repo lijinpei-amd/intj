@@ -277,22 +277,6 @@ class DeviceBinding(str, enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class KeyLayout:
-    """The placement of every key field in a launcher's spec key.
-
-    Attributes:
-        fields: `(parameter index, placed field)` pairs, in the input order.
-        device_offset: The byte offset of the device slot, or None when the
-            device is fixed.
-        nwords: The spec-key length, in uint64 words.
-    """
-
-    fields: tuple[tuple[int, CacheKeyField], ...]
-    device_offset: int | None
-    nwords: int
-
-
-@dataclasses.dataclass(frozen=True)
 class CanonicalAnnotation:
     """The merged, validated annotation of one parameter, as keyed and rendered.
 
@@ -595,57 +579,6 @@ def _applicable(name: str | None, field: str) -> bool:
     if field == "equal_to_one":
         return name.startswith(("i", "u")) and name != "u1"
     return name.startswith("*") or (name.startswith(("i", "u")) and name != "u1")
-
-
-def _cache_key_fields(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
-    annotation: CanonicalAnnotation,
-) -> tuple[CacheKeyField, ...]:
-    """Returns the unplaced key fields `annotation` contributes to the spec key."""
-    if annotation.tuned or annotation.baked_value or annotation.bind_value is not None:
-        return ()
-    types = annotation.types
-    if annotation.kind == "constexpr":
-        if annotation.power_of_two_or_zero:
-            return (CacheKeyField("payload", 1),)
-        if types == (None,):
-            return ()
-        descriptor = types is None or len(types) > 1
-        width = (
-            8
-            if types is None
-            else max(
-                0
-                if ty is None
-                else 8
-                if ty == "fp64"
-                else 1
-                if ty == "u1"
-                else int(ty[1:]) // 8
-                for ty in types
-            )
-        )
-        return ((CacheKeyField("descriptor", 1),) if descriptor else ()) + (
-            (CacheKeyField("payload", width),) if width else ()
-        )
-    descriptor = (
-        types is None
-        or len(types) > 1
-        or any(
-            mode == "auto" and any(_applicable(ty, field) for ty in types)
-            for field, mode in zip(
-                _FACT_NAMES,
-                (
-                    annotation.equal_to_one,
-                    annotation.aligned_16,
-                    annotation.pointer_range_32,
-                ),
-            )
-        )
-    )
-    fields = (CacheKeyField("descriptor", 1),) if descriptor else ()
-    if annotation.exact_key:
-        fields += (CacheKeyField("exact_kind", 1), CacheKeyField("exact", 8))
-    return fields
 
 
 def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher

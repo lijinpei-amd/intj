@@ -30,3 +30,16 @@ For `RUNTIME_SHIM`, each version file in `torch_abi/` stores `cdata` relative to
 `PyObject_HEAD`. `layout_for()` selects the verified Torch row, and the
 generated module's `_set_torch_abi()` adds its compiled `sizeof(PyObject)`
 and saves the absolute offset before the first launch.
+
+# Specialization
+
+`intj/specialization.py` holds both sides of the invariant
+"same intj spec key ⟹ same triton specialization".
+
+| Term | Definition |
+| --- | --- |
+| spec key | The bytes a launch looks its compiled kernel up by: the key fields of the parameters, level-0 computed keys and dynamic values, then the device byte unless the launcher is bound to a device. |
+| key field | One piece of a parameter's spec key: a `descriptor` (type and facts), a `payload` (a constexpr's value), or `exact_kind`/`exact` (an exact key). |
+| call layout | Where each parameter sits in the public call (`call_index`, None when baked, bound or tuned) and which take objects (`memo`). Places no key field. |
+| key layout | Where every key field sits in the spec key, widest first, and how many 64-bit words the key takes. |
+| compiler input | What Triton is given for one call: signature, constants and attrs. The key must never be coarser than it. |

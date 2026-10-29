@@ -806,7 +806,8 @@ def test_exactly_adds_no_key_bytes(tmp_path, ty, exactly, assume):
 
     The `Assume` of the same facts measures the others, in one descriptor byte.
     """
-    from intj.annotation import _cache_key_fields, _merge_annotations
+    from intj.annotation import _merge_annotations
+    from intj.specialization import _cache_key_fields
 
     kernel = kernel_with_params(tmp_path, "x")
 
@@ -857,7 +858,7 @@ def test_layout_key_fields_are_grouped_by_descending_alignment(
     widths, fixed_device, expected_offsets, device_offset, nwords
 ):
     from intj.annotation import CacheKeyField, DeviceBinding
-    from intj.render.module import _layout_fields
+    from intj.specialization import _layout_fields
 
     layout = _layout_fields(
         tuple(
@@ -873,7 +874,7 @@ def test_layout_key_fields_are_grouped_by_descending_alignment(
 
 def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path):
     from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, key_layout
 
     kernel = kernel_with_params(
         tmp_path,
@@ -895,9 +896,8 @@ def test_layout_canonical_key_fields_cover_dynamic_and_fixed_parameters(tmp_path
             "baked": intj.Argument(type=tl.int32, specialize=intj.NEVER, value=4),
         },
     )
-    params, device_offset, nwords, _, _ = _spec_key_layout(
-        resolved, DeviceBinding.NOT_FIXED
-    )
+    layout = key_layout(call_layout(resolved), DeviceBinding.NOT_FIXED)
+    params, device_offset, nwords = layout.params, layout.device_offset, layout.nwords
     fields = [
         tuple((f.kind, f.width, f.offset) for f in p.annotation.key_fields)
         for p in params
@@ -931,9 +931,8 @@ class CompilerBackendStub:
 
 
 def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path):
-    from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.annotation import _merge_annotations
+    from intj.specialization import call_layout, compiler_input
 
     kernel = kernel_with_params(tmp_path, "x, n, BLOCK")
     resolved = _merge_annotations(
@@ -947,12 +946,12 @@ def test_compiler_input_applies_fixed_and_automatic_fields(monkeypatch, tmp_path
             "BLOCK": intj.Constexpr(type=tl.int32),
         },
     )
-    params, _, _, _, _ = _spec_key_layout(resolved, DeviceBinding.NOT_FIXED)
+    params = call_layout(resolved)
     monkeypatch.setattr(
-        "intj.launcher._triton_specialize",
+        "intj.specialization._triton_specialize",
         lambda *args, **kwargs: pytest.fail("fixed input was specialized"),
     )
-    source = _compiler_input(kernel, params, (object(), 7, 128), CompilerBackendStub())
+    source = compiler_input(kernel, params, (object(), 7, 128), CompilerBackendStub())
     assert source.signature == (("x", "*fp32"), ("n", "i32"), ("BLOCK", "constexpr"))
     assert source.constants == (((2,), ("int", "128")),)
     assert source.attrs == (
@@ -1056,21 +1055,18 @@ def test_global_pointer_annotation_accepts_both_triton_address_space_abis():
 def test_compiler_input_canonical_overrides(
     monkeypatch, tmp_path, annotation, value, inferred, signature, constant, attrs
 ):
-    from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.annotation import _merge_annotations
+    from intj.specialization import call_layout, compiler_input
 
     kernel = kernel_with_params(tmp_path, "x")
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(kernel, {"x": annotation}), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(kernel, {"x": annotation}))
 
     def specialize(value, **kwargs):
         assert inferred is not None, "fixed input was specialized"
         return inferred
 
-    monkeypatch.setattr("intj.launcher._triton_specialize", specialize)
-    source = _compiler_input(kernel, params, (value,), CompilerBackendStub())
+    monkeypatch.setattr("intj.specialization._triton_specialize", specialize)
+    source = compiler_input(kernel, params, (value,), CompilerBackendStub())
     assert source.signature == (("x", signature),)
     assert source.constants == ((((0,), constant),) if constant else ())
     assert source.attrs == ((((0,), attrs),) if attrs else ())
@@ -1083,9 +1079,8 @@ def test_compiler_input_canonical_overrides(
 
 
 def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_path):
-    from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.annotation import _merge_annotations
+    from intj.specialization import call_layout, compiler_input
 
     kernel = kernel_with_params(tmp_path, "a, b, c, d")
     original = float("-0.0")
@@ -1098,12 +1093,12 @@ def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_p
             "d": intj.Constexpr(type=tl.int16),
         },
     )
-    params, _, _, _, _ = _spec_key_layout(resolved, DeviceBinding.NOT_FIXED)
+    params = call_layout(resolved)
     monkeypatch.setattr(
-        "intj.launcher._triton_specialize",
+        "intj.specialization._triton_specialize",
         lambda *args, **kwargs: pytest.fail("fixed input was specialized"),
     )
-    source = _compiler_input(
+    source = compiler_input(
         kernel,
         params,
         (3, 1024),
@@ -1124,17 +1119,14 @@ def test_compiler_input_baked_values_follow_declaration_order(monkeypatch, tmp_p
 
 
 def test_compiler_input_compares_tagged_constants_not_python_equality(tmp_path):
-    from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.annotation import _merge_annotations
+    from intj.specialization import call_layout, compiler_input
 
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(kernel, None), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(kernel, None))
     values = (None, False, 0, 0.0, -0.0, float("nan"), float("nan"))
     sources = [
-        _compiler_input(kernel, params, (value,), CompilerBackendStub())
+        compiler_input(kernel, params, (value,), CompilerBackendStub())
         for value in values
     ]
     assert len(set(sources)) == 6

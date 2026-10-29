@@ -29,12 +29,14 @@ stay in `python_intf/` and `torch_intf/`. Run tools with `python -m intj.tools.<
 - `entry.c.jinja`: the rendered entry point.
 - `build.py`: build flags, compiling, and loading the `.so`.
 - `deps.py`: pinned kernel-cache dependencies, provisioning, and installer CLI.
-- `module.py`: assembling the key, shared parameter layout and ABI checks, and
-  the per-process loaded-module cache.
+- `module.py`: assembling the key, ABI checks, and the per-process
+  loaded-module cache.
 
 `launcher.py` checks launcher options and owns the compile callback and Python
 compile state; it passes its C stub to `module.py` for module initialization.
-Shared compile-option merging lives in `backend.py`, checked dependency
+Both sides of the invariant (key fields, call and key layout, compiler input)
+live in `specialization.py`. Shared compile-option merging lives in
+`backend.py`, checked dependency
 provisioning in `render/deps.py`, and `UnsupportedKernel` in `errors.py`
 (re-exported by `launcher.py`).
 `kernel_cache.py` holds the public `KernelCache` enum and delegates its CLI to

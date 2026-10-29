@@ -24,10 +24,8 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 from . import _imports, launcher_base
 from . import backend as backends
 from .annotation import (
-    CanonicalAnnotation,
     DeviceBinding,
     ResolvedParam,
-    _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
     _merge_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
@@ -38,6 +36,7 @@ from .options import OPTION_FIELDS, MakeLauncherKwargs, MakeLauncherOption
 from .render import module as render_module
 from .render.build import compiler_path
 from .render.key import Param
+from .specialization import CompilerInput, call_layout, compiler_input
 from .torch_intf.torch_abi import TorchAccessMode
 
 # triton and torch ship no type information, so everything reaching into them is
@@ -61,51 +60,6 @@ class ClassGlobalWarning(RuntimeWarning):
 
 
 @dataclasses.dataclass(frozen=True)
-class CompilerInput:
-    """The final annotated ASTSource identity, with its original Python constants.
-
-    `attrs` holds each parameter's facts; `bare` the parameters Triton's launch
-    lists in its attrs with no facts (`(i,): []`). Both enter
-    `ASTSource.hash()`, so the source hashes as Triton's own does, but an empty
-    entry never changes the binary: only `attrs` is compared. A Triton-typed
-    integer is listed for 3 and not for 1, under one intj key.
-    """
-
-    signature: tuple[tuple[str, str], ...]
-    constants: tuple[tuple[tuple[int, ...], tuple[object, ...]], ...]
-    attrs: tuple[tuple[tuple[int, ...], tuple[tuple[str, int], ...]], ...]
-    values: tuple[tuple[tuple[int, ...], object], ...] = dataclasses.field(
-        compare=False, hash=False, repr=False
-    )
-    bare: tuple[tuple[int, ...], ...] = dataclasses.field(
-        default=(), compare=False, hash=False
-    )
-
-    def ast_source(self, jit_func: JitFunction) -> Any:
-        """Returns the triton `ASTSource` (`GluonASTSource` for Gluon) to compile.
-
-        Its attrs list parameters in Triton's order, empty entries included.
-        """
-        _imports.ensure_triton_imported()
-        source_type = _imports.ASTSource
-        if jit_func.is_gluon():
-            # not cached with the rest: importing gluon costs ~35 ms
-            from triton.experimental.gluon._runtime import GluonASTSource
-
-            source_type = GluonASTSource
-        entries = [
-            *((path, [list(attr) for attr in attrs]) for path, attrs in self.attrs),
-            *((path, []) for path in self.bare),
-        ]
-        return source_type(
-            jit_func,
-            dict(self.signature),
-            dict(self.values),
-            dict(sorted(entries, key=lambda entry: entry[0])),
-        )
-
-
-@dataclasses.dataclass(frozen=True)
 class _BuildOptions:
     """Everything the build needs from a checked `MakeLauncherOption`.
 
@@ -116,6 +70,7 @@ class _BuildOptions:
     jit_func: JitFunction  # the chain unwrapped, checked
     tuned: Tuned | None
     params: tuple[ResolvedParam, ...]  # bound tensors' types resolved
+    call: tuple[Param, ...]  # `params` numbered in the public call
     torch_access_mode: TorchAccessMode
     grid_code: GridCode | None  # `grid_cpp` compiled
     dynamic: tuple[str, ...]
@@ -329,24 +284,23 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
             "that compile option on every call; pass it as the argument, or bake "
             "it with extra_annotation"
         )
+    # unbound: binding below changes no parameter's place in the call
+    numbered = call_layout(resolved)
     deps: Mapping[str, int] | None = None
     if tuned is not None:
         from .tuning import tuning_render
 
-        render = tuning_render(tuned.plan, resolved, grid_cpp, grid_py)
+        render = tuning_render(tuned.plan, resolved, numbered, grid_cpp, grid_py)
         tuned = dataclasses.replace(tuned, render=render)
         deps = {n: i for i, n in enumerate(render.dep_names)}
     compiled_grid: GridCode | None = None
     if grid_cpp is not None:
         from .grid import GridError, compile_grid
 
-        grid_params, _, _, _, _ = render_module._spec_key_layout(  # pyright: ignore[reportPrivateUsage]  # shared key layout
-            resolved, DeviceBinding.NOT_FIXED
-        )
         try:
             compiled_grid = compile_grid(
                 grid_cpp,
-                grid_params,
+                numbered,
                 {p.index: p.baked for p in resolved if p.annotation.baked_value},
                 deps,
                 offset=len(dynamic),
@@ -436,9 +390,9 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
     )
     device_binding = DeviceBinding.NOT_FIXED if device is None else DeviceBinding.FIXED
     args = (*(() if device is None else (device,)), *bound_values)
-    rendered, _, _, _, _ = render_module._spec_key_layout(params, device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
+    call = call_layout(params)
     doc = _launch_doc(
-        rendered,
+        call,
         device is not None,
         grid_arg,
         compiled_grid,
@@ -456,6 +410,7 @@ def _check_options(option: MakeLauncherOption) -> _BuildOptions:
         jit_func=kernel,
         tuned=tuned,
         params=params,
+        call=call,
         torch_access_mode=access,
         grid_code=compiled_grid,
         dynamic=dynamic,
@@ -734,13 +689,12 @@ class Launcher:
         if target is None:
             return _KernelCompiler(None)
         assert b.knob_values is not None, "GPU builds read knobs at the first call"
-        params, _, _, _, _ = render_module._spec_key_layout(b.params, b.device_binding)  # pyright: ignore[reportPrivateUsage]  # shared key layout
         return _KernelCompiler(
             b.jit_func,
             dict(b.compile_options),
             b.knob_values,
             return_compiled=b.return_compiled,
-            params=params,
+            params=b.call,
             baked_values={
                 p.index: p.baked for p in b.params if p.annotation.baked_value
             },
@@ -1345,147 +1299,6 @@ class _Interner:
         return found
 
 
-def _triton_specialize(
-    value: object, *, backend: Any, is_const: bool, specialize: bool, align: bool
-) -> tuple[str, Any]:
-    _imports.ensure_triton_imported()
-    return _imports.native_specialize_impl(backend, value, is_const, specialize, align)
-
-
-def _compiler_input(
-    jit_func: JitFunction,
-    params: Sequence[Param],
-    public_args: Sequence[object],
-    backend: Any,
-    *,
-    baked_values: Mapping[int, object] | None = None,
-) -> CompilerInput:
-    """Returns the annotated compiler input triton would build for one call.
-
-    `public_args` are the call's public arguments; bound parameters count as
-    None and fixed ones come from `baked_values`. Annotated facts apply as
-    declared; `auto` ones are specialized the way triton does.
-    """
-    _imports.ensure_triton_imported()
-    signature: list[tuple[str, str]] = []
-    constants: list[tuple[tuple[int, ...], tuple[object, ...]]] = []
-    attrs: list[tuple[tuple[int, ...], tuple[tuple[str, int], ...]]] = []
-    values: list[tuple[tuple[int, ...], object]] = []
-    bare: list[tuple[int, ...]] = []
-    for param in params:
-        annotation = param.annotation
-        if annotation.bind_value is not None:
-            # Bound type/facts are fixed in this module. Only inferred None
-            # becomes a compiler constant; no callback owns a bound value.
-            value = None
-        elif param.call_index is None:
-            assert baked_values is not None, (
-                "fixed values must accompany their canonical annotations"
-            )
-            value = baked_values[param.index]
-        else:
-            value = public_args[param.call_index]
-        ty = "constexpr"
-        desc = ""
-        if annotation.kind == "argument":
-            fixed_type = annotation.types is not None and len(annotation.types) == 1
-            effective = annotation.types[0] if fixed_type and annotation.types else None
-            modes = (
-                ("equal_to_one", annotation.equal_to_one),
-                ("aligned_16", annotation.aligned_16),
-                ("pointer_range_32", annotation.pointer_range_32),
-            )
-            assumed_one = annotation.equal_to_one == "assume" and _applicable(
-                effective, "equal_to_one"
-            )
-            inferred_desc = None
-            if not assumed_one and (
-                not fixed_type
-                or any(
-                    mode == "auto" and _applicable(effective, field)
-                    for field, mode in modes
-                )
-            ):
-                inference_value = value
-                if (
-                    effective is not None
-                    and effective.startswith("*")
-                    and (value is None or type(value) is int and value == 0)
-                ):
-                    # Both public null spellings have pointer 0 and storage range 0.
-                    inference_value = _imports.MockTensor(effective[1:])
-                inferred, inferred_desc = _triton_specialize(
-                    inference_value,
-                    backend=backend,
-                    is_const=jit_func.params[param.index].is_const,
-                    specialize=any(mode == "auto" for _, mode in modes),
-                    align=annotation.aligned_16 == "auto",
-                )
-                if not fixed_type:
-                    # The native primitive folds only None and integer 1.
-                    effective = (
-                        (None if value is None else "i32")
-                        if inferred == "constexpr"
-                        else inferred
-                    )
-            ty = effective or "constexpr"
-            if _applicable(effective, "equal_to_one") and (
-                annotation.equal_to_one == "assume"
-                or annotation.equal_to_one == "auto"
-                and value == 1
-            ):
-                ty = "constexpr"
-                if annotation.equal_to_one == "assume":
-                    value = 1
-            if ty != "constexpr":
-                desc = "".join(
-                    char
-                    for field, mode, char in (
-                        ("aligned_16", annotation.aligned_16, "D"),
-                        ("pointer_range_32", annotation.pointer_range_32, "S"),
-                    )
-                    if _applicable(effective, field)
-                    and (
-                        mode == "assume"
-                        or mode == "auto"
-                        and isinstance(inferred_desc, str)
-                        and char in inferred_desc
-                    )
-                )
-        path = (param.index,)
-        signature.append((param.name, ty))
-        parsed: tuple[tuple[str, int], ...] = ()
-        if ty == "constexpr":
-            constants.append((path, _canonical_value(value)))
-            values.append((path, value))
-        elif desc:
-            parsed = tuple((name, amount) for name, amount in backend.parse_attr(desc))
-        if parsed:
-            attrs.append((path, parsed))
-        elif ty == "constexpr" or _lists_attrs(
-            jit_func.params[param.index], annotation, ty, value
-        ):
-            bare.append(path)
-    return CompilerInput(
-        tuple(signature), tuple(constants), tuple(attrs), tuple(values), tuple(bare)
-    )
-
-
-def _lists_attrs(
-    jit_param: Any, annotation: CanonicalAnnotation, ty: str, value: object
-) -> bool:
-    # Triton lists a runtime parameter whose specialize_impl key is a str: not
-    # under do_not_specialize, nor a bool or a float. A Triton-typed one keeps
-    # the key of its value, which is the int 1 for 1 and None for a bool or None.
-    if jit_param.do_not_specialize or not _applicable(ty, "aligned_16"):
-        return False
-    if annotation.triton_typed and annotation.bind_value is None:
-        return not (
-            value is None or type(value) is bool or type(value) is int and value == 1
-        )
-    return True
-
-
 def _checked_compile(
     jit_func: JitFunction,
     compiler_input: CompilerInput,
@@ -1647,14 +1460,14 @@ class _KernelCompiler:
                 dyn_knobs,
             )
         )
-        compiler_input = _compiler_input(
+        source = compiler_input(
             self.jit_func,
             self._params,
             args,
             self.backend,
             baked_values=self._baked_values,
         )
-        identity = _Identity.of(compiler_input, canonical, dyn_knobs)
+        identity = _Identity.of(source, canonical, dyn_knobs)
         # b"" is a keyless launcher's one key; seen is per launcher.
         if self.seen.setdefault(keyblob, identity) != identity:
             raise RuntimeError(

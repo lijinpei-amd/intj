@@ -71,6 +71,7 @@ from knob_helpers import (
 from intj.kernel_cache import KernelCache
 from intj.python_intf import cpython_abi
 from intj.render import deps as render_deps
+from intj import specialization
 from intj.render import module as render_module
 from intj.render.deps import INSTALL_ERRORS, install
 from intj.render.build import build, compiler_identity
@@ -711,7 +712,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
 ):
     from intj.annotation import DeviceBinding, _merge_annotations
     from intj.backend import BACKENDS, HOST
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, key_layout
 
     backend = BACKENDS.get(backend_name, HOST)
     assert (
@@ -722,15 +723,18 @@ def test_bind_device_cuda_template_backend_branches_compile(
             "host": "intj_host_device_get",
         }[backend_name]
     )
-    params, offset, nwords, _, _ = _spec_key_layout(
-        _merge_annotations(
-            device_kernel,
-            {
-                "x": Argument(type=tl.int32, specialize=NEVER),
-            },
+    layout = key_layout(
+        call_layout(
+            _merge_annotations(
+                device_kernel,
+                {
+                    "x": Argument(type=tl.int32, specialize=NEVER),
+                },
+            )
         ),
         DeviceBinding.FIXED,
     )
+    params, offset, nwords = layout.params, layout.device_offset, layout.nwords
     key = _make_render_key(
         params=params,
         nwords=nwords,
@@ -1067,7 +1071,7 @@ def test_bind_none_materializes_triton_constexpr(
 ):
     from intj.backend import current_target
     from intj.render.module import _LOADED
-    from intj.launcher import _compiler_input
+    from intj.specialization import compiler_input
     from triton.compiler import make_backend
 
     factory = make_launcher(
@@ -1088,7 +1092,7 @@ def test_bind_none_materializes_triton_constexpr(
     built = module_of(bound)
     key = next(key for key, module in _LOADED.items() if module is built)
     assert key.params[0].annotation.types == (None,)
-    source = _compiler_input(
+    source = compiler_input(
         pointer_kernel, key.params, (), make_backend(current_target())
     )
     assert source.signature == (("x", "constexpr"),)
@@ -3356,19 +3360,13 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
             else make_launcher(jit, extra_annotation=extra)
         )
     module = module_of(launch)
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
     from triton.compiler import make_backend
 
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(jit, extra),
-        DeviceBinding.FIXED if bind_device else DeviceBinding.NOT_FIXED,
-    )
-    plain_params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(axpy, extra), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(jit, extra))
+    plain_params = call_layout(_merge_annotations(axpy, extra))
     backend = make_backend(current_target())
     base = torch.randn(4096, device="cuda")
     tensors = [
@@ -3401,13 +3399,13 @@ def test_spec_key_is_never_coarser_than_triton(axpy_launcher, bind_device, kerne
     seen = {}
     for args in cases:
         key, nparams = launch.__self__.spec_key(0, *args)
-        source = _compiler_input(jit, params, args, backend)
+        source = compiler_input(jit, params, args, backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
         )
         assert nparams == sum(ty != "constexpr" for _, ty in source.signature)
         # Triton treats tensor annotations as absent: same compiler input
-        assert source == _compiler_input(axpy, plain_params, args, backend)
+        assert source == compiler_input(axpy, plain_params, args, backend)
         # and the source hashes as Triton's, so the two share its cache entry
         check_same_ast_source(jit, source, args)
 
@@ -3431,17 +3429,14 @@ def test_python_annotated_params_compile_like_triton():
     divisibility survives), `float`/`bool` are never specialized, and the
     unannotated `m` still folds 1 -- intj must hand the compiler exactly that.
     """
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
     from triton.compiler import make_backend
 
     launch = make_launcher(python_annotated)
     module = module_of(launch)
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(python_annotated, None), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(python_annotated, None))
     backend = make_backend(current_target())
     o = torch.zeros(1, device="cuda")
     seen = {}
@@ -3459,7 +3454,7 @@ def test_python_annotated_params_compile_like_triton():
             for i, (_, desc) in enumerate(spec)
             if isinstance(desc, str) and backend.parse_attr(desc)
         )
-        source = _compiler_input(python_annotated, params, args, backend)
+        source = compiler_input(python_annotated, params, args, backend)
         assert [ty for _, ty in source.signature] == [ty for ty, _ in spec], args
         assert source.attrs == expected_attrs, args
         assert dict(source.values) == {
@@ -3561,19 +3556,16 @@ def test_ast_source_hashes_as_triton_launch(kernel):
     """
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
 
     jit = PARITY_KERNELS[kernel]
     backend = make_backend(current_target())
     for args in _parity_calls():
         for extra in _parity_annotations(_triton_facts(jit, args)):
-            params, _, _, _, _ = _spec_key_layout(
-                _merge_annotations(jit, extra), DeviceBinding.NOT_FIXED
-            )
-            source = _compiler_input(jit, params, args, backend)
+            params = call_layout(_merge_annotations(jit, extra))
+            source = compiler_input(jit, params, args, backend)
             check_same_ast_source(jit, source, args)
 
 
@@ -3660,10 +3652,9 @@ def test_baked_int_specializes_like_triton(kernel):
     """
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
 
     jit = {**PARITY_KERNELS, "i64": parity_i64, "u8": parity_u8}[kernel]
     backend = make_backend(current_target())
@@ -3671,10 +3662,8 @@ def test_baked_int_specializes_like_triton(kernel):
     for value in BAKED_VALUES[kernel]:
         args = (o, x, value, 1.5, 4)
         for annotation in _baked_annotations(jit, args):
-            params, _, _, _, _ = _spec_key_layout(
-                _merge_annotations(jit, {"s": annotation}), DeviceBinding.NOT_FIXED
-            )
-            source = _compiler_input(
+            params = call_layout(_merge_annotations(jit, {"s": annotation}))
+            source = compiler_input(
                 jit, params, (o, x, 1.5, 4), backend, baked_values={2: value}
             )
             check_same_ast_source(jit, source, args)
@@ -3833,17 +3822,14 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
 
     This is the invariant for interned values, whichever object carries them.
     """
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
     from triton.compiler import make_backend
 
     launch = make_launcher(act_store)
     module = module_of(launch)
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(act_store, None), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(act_store, None))
     backend = make_backend(current_target())
     o = torch.zeros(1, device="cuda")
     values = [
@@ -3867,7 +3853,7 @@ def test_object_constexpr_key_is_never_coarser_than_triton():
     seen, keys = {}, set()
     for value in values:
         key, _ = launch.__self__.spec_key(0, o, 2.0, value)
-        source = _compiler_input(act_store, params, (o, 2.0, value), backend)
+        source = compiler_input(act_store, params, (o, 2.0, value), backend)
         assert seen.setdefault(key, source) == source, value
         keys.add(key)
     assert len(keys) == len(values) - 3  # "neg", tl.int32 and _twice each twice
@@ -4231,9 +4217,8 @@ def annotated_baked(x, BLOCK, o, bias):
 
 
 def test_annotated_cuda_compile_only():
-    from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.annotation import _merge_annotations
+    from intj.specialization import call_layout, compiler_input
     from triton.backends.compiler import GPUTarget
     from triton.compiler import compile as triton_compile, make_backend
 
@@ -4249,8 +4234,8 @@ def test_annotated_cuda_compile_only():
             "bias": Argument(type=tl.int32, specialize=NEVER),
         },
     )
-    params, _, _, _, _ = _spec_key_layout(resolved, DeviceBinding.NOT_FIXED)
-    source = _compiler_input(
+    params = call_layout(resolved)
+    source = compiler_input(
         annotated_baked,
         params,
         (None, 7),
@@ -4424,16 +4409,13 @@ def test_annotated_baked_arguments_compile_without_jit_state(monkeypatch):
 def test_annotated_spec_key_is_never_coarser_than_triton(
     scalar_kernel, annotation, values
 ):
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
     from triton.compiler import make_backend
 
     extra = {"x": annotation}
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(scalar_kernel, extra), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(scalar_kernel, extra))
     backend = make_backend(current_target())
     launch = make_launcher(
         scalar_kernel,
@@ -4445,7 +4427,7 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
     seen = {}
     for value in values:
         key, nparams = launch.__self__.spec_key(0, value)
-        source = _compiler_input(scalar_kernel, params, (value,), backend)
+        source = compiler_input(scalar_kernel, params, (value,), backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
         )
@@ -4466,18 +4448,15 @@ def test_annotated_spec_key_is_never_coarser_than_triton(
 def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     pointer_kernel, specialize
 ):
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import current_target
-    from intj.launcher import _compiler_input
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, compiler_input
     from triton.compiler import make_backend
 
     base = torch.empty(16, device="cuda")
     large = torch.empty(2**29 + 8, device="cuda")
     extra = {"x": Argument(type=tl.pointer_type(tl.float32), specialize=specialize)}
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(pointer_kernel, extra), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(pointer_kernel, extra))
     backend = make_backend(current_target())
     launch = make_launcher(
         pointer_kernel,
@@ -4488,7 +4467,7 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
     seen = {}
     for value in (None, 0, base, base[1:], large, large[1:]):
         key, nparams = launch.__self__.spec_key(0, value)
-        source = _compiler_input(pointer_kernel, params, (value,), backend)
+        source = compiler_input(pointer_kernel, params, (value,), backend)
         assert seen.setdefault(key, source) == source, (
             "intj key collides for annotated ASTSource inputs"
         )
@@ -4497,13 +4476,11 @@ def test_annotated_pointer_spec_key_is_never_coarser_than_triton(
 
 @pytest.mark.parametrize("key", [b"", b"\x00" * 8])
 def test_annotated_cold_invariant_checks_final_compiler_input(power_kernel, key):
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.launcher import _KernelCompiler
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout
 
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(power_kernel, {"N": Constexpr()}), DeviceBinding.FIXED
-    )
+    params = call_layout(_merge_annotations(power_kernel, {"N": Constexpr()}))
     state = _KernelCompiler(power_kernel, {}, launcher._live_knobs(), params=params)
     device = torch.cuda.current_device()
     state.compile_miss(key, 0, device, 1)
@@ -4534,7 +4511,8 @@ def _recording_input_launcher(
         their ASTSource, and the list of recorded misses.
     """
     from intj.backend import current_target
-    from intj.launcher import _compiler_input, _KernelCompiler
+    from intj.launcher import _KernelCompiler
+    from intj.specialization import compiler_input
     from triton.backends.compiler import GPUTarget
     from triton.compiler import make_backend
 
@@ -4560,17 +4538,17 @@ def _recording_input_launcher(
     real_compile = state.compile_miss
     calls = []
 
-    def compiler_input(*args):
-        return _compiler_input(kernel, params, args, backend)
+    def input_of(*args):
+        return compiler_input(kernel, params, args, backend)
 
     def record(key, slots, device, *args):
-        source = compiler_input(*args)
+        source = input_of(*args)
         result = real_compile(key, slots, device, *args)
         calls.append((key, source))
         return result
 
     override_compile(native, record)
-    return native, compiler_input, calls
+    return native, input_of, calls
 
 
 @pytest.mark.parametrize("no_gpu", [True, False], ids=["host", "gpu"])
@@ -4700,7 +4678,7 @@ def _attrs_for_backend(attrs, no_gpu):
     An `Assume(PointerRange(...))` is parsed by the triton backend itself, and
     one without `pointer_range` (NVIDIA) does not know the `S` descriptor: the
     annotation is accepted and contributes no attribute. A path left with no
-    attributes is omitted, as `_compiler_input` omits it.
+    attributes is omitted, as `compiler_input` omits it.
 
     `no_gpu` launchers are keyed against the gfx942 target
     `_recording_input_launcher` pins, so they always carry it.
@@ -4754,7 +4732,7 @@ def test_no_map_compiler_input_invariant(
     constants,
     attrs,
 ):
-    from intj.launcher import CompilerInput
+    from intj.specialization import CompilerInput
 
     binding = isinstance(annotation, Argument) and annotation.bind_value is not None
     bound_values = (
@@ -4801,7 +4779,7 @@ def test_spec_key_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     import importlib.util
 
     from intj.annotation import DeviceBinding, _merge_annotations
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, key_layout
 
     names = [f"p{i}" for i in range(nparams)]
     cxnames = [f"C{i}" for i in range(nconstexpr)]
@@ -4816,9 +4794,10 @@ def test_spec_key_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
 
-    params, device_offset, nwords, _, _ = _spec_key_layout(
-        _merge_annotations(module.k, None), DeviceBinding.NOT_FIXED
+    layout = key_layout(
+        call_layout(_merge_annotations(module.k, None)), DeviceBinding.NOT_FIXED
     )
+    params, device_offset, nwords = layout.params, layout.device_offset, layout.nwords
 
     assert [p.name for p in params] == names + cxnames
     assert [p.index for p in params] == list(range(nparams + nconstexpr))
@@ -4837,7 +4816,7 @@ def test_spec_key_layout_and_call_indexes(tmp_path, nparams, nconstexpr):
 def _make_render_key(**overrides):
     """Returns a valid two-parameter `RenderKey` with `overrides` applied."""
     from intj.annotation import DeviceBinding, ResolvedParam
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout, key_layout
 
     ordinary = CanonicalAnnotation(
         "argument", None, "auto", "auto", "auto", (), False, None, ()
@@ -4845,10 +4824,13 @@ def _make_render_key(**overrides):
     constexpr = CanonicalAnnotation(
         "constexpr", None, "auto", "auto", "auto", (), False, None, ()
     )
-    params, device_offset, nwords, _, _ = _spec_key_layout(
-        (ResolvedParam("x", 0, ordinary), ResolvedParam("BLOCK", 1, constexpr)),
+    layout = key_layout(
+        call_layout(
+            (ResolvedParam("x", 0, ordinary), ResolvedParam("BLOCK", 1, constexpr))
+        ),
         DeviceBinding.NOT_FIXED,
     )
+    params, device_offset, nwords = layout.params, layout.device_offset, layout.nwords
     fields = dict(
         module_name="m",
         kernel_repr="a.b",
@@ -6722,17 +6704,16 @@ def check_dynamic_invariant():
 
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import canonical_options, current_target
-    from intj.launcher import _compiler_input, _live_knobs, _split_dynamic
+    from intj.launcher import _live_knobs, _split_dynamic
+    from intj.specialization import compiler_input
     from intj.backend import _knob_options
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout
 
     launch = make_launcher(dyn_axpy, dynamic_options=_DYNAMIC)
     module, device = module_of(launch), torch.cuda.current_device()
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(dyn_axpy, None), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(dyn_axpy, None))
     target = current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
     x = torch.randn(64, device="cuda")
@@ -6752,7 +6733,7 @@ def check_dynamic_invariant():
                         public = (o, x, 64, act, dt, fn, 64)
                         key, _ = launch.__self__.spec_key(device, *dyn, *public)
                         truth = (
-                            _compiler_input(dyn_axpy, params, public, backend),
+                            compiler_input(dyn_axpy, params, public, backend),
                             canonical,
                             tuple(sorted(knob_values.items())),
                         )
@@ -6767,9 +6748,9 @@ def test_dynamic_values_are_never_coarser_than_triton():
 
 @pytest.mark.parametrize("dropped", _DYNAMIC)
 def test_dynamic_invariant_catches_a_dropped_value(monkeypatch, dropped):
-    original = render_module._dynamic_key_fields
+    original = specialization._dynamic_key_fields
     monkeypatch.setattr(
-        render_module,
+        specialization,
         "_dynamic_key_fields",
         lambda name: () if name == dropped else original(name),
     )
@@ -6857,17 +6838,16 @@ def check_option_parameter_invariant():
     """
     from triton.compiler import make_backend
 
-    from intj.annotation import DeviceBinding, _merge_annotations
+    from intj.annotation import _merge_annotations
     from intj.backend import canonical_options, current_target
-    from intj.launcher import _compiler_input, _live_knobs
+    from intj.launcher import _live_knobs
+    from intj.specialization import compiler_input
     from intj.backend import _knob_options
-    from intj.render.module import _spec_key_layout
+    from intj.specialization import call_layout
 
     launch = make_launcher(option_axpy, return_compiled=True)
     module, device = module_of(launch), torch.cuda.current_device()
-    params, _, _, _, _ = _spec_key_layout(
-        _merge_annotations(option_axpy, None), DeviceBinding.NOT_FIXED
-    )
+    params = call_layout(_merge_annotations(option_axpy, None))
     target = current_target()
     backend, knobs_now = make_backend(target), _live_knobs()
     x = torch.randn(64, device="cuda")
@@ -6878,7 +6858,7 @@ def check_option_parameter_invariant():
         options = {"num_warps": warps, "num_stages": stages}
         key, _ = launch.__self__.spec_key(device, *public)
         truth = (
-            _compiler_input(option_axpy, params, public, backend),
+            compiler_input(option_axpy, params, public, backend),
             canonical_options(
                 target, _knob_options(option_axpy, options, knobs_now)
             ).hash(),

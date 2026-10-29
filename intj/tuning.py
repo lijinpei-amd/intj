@@ -20,12 +20,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
 from . import backend as backends
-from .annotation import DeviceBinding, ResolvedParam
+from .annotation import ResolvedParam
 from .errors import UnsupportedKernel
 from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
 from .launcher import Launcher
-from .render import module as render_module
 from .render.key import Param, TuningRender
+from .specialization import compiler_input
 
 if TYPE_CHECKING:
     from .grid import GridCode
@@ -302,17 +302,16 @@ def check_tuned_configs(
 def tuning_render(
     plan: TuningPlan,
     resolved: tuple[ResolvedParam, ...],
+    call: tuple[Param, ...],
     grid_cpp: object | None,
     grid_py: object | None,
 ) -> TuningRender:
     """Returns the dep and comp slots for the grid and lowered heuristics, level-major.
 
-    `computed_fields` is left empty: `render.module._build_module` places it."""
+    `call` is `resolved` numbered in the public call. `computed_fields` is left
+    empty: `render.module._build_module` places it."""
     _imports.ensure_triton_imported()
-    by_name = {
-        p.name: p
-        for p in render_module._spec_key_layout(resolved, DeviceBinding.NOT_FIXED)[0]  # pyright: ignore[reportPrivateUsage]  # shared key layout
-    }
+    by_name = {p.name: p for p in call}
     grid_code = getattr(grid_cpp, "__code__", None)
     grid_reads: tuple[str, ...] = (
         grid_code.co_varnames[: grid_code.co_argcount] if grid_code else ()
@@ -577,21 +576,20 @@ class TunedCompileState:
     ) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
         from .launcher import (
-            _compiler_input,  # pyright: ignore[reportPrivateUsage]  # launcher internals
             _Identity,  # pyright: ignore[reportPrivateUsage]  # launcher internals
         )
 
         canonical = self.compiler.canonical(
             {**config_options, **{n: values[n] for n in self.fed}}, self.call_knobs
         )
-        compiler_input = _compiler_input(
+        source = compiler_input(
             self.jit_func,
             self.params,
             [values[p.name] for p in self.params],
             self.compiler.backend,
         )
         return self.compiler.compile(
-            _Identity.of(compiler_input, canonical, self.call_knobs), canonical
+            _Identity.of(source, canonical, self.call_knobs), canonical
         )
 
     def run(

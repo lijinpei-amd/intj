@@ -12,7 +12,7 @@ import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, triton_specialization
-from intj.render import module as render_module
+from intj import specialization
 from knob_helpers import live_knob_values, needs_hip
 
 
@@ -910,15 +910,14 @@ def test_tuned_key_chain_is_never_coarser_than_triton():
 
 
 def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
-    from intj import annotation
+    from intj import specialization
 
-    original = annotation._cache_key_fields
+    original = specialization._cache_key_fields
 
     def without_exact(a):
         return tuple(f for f in original(a) if f.kind not in ("exact", "exact_kind"))
 
-    monkeypatch.setattr(annotation, "_cache_key_fields", without_exact)
-    monkeypatch.setattr("intj.render.module._cache_key_fields", without_exact)
+    monkeypatch.setattr(specialization, "_cache_key_fields", without_exact)
     with pytest.raises(AssertionError, match="collides"):
         check_tuned_invariant(_invariant_kernel, _invariant_cases())
 
@@ -1048,9 +1047,9 @@ def test_tuned_dynamic_values_are_never_coarser_than_triton():
 @pytest.mark.parametrize("dropped", _TUNED_DYNAMIC)
 def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
 
-    original = render_module._dynamic_key_fields
+    original = specialization._dynamic_key_fields
     monkeypatch.setattr(
-        render_module,
+        specialization,
         "_dynamic_key_fields",
         lambda name: () if name == dropped else original(name),
     )

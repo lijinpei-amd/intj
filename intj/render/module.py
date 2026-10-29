@@ -1,7 +1,7 @@
 """Builds a kernel's RenderKey and loads its rendered module.
 
-Owns the process module cache, shared key layout, and ABI checks. The launcher
-supplies its C stub and keeps Python compile state in its own instance.
+Owns the process module cache and ABI checks. The launcher supplies its C stub
+and keeps Python compile state in its own instance.
 """
 
 from __future__ import annotations
@@ -18,16 +18,9 @@ from typing import TYPE_CHECKING, Any
 from .. import _imports
 from .. import backend as backends
 from .._version import __version__
-from ..annotation import (
-    CacheKeyField,
-    CanonicalAnnotation,
-    DeviceBinding,
-    KeyLayout,
-    ResolvedParam,
-    _cache_key_fields,  # pyright: ignore[reportPrivateUsage]  # canonical key fields
-)
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
+from ..specialization import key_layout
 from ..torch_intf.torch_abi import (
     TorchAccessMode,
     dtype_index_table,
@@ -47,7 +40,7 @@ from .build import (
     runtime_headers,
 )
 from .context import ENTRY_TEMPLATE
-from .key import DynamicSlot, Param, RenderKey
+from .key import Param, RenderKey
 
 if TYPE_CHECKING:
     from ..launcher import _BuildOptions  # pyright: ignore[reportPrivateUsage]  # checked build inputs
@@ -84,17 +77,18 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
             [n for n in b.dynamic if not n.startswith("knobs.")]
             + list(b.declared_parameters),
         )
-    params, device_offset, nwords, computed_fields, slots = _spec_key_layout(
-        b.params,
+    layout = key_layout(
+        b.call,
         b.device_binding,
         tuning.computed[0] if tuning is not None else 0,
         b.dynamic,
     )
+    params = layout.params
     if tuning is not None:
         # final only now: level-0 computed keys are placed with the spec fields
-        tuning = dataclasses.replace(tuning, computed_fields=computed_fields)
+        tuning = dataclasses.replace(tuning, computed_fields=layout.computed_fields)
     # tuned levels always use a map
-    nwords = max(nwords, 1) if tuning is not None else nwords
+    nwords = max(layout.nwords, 1) if tuning is not None else layout.nwords
     # check() provisioned already: this is the idempotent, no-network
     # lookup of the toolchain it installed
     cache_toolchain = deps._provision(b.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
@@ -110,7 +104,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         params=params,
         nwords=nwords,
         device_binding=b.device_binding,
-        device_offset=device_offset,
+        device_offset=layout.device_offset,
         verify_annotation=b.verify_annotation,
         max_slots=sum(p.annotation.kind == "argument" for p in params),
         # Where the backend specializes on it, the pointer-range bit is always in
@@ -141,7 +135,7 @@ def _build_module(b: _BuildOptions, stub: types.ModuleType) -> types.ModuleType:
         return_compiled=b.return_compiled,
         ndebug=b.ndebug,
         tuning=tuning,
-        dynamic=slots,
+        dynamic=layout.dynamic,
         template=ENTRY_TEMPLATE.read_bytes().hex(),
         runtime_header=runtime_headers().hex(),
         cache_key=b.jit_func.cache_key + (":gluon" if b.jit_func.is_gluon() else ""),
@@ -332,132 +326,3 @@ def _torch_version_string() -> str:
 
 _LOADED: dict[RenderKey, types.ModuleType] = {}
 _LOAD_LOCK = threading.Lock()
-
-
-def _layout_fields(
-    fields: tuple[tuple[int, CacheKeyField], ...], device_binding: DeviceBinding
-) -> KeyLayout:
-    """Places `fields` in the key, widest first, then the device slot if keyed."""
-    ordered = sorted(enumerate(fields), key=lambda item: -item[1][1].width)
-    offsets: dict[int, int] = {}
-    offset = 0
-    for source_index, (_, field) in ordered:
-        offsets[source_index] = offset
-        offset += field.width
-    device_offset = None
-    if device_binding is DeviceBinding.NOT_FIXED:
-        device_offset = offset
-        offset += 1
-    placed = tuple(
-        (param_index, dataclasses.replace(field, offset=offsets[source_index]))
-        for source_index, (param_index, field) in enumerate(fields)
-    )
-    return KeyLayout(placed, device_offset, (offset + 7) // 8)
-
-
-def _spec_key_layout(
-    resolved: tuple[ResolvedParam, ...],
-    device_binding: DeviceBinding,
-    computed0: int = 0,
-    dynamic: Sequence[str] = (),
-) -> tuple[
-    tuple[Param, ...],
-    int | None,
-    int,
-    tuple[tuple[int, int], ...],
-    tuple[DynamicSlot, ...],
-]:
-    """Places the key fields and numbers the arguments in the public call.
-
-    Level-0 computed keys and dynamic values are placed too.
-
-    A computed key is a (value, kind) pair: payload and descriptor, the way a
-    constexpr is keyed, so True and 1 key apart.  A dynamic value is keyed
-    like an exact key, and its memo follows the parameters'.
-    """
-    fields = tuple(
-        (p.index, field) for p in resolved for field in _cache_key_fields(p.annotation)
-    )
-    fields += tuple(
-        (-1 - j, CacheKeyField(kind, width))
-        for j in range(computed0)
-        for kind, width in (("payload", 8), ("descriptor", 1))
-    )
-    fields += tuple(
-        (-1 - computed0 - j, field)
-        for j, name in enumerate(dynamic)
-        for field in _dynamic_key_fields(name)
-    )
-    layout = _layout_fields(fields, device_binding)
-    params: list[Param] = []
-    call_index = 0
-    memo = 0
-    for p in resolved:
-        annotation = dataclasses.replace(
-            p.annotation,
-            key_fields=tuple(
-                sorted(
-                    (field for index, field in layout.fields if index == p.index),
-                    key=lambda field: field.offset,
-                )
-            ),
-        )
-        public = (
-            not annotation.baked_value
-            and annotation.bind_value is None
-            and not annotation.tuned
-        )
-        slot = None
-        if public and _object_capable(annotation):
-            slot, memo = memo, memo + 1
-        params.append(
-            Param(p.name, p.index, call_index if public else None, annotation, slot)
-        )
-        if public:
-            call_index += 1
-    placed = {
-        (index, field.kind): field.offset for index, field in layout.fields if index < 0
-    }
-    computed_fields = tuple(
-        (placed[(-1 - j, "payload")], placed[(-1 - j, "descriptor")])
-        for j in range(computed0)
-    )
-    slots = tuple(
-        DynamicSlot(
-            name,
-            placed.get((-1 - computed0 - j, "exact")),
-            placed.get((-1 - computed0 - j, "exact_kind")),
-            memo + j,
-        )
-        for j, name in enumerate(dynamic)
-    )
-    return (
-        tuple(params),
-        layout.device_offset,
-        layout.nwords,
-        computed_fields,
-        slots,
-    )
-
-
-def _dynamic_key_fields(name: str) -> tuple[CacheKeyField, ...]:
-    """Returns one dynamic value's key fields: a kind byte and 8 value bytes.
-
-    Laid out like an exact key.  `name` picks nothing here; the invariant
-    tests' mutation checks drop one value's fields by name.
-    """
-    del name
-    return (CacheKeyField("exact_kind", 1), CacheKeyField("exact", 8))
-
-
-def _object_capable(annotation: CanonicalAnnotation) -> bool:
-    """Returns whether a public parameter with `annotation` takes objects.
-
-    A constexpr keyed by descriptor + 8-byte payload does: str, tl.dtype and
-    JIT functions key as INTJ_B_CX_OBJECT plus an id.
-    """
-    return (
-        annotation.kind == "constexpr"
-        and annotation.types is None
-        and not annotation.power_of_two_or_zero
-    )

@@ -41,6 +41,7 @@ from intj.render import build
 from intj.render import module as render_module
 from intj.render.context import render
 from intj.render.key import RenderKey
+from intj.specialization import call_layout, key_layout
 from intj.python_intf import cpython_abi
 from intj.torch_intf.torch_abi import (
     NDTYPES,
@@ -133,17 +134,20 @@ _AUTO = CanonicalAnnotation(
 )
 _NEVER = dataclasses.replace(_AUTO, equal_to_one="never", aligned_16="never")
 _CONSTEXPR = dataclasses.replace(_AUTO, kind="constexpr")
-_PARAMS, _DEVICE_OFFSET, _NWORDS, _, _ = render_module._spec_key_layout(
-    (
-        ResolvedParam("x", 0, _AUTO),
-        ResolvedParam("n", 1, _AUTO),
-        ResolvedParam("m", 2, _NEVER),
-        ResolvedParam("f", 3, _AUTO),
-        ResolvedParam("flag", 4, _AUTO),
-        ResolvedParam("BLOCK", 5, _CONSTEXPR),
+_LAYOUT = key_layout(
+    call_layout(
+        (
+            ResolvedParam("x", 0, _AUTO),
+            ResolvedParam("n", 1, _AUTO),
+            ResolvedParam("m", 2, _NEVER),
+            ResolvedParam("f", 3, _AUTO),
+            ResolvedParam("flag", 4, _AUTO),
+            ResolvedParam("BLOCK", 5, _CONSTEXPR),
+        )
     ),
     DeviceBinding.NOT_FIXED,
 )
+_PARAMS, _DEVICE_OFFSET, _NWORDS = _LAYOUT.params, _LAYOUT.device_offset, _LAYOUT.nwords
 
 
 def _cc(language: str) -> str:
