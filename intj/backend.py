@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import types
 from typing import Any
 
 from . import _imports
@@ -33,8 +34,11 @@ class Backend(abc.ABC):
     pointer_range: bool
 
     @abc.abstractmethod
-    def library_path(self) -> str:
-        """Returns the driver dylib to dlopen -- the same one triton itself uses."""
+    def library_path(self, stub: types.ModuleType) -> str:
+        """Returns the driver dylib to dlopen -- the same one triton itself uses.
+
+        `stub` is the process's `_intj_launcher_base`, the host backend's driver.
+        """
 
 
 class HipBackend(Backend):
@@ -47,7 +51,8 @@ class HipBackend(Backend):
     error_style = "return"
     pointer_range = True
 
-    def library_path(self) -> str:
+    def library_path(self, stub: types.ModuleType) -> str:
+        del stub
         # private, but it is the resolution order triton itself launches through;
         # imported here, as a triton built without the AMD backend lacks it
         from triton.backends.amd import driver
@@ -68,7 +73,8 @@ class CudaBackend(Backend):
     error_style = "outparam"
     pointer_range = False
 
-    def library_path(self) -> str:
+    def library_path(self, stub: types.ModuleType) -> str:
+        del stub
         return "libcuda.so.1"  # already mapped by torch, resolved through the normal search path
 
 
@@ -87,11 +93,8 @@ class HostBackend(Backend):
     error_style = "return"
     pointer_range = False
 
-    def library_path(self) -> str:
-        # deferred: launcher imports this module
-        from .launcher import _stub  # pyright: ignore[reportPrivateUsage]  # the process's C launcher base
-
-        path = _stub().__file__
+    def library_path(self, stub: types.ModuleType) -> str:
+        path = stub.__file__
         assert path is not None, "_intj_launcher_base is loaded from a file"
         return path
 

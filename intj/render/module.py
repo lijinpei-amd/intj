@@ -103,7 +103,7 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         # a > 2 GiB buffer apart would launch a tt.pointer_range=32 binary on it
         # after the knob is flipped back on.
         spec_pointer_range=int(backend.pointer_range),
-        driver_path=backend.library_path(),
+        driver_path=backend.library_path(stub),
         launch_symbol=backend.launch_symbol,
         device_symbol=backend.device_symbol,
         error_symbol=backend.error_symbol,
