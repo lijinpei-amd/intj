@@ -43,6 +43,8 @@ and saves the absolute offset before the first launch.
 | call layout | Where each parameter sits in the public call (`call_index`, None when baked, bound or tuned) and which take objects (`memo`). Places no key field. |
 | key layout | Where every key field sits in the spec key, widest first, and how many 64-bit words the key takes. |
 | compiler input | What Triton is given for one call: signature, constants and attrs. The key must never be coarser than it. |
+| scalar type name | Triton's canonical name for a scalar (`u1`, `i8`..`u64`, `fp32`, `fp64`); a pointer's is `*` plus its element's. `intj/scalar_types.py` holds their kinds and widths. |
+| narrowness | The order a union's types are tried in, narrowest first, so a value keys as the first type it fits. `fp32` and pointers sort first, as width 0. |
 
 # Compiling a miss
 

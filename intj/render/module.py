@@ -21,6 +21,7 @@ from .._version import __version__
 from ..compile_options import refuse_unknown_options, resolve
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
+from ..scalar_types import triton_name
 from ..torch_intf.torch_abi import (
     TorchAccessMode,
     dtype_index_table,
@@ -235,7 +236,7 @@ def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:
         sorted(
             ("*" + canonical, code)
             for code, (name, _) in live_dtypes().items()
-            if (canonical := _imports.type_canonicalisation_dict.get(name)) in wanted
+            if (canonical := triton_name(name)) in wanted
         )
     )
 

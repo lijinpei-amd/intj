@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ..annotation import CacheKeyField, CanonicalAnnotation, DeviceBinding
+from ..scalar_types import SCALARS, is_float, is_integer, narrowness
 from .key import DynamicSlot, Param, RenderKey, TuningRender
 
 ENTRY_TEMPLATE = Path(__file__).parent / "entry.c.jinja"
@@ -63,11 +64,11 @@ class AutoPart:
 class TypeCode:
     """One Triton type name, classified for the C that tests and encodes it."""
 
-    #: "none", "pointer", "bool", "float" (fp32 and fp64 only), "signed", or
-    #: "unsigned" -- which is also what any other float name falls under
+    #: "none", "pointer", or a scalar's kind: "bool", "float", "signed" or
+    #: "unsigned"
     kind: str
     name: str  # upper case: the INTJ_B_<name> constant
-    width: str  # the name's digits: INT<width>_MIN
+    width: str  # the scalar's bits: INT<width>_MIN
     #: a pointer's live torch ScalarType code; None if no live dtype has it
     dtype: int | None = None
 
@@ -490,36 +491,8 @@ def _type_code(ty: str | None, codes: Mapping[str, int]) -> TypeCode:
         return TypeCode("none", "NONE", "")
     if ty.startswith("*"):
         return TypeCode("pointer", "", "", codes.get(ty))
-    kind = (
-        "bool"
-        if ty == "u1"
-        else "float"
-        if ty in ("fp32", "fp64")
-        else "signed"
-        if ty.startswith("i")
-        else "unsigned"
-    )
-    return TypeCode(kind, ty.upper(), ty[1:])
-
-
-def _choice_order(ty: str | None) -> tuple[int, str]:
-    """Narrowest first, so the first type a value fits is the one it keys as.
-
-    Only integer widths are read: floats other than fp64 sort as width 0, by
-    name, which still puts fp16 ahead of fp32.
-    """
-    if ty is None:
-        return (0, "")
-    width = (
-        1
-        if ty == "u1"
-        else 64
-        if ty == "fp64"
-        else int(ty[1:])
-        if ty[1:].isdigit()
-        else 0
-    )
-    return (width, ty)
+    scalar = SCALARS[ty]
+    return TypeCode(scalar.kind, ty.upper(), str(scalar.bits))
 
 
 def _param_view(
@@ -596,7 +569,7 @@ def _param_view(
         type_from=type_from,
         fixed_type=fixed_type,
         type_choices=tuple(
-            _type_code(ty, codes) for ty in sorted(types or (), key=_choice_order)
+            _type_code(ty, codes) for ty in sorted(types or (), key=narrowness)
         )
         if type_from == "choices"
         else (),
@@ -632,7 +605,7 @@ def _decoder(p: Param, typed: str | None) -> str:
         return "constexpr_memo" if p.memo is not None else "constexpr"
     if a.tensor_only:
         return "tensor"
-    if typed in ("fp32", "fp64"):
+    if is_float(typed):
         return "typed_float"
     return "typed_int" if typed is not None else "argument"
 
@@ -654,7 +627,7 @@ def _checks(
         if len(a.types) == 1:
             ty = a.types[0]
             code = _type_code(ty, codes)
-            if ty is not None and ty.startswith(("i", "u")) and ty != "u1":
+            if is_integer(ty):
                 checks += [
                     Check("integer_kind", "type", type_error),
                     Check("valid", "range", range_error, code),

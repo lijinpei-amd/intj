@@ -23,6 +23,7 @@ else:  # the same parser, before it joined the stdlib
 
 from .. import _imports
 from ..python_intf.cpython_abi import pyobject_size
+from ..scalar_types import triton_name
 
 #: How many dtype codes the C side reserves room for; mirrors INTJ_NDTYPES.
 NDTYPES = 64
@@ -176,12 +177,9 @@ def dtype_index_table() -> bytes:
     table = bytearray(b"\xff" * NDTYPES)
     indices: dict[str, int] = {}
     for code in sorted(by_code):  # code order, so the assignment is stable
-        # `str(dtype)` is what triton's own canonicalize_dtype splits; the
-        # attribute name is not.  `torch.chalf` and `torch.complex32` are one
-        # dtype, and only the latter spelling is ever a key in that dict.
-        canon = _imports.type_canonicalisation_dict.get(
-            str(by_code[code]).split(".")[-1]
-        )
+        # `torch.chalf` and `torch.complex32` are one dtype, and only the
+        # latter spelling is ever a key in triton's table.
+        canon = triton_name(by_code[code])
         if canon is None:
             continue
         table[code] = indices.setdefault(canon, len(indices))

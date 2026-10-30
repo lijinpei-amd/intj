@@ -24,6 +24,7 @@ from .annotation import (
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
 )
 from .render.key import DynamicSlot, Param
+from .scalar_types import key_bytes
 
 # triton ships no type information
 JitFunction = Any
@@ -42,20 +43,7 @@ def _cache_key_fields(
         if types == (None,):
             return ()
         descriptor = types is None or len(types) > 1
-        width = (
-            8
-            if types is None
-            else max(
-                0
-                if ty is None
-                else 8
-                if ty == "fp64"
-                else 1
-                if ty == "u1"
-                else int(ty[1:]) // 8
-                for ty in types
-            )
-        )
+        width = 8 if types is None else max(key_bytes(ty) for ty in types)
         return ((CacheKeyField("descriptor", 1),) if descriptor else ()) + (
             (CacheKeyField("payload", width),) if width else ()
         )

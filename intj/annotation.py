@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
+from .scalar_types import fits, is_integer, narrowness
 
 if TYPE_CHECKING:
     import triton.language as tl
@@ -547,38 +548,14 @@ def _inferred_scalar_type(value: object) -> str | None:
     raise ValueError("intj: baked integer is outside Triton's scalar range")
 
 
-def _fits_scalar(value: object, name: str | None, kind: str) -> bool:
-    """Returns whether `value` is representable as the canonical type `name`."""
-    if name is None:
-        return value is None
-    if name.startswith("*"):
-        return False
-    if name == "u1":
-        return type(value) is bool
-    if name[0] in ("i", "u") and type(value) is int:
-        bits = int(name[1:])
-        low = -(1 << (bits - 1)) if name[0] == "i" else 0
-        high = (1 << (bits - 1)) if name[0] == "i" else (1 << bits)
-        return low <= value < high
-    if name in ("fp32", "fp64") and type(value) is float:
-        if name == "fp64":
-            return True
-        try:
-            rounded = struct.unpack(">f", struct.pack(">f", value))[0]
-        except OverflowError:
-            return False
-        return kind == "argument" or rounded == value
-    return False
-
-
 def _applicable(name: str | None, field: str) -> bool:
     if name is None:
         return False
     if field == "pointer_range_32":
         return name.startswith("*")
     if field == "equal_to_one":
-        return name.startswith(("i", "u")) and name != "u1"
-    return name.startswith("*") or (name.startswith(("i", "u")) and name != "u1")
+        return is_integer(name)
+    return name.startswith("*") or is_integer(name)
 
 
 def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
@@ -704,14 +681,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                 f"intj: parameter {name!r} is annotated as a tensor; it cannot also "
                 "be a constexpr, a non-pointer type, baked or bound"
             )
-        if (
-            power
-            and types is not None
-            and any(
-                ty is None or not ty.startswith(("i", "u")) or ty == "u1"
-                for ty in types
-            )
-        ):
+        if power and types is not None and not all(is_integer(ty) for ty in types):
             raise ValueError(
                 f"intj: parameter {name!r} power_of_two_or_zero needs an integer type"
             )
@@ -738,31 +708,17 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                     raise ValueError(
                         f"intj: parameter {name!r} cannot bake a pointer value"
                     )
-                if not _fits_scalar(baked, types[0], kind):
+                if not fits(baked, types[0], kind):
                     raise ValueError(
                         f"intj: parameter {name!r} baked value does not fit type"
                     )
             elif types is not None:
-                matching = [ty for ty in types if _fits_scalar(baked, ty, kind)]
+                matching = [ty for ty in types if fits(baked, ty, kind)]
                 if not matching:
                     raise ValueError(
                         f"intj: parameter {name!r} baked value does not fit type"
                     )
-                types = (
-                    min(
-                        matching,
-                        key=lambda ty: (
-                            0
-                            if ty is None
-                            else 1
-                            if ty == "u1"
-                            else 64
-                            if ty == "fp64"
-                            else int(ty[1:]),
-                            ty or "",
-                        ),
-                    ),
-                )
+                types = (min(matching, key=narrowness),)
         if power:
             if baked is not UNSET and (
                 type(baked) is not int

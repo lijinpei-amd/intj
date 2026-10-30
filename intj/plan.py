@@ -29,6 +29,7 @@ from .options import MakeLauncherOption
 from .render import deps as render_deps
 from .render import module as render_module
 from .render.key import Param, TuningRender
+from .scalar_types import triton_name
 from .specialization import KeyLayout, call_layout, key_layout
 from .torch_intf.torch_abi import TorchAccessMode
 
@@ -423,9 +424,7 @@ def _bind(
                 ty = None
                 if value is not None:
                     tensor: Any = value
-                    dtype = _imports.type_canonicalisation_dict.get(
-                        str(tensor.dtype).split(".")[-1]
-                    )
+                    dtype = triton_name(tensor.dtype)
                     if dtype is None:
                         raise TypeError(
                             f"intj: bound tensor {p.name!r} has unsupported dtype {tensor.dtype}"

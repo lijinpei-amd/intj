@@ -40,7 +40,9 @@ callback; it passes its C stub to `module.py` for module initialization. `compil
 cache miss into the record C launches (`KernelCompiler`), and is the one place
 Triton compiles (`triton_load`, the port tests replace). Both sides of the
 invariant (key fields, call and key layout, compiler input) live in
-`specialization.py`. Compile options live in `compile_options.py`: the knob
+`specialization.py`, and every question asked of a scalar type name (its kind,
+key width, narrowness order, whether a value fits it, a torch dtype's name) in
+`scalar_types.py`. Compile options live in `compile_options.py`: the knob
 table (`KNOBS`, read by both launchers and compat's launcher key), parameter-fed
 and forbidden options, and `resolve`, the one merge (base, then a call's
 overlay, then knobs) and canonicalization every compile, module key and config
