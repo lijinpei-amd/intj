@@ -206,6 +206,11 @@ test must be able to fail: mutate the change away and check the test catches it.
 tuned launchers the same holds for
 `tests/test_tuned.py::test_tuned_key_chain_is_never_coarser_than_triton`, whose
 mutation test `test_tuned_invariant_catches_a_dropped_exact_key` shows it can fail.
+`tests/test_invariant_host.py` checks the invariant on `no_gpu=True` builds
+with CPU tensors, so it needs Triton but no GPU: the GPU test's kernels plus
+seeded random annotations, each under the host driver against CUDA's rules and
+under a host driver keying the pointer range against HIP's. Its
+`test_host_invariant_catches_*` tests are the mutation proofs.
 
 ## Types
 
