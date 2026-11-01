@@ -11,8 +11,8 @@ from __future__ import annotations
 import dataclasses
 import threading
 import weakref
-from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping, MutableMapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import _imports
 from . import backend as backends
@@ -31,6 +31,7 @@ CompiledKernel = Any
 
 #: The port to Triton: compile `compiler_input` for `target` under the
 #: canonical options and load the binary on the current device.
+# This runtime alias needs typing.Callable on Python 3.8.
 TritonLoad = Callable[[JitFunction, CompilerInput, Any, Any], CompiledKernel]
 
 
