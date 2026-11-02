@@ -768,11 +768,7 @@ static inline void intj_not_a_tensor(PyObject *o, const char *pname,
  * propagate unwrapped.  Returns -1 with a python error set. */
 static inline int intj_ptr_range(PyObject *o, int64_t *storage_nbytes) {
   PyObject *probe;
-#if PY_VERSION_HEX >= 0x030D0000
   int found = PyObject_GetOptionalAttr(o, intj_str_ptr_range, &probe);
-#else
-  int found = _PyObject_LookupAttr(o, intj_str_ptr_range, &probe);
-#endif
   if (found <= 0)
     return found;
   Py_DECREF(probe);

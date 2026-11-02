@@ -104,9 +104,9 @@ are unsupported; the generated module declares this on CPython 3.12+.
 
 The C header supplies older interpreters with calls the runtime uses:
 vectorcall, `PyObject_VectorcallMethod` and `PyObject_CallMethodNoArgs` before
-3.9, `Py_NewRef` before 3.10, and the raised-exception get/set functions before
-3.12. This keeps version branches out of callers. Guard each shim by the
-version that added its call.
+3.9, `Py_NewRef` before 3.10, the raised-exception get/set functions before
+3.12, and `PyObject_GetOptionalAttr` before 3.13. This keeps version branches
+out of callers. Guard each shim by the version that added its call.
 
 Launcher entry swapping relies on CPython reading
 `PyCFunctionObject.m_ml->ml_meth` at every call, including from specialized call sites (3.11

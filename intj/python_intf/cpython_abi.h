@@ -170,3 +170,6 @@ static inline void PyErr_SetRaisedException(PyObject *exc) { /* steals exc */
                 PyException_GetTraceback(exc));
 }
 #endif
+#if PY_VERSION_HEX < 0x030D0000
+#define PyObject_GetOptionalAttr _PyObject_LookupAttr
+#endif
