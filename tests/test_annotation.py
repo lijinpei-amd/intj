@@ -90,6 +90,7 @@ def test_assume_fact_values_require_exact_int(fact, specialization):
             ValueError,
             "mutually exclusive",
         ),
+        (lambda: intj.Argument(ptr_range=cast(Any, 1)), TypeError, "ptr_range"),
         (lambda: intj.Assume(intj.EqualTo(2)), ValueError, r"EqualTo\(1\)"),
         (lambda: intj.Assume(intj.Aligned(8)), ValueError, r"Aligned\(16\)"),
         (lambda: intj.Assume(intj.PointerRange(64)), ValueError, r"PointerRange\(32\)"),
@@ -123,6 +124,27 @@ def test_annotation_sources_merge_field_by_field(tmp_path):
         "never",
         "never",
     )
+
+
+def test_ptr_range_is_off_unless_either_source_turns_it_on(tmp_path):
+    from intj.annotation import _merge_annotations
+
+    kernel = kernel_with_params(tmp_path, "x: intj.Argument(ptr_range=True), y, z")
+    x, y, z = (
+        p.annotation.ptr_range
+        for p in _merge_annotations(
+            kernel, {"x": intj.Argument(), "y": intj.Argument(ptr_range=True)}
+        )
+    )
+    assert (x, y, z) == (True, True, False)
+    # Triton's do_not_specialize leaves no pointer range to measure
+    kernel = kernel_with_params(
+        tmp_path,
+        "x: intj.Argument(ptr_range=True)",
+        "@triton.jit(do_not_specialize=['x'])",
+    )
+    with pytest.raises(ValueError, match="dead ptr_range"):
+        _merge_annotations(kernel, None)
 
 
 def test_annotation_sources_merge_equivalent_type_sets(tmp_path):
@@ -498,6 +520,23 @@ def test_annotation_sources_reject_conflicts(tmp_path, params, extra, decorator,
                 )
             },
             "power_of_two_or_zero",
+        ),
+        ("x", {"x": intj.Argument(type=tl.int32, ptr_range=True)}, "dead ptr_range"),
+        (
+            "x",
+            {"x": intj.Argument(specialize=intj.NEVER, ptr_range=True)},
+            "dead ptr_range",
+        ),
+        (
+            "x",
+            {
+                "x": intj.Argument(
+                    specialize=intj.Assume(intj.PointerRange(32)),
+                    bind_value=intj.BindValue.TENSOR,
+                    ptr_range=True,
+                )
+            },
+            "dead ptr_range",
         ),
     ],
 )

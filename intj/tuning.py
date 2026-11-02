@@ -555,12 +555,16 @@ class TunedCompileState:
         self.baked = {p.name: p.baked for p in resolved if p.annotation.baked_value}
         self.lock = threading.RLock()
         self.running = False
+        #: the running miss's measured pointer ranges; see `compiler_input`
+        self.ranges: Mapping[int, bool] | None = None
 
     def _compile_kernel(
         self, values: dict[str, Any], config_options: dict[str, Any]
     ) -> Any:
         """Returns the `CompiledKernel` for one candidate, compiling it once."""
-        return self.compiler.candidate(values, config_options, self.call_knobs)
+        return self.compiler.candidate(
+            values, config_options, self.call_knobs, self.ranges
+        )
 
     def run(
         self,
@@ -570,8 +574,12 @@ class TunedCompileState:
         stream: int,
         controls: Any,
         *args: Any,
+        ranges: Mapping[int, bool] | None = None,
     ) -> tuple[Any, ...]:
-        """Tunes for one miss under `lock`, refusing re-entry."""
+        """Tunes for one miss under `lock`, refusing re-entry.
+
+        Every candidate compiles the pointer `ranges` the miss's key measured.
+        """
         del keyblob
         with self.lock:
             if self.running:
@@ -579,10 +587,12 @@ class TunedCompileState:
                     "intj: a tuned launcher was re-entered while tuning"
                 )
             self.running = True
+            self.ranges = ranges
             try:
                 return self._tune(nparams, device, stream, controls, args)
             finally:
                 self.running = False
+                self.ranges = None
 
     def _tune(
         self,
@@ -698,7 +708,10 @@ class TunedLauncher(Launcher):
         controls: object,
         /,
         *args: Any,
+        ranges: Mapping[int, bool] | None = None,
     ) -> Any:
         """Tunes and launches the winner, returning its record for C to cache."""
         state = cast(TunedCompileState, self._compile_state)
-        return state.run(keyblob, nparams, device, stream, controls, *args)
+        return state.run(
+            keyblob, nparams, device, stream, controls, *args, ranges=ranges
+        )

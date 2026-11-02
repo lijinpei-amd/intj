@@ -317,6 +317,8 @@ static PyObject *intj_str_data_ptr;
 static PyObject *intj_str_untyped_storage;
 static PyObject *intj_str_nbytes;
 static PyObject *intj_str_name; /* tl.dtype's, for the object table */
+static PyObject *intj_str_ptr_range;
+static PyObject *intj_int32_max; /* 2**31 - 1, what ptr_range() compares to */
 
 #if defined(INTJ_TORCH_ACCESS_RUNTIME_SHIM)
 
@@ -542,8 +544,11 @@ static inline int intj_intern_names(void) {
   intj_str_untyped_storage = PyUnicode_InternFromString("untyped_storage");
   intj_str_nbytes = PyUnicode_InternFromString("nbytes");
   intj_str_name = PyUnicode_InternFromString("name");
+  intj_str_ptr_range = PyUnicode_InternFromString("ptr_range");
+  intj_int32_max = PyLong_FromLong(2147483647L);
   return (intj_str_dtype && intj_str_data_ptr && intj_str_untyped_storage &&
-          intj_str_nbytes && intj_str_name)
+          intj_str_nbytes && intj_str_name && intj_str_ptr_range &&
+          intj_int32_max)
              ? 0
              : -1;
 }
@@ -748,12 +753,52 @@ static inline void intj_not_a_tensor(PyObject *o, const char *pname,
                none_ok ? "tensor or None" : "tensor", Py_TYPE(o)->tp_name);
 }
 
+/* `want_size` for a parameter annotated `Argument(ptr_range=True)`: Triton's
+ * pointer-range test replaces the storage size.  `hasattr(o, "ptr_range")`
+ * first; when it holds, `o.ptr_range() <= 2**31 - 1` decides and the storage
+ * is never read, else the storage size does. */
+#define INTJ_WANT_PTR_RANGE 2
+
+/* Triton's `hasattr(o, "ptr_range")` and then `o.ptr_range()` for
+ * INTJ_WANT_PTR_RANGE: two lookups, as Triton makes them, so a descriptor sees
+ * both and only the first swallows an AttributeError.  Found, sets
+ * `*storage_nbytes` to 0 or INT64_MAX, so every later `<= 2147483647` test
+ * reads ptr_range()'s answer, and returns 1; absent, returns 0.  The
+ * comparison is Python's, as Triton's is, and so are its errors: they
+ * propagate unwrapped.  Returns -1 with a python error set. */
+static inline int intj_ptr_range(PyObject *o, int64_t *storage_nbytes) {
+  PyObject *probe;
+#if PY_VERSION_HEX >= 0x030D0000
+  int found = PyObject_GetOptionalAttr(o, intj_str_ptr_range, &probe);
+#else
+  int found = _PyObject_LookupAttr(o, intj_str_ptr_range, &probe);
+#endif
+  if (found <= 0)
+    return found;
+  Py_DECREF(probe);
+  PyObject *range = PyObject_CallMethodNoArgs(o, intj_str_ptr_range);
+  if (!range)
+    return -1;
+  int within = PyObject_RichCompareBool(range, intj_int32_max, Py_LE);
+  Py_DECREF(range);
+  if (within < 0)
+    return -1;
+  *storage_nbytes = within ? 0 : INT64_MAX;
+  return 1;
+}
+
 /* `o` is an exact torch.Tensor or nn.Parameter. */
 static INTJ_ALWAYS_INLINE int
 intj_decode_tensor_checked(const intj_torch_abi *abi, PyObject *o,
                            int want_size, const char *pname,
                            intj_decoded *out) {
   memset(out, 0, sizeof(*out));
+  if (want_size == INTJ_WANT_PTR_RANGE) {
+    int found = intj_ptr_range(o, &out->storage_nbytes);
+    if (INTJ_UNLIKELY(found < 0))
+      return -1;
+    want_size = !found;
+  }
   int32_t dtype = -1;
   if (INTJ_UNLIKELY(intj_read_tensor(abi, o, &out->pointer, &dtype, want_size,
                                      &out->storage_nbytes) != 0)) {

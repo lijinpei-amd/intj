@@ -439,8 +439,8 @@ hook-sensitive launches on Triton.
 Import `Argument`, `Constexpr`, `AUTO`, `NEVER`, `Assume`, `Exactly`, `EqualTo`,
 `Aligned`, `PointerRange`, `BindValue`, `INT_TYPES`, and `FLOAT_TYPES` from `intj`.
 `Annotation`, `SpecializationPolicy`, and `Fact` are their public base classes.
-`Argument(type=..., specialize=..., value=..., bind_value=...)` describes an
-ordinary parameter. `Constexpr(type=..., power_of_two_or_zero=False,
+`Argument(type=..., specialize=..., value=..., bind_value=...,
+ptr_range=...)` describes an ordinary parameter. `Constexpr(type=..., power_of_two_or_zero=False,
 value=...)` describes a constexpr parameter. Every field is optional.
 `INT_TYPES` is `(tl.int32, tl.int64, tl.uint64)` and `FLOAT_TYPES` is
 `(tl.float32,)`; either can be used as a type allowlist. A single dtype or a
@@ -504,6 +504,23 @@ to key. Sources merge per fact, as above:
 `NEVER`, `Assume(PointerRange(32))` or `do_not_specialize_on_alignment`. The
 aligned and equal-to-one facts cannot both hold for one integer. An assumed
 fact is a caller promise unless `verify_annotation=True`.
+
+Triton decides a tensor's pointer range by `ptr_range() <= 2**31 - 1` when the
+tensor has a `ptr_range` attribute, and by its storage size only otherwise.
+intj reads the storage size alone unless the parameter is annotated
+`Argument(ptr_range=True)`; then, on every call, it does what Triton does
+through the CPython API, before reading the storage: `hasattr(x, "ptr_range")`,
+and if that holds, `x.ptr_range()`, a second lookup, compared as Python
+compares. Only the first lookup's `AttributeError` is swallowed; every other
+error propagates unchanged, and the storage is read only when the attribute is
+absent. That is one attribute lookup per such tensor per call without the
+attribute, two with it, so it is off by default; off, the attribute is never
+looked up, for the key or the compile. A miss compiles the range its key
+measured rather than calling `ptr_range()` again. It applies wherever intj measures the range: an `AUTO` fact
+on a backend that keys it (AMD), or an assumed one under
+`verify_annotation=True`. A `ptr_range=True` parameter whose range is never
+measured -- a non-pointer type, a `NEVER` range fact or `do_not_specialize`,
+a baked or bound value -- raises at `check()`.
 
 Ordinary scalar types include `tl.int1` (canonical key name `u1`), signed and
 unsigned 8/16/32/64-bit integers, and `tl.float32`/`tl.float64`; pointers use
@@ -601,7 +618,7 @@ launcher, on each `check()` and at the build, and trusts the range promise.
 
 | passed value | triton type | key |
 |---|---|---|
-| `torch.Tensor` / `torch.nn.Parameter` (exact type) | `*<dtype>` | `D` when the data pointer is 16B-aligned, `S` (AMD) when the storage is < 2 GiB |
+| `torch.Tensor` / `torch.nn.Parameter` (exact type) | `*<dtype>` | `D` when the data pointer is 16B-aligned, `S` (AMD) when the storage is < 2 GiB (or, under `Argument(ptr_range=True)`, `ptr_range()` says so) |
 | `int` | `constexpr` when the value is 1, else `i32`/`i64`/`u64` | `D` when divisible by 16 |
 | `float` | `fp32` | — |
 | `bool` | `u1` | — |

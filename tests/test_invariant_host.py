@@ -25,6 +25,7 @@ pytest.importorskip("triton")
 import torch  # noqa: E402
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
+from triton import knobs  # noqa: E402
 from triton.backends.compiler import GPUTarget  # noqa: E402
 from triton.compiler import make_backend  # noqa: E402
 
@@ -87,8 +88,11 @@ def tensors():
     return out
 
 
-def check(jit, extra, cases, truth):
+def check(jit, extra, cases, truth, compiled_extra=None):
     """Asserts that every case a host launcher of `jit` accepts keys as Triton compiles.
+
+    `compiled_extra`, if given, replaces `extra` on the compiler side only: a
+    mutation of what the launcher keys.
 
     Returns:
         How many cases were keyed (the rest were refused).
@@ -100,7 +104,9 @@ def check(jit, extra, cases, truth):
         verify_annotation=True,
         torch_access_mode=TorchAccessMode.RUNTIME_SHIM,
     )
-    resolved = _merge_annotations(jit, extra)
+    resolved = _merge_annotations(
+        jit, extra if compiled_extra is None else compiled_extra
+    )
     params = call_layout(resolved)
     baked = {p.index: p.baked for p in resolved if p.annotation.baked_value}
     seen, keyed = {}, 0
@@ -189,6 +195,167 @@ def test_axpy_keys_as_triton_compiles(kernel, tensors, truth):
     )
     cases = axpy_cases(tensors, optional=jit is axpy_optional)
     assert check(jit, extra, cases, truth) == len(cases)
+
+
+def ptr_range_cases(tensors):
+    """`axpy` calls whose `x` has a `ptr_range()` disagreeing with its storage."""
+    cases = []
+    for x in tensors.values:
+        for answer in (None, 0, 2**31 - 1, 2**31):
+            view = x[:]  # a fresh object, so the attribute stays on it
+            if answer is not None:
+                view.ptr_range = lambda answer=answer: answer
+            cases.append((view, tensors.base, tensors.base, 4096, 1.5, True, None, 128))
+    return cases
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_ptr_range_keys_as_triton_compiles(on, tensors, truth):
+    """Off, intj keys and compiles the storage size; on, Triton's `ptr_range()`."""
+    cases = ptr_range_cases(tensors)
+    assert check(axpy, {"x": Argument(ptr_range=on)}, cases, truth) == len(cases)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_host_invariant_catches_an_ignored_ptr_range(on, monkeypatch, tensors):
+    """Keying one rule and compiling the other collides, in either direction."""
+    monkeypatch.setattr(backends, "HOST", PointerRangeHost())
+    hip = make_backend(PAIRS["range-hip"][1])
+    with pytest.raises(AssertionError, match="collides"):
+        check(
+            axpy,
+            {"x": Argument(ptr_range=on)},
+            ptr_range_cases(tensors),
+            hip,
+            compiled_extra={"x": Argument(ptr_range=not on)},
+        )
+
+
+@triton.jit
+def one_pointer(p):
+    pass
+
+
+def _unreadable(*_):
+    raise AssertionError("intj read what it does not key")
+
+
+def _vanish():
+    raise AttributeError("ptr_range")
+
+
+@pytest.mark.parametrize("mode", list(TorchAccessMode))
+@pytest.mark.parametrize(
+    "lookups",
+    [
+        pytest.param((lambda: 0, lambda: 2**31), id="widens"),
+        pytest.param((lambda: 2**31, lambda: 0), id="narrows"),
+        pytest.param((lambda: 0, _vanish), id="vanishes"),
+    ],
+)
+def test_ptr_range_looks_up_twice_as_triton(lookups, mode, monkeypatch):
+    """`hasattr(x, "ptr_range")`, then `x.ptr_range()`: a descriptor sees both.
+
+    Triton's own specialization is the truth, for the C key and for the
+    compiler input built without the key's measurement alike.
+    """
+    monkeypatch.setattr(backends, "HOST", PointerRangeHost())
+    monkeypatch.setattr(knobs.amd, "use_buffer_ops", True)
+    hip = make_backend(PAIRS["range-hip"][1])
+    annotation = Argument(ptr_range=True)
+    launch = make_launcher(
+        one_pointer,
+        extra_annotation={"p": annotation},
+        no_gpu=True,
+        torch_access_mode=mode,
+    )
+    params = call_layout(_merge_annotations(one_pointer, {"p": annotation}))
+    x = torch.empty(4, dtype=torch.uint8)
+    # CPU storage is virtual: the wide tensor's bytes are never touched
+    narrow, wide = (
+        launch.__self__.spec_key(0, t)
+        for t in (x, torch.empty(2**31, dtype=torch.uint8))
+    )
+    seen = []
+
+    def descriptor(self):
+        answer = lookups[len(seen)]
+        seen.append(answer)
+        return _vanish() if answer is _vanish else answer
+
+    monkeypatch.setattr(torch.Tensor, "ptr_range", property(descriptor), False)
+
+    def run(fn):
+        seen.clear()
+        try:
+            return fn()
+        except AttributeError:
+            return AttributeError
+        finally:
+            assert len(seen) == 2, "one hasattr() and one call, as Triton makes"
+
+    truth = run(
+        lambda: specialization._triton_specialize(
+            x, backend=hip, is_const=False, specialize=True, align=True
+        )[1]
+    )
+    key = run(lambda: launch.__self__.spec_key(0, x))
+    source = run(lambda: str(compiler_input(one_pointer, params, [x], hip).attrs))
+    if truth is AttributeError:
+        assert key is source is AttributeError
+    else:
+        assert isinstance(truth, str) and isinstance(source, str)
+        assert key == (narrow if "S" in truth else wide)
+        assert ("tt.pointer_range" in source) == ("S" in truth)
+
+
+@pytest.mark.parametrize("mode", list(TorchAccessMode))
+@pytest.mark.parametrize(
+    "case",
+    [
+        "override skips storage",
+        "off skips ptr_range",
+        "NEVER skips storage",
+        "assumed skips storage",
+    ],
+)
+def test_ptr_range_reads_only_what_it_keys(case, mode, monkeypatch):
+    """Neither the C key nor the compiler input touches a tensor's unused range.
+
+    On, a `ptr_range` attribute decides before the storage is read; off, the
+    attribute is never looked up; NEVER measures nothing, and an unverified
+    assumed range ignores what Triton would measure.
+    """
+    monkeypatch.setattr(backends, "HOST", PointerRangeHost())
+    monkeypatch.setattr(knobs.amd, "use_buffer_ops", True)
+    hip = make_backend(PAIRS["range-hip"][1])
+    x = torch.empty(4)
+    if case == "override skips storage":
+        annotation = Argument(ptr_range=True)
+        x.ptr_range = lambda: 0  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+        x.untyped_storage = _unreadable  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as INTERPRETER calls it
+    elif case == "off skips ptr_range":
+        annotation = Argument()
+        monkeypatch.setattr(torch.Tensor, "ptr_range", property(_unreadable), False)
+    else:
+        annotation = Argument(
+            specialize=NEVER
+            if case == "NEVER skips storage"
+            else Assume(PointerRange(32))
+        )
+        x.ptr_range = lambda: 0  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+        x.untyped_storage = _unreadable  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as INTERPRETER calls it
+    launch = make_launcher(
+        one_pointer,
+        extra_annotation={"p": annotation},
+        no_gpu=True,
+        torch_access_mode=mode,
+    )
+    key = launch.__self__.spec_key(0, x)
+    assert key == launch.__self__.spec_key(0, torch.empty(4))
+    params = call_layout(_merge_annotations(one_pointer, {"p": annotation}))
+    attrs = str(compiler_input(one_pointer, params, [x], hip).attrs)
+    assert ("tt.pointer_range" in attrs) == (case != "NEVER skips storage")
 
 
 @triton.jit

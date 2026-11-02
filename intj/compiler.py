@@ -301,16 +301,31 @@ class KernelCompiler:
         _check_live_knobs(knobs)
         return options, knobs, args[len(dynamic) :]
 
-    def miss(self, keyblob: bytes, nparams: int, device: int, *args: Any) -> Any:
+    def miss(
+        self,
+        keyblob: bytes,
+        nparams: int,
+        device: int,
+        *args: Any,
+        ranges: Mapping[int, bool] | None = None,
+    ) -> Any:
         """Returns the record for one miss: the override's, else `compile_miss`'s."""
         if self.override is not None:
             return self.override(keyblob, nparams, device, *args)
-        return self.compile_miss(keyblob, nparams, device, *args)
+        return self.compile_miss(keyblob, nparams, device, *args, ranges=ranges)
 
     def compile_miss(
-        self, keyblob: bytes, nparams: int, device: int, *args: Any
+        self,
+        keyblob: bytes,
+        nparams: int,
+        device: int,
+        *args: Any,
+        ranges: Mapping[int, bool] | None = None,
     ) -> Any:
-        """Compiles or reuses the kernel for one miss and returns its record."""
+        """Compiles or reuses the kernel for one miss and returns its record.
+
+        `ranges` are the pointer ranges the key measured; see `compiler_input`.
+        """
         if self.target is None:
             return 0, 1, 0, nparams
         dyn_options, dyn_knobs, args = self.split_call(device, args)
@@ -332,6 +347,7 @@ class KernelCompiler:
             args,
             self.backend,
             baked_values=self._baked_values,
+            ranges=ranges,
         )
         identity = _Identity.of(source, canonical, dyn_knobs)
         # b"" is a keyless launcher's one key; seen is per launcher.
@@ -348,10 +364,12 @@ class KernelCompiler:
         values: Mapping[str, Any],
         config_options: Mapping[str, Any],
         knobs: Mapping[str, object],
+        ranges: Mapping[int, bool] | None = None,
     ) -> CompiledKernel:
         """Returns the kernel for one tuned candidate, compiling it once.
 
-        `values` holds every parameter's value by name.
+        `values` holds every parameter's value by name; `ranges` are the
+        pointer ranges the miss's key measured, see `compiler_input`.
         """
         canonical = self._canonical(
             {**config_options, **{n: values[n] for n in self._per_call}}, knobs
@@ -361,6 +379,7 @@ class KernelCompiler:
             self._params,
             [values[p.name] for p in self._params],
             self.backend,
+            ranges=ranges,
         )
         return self._compile(_Identity.of(source, canonical, knobs), canonical)
 

@@ -150,7 +150,8 @@ So I decide to reimplemen the above using C++.
 
 Some of the user facing features of triton `JitFunction` incurs launch overhead, which can be avoid if the user interface is changed. For example:
 
-- AMDGPU 'S' spec-key can depends on per object "ptr_range".
+- AMDGPU 'S' spec-key can depends on per object "ptr_range"; intj ignores it
+  unless a parameter opts in with `Argument(ptr_range=True)`.
 - Arbitrary Python grid functions cannot be compiled; `grid_py` calls them on
   every launch, while `grid_cpp` compiles a restricted annotated `def`.
 - Polimophic type.

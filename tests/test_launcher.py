@@ -2441,6 +2441,50 @@ def test_ordinary_never_omits_pointer_range(pointer_kernel, monkeypatch):
             assert small_key == large_key == launch.__self__.spec_key(0, small)
 
 
+@pytest.mark.parametrize("mode", list(TorchAccessMode))
+def test_ptr_range_annotation_keys_ptr_range_as_triton(
+    pointer_kernel, monkeypatch, mode
+):
+    """`Argument(ptr_range=True)`: a tensor's `ptr_range()` decides its range bit."""
+    monkeypatch.setattr(backends.HOST, "pointer_range", True)
+    # CPU storage is virtual: neither tensor's bytes are touched
+    small = torch.empty(16, dtype=torch.uint8)
+    large = torch.empty(2**31, dtype=torch.uint8)
+
+    def key(launch, tensor, ptr_range=None):
+        view = tensor[:]  # a fresh object, so the attribute stays on it
+        if ptr_range is not None:
+            view.ptr_range = ptr_range
+        return launch.__self__.spec_key(0, view)
+
+    plain, ranged = (
+        make_launcher(
+            pointer_kernel,
+            extra_annotation={"x": Argument(ptr_range=on)},
+            no_gpu=True,
+            torch_access_mode=mode,
+        )
+        for on in (False, True)
+    )
+    for launch in (plain, ranged):
+        assert key(launch, small) != key(launch, large)
+    # off: the storage size decides, ptr_range() or not
+    assert key(plain, large, lambda: 0) == key(plain, large)
+    assert key(plain, small, lambda: 2**31) == key(plain, small)
+    # on: ptr_range() decides, compared as Python compares
+    assert key(ranged, large, lambda: 0) == key(ranged, small)
+    assert key(ranged, large, lambda: -1) == key(ranged, small)
+    assert key(ranged, small, lambda: 2**31) == key(ranged, large)
+    assert key(ranged, small, lambda: 2**100) == key(ranged, large)
+    # and its errors are Triton's, raised as they are
+    with pytest.raises(ZeroDivisionError):
+        key(ranged, small, lambda: 1 // 0)
+    with pytest.raises(TypeError, match="not callable"):
+        key(ranged, small, 0)
+    with pytest.raises(TypeError, match="<="):
+        key(ranged, small, lambda: "0")
+
+
 def test_checked_ordinary_assumed_facts(scalar_kernel, pointer_kernel):
     with pytest.raises(ValueError, match="impossible"):
         make_launcher(
@@ -3721,6 +3765,68 @@ def test_exactly_compiles_only_its_facts():
     assert compiled(Assume(PointerRange(32)), x).src.attrs == {
         (0,): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
     }
+
+
+@needs_pointer_range
+def test_ptr_range_annotation_compiles_ptr_range():
+    """`Argument(ptr_range=True)` compiles the range `ptr_range()` reports.
+
+    Off, the storage size decides, ptr_range() or not.
+    """
+    from triton import knobs
+
+    if not knobs.amd.use_buffer_ops:
+        pytest.skip("Triton puts no tt.pointer_range on any tensor")
+    x = torch.zeros(4, dtype=torch.int32, device="cuda")
+    wide = x[:]  # a fresh object, so the attribute stays on it
+    wide.ptr_range = lambda: 2**31  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+
+    def ranged(on, tensor):
+        launch = make_launcher(
+            store_one,
+            extra_annotation={"p": Argument(ptr_range=on)},
+            return_compiled=True,
+        )
+        attrs = launch(*_gpu_controls(), tensor).src.attrs
+        return "tt.pointer_range" in str(attrs)
+
+    assert ranged(False, x) and ranged(False, wide) and ranged(True, x)
+    assert not ranged(True, wide)
+    assert x.tolist() == [1, 0, 0, 0]
+
+
+@needs_pointer_range
+def test_ptr_range_miss_compiles_the_range_its_key_measured():
+    """A miss compiles the `ptr_range()` answer its key read, calling it once.
+
+    Asked again, a callback may answer differently: Triton asks once and keys
+    and compiles that answer, so a wide key must never hold a 32-bit kernel.
+    """
+    from triton import knobs
+
+    if not knobs.amd.use_buffer_ops:
+        pytest.skip("Triton puts no tt.pointer_range on any tensor")
+    x = torch.zeros(4, dtype=torch.int32, device="cuda")
+    answers = [2**31, 0]
+
+    def ptr_range():
+        return answers.pop(0) if answers else 0
+
+    x.ptr_range = ptr_range  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+    launch = make_launcher(
+        store_one,
+        extra_annotation={"p": Argument(ptr_range=True)},
+        return_compiled=True,
+    )
+    missed = launch(*_gpu_controls(), x)
+    assert answers == [0], "the miss must reuse its key's measurement"
+    assert "tt.pointer_range" not in str(missed.src.attrs)
+    x.ptr_range = lambda: 2**31  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+    assert launch(*_gpu_controls(), x) is missed  # the wide key's hit
+    x.ptr_range = lambda: 0  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+    narrow = launch(*_gpu_controls(), x)
+    assert narrow is not missed and "tt.pointer_range" in str(narrow.src.attrs)
+    assert x.tolist() == [1, 0, 0, 0]
 
 
 @triton.jit

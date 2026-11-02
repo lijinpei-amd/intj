@@ -339,14 +339,17 @@ class Launcher:
         controls: object,
         /,
         *args: Any,
+        ranges: Mapping[int, bool] | None = None,
     ) -> Any:
         """Returns the record for C to launch on an ordinary cache miss.
 
         `args` are the dynamic values, then the public kernel arguments.
+        `ranges`, passed when a `ptr_range=True` range is keyed, are the
+        pointer ranges the key measured, by parameter index.
         """
         del stream, controls
         state = cast(KernelCompiler, self._compile_state)
-        return state.miss(keyblob, nparams, device, *args)
+        return state.miss(keyblob, nparams, device, *args, ranges=ranges)
 
 
 class LaunchFunction(Protocol):

@@ -110,6 +110,8 @@ class ParamView:
     baked_bits: str
     baked_negative: bool
     range_check: bool  # the decoder reads the storage size for the range bit
+    #: ... unless a `ptr_range()`, looked up first, replaces it
+    ptr_range: bool
     bound_range_check: bool
     #: where its type code comes from: "constexpr" (the value's own),
     #: "choices", "fixed" or "infer"
@@ -122,6 +124,9 @@ class ParamView:
     one_tests_value: bool  # ... and only does if it is 1
     align_code: bool  # keys its 16-byte divisibility
     range_code: bool  # keys a tensor's 2 GiB range
+    #: a keyed `ptr_range=True` range: its index in the observations a miss
+    #: passes on, so compiling reuses what the key measured
+    range_slot: int | None
     descriptor: KeyWrite | None
     descriptor_part: KeyWrite | None  # the descriptor on the auto path
     payload: KeyWrite | None
@@ -247,6 +252,8 @@ class RenderContext:
     ncomp: int
     dep_len: int
     comp_len: int
+    nranges: int  # the range observations a miss passes on
+    range_len: int  # their array, never empty
     computed_names_len: int
     computed_names: tuple[str, ...]  # every level's computed keys, for errors
     nmeta: int
@@ -288,6 +295,13 @@ class RenderContext:
             p for p in key.params if p.call_index is None and not p.annotation.tuned
         ]
         meta_names = tuning.meta_names if tuning is not None else ()
+        ranged = [
+            p
+            for p in key.params
+            if p.annotation.ptr_range
+            and p.annotation.pointer_range_32 == "auto"
+            and key.spec_pointer_range
+        ]
         params = tuple(
             _param_view(
                 p,
@@ -295,6 +309,7 @@ class RenderContext:
                 spec_pointer_range=bool(key.spec_pointer_range),
                 codes=codes,
                 bound_slot=bound.index(p) if p in bound else None,
+                range_slot=ranged.index(p) if p in ranged else None,
                 init_extra=init_extra,
                 hidden_slot=hidden.index(p) if p in hidden else None,
                 meta_slot=meta_names.index(p.name) if p.name in meta_names else None,
@@ -385,6 +400,8 @@ class RenderContext:
             ncomp=ncomp,
             dep_len=max(2 * ndeps, 1),
             comp_len=max(2 * ncomp, 1),
+            nranges=len(ranged),
+            range_len=max(len(ranged), 1),
             computed_names_len=ncomp + 1,
             computed_names=tuning.computed_names if tuning is not None else (),
             nmeta=len(meta_names),
@@ -398,6 +415,7 @@ def _needs_generic_decode(a: CanonicalAnnotation) -> bool:
         or a.baked_value
         or a.bind_value is not None
         or a.power_of_two_or_zero
+        or a.ptr_range
         or (
             a.kind == "argument"
             and (
@@ -502,6 +520,7 @@ def _param_view(
     spec_pointer_range: bool,
     codes: Mapping[str, int],
     bound_slot: int | None,
+    range_slot: int | None,
     init_extra: int,
     hidden_slot: int | None,
     meta_slot: int | None,
@@ -543,6 +562,9 @@ def _param_view(
     else:
         type_from = "infer"
     descriptor = fields.get("descriptor")
+    range_check = (a.pointer_range_32 == "auto" and spec_pointer_range) or (
+        a.pointer_range_32 == "assume" and verify
+    )
     return ParamView(
         name=p.name,
         index=p.index,
@@ -563,8 +585,8 @@ def _param_view(
         }.get(baked_tag or "", ""),
         baked_bits=baked_bits,
         baked_negative=baked_negative,
-        range_check=(a.pointer_range_32 == "auto" and spec_pointer_range)
-        or (a.pointer_range_32 == "assume" and verify),
+        range_check=range_check,
+        ptr_range=a.ptr_range and range_check,
         bound_range_check=a.pointer_range_32 == "assume" and verify,
         type_from=type_from,
         fixed_type=fixed_type,
@@ -579,6 +601,7 @@ def _param_view(
         one_tests_value=a.equal_to_one == "auto",
         align_code=a.aligned_16 == "auto",
         range_code=a.pointer_range_32 == "auto" and spec_pointer_range,
+        range_slot=range_slot,
         descriptor=_write(descriptor),
         descriptor_part=KeyWrite.into_part(descriptor.offset) if descriptor else None,
         payload=_write(fields.get("payload")),

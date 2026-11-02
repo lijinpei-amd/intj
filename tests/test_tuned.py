@@ -13,7 +13,7 @@ import triton.language as tl
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
 from intj.launcher import UnsupportedKernel, module_of, triton_specialization
 from intj import compiler, specialization
-from knob_helpers import live_knob_values, needs_hip
+from knob_helpers import live_knob_values, needs_hip, needs_pointer_range
 
 
 @triton.jit
@@ -79,6 +79,43 @@ def test_tunes_on_miss_and_launches_natively_on_hit():
         torch.cuda.synchronize()
         assert int(out[n - 1].item()) == tag
     assert bench.calls == [1, 2, 1, 2], "a hit must not reach Triton"
+
+
+@needs_pointer_range
+def test_tuned_miss_compiles_the_range_its_key_measured(monkeypatch):
+    """Every candidate compiles the `ptr_range()` answer the miss's key read.
+
+    The callback is called once per miss, as Triton calls it once per run.
+    """
+    from triton import knobs
+
+    if not knobs.amd.use_buffer_ops:
+        pytest.skip("Triton puts no tt.pointer_range on any tensor")
+    sources = []
+
+    def recording(*args, **kwargs):
+        source = specialization.compiler_input(*args, **kwargs)
+        sources.append(source)
+        return source
+
+    monkeypatch.setattr(compiler, "compiler_input", recording)
+    x = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    answers = [2**31]
+
+    def ptr_range():
+        return answers.pop(0) if answers else 0
+
+    x.ptr_range = ptr_range  # pyright: ignore[reportAttributeAccessIssue]  # an instance attribute, as Triton reads it
+    bench = Bench(out, {16: {1: 1.0, 2: 2.0}})
+    bench.key = 16
+    _, launch = tuned_launcher(bench, extra_annotation={"x": Argument(ptr_range=True)})
+    launch(*controls(), x, out, 16)
+    torch.cuda.synchronize()
+    assert answers == [], "the miss must call ptr_range() exactly once"
+    assert len(sources) > len(configs())  # every candidate, then the final launch
+    for source in sources:
+        assert "tt.pointer_range" not in str(dict(source.attrs).get((0,)))
 
 
 def test_tuned_misses_dispatch_through_launcher_method(monkeypatch):
@@ -465,8 +502,8 @@ def test_tuned_callback_block_dim_zero_is_refused(monkeypatch):
 
     original = tuning_mod.TunedCompileState.run
 
-    def zeroed(self, *args):
-        function, _block_dim, shared, nparams, *rest = original(self, *args)
+    def zeroed(self, *args, **kwargs):
+        function, _block_dim, shared, nparams, *rest = original(self, *args, **kwargs)
         return (function, 0, shared, nparams, *rest)
 
     monkeypatch.setattr(tuning_mod.TunedCompileState, "run", zeroed)

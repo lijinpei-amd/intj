@@ -10,6 +10,7 @@ parameters (`call_layout`), and what Triton is given for one call
 from __future__ import annotations
 
 import dataclasses
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -284,6 +285,45 @@ class CompilerInput:
         )
 
 
+class _TensorRange:
+    """An exact tensor as Triton sees it, but with the range intj measures.
+
+    `ptr_range()` reads only what the C launcher reads for the same tensor:
+    nothing unless the parameter's pointer-range fact is `auto` (any other
+    mode discards Triton's answer), and then the tensor's own `ptr_range()`
+    under `Argument(ptr_range=True)` when it has one, else the storage size.
+    Off, the tensor's `ptr_range` attribute is never looked up.
+    """
+
+    def __init__(
+        self, tensor: Any, annotation: CanonicalAnnotation, observed: bool | None
+    ) -> None:
+        self.dtype = tensor.dtype
+        self._tensor = tensor
+        self._pointer: int = tensor.data_ptr()
+        self._measured = annotation.pointer_range_32 == "auto"
+        self._override = annotation.ptr_range
+        self._observed = observed
+
+    def data_ptr(self) -> int:
+        return self._pointer
+
+    def ptr_range(self) -> object:
+        if not self._measured:
+            return 0
+        if self._observed is not None:
+            return 0 if self._observed else 2**31
+        if self._override and hasattr(self._tensor, "ptr_range"):
+            return self._tensor.ptr_range()  # looked up again, as Triton does
+        return self._tensor.untyped_storage().nbytes()
+
+
+def _is_tensor(value: object) -> bool:
+    """Whether the C launcher decodes `value` as a tensor: exact types only."""
+    torch = sys.modules.get("torch")  # a tensor's module is loaded
+    return torch is not None and type(value) in (torch.Tensor, torch.nn.Parameter)
+
+
 def _triton_specialize(
     value: object, *, backend: Any, is_const: bool, specialize: bool, align: bool
 ) -> tuple[str, Any]:
@@ -298,12 +338,15 @@ def compiler_input(
     backend: Any,
     *,
     baked_values: Mapping[int, object] | None = None,
+    ranges: Mapping[int, bool] | None = None,
 ) -> CompilerInput:
     """Returns the annotated compiler input triton would build for one call.
 
     `public_args` are the call's public arguments; bound parameters count as
     None and fixed ones come from `baked_values`. Annotated facts apply as
-    declared; `auto` ones are specialized the way triton does.
+    declared; `auto` ones are specialized the way triton does. `ranges` holds,
+    by parameter index, whether a tensor's range is within 2 GiB as the spec
+    key already measured it; Triton is told that rather than measuring again.
     """
     _imports.ensure_triton_imported()
     signature: list[tuple[str, str]] = []
@@ -353,6 +396,12 @@ def compiler_input(
                 ):
                     # Both public null spellings have pointer 0 and storage range 0.
                     inference_value = _imports.MockTensor(effective[1:])
+                elif _is_tensor(value):
+                    inference_value = _TensorRange(
+                        value,
+                        annotation,
+                        None if ranges is None else ranges.get(param.index),
+                    )
                 inferred, inferred_desc = _triton_specialize(
                     inference_value,
                     backend=backend,

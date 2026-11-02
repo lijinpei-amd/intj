@@ -182,10 +182,14 @@ class Argument(Annotation):
             the public call.
         bind_value: Binds the value later through `bind()`; exclusive with
             `value`.
+        ptr_range: Measures a passed tensor's pointer range as Triton does:
+            when the tensor has a `ptr_range` attribute, `ptr_range()` decides
+            the range instead of the storage size. Off by default, which saves
+            an attribute lookup per tensor and call.
 
     Raises:
-        TypeError: `specialize` or `bind_value` has the wrong type, or `value`
-            is unhashable.
+        TypeError: `specialize` or `bind_value` has the wrong type, `ptr_range`
+            is not a bool, or `value` is unhashable.
         ValueError: `type` is an empty sequence, or both `value` and
             `bind_value` are given.
     """
@@ -194,9 +198,12 @@ class Argument(Annotation):
     specialize: SpecializationPolicy | _Unset = UNSET
     value: object = UNSET
     bind_value: BindValue | None = None
+    ptr_range: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "type", _normalize_type_field(self.type))
+        if not isinstance(cast(object, self.ptr_range), bool):
+            raise TypeError("intj: ptr_range must be bool")
         if not isinstance(
             cast(object, self.specialize), (SpecializationPolicy, _Unset)
         ):
@@ -308,6 +315,9 @@ class CanonicalAnnotation:
     #: annotated `torch.Tensor | None` (or `tl.tensor`): a tensor or None, each
     #: keyed as unannotated; implies `tensor_only`
     none_ok: bool = False
+    #: `Argument(ptr_range=True)`: a tensor's `ptr_range()`, when it has one,
+    #: decides its pointer range
+    ptr_range: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -626,6 +636,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             power = left.power_of_two_or_zero or right.power_of_two_or_zero
             modes = ("auto", "auto", "auto")
             bind_value = None
+            ptr_range = False
         else:
             left = inline if inline is not None else Argument()
             right = other if other is not None else Argument()
@@ -640,6 +651,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             )
             if bind_value is UNSET:
                 bind_value = None
+            ptr_range = left.ptr_range or right.ptr_range
             if baked is not UNSET and bind_value is not None:
                 raise ValueError(
                     f"intj: parameter {name!r} has both value and bind_value"
@@ -737,6 +749,18 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             for field, _ in assumed:
                 if not any(_applicable(branch, field) for branch in branches):
                     raise ValueError(f"intj: parameter {name!r} has dead {field} fact")
+            if ptr_range and (
+                modes[2] == "never"
+                or baked is not UNSET
+                or bind_value is not None
+                or not any(
+                    _applicable(branch, "pointer_range_32") for branch in branches
+                )
+            ):
+                raise ValueError(
+                    f"intj: parameter {name!r} has dead ptr_range: it needs a passed "
+                    "pointer whose pointer_range_32 fact is not NEVER"
+                )
             for branch in branches:
                 if (
                     branch is not None
@@ -832,6 +856,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             triton_typed=bool(triton_type) and kind == "argument",
             tensor_only=tensor_only,
             none_ok=none_ok,
+            ptr_range=ptr_range,
         )
         resolved.append(ResolvedParam(name, index, annotation, baked))
     return tuple(resolved)

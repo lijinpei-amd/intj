@@ -302,7 +302,9 @@ INTJ_B_PTR({% if t.dtype is not none %}st->abi.dtype_index[{{ t.dtype }}]{% else
 /* The launch and diagnostic entry points use exactly the same packing path. */
 static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
                                        PyObject *const *args, uint64_t *key, uint64_t *vals, int *nparams,
-                                       uint32_t device, intj_bound_launcher *bound, int64_t *comp) {
+                                       uint32_t device, intj_bound_launcher *bound, int64_t *comp,
+                                       int8_t *ranges) {
+  (void)ranges;
 {% if bound_params %}
   if (INTJ_UNLIKELY(!bound)) {
     PyErr_SetString(PyExc_TypeError, "intj: this module requires a bound launcher");
@@ -358,7 +360,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% elif p.decoder == 'tensor' %}
   if (intj_decode_tensor(&st->abi, st->tensor_type, st->param_type,
                          args[{{ p.call_index }}],
-                         {{ 1 if p.range_check else 0 }},
+                         {{ 'INTJ_WANT_PTR_RANGE' if p.ptr_range else 1 if p.range_check else 0 }},
                          {{ 1 if a.none_ok else 0 }}, intj_param_names[{{ i }}], &{{ d }}) != 0)
     return -1;
 {% elif p.decoder == 'typed_float' %}
@@ -370,7 +372,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% else %}
   if (intj_decode_argument(&st->abi, st->tensor_type, st->param_type,
                            args[{{ p.call_index }}],
-                           {{ 1 if p.range_check else 0 }},
+                           {{ 'INTJ_WANT_PTR_RANGE' if p.ptr_range else 1 if p.range_check else 0 }},
                            intj_param_names[{{ i }}], &{{ d }}) != 0)
     return -1;
 {% endif %}
@@ -435,6 +437,12 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% endif %}
 {% if p.descriptor is not none %}
 {{ key_accumulate(p.descriptor, 'code_' ~ i) }}
+{% endif %}
+{% if p.range_slot is not none %}
+  /* what the range bit measured, for a miss to compile: -1 when no tensor */
+  ranges[{{ p.range_slot }}] = {{ d }}.kind != INTJ_VALUE_TENSOR
+                                   ? -1
+                                   : {{ d }}.storage_nbytes <= 2147483647LL;
 {% endif %}
 {% if p.exact is not none %}
   if (INTJ_UNLIKELY({{ d }}.kind == INTJ_VALUE_TENSOR)) {
@@ -677,7 +685,7 @@ static PyObject *intj_fill(intj_state *st, intj_bound_launcher *bound,
                            int np, int64_t device_ordinal, uint64_t stream,
                            uint32_t gx, uint32_t gy, uint32_t gz,
                            PyObject *const *args, int64_t *comp, int64_t *dep,
-                           PyObject *launcher) {
+                           const int8_t *ranges, PyObject *launcher) {
   (void)comp; (void)dep;
 {% if grid_cpp_source %}
   PyObject *controls = PyTuple_New({{ grid_count }});
@@ -702,17 +710,47 @@ static PyObject *intj_fill(intj_state *st, intj_bound_launcher *bound,
     Py_DECREF(controls);
     return NULL;
   }
+  (void)ranges;
+  PyObject *kwnames = NULL;
+{% if nranges %}
+  /* `ranges=`: what the key's range bits measured, by parameter index.  The
+   * compile reuses it rather than calling a `ptr_range()` again, which may
+   * answer differently. */
+  PyObject *observed = PyDict_New();
+  int unbuilt = !observed;
+{% for p in params if p.range_slot is not none %}
+  if (!unbuilt && ranges[{{ p.range_slot }}] >= 0) {
+    PyObject *index = PyLong_FromLong({{ p.index }});
+    unbuilt = !index || PyDict_SetItem(observed, index,
+                                       ranges[{{ p.range_slot }}] ? Py_True : Py_False) != 0;
+    Py_XDECREF(index);
+  }
+{% endfor %}
+  kwnames = unbuilt ? NULL : Py_BuildValue("(s)", "ranges");
+  if (!kwnames) {
+    Py_XDECREF(observed);
+    Py_DECREF(blob); Py_DECREF(nparams_obj);
+    Py_DECREF(device_obj); Py_DECREF(stream_obj); Py_DECREF(controls);
+    return NULL;
+  }
+{% endif %}
   /* after the controls: the dynamic values, then the public kernel arguments */
-  PyObject *cb_args[6 + INTJ_NDYN + INTJ_NPARAMS];
+  PyObject *cb_args[7 + INTJ_NDYN + INTJ_NPARAMS];
   cb_args[0] = launcher;
   cb_args[1] = blob; cb_args[2] = nparams_obj; cb_args[3] = device_obj;
   cb_args[4] = stream_obj; cb_args[5] = controls;
   for (int i = 0; i < INTJ_NDYN + INTJ_NPARAMS; i++)
     cb_args[6 + i] = args[{{ grid_count }} + i];
+{% if nranges %}
+  cb_args[6 + INTJ_NDYN + INTJ_NPARAMS] = observed;
+{% endif %}
   PyObject *res = PyObject_VectorcallMethod(st->compile_name, cb_args,
-                                            6 + INTJ_NDYN + INTJ_NPARAMS, NULL);
+                                            6 + INTJ_NDYN + INTJ_NPARAMS, kwnames);
   Py_DECREF(blob); Py_DECREF(nparams_obj);
   Py_DECREF(device_obj); Py_DECREF(stream_obj); Py_DECREF(controls);
+{% if nranges %}
+  Py_DECREF(observed); Py_DECREF(kwnames);
+{% endif %}
   if (!res)
     return NULL;
   /* (function, block_dim, shared, nparams[, compiled[, deps, computed[, meta]]]) */
@@ -1074,7 +1112,8 @@ static PyObject *intj_call(intj_state *st,
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   int64_t comp[{{ comp_len }}];
-  if (intj_pack(st, dyn, kargs, key, vals, &np, (uint32_t)device_ordinal, bound, comp) != 0)
+  int8_t ranges[{{ range_len }}];
+  if (intj_pack(st, dyn, kargs, key, vals, &np, (uint32_t)device_ordinal, bound, comp, ranges) != 0)
     return NULL;
 
   int64_t dep[{{ dep_len }}];
@@ -1086,10 +1125,10 @@ static PyObject *intj_call(intj_state *st,
 {% if tuned %}
     /* tuning launched it: the record is only stored */
     return intj_fill(st, bound, key, np, device_ordinal, stream,
-                     gx, gy, gz, args, comp, dep, launcher);
+                     gx, gy, gz, args, comp, dep, ranges, launcher);
 {% else %}
     PyObject *filled = intj_fill(st, bound, key, np, device_ordinal, stream,
-                                 gx, gy, gz, args, comp, dep, launcher);
+                                 gx, gy, gz, args, comp, dep, ranges, launcher);
     if (!filled)
       return NULL;
     Py_DECREF(filled);
@@ -1462,7 +1501,8 @@ static PyObject *intj_spec_key(void *state, PyObject *const *args, Py_ssize_t na
   uint64_t vals[INTJ_NSLOTS];
   int np = 0;
   int64_t comp[{{ comp_len }}];
-  if (intj_pack(st, args + 1, args + 1 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp) != 0)
+  int8_t ranges[{{ range_len }}];
+  if (intj_pack(st, args + 1, args + 1 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp, ranges) != 0)
     return NULL;
   return Py_BuildValue("(y#i)", (const char *)key, (Py_ssize_t)INTJ_KEY_BYTES, np);
 }
@@ -1488,8 +1528,9 @@ static PyObject *intj_key_chain(void *state, PyObject *const *args, Py_ssize_t n
   uint64_t vals[INTJ_NSLOTS];
   int64_t comp[{{ comp_len }}];
   int64_t dep[{{ dep_len }}];
+  int8_t ranges[{{ range_len }}];
   int np = 0;
-  if (intj_pack(st, args + 1, args + 1 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp) != 0)
+  if (intj_pack(st, args + 1, args + 1 + INTJ_NDYN, key, vals, &np, {{ '(uint32_t)bound->device_ordinal' if fixed_device else '(uint32_t)device' }}, bound, comp, ranges) != 0)
     return NULL;
   int missed = 0;
   intj_final *kernel = intj_walk(st, bound, args + 1 + INTJ_NDYN, key, comp, dep, &missed);
