@@ -140,70 +140,72 @@ class Launcher:
         """
         return self._C_key_chain(*args)
 
-    def _bind(self, /, **values: object) -> None:
-        """Merges `values` into this launcher's `bind_values`; `bind` copies instead.
+    def _bind_args(self, /, **values: object) -> None:
+        """Merges `values` into this launcher's `bind_args`; `bind_args` copies instead.
 
         Raises:
             RuntimeError: The launcher is built.
         """
         self._edit_options(
             lambda o: dataclasses.replace(
-                o, bind_values={**(o.bind_values or {}), **values}
+                o, bind_args={**(o.bind_args or {}), **values}
             )
         )
 
-    def bind(self, /, **values: object) -> LaunchFunction:
-        """Returns a new launcher with `values` merged into `bind_values`.
+    def bind_args(self, /, **values: object) -> LaunchFunction:
+        """Returns a new launcher with `values` merged into `bind_args`.
 
         Validates nothing: a missing, unknown or mistyped value fails in the
         new launcher's `check()`.  A bound tensor takes an exact
         `torch.Tensor`, `torch.nn.Parameter`, or None.
         """
         k = self._copy()
-        k.__self__._bind(**values)
+        k.__self__._bind_args(**values)
         return k
 
-    def _bind_device(self, ordinal: int | None, /, **values: object) -> None:
-        """Fixes this launcher to device `ordinal` in place; see `bind_device`.
+    def _bind_device_args(self, ordinal: int | None, /, **values: object) -> None:
+        """Fixes this launcher to device `ordinal` in place; see `bind_device_args`.
 
         Raises:
             RuntimeError: The launcher is built.
         """
         self._edit_options(
             lambda o: dataclasses.replace(
-                o, bind_device=ordinal, bind_values={**(o.bind_values or {}), **values}
+                o, bind_device=ordinal, bind_args={**(o.bind_args or {}), **values}
             )
         )
 
-    def bind_device(self, ordinal: int | None, /, **values: object) -> LaunchFunction:
-        """Returns a new launcher fixed to device `ordinal`, `values` merged as for `bind`.
+    def bind_device_args(
+        self, ordinal: int | None, /, **values: object
+    ) -> LaunchFunction:
+        """Returns a new launcher fixed to device `ordinal`, `values` merged as for `bind_args`.
 
         It is called as `(stream, grid, ...)` and owns a separate kernel
         cache, or one kernel when no dynamic specialization key remains.
-        None is `unbind_device()`.
+        None is `unbind_device_args()`.
         """
         k = self._copy()
-        k.__self__._bind_device(ordinal, **values)
+        k.__self__._bind_device_args(ordinal, **values)
         return k
 
-    def _unbind(self) -> None:
-        """Drops this launcher's bound values in place; `unbind` copies instead."""
-        self._edit_options(lambda o: dataclasses.replace(o, bind_values=None))
+    def _unbind_args(self) -> None:
+        """Drops this launcher's bound values in place; `unbind_args` copies instead."""
+        self._edit_options(lambda o: dataclasses.replace(o, bind_args=None))
 
-    def unbind(self) -> LaunchFunction:
+    def unbind_args(self) -> LaunchFunction:
         """Returns a new launcher with no bound values."""
         k = self._copy()
-        k.__self__._unbind()
+        k.__self__._unbind_args()
         return k
 
-    def _unbind_device(self) -> None:
-        """Makes this launcher take the device per call; `unbind_device` copies instead."""
+    def _unbind_device_args(self) -> None:
+        """Makes this launcher take the device per call; `unbind_device_args` copies instead."""
         self._edit_options(lambda o: dataclasses.replace(o, bind_device=None))
 
-    def unbind_device(self) -> LaunchFunction:
+    def unbind_device_args(self) -> LaunchFunction:
         """Returns a new launcher that takes the device per call."""
         k = self._copy()
-        k.__self__._unbind_device()
+        k.__self__._unbind_device_args()
         return k
 
     def _replace_delayed(self, fn: Callable[[], Mapping[str, Any]] | None, /) -> None:
@@ -433,18 +435,27 @@ def make_launcher(
         jit_func: A `@triton.jit` kernel, optionally wrapped in
             `triton.autotune`/`triton.heuristics`. Omit it for the decorator
             factory form.
-        delayed: A function of no arguments returning more of these
-            keywords, as a mapping; they replace the ones passed here. Each
-            launcher calls it on its first call (and on every `check()`
-            before that); its exception propagates and is retried on the
-            next call.
+        options: Triton compile options (`num_warps`, `num_stages`, ...)
+            baked into every launch. One naming a `tl.constexpr` parameter
+            bakes that parameter.
         dynamic_options: Compile options and `knobs.<group>.<name>` paths
-            passed per call, right after the grid controls, and keyed.
+            passed per call, right after the grid controls, and keyed. One
+            naming a `tl.constexpr` parameter passes that parameter here
+            instead of among the kernel arguments.
+        bind_device: A non-negative int32 device ordinal: the launcher is
+            called as `(stream, grid, ...)` and owns a separate kernel cache,
+            or one kernel when no dynamic specialization key remains.
+        bind_args: Bound parameter name -> value; see `Launcher.bind_args`.
+        grid_arg_num: Take that many (1, 2 or 3) separate grid dimensions
+            instead of `grid`.
+        grid_cpp: An annotated def computing the grid in the extension from
+            same-name JIT inputs and keyword-only extra inputs.
+        grid_py: A callable given a fresh dict of JIT inputs on every launch,
+            returning the grid. `grid_arg_num`, `grid_cpp` and `grid_py` are
+            mutually exclusive.
         extra_annotation: Parameter name -> annotation or shorthand: fixes
             types or specialization facts, bakes values, or marks values for
             binding.
-        options: Triton compile options (`num_warps`, `num_stages`, ...)
-            baked into every launch.
         torch_access_mode: How the module reads a tensor; None selects
             automatically. See `TorchAccessMode`.
         kernel_cache: The hash map behind the kernel cache; see `KernelCache`.
@@ -452,17 +463,6 @@ def make_launcher(
             GPU kernel.
         verify_annotation: Check declared types, ranges and assumed facts;
             otherwise these are caller promises.
-        bind_device: A non-negative int32 device ordinal: the launcher is
-            called as `(stream, grid, ...)` and owns a separate kernel cache,
-            or one kernel when no dynamic specialization key remains.
-        bind_values: Bound parameter name -> value; see `Launcher.bind`.
-        grid_arg: Take that many (1, 2 or 3) separate grid dimensions instead
-            of `grid`.
-        grid_cpp: An annotated def computing the grid in the extension from
-            same-name JIT inputs and keyword-only extra inputs.
-        grid_py: A callable given a fresh dict of JIT inputs on every launch,
-            returning the grid. `grid_arg`, `grid_cpp` and `grid_py` are
-            mutually exclusive.
         return_compiled: Return the cached Triton CompiledKernel after a
             successful launch, including on a zero-volume grid. Requires GPU
             mode.
@@ -473,12 +473,17 @@ def make_launcher(
         ndebug: Compile the module with `NDEBUG` defined, so `assert()` in
             CPython's headers and intj's runtime is compiled out. False keeps
             them live, for debugging; it builds a separate module.
+        delayed: A function of no arguments returning more of these
+            keywords, as a mapping; they replace the ones passed here. Each
+            launcher calls it on its first call (and on every `check()`
+            before that); its exception propagates and is retried on the
+            next call.
 
     Returns:
         The launcher, a C function whose `__self__` is its `Launcher`
-        (`bind`, `bind_device`, `unbind`, `unbind_device`, `replace_delayed`,
-        `chain_delayed`, `resolve_delayed`, each with an in-place `_` twin,
-        and `check`). Without `jit_func`, a decorator that makes one.
+        (`bind_args`, `bind_device_args`, `unbind_args`, `unbind_device_args`,
+        `replace_delayed`, `chain_delayed`, `resolve_delayed`, each with an
+        in-place `_` twin, and `check`). Without `jit_func`, a decorator that makes one.
 
     Raises:
         TypeError: A None kernel, an unknown keyword, or a `delayed` that is

@@ -43,7 +43,7 @@ def compile_grid(
     params: Sequence[Param],
     baked: Mapping[int, object],
     deps: Mapping[str, int] | None = None,
-    offset: int = 0,
+    dynamic: Sequence[str] = (),
 ) -> GridCode:
     """Validates `fn` without executing it and emits one checked native evaluator.
 
@@ -54,8 +54,8 @@ def compile_grid(
         deps: Maps tuned parameter names to their slot in the record's
             dependent values. When it is given, the evaluator takes them as
             `const int64_t *dep`.
-        offset: The number of dynamic values between the grid extras and the
-            public arguments.
+        dynamic: The `dynamic_options` names: their values sit between the
+            grid extras and the public arguments.
 
     Raises:
         GridError: `fn` is outside the native subset.
@@ -180,8 +180,14 @@ def compile_grid(
                     f"  if (intj_grid_input_dep(dep[{2 * slot}], dep[{2 * slot + 1}], "
                     f"{1 if kind == 'bool' else 0}, {json.dumps(name)}, &{var}) != 0) return -1;"
                 )
+            elif param.annotation.dynamic:
+                index = len(extras) + list(dynamic).index(name)
+                lines.append(f"  int64_t {var};")
+                lines.append(
+                    f"  if (intj_grid_input_{kind}(args[{index}], {json.dumps(name)}, &{var}) != 0) return -1;"
+                )
             elif param.call_index is not None:
-                index = len(extras) + offset + param.call_index
+                index = len(extras) + len(dynamic) + param.call_index
                 lines.append(f"  int64_t {var};")
                 lines.append(
                     f"  if (intj_grid_input_{kind}(args[{index}], {json.dumps(name)}, &{var}) != 0) return -1;"

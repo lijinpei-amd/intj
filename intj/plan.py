@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
 from .annotation import (
+    Constexpr,
     DeviceBinding,
     ResolvedParam,
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
@@ -54,9 +55,9 @@ class Grid:
     """How a launcher's calls give the grid.
 
     Attributes:
-        mode: `"object"` (one grid argument), `"dims"` (`grid_arg` ints),
+        mode: `"object"` (one grid argument), `"dims"` (`grid_arg_num` ints),
             `"cpp"` (`grid_cpp`) or `"py"` (`grid_py`).
-        dims: `grid_arg`, in `"dims"` mode.
+        dims: `grid_arg_num`, in `"dims"` mode.
         code: `grid_cpp` compiled, in `"cpp"` mode.
         fn: The `grid_cpp` def or the `grid_py` callable.
         hidden: `grid_py`'s fixed values: the bound and baked parameters'.
@@ -83,10 +84,10 @@ class BuildPlan:
     params: tuple[ResolvedParam, ...]  # bound tensors' types resolved
     layout: KeyLayout  # `params` numbered in the call, key fields placed
     compile_options: tuple[tuple[str, Any], ...]  # `options=`, checked and sorted
-    dynamic: tuple[str, ...]  # `dynamic_options` that get a slot
-    #: `dynamic_options` naming a tl.constexpr parameter: no slot, and only
-    #: checked to be a compile option once the target is known
-    declared_parameters: tuple[str, ...]
+    #: `options=` naming a tl.constexpr parameter: baked, and only checked to
+    #: be a compile option once the target is known
+    baked_options: tuple[str, ...]
+    dynamic: tuple[str, ...]  # `dynamic_options`, in call order
     #: the live knobs but the declared ones; None under no_gpu
     knob_values: Mapping[str, object] | None
     global_values: tuple[tuple[str, str, tuple[object, ...]], ...]
@@ -112,7 +113,7 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
     Raises:
         UnsupportedKernel: The kernel or an option is outside intj's scope,
             or the kernel cache's library cannot be provisioned.
-        TypeError: A malformed option, or bind_device/bind_values that do not
+        TypeError: A malformed option, or bind_device/bind_args that do not
             fit the kernel.
         ValueError: A malformed grid option.
 
@@ -123,16 +124,16 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
             pointer's range assumption.
     """
     assert option.delayed is None, "resolve delayed first"
-    declared = _check_values(option)
+    dynamic = _check_values(option)
     kernel, chain = _checked_kernel(option)
     options = dict(sorted((option.options or {}).items()))
     kernel = _check_kernel(kernel, options, option.assume_constant_globals)
     global_values = _global_values(kernel) if option.assume_constant_globals else ()
-    resolved, tuned = _annotate(option, kernel, chain, options)
-    _check_dynamic(declared, options, kernel, tuned)
-    # a tl.constexpr parameter feeds its option on every call already: no slot
-    dynamic = tuple(n for n in declared if n not in kernel.arg_names)
-    _check_parameter_clash(options, kernel)
+    baked_options = _baked_options(options, kernel, option.extra_annotation)
+    resolved, tuned = _annotate(option, kernel, chain, options, baked_options)
+    _check_dynamic(dynamic, options, kernel, tuned)
+    resolved = _mark_dynamic(resolved, dynamic)
+    options = {n: v for n, v in options.items() if n not in baked_options}
     # unbound: binding below changes no parameter's place in the call
     numbered = call_layout(resolved)
     render: TuningRender | None = None
@@ -144,7 +145,7 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
             tuned.plan, resolved, numbered, option.grid_cpp, option.grid_py
         )
         deps = {n: i for i, n in enumerate(render.dep_names)}
-    grid = _grid(option, resolved, numbered, deps, len(dynamic))
+    grid = _grid(option, resolved, numbered, deps, dynamic)
     access = render_module._resolve_torch_access_mode(option.torch_access_mode)  # pyright: ignore[reportPrivateUsage]  # shared access checks
     _warn_unverifiable(option, resolved, kernel, global_values)
     params, device_binding, args, hidden = _bind(option, resolved)
@@ -179,8 +180,8 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
         params=params,
         layout=layout,
         compile_options=tuple(options.items()),
+        baked_options=tuple(baked_options),
         dynamic=dynamic,
-        declared_parameters=tuple(n for n in declared if n in kernel.arg_names),
         knob_values=knob_values,
         global_values=global_values,
         grid=grid,
@@ -194,7 +195,11 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
 def _check_values(option: MakeLauncherOption) -> tuple[str, ...]:
     """Checks the option's own values, with no imports, and returns `dynamic_options`."""
     dynamic_options = option.dynamic_options
-    grid_arg, grid_cpp, grid_py = option.grid_arg, option.grid_cpp, option.grid_py
+    grid_arg_num, grid_cpp, grid_py = (
+        option.grid_arg_num,
+        option.grid_cpp,
+        option.grid_py,
+    )
     no_gpu = option.no_gpu
     flags: dict[str, object] = {
         "no_gpu": no_gpu,
@@ -237,12 +242,12 @@ def _check_values(option: MakeLauncherOption) -> tuple[str, ...]:
     for name in declared:
         if type(name) is not str:
             raise TypeError(f"intj: dynamic_options names must be str, got {name!r}")
-    if grid_arg is not None and (
-        type(grid_arg) is not int or grid_arg not in (1, 2, 3)
+    if grid_arg_num is not None and (
+        type(grid_arg_num) is not int or grid_arg_num not in (1, 2, 3)
     ):
-        raise ValueError("intj: grid_arg must be 1, 2, or 3")
-    if sum(value is not None for value in (grid_arg, grid_cpp, grid_py)) > 1:
-        raise ValueError("intj: choose only one of grid_arg, grid_cpp and grid_py")
+        raise ValueError("intj: grid_arg_num must be 1, 2, or 3")
+    if sum(value is not None for value in (grid_arg_num, grid_cpp, grid_py)) > 1:
+        raise ValueError("intj: choose only one of grid_arg_num, grid_cpp and grid_py")
     if grid_py is not None and not callable(grid_py):
         raise TypeError("intj: grid_py must be callable")
     if no_gpu and declared:
@@ -280,9 +285,19 @@ def _annotate(
     kernel: JitFunction,
     chain: Any,
     options: Mapping[str, Any],
+    baked_options: Mapping[str, Any],
 ) -> tuple[tuple[ResolvedParam, ...], Tuned | None]:
-    """Returns the kernel's merged annotations and, for a chain, its tuning plan."""
-    resolved = _merge_annotations(kernel, option.extra_annotation)
+    """Returns the kernel's merged annotations and, for a chain, its tuning plan.
+
+    `baked_options` bake their parameters as `Constexpr(value=...)` would.
+    """
+    extra = option.extra_annotation
+    if baked_options:
+        extra = {
+            **(extra or {}),
+            **{n: Constexpr(value=v) for n, v in baked_options.items()},
+        }
+    resolved = _merge_annotations(kernel, extra)
     tuned: Tuned | None = None
     if chain is not kernel:
         from .tuning import plan_tuning
@@ -302,15 +317,57 @@ def _annotate(
     return resolved, tuned
 
 
-def _check_parameter_clash(options: Mapping[str, Any], kernel: JitFunction) -> None:
+def _baked_options(
+    options: Mapping[str, Any], kernel: JitFunction, extra_annotation: object
+) -> dict[str, Any]:
+    """Returns the `options` naming a tl.constexpr parameter, which bakes it.
+
+    As Triton's keyword call makes it, such a parameter's value is also that
+    compile option.  Whether the name is a compile option waits for the target.
+
+    Raises:
+        UnsupportedKernel: `extra_annotation` names one of them too.
+    """
     constexprs = {p.name for p in kernel.params if p.is_constexpr}
-    clash = sorted(n for n in options if n in constexprs)
-    if clash:
+    baked = {n: v for n, v in options.items() if n in constexprs}
+    twice = (
+        sorted(set(baked) & set(cast("Mapping[str, object]", extra_annotation)))
+        if isinstance(extra_annotation, Mapping)
+        else []
+    )
+    if twice:
         raise UnsupportedKernel(
-            f"intj: options {clash} name tl.constexpr parameter(s), whose value is "
-            "that compile option on every call; pass it as the argument, or bake "
-            "it with extra_annotation"
+            f"intj: options {twice} also named in extra_annotation; give a "
+            "tl.constexpr parameter's value in one of them"
         )
+    return baked
+
+
+def _mark_dynamic(
+    resolved: tuple[ResolvedParam, ...], dynamic: Sequence[str]
+) -> tuple[ResolvedParam, ...]:
+    """Marks the tl.constexpr parameters named in `dynamic`: passed as dynamic values.
+
+    Raises:
+        UnsupportedKernel: One is also baked, or annotated beyond `tl.constexpr`:
+            a dynamic value is keyed exactly and passed to Triton as given.
+    """
+    marked: list[ResolvedParam] = []
+    for p in resolved:
+        a = p.annotation
+        if p.name in dynamic:
+            if a.baked_value:
+                raise UnsupportedKernel(
+                    f"intj: dynamic option {p.name!r} is also baked by extra_annotation"
+                )
+            if a.types is not None or a.power_of_two_or_zero:
+                raise UnsupportedKernel(
+                    f"intj: dynamic option {p.name!r} takes no annotation but "
+                    "tl.constexpr: its value is keyed exactly"
+                )
+            p = dataclasses.replace(p, annotation=dataclasses.replace(a, dynamic=True))
+        marked.append(p)
+    return tuple(marked)
 
 
 def _grid(
@@ -318,15 +375,15 @@ def _grid(
     resolved: tuple[ResolvedParam, ...],
     numbered: tuple[Param, ...],
     deps: Mapping[str, int] | None,
-    ndynamic: int,
+    dynamic: tuple[str, ...],
 ) -> Grid:
     """Returns the launcher's grid, `grid_cpp` compiled; `grid_py` gets its values once bound."""
     if option.grid_py is not None:
         return Grid("py", fn=option.grid_py)
     if option.grid_cpp is None:
-        if option.grid_arg is None:
+        if option.grid_arg_num is None:
             return Grid("object")
-        return Grid("dims", dims=option.grid_arg)
+        return Grid("dims", dims=option.grid_arg_num)
     from .grid import GridError, compile_grid
 
     try:
@@ -335,7 +392,7 @@ def _grid(
             numbered,
             {p.index: p.baked for p in resolved if p.annotation.baked_value},
             deps,
-            offset=ndynamic,
+            dynamic,
         )
     except GridError as error:
         raise UnsupportedKernel(f"intj: {error}") from error
@@ -386,15 +443,15 @@ def _bind(
     if type(device) is bool:
         raise TypeError(
             "intj: bind_device takes an int device ordinal, not a flag; "
-            "use k.__self__.bind_device(ordinal)"
+            "use k.__self__.bind_device_args(ordinal)"
         )
     if device is not None and (type(device) is not int or not 0 <= device <= 2**31 - 1):
         raise TypeError("intj: device ordinal must be an int in [0, 2**31)")
-    values = cast(object, option.bind_values)  # as given: nothing checked it
+    values = cast(object, option.bind_args)  # as given: nothing checked it
     if values is None:
         values = {}
     if not (isinstance(values, Mapping) and all(type(k) is str for k in values)):
-        raise TypeError("intj: bind_values must be None or a mapping keyed by str")
+        raise TypeError("intj: bind_args must be None or a mapping keyed by str")
     names = {p.name for p in resolved if p.annotation.bind_value is not None}
     unknown = values.keys() - names
     if unknown:
@@ -533,7 +590,8 @@ def _check_dynamic(
             if not kernel.params[kernel.arg_names.index(name)].is_constexpr:
                 raise UnsupportedKernel(
                     f"intj: dynamic option {name!r} is a runtime kernel parameter; "
-                    "only a tl.constexpr parameter can also be a compile option"
+                    "only a tl.constexpr parameter named like a compile option "
+                    "can be one"
                 )
     derived = {k.path: k.option for k in KNOBS}
     both = sorted(n for n in dynamic if n in options or derived.get(n) in options)

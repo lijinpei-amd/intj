@@ -87,7 +87,7 @@ def callback(iters: int, batches: int) -> None:
     callback and inserts a cache entry; the callback count is checked afterwards.
     """
     tensors = tuple(torch.zeros(1, device="cuda") for _ in range(3))
-    launch = make_launcher(callback_kernel, no_gpu=True).__self__.bind_device(0)
+    launch = make_launcher(callback_kernel, no_gpu=True).__self__.bind_device_args(0)
     count = 0
 
     def compile_callback(_key, nparams, _device, *_args):

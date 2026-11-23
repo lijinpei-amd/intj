@@ -136,6 +136,7 @@ class ParamView:
     init_arg: int | None  # its argument of _init
     hidden_slot: int | None  # grid_py: its index in the fixed-value tuple
     meta_slot: int | None  # tuned grid_py: its index in a record's meta
+    dyn_slot: int | None  # a dynamic option parameter: its dynamic value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,7 +198,7 @@ class RenderContext:
     python_version: tuple[int, int, int]
     free_threaded: bool
     cpython_static_compile_header: str
-    grid_arg: int | None
+    grid_arg_num: int | None
     grid_py_mode: bool
     grid_cpp_source: str
     return_compiled: bool
@@ -212,7 +213,7 @@ class RenderContext:
     tuned: bool
     tuned_meta: bool  # records hold the tuned values, for grid_py
     tuned_level0: bool  # level 0 keys computed values too
-    #: "dims" (grid_arg), "cpp", "py" or "object" (one grid argument)
+    #: "dims" (grid_arg_num), "cpp", "py" or "object" (one grid argument)
     grid_mode: str
     #: how a call gets its grid: as `grid_mode`, or "deferred" -- after a tuned
     #: lookup, since the grid may read tuned values
@@ -270,14 +271,14 @@ class RenderContext:
             else "py"
             if key.grid_py_mode
             else "object"
-            if key.grid_arg is None
+            if key.grid_arg_num is None
             else "dims"
         )
         grid_count = {
             "cpp": len(key.grid_extra),
             "py": 0,
             "object": 1,
-            "dims": key.grid_arg or 0,
+            "dims": key.grid_arg_num or 0,
         }[grid_mode]
         lead_args = 1 if fixed_device else 2
         grid_py_offset = 2 if key.grid_py_mode else 0
@@ -292,8 +293,13 @@ class RenderContext:
             codes.setdefault(name, code)
         bound = [p for p in key.params if p.annotation.bind_value is not None]
         hidden = [
-            p for p in key.params if p.call_index is None and not p.annotation.tuned
+            p
+            for p in key.params
+            if p.call_index is None
+            and not p.annotation.tuned
+            and not p.annotation.dynamic
         ]
+        dynamic_names = [slot.name for slot in key.dynamic]
         meta_names = tuning.meta_names if tuning is not None else ()
         ranged = [
             p
@@ -313,6 +319,7 @@ class RenderContext:
                 init_extra=init_extra,
                 hidden_slot=hidden.index(p) if p in hidden else None,
                 meta_slot=meta_names.index(p.name) if p.name in meta_names else None,
+                dyn_slot=dynamic_names.index(p.name) if p.annotation.dynamic else None,
             )
             for p in key.params
         )
@@ -336,7 +343,7 @@ class RenderContext:
             python_version=key.python_version,
             free_threaded=key.free_threaded,
             cpython_static_compile_header=key.cpython_static_compile_header,
-            grid_arg=key.grid_arg,
+            grid_arg_num=key.grid_arg_num,
             grid_py_mode=key.grid_py_mode,
             grid_cpp_source=key.grid_cpp_source,
             return_compiled=key.return_compiled,
@@ -445,7 +452,7 @@ def _launch_signature(key: RenderKey, fixed_device: bool, grid_mode: str) -> str
         "cpp": list(key.grid_extra),
         "py": [],
         "object": ["grid"],
-        "dims": [f"grid_{'xyz'[i]}" for i in range(key.grid_arg or 0)],
+        "dims": [f"grid_{'xyz'[i]}" for i in range(key.grid_arg_num or 0)],
     }[grid_mode]
     return ", ".join(
         [
@@ -524,6 +531,7 @@ def _param_view(
     init_extra: int,
     hidden_slot: int | None,
     meta_slot: int | None,
+    dyn_slot: int | None,
 ) -> ParamView:
     a = p.annotation
     fields: dict[str, CacheKeyField] = {}
@@ -572,7 +580,7 @@ def _param_view(
         memo=p.memo,
         annotation=a,
         constexpr=constexpr,
-        decoded=not a.tuned and (not constexpr or not a.baked_value),
+        decoded=not a.tuned and not a.dynamic and (not constexpr or not a.baked_value),
         decoder=_decoder(p, typed),
         typed=typed,
         typed_unsigned=typed is not None and typed.startswith("u"),
@@ -611,6 +619,7 @@ def _param_view(
         init_arg=None if bound_slot is None else bound_slot + init_extra,
         hidden_slot=hidden_slot,
         meta_slot=meta_slot,
+        dyn_slot=dyn_slot,
     )
 
 

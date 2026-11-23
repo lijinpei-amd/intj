@@ -302,7 +302,7 @@ def pick_half(a):
     return _SEEN.append(a["TAG"]) or a["TAG"] // 2
 
 
-@pytest.mark.parametrize("mode", ["grid_arg", "default", "grid_py"])
+@pytest.mark.parametrize("mode", ["grid_arg_num", "default", "grid_py"])
 def test_grid_modes(mode):
     x = torch.zeros(256, device="cuda", dtype=torch.int32)
     out = torch.zeros_like(x)
@@ -310,8 +310,8 @@ def test_grid_modes(mode):
     kernel = triton.autotune(configs=configs(), key=[], do_bench=bench)(tagged)
     device, stream = controls()
     metas = []
-    if mode == "grid_arg":
-        launch = make_launcher(kernel, grid_arg=1)
+    if mode == "grid_arg_num":
+        launch = make_launcher(kernel, grid_arg_num=1)
         call = lambda: launch(device, stream, 4, x, out, 256)  # noqa: E731
     elif mode == "default":
         launch = make_launcher(kernel)
@@ -449,7 +449,7 @@ def test_failed_tuning_leaves_no_record():
 def test_autotune_key_refuses_a_tensor_at_call():
     x = torch.zeros(64, device="cuda", dtype=torch.int32)
     kernel = triton.autotune(configs=configs(), key=["n"])(tagged)
-    launch = make_launcher(kernel, grid_arg=1)
+    launch = make_launcher(kernel, grid_arg_num=1)
     device, stream = controls()
     with pytest.raises(TypeError, match="autotune key 'n'"):
         launch(device, stream, 1, x, x, x)
@@ -1268,6 +1268,24 @@ def test_tuned_constexpr_option_parameter_feeds_the_option(layer):
         make_launcher(kernel, dynamic_options=("num_warps",)).__self__.check()
 
 
+@triton.jit
+def warps_block(out, n, num_warps: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out + offs, tl.full([BLOCK], num_warps, tl.int32) + n * 0)
+
+
+def test_tuned_launcher_takes_a_dynamic_option_parameter():
+    """A heuristics chain passes the dynamic `num_warps` to Triton as the keyword."""
+    kernel = triton.heuristics({"BLOCK": lambda a: 64})(warps_block)
+    launch = make_launcher(kernel, dynamic_options=("num_warps",), return_compiled=True)
+    out = torch.zeros(64, device="cuda", dtype=torch.int32)
+    for warps in (2, 8):
+        compiled = launch(*controls(), 1, warps, out, 1)
+        assert compiled.metadata.num_warps == warps
+        torch.cuda.synchronize()
+        assert (out == warps).all()
+
+
 def test_tuned_and_ordinary_misses_reach_triton_through_one_port(monkeypatch):
     """Both miss paths compile through `triton_load`."""
     real = compiler.triton_load
@@ -1305,7 +1323,7 @@ def test_a_chain_gets_a_tuned_launcher_and_its_copies_keep_it():
     _, launch = tuned_launcher(bench)
     device, stream = controls()
     copies = [
-        launch.__self__.bind_device(device),
+        launch.__self__.bind_device_args(device),
         launch.__self__.replace_delayed(None),
     ]
     assert all(isinstance(k.__self__, TunedLauncher) for k in (launch, *copies))

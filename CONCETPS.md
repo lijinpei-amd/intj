@@ -71,4 +71,4 @@ they merge.
 | Term | Definition |
 | --- | --- |
 | build plan | `intj/plan.py`'s `BuildPlan`: everything a build needs, checked without a GPU. `check()` computes one and drops it; a first call computes one and builds from it. |
-| grid mode | How a launcher's calls give the grid: `object` (one grid argument), `dims` (`grid_arg` ints), `cpp` (`grid_cpp`) or `py` (`grid_py`). |
+| grid mode | How a launcher's calls give the grid: `object` (one grid argument), `dims` (`grid_arg_num` ints), `cpp` (`grid_cpp`) or `py` (`grid_py`). |

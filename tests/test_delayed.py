@@ -45,12 +45,12 @@ def test_each_launcher_resolves_its_own_delayed():
     base = make_launcher(store, extra_annotation={"x": _POINTER}, delayed=delayed)
     assert calls == [] and base.__self__.options.delayed is delayed
     assert base.__self__.options.jit_func is store  # known before any call
-    children = [base.__self__.bind(x=0), base.__self__.bind_device(0, x=0)]
+    children = [base.__self__.bind_args(x=0), base.__self__.bind_device_args(0, x=0)]
     assert children[0](0, 0, 1, 4) is None and children[1](0, 1, 4) is None
     assert calls == [1, 1]
     options = children[0].__self__.options
     assert options.delayed is None  # resolved by the build
-    assert options.no_gpu is True and options.bind_values == {"x": 0}
+    assert options.no_gpu is True and options.bind_args == {"x": 0}
 
 
 def test_decorator_form():
@@ -97,7 +97,7 @@ def test_a_failure_is_not_cached():
 def test_concurrent_first_calls_run_it_once_per_launcher(siblings):
     delayed, calls = _counting(_HOST)
     base = make_launcher(store, delayed=delayed)
-    launchers = [base.__self__.bind() if siblings else base for _ in range(8)]
+    launchers = [base.__self__.bind_args() if siblings else base for _ in range(8)]
     barrier, errors = threading.Barrier(8), []
 
     def worker(k):
@@ -141,7 +141,7 @@ def test_calling_itself_or_a_sibling_is_refused():
         return _HOST
 
     box["k"] = make_launcher(store, delayed=delayed)
-    box["sibling"] = box["k"].__self__.bind()
+    box["sibling"] = box["k"].__self__.bind_args()
     assert box["k"](0, 0, 1, 0, 4) is None
     # k() and k.check() refused; sibling.check() runs delayed again, where all three are refused
     assert len(seen) == 5 and all("while it was being built" in s for s in seen)
@@ -204,7 +204,7 @@ def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
         return _HOST
 
     k1 = make_launcher(store, delayed=delayed)
-    k2 = k1.__self__.bind()
+    k2 = k1.__self__.bind_args()
 
     def run(launch, other):
         mine.other = other

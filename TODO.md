@@ -99,7 +99,7 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   three dynamic options pushed it to 31. aiter's pa_decode_gluon kernels (54
   parameters) pay this on every launch. The threshold is a property of the
   caller's source, so intj cannot avoid it inside the entry; options are a
-  packed-argument call form, guidance to bake or `bind_values` arguments to stay
+  packed-argument call form, guidance to bake or `bind_args` arguments to stay
   at or below 30, or both.
 - **Two-entry memo per object slot.** A slot remembers one object; a call site
   alternating two `str`/dtype/JIT objects in one slot pays an interner call

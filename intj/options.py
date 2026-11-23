@@ -25,18 +25,18 @@ class MakeLauncherOption:
     """
 
     jit_func: Any
-    dynamic_options: Sequence[str] = ()
-    extra_annotation: Mapping[str, object] | None = None
     options: Mapping[str, Any] | None = None
+    dynamic_options: Sequence[str] = ()
+    bind_device: int | None = None
+    bind_args: Mapping[str, object] | None = None
+    grid_arg_num: int | None = None
+    grid_cpp: object | None = None
+    grid_py: Callable[[dict[str, object]], object] | None = None
+    extra_annotation: Mapping[str, object] | None = None
     torch_access_mode: TorchAccessMode | None = None
     kernel_cache: KernelCache = KernelCache.INTJ
     no_gpu: bool = False
     verify_annotation: bool = False
-    bind_device: int | None = None
-    bind_values: Mapping[str, object] | None = None
-    grid_arg: int | None = None
-    grid_cpp: object | None = None
-    grid_py: Callable[[dict[str, object]], object] | None = None
     return_compiled: bool = False
     assume_constant_globals: bool = False
     ndebug: bool = True
@@ -45,7 +45,7 @@ class MakeLauncherOption:
     def __post_init__(self) -> None:
         # a snapshot: check() reads these later; anything else stays as given
         # for check() to report
-        for name in ("extra_annotation", "options", "bind_values"):
+        for name in ("options", "bind_args", "extra_annotation"):
             value: object = getattr(self, name)
             if isinstance(value, Mapping):
                 object.__setattr__(self, name, dict(value))
@@ -59,18 +59,18 @@ class MakeLauncherOption:
 class MakeLauncherKwargs(TypedDict, total=False):
     """`make_launcher`'s `**kwargs`: `MakeLauncherOption`'s fields but `jit_func` and `delayed`."""
 
-    dynamic_options: Sequence[str]
-    extra_annotation: Mapping[str, object] | None
     options: Mapping[str, Any] | None
+    dynamic_options: Sequence[str]
+    bind_device: int | None
+    bind_args: Mapping[str, object] | None
+    grid_arg_num: int | None
+    grid_cpp: object | None
+    grid_py: Callable[[dict[str, object]], object] | None
+    extra_annotation: Mapping[str, object] | None
     torch_access_mode: TorchAccessMode | None
     kernel_cache: KernelCache
     no_gpu: bool
     verify_annotation: bool
-    bind_device: int | None
-    bind_values: Mapping[str, object] | None
-    grid_arg: int | None
-    grid_cpp: object | None
-    grid_py: Callable[[dict[str, object]], object] | None
     return_compiled: bool
     assume_constant_globals: bool
     ndebug: bool

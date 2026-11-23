@@ -74,7 +74,7 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         refuse_unknown_options(
             canonical_options,
             [n for n in b.dynamic if not n.startswith("knobs.")]
-            + list(b.declared_parameters),
+            + list(b.baked_options),
         )
     layout = b.layout
     params = layout.params
@@ -119,7 +119,7 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=_verified_cpython_header(),
         pointer_types=_pointer_types(params),
-        grid_arg=b.grid.dims,
+        grid_arg_num=b.grid.dims,
         grid_py_mode=b.grid.mode == "py",
         grid_cpp_source=b.grid.code.source if b.grid.code else "",
         grid_extra=b.grid.code.extras if b.grid.code else (),

@@ -344,7 +344,7 @@ def tuning_render(
     for p in resolved:
         if p.annotation.baked_value:
             sources[p.name] = Source("fixed", value=p.baked)
-        elif not p.annotation.tuned:
+        elif not p.annotation.tuned and not p.annotation.dynamic:
             sources[p.name] = Source("arg", by_name[p.name].call_index or 0)
     for slot, name in enumerate(dep_names):
         sources[name] = Source("dep", slot)
@@ -550,8 +550,11 @@ class TunedCompileState:
         self.public = [
             p.name
             for p in resolved
-            if not p.annotation.baked_value and not p.annotation.tuned
+            if not p.annotation.baked_value
+            and not p.annotation.tuned
+            and not p.annotation.dynamic
         ]
+        self.dynamic_params = [p.name for p in resolved if p.annotation.dynamic]
         self.baked = {p.name: p.baked for p in resolved if p.annotation.baked_value}
         self.lock = threading.RLock()
         self.running = False
@@ -606,6 +609,8 @@ class TunedCompileState:
         _imports.ensure_torch_imported()
         dyn_options, self.call_knobs, args = self.compiler.split_call(device, args)
         named = {**dict(zip(self.public, args)), **self.baked}
+        # a dynamic option parameter is the parameter, passed by keyword
+        named.update((n, dyn_options.pop(n)) for n in self.dynamic_params)
         # Positional up to the first tuned parameter, as a Triton caller would
         # write it: prune functions read `named_args`, which is positional only.
         prefix: list[Any] = []

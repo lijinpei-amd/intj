@@ -202,10 +202,16 @@ class KernelCompiler:
             if self.target is not None
             else {}
         )
+        # a dynamic option parameter's value comes with each miss's dynamic values
+        self._dynamic_params = {
+            p.name: p.index
+            for p in params
+            if p.annotation.dynamic and p.call_index is None
+        }
         self._fixed = {
             n: (baked_values or {})[p.index]
             for n, p in fed.items()
-            if p.call_index is None
+            if p.call_index is None and n not in self._dynamic_params
         }
         self._per_call = {
             n: p.call_index for n, p in fed.items() if p.call_index is not None
@@ -341,12 +347,18 @@ class KernelCompiler:
                 dyn_knobs,
             )
         )
+        baked_values = self._baked_values
+        if self._dynamic_params:
+            baked_values = {
+                **(baked_values or {}),
+                **{i: dyn_options[n] for n, i in self._dynamic_params.items()},
+            }
         source = compiler_input(
             self.jit_func,
             self._params,
             args,
             self.backend,
-            baked_values=self._baked_values,
+            baked_values=baked_values,
             ranges=ranges,
         )
         identity = _Identity.of(source, canonical, dyn_knobs)

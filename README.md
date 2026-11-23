@@ -119,7 +119,7 @@ my_kernel(
 )
 ```
 
-`grid_arg=1`, `2`, or `3` accepts that many dimensions before the kernel
+`grid_arg_num=1`, `2`, or `3` accepts that many dimensions before the kernel
 arguments. `grid_py=lambda meta: ...` calls Python on every launch with a dict
 of the kernel's named arguments. Omitting all three options keeps the original
 single-grid-object call shown above. See [the usage guide](docs/Usage.md) for

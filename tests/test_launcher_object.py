@@ -1,5 +1,5 @@
 # pyright: standard
-"""The launcher object: decoration records options; check() and bind/unbind."""
+"""The launcher object: decoration records options; check() and bind_args/unbind_args."""
 
 import dataclasses
 import gc
@@ -128,17 +128,17 @@ def _option(launch):
 
 def test_bind_and_unbind_derive_new_launchers():
     base = make_launcher(store, extra_annotation={"x": _POINTER}, **_HOST)
-    bound = base.__self__.bind(x=0)
-    fixed = bound.__self__.bind_device(3)
-    assert _option(base).bind_values is None
-    assert _option(bound).bind_values == {"x": 0}
-    assert (_option(fixed).bind_device, _option(fixed).bind_values) == (3, {"x": 0})
-    assert _option(fixed.__self__.unbind_device()) == _option(bound)
-    assert _option(bound.__self__.unbind()) == _option(base)
-    assert _option(fixed.__self__.bind_device(None)).bind_device is None
+    bound = base.__self__.bind_args(x=0)
+    fixed = bound.__self__.bind_device_args(3)
+    assert _option(base).bind_args is None
+    assert _option(bound).bind_args == {"x": 0}
+    assert (_option(fixed).bind_device, _option(fixed).bind_args) == (3, {"x": 0})
+    assert _option(fixed.__self__.unbind_device_args()) == _option(bound)
+    assert _option(bound.__self__.unbind_args()) == _option(base)
+    assert _option(fixed.__self__.bind_device_args(None)).bind_device is None
     assert bound(0, 0, 1, 4) is None and fixed(0, 1, 4) is None
     with pytest.raises(TypeError, match="missing"):
-        bound.__self__.unbind()(0, 0, 1, 4)
+        bound.__self__.unbind_args()(0, 0, 1, 4)
 
 
 def test_each_launcher_checks_its_own_options(monkeypatch):
@@ -150,7 +150,7 @@ def test_each_launcher_checks_its_own_options(monkeypatch):
         launcher, "build_plan", lambda o: calls.append(o.bind_device) or real(o)
     )
     base = make_launcher(store, extra_annotation={"x": _POINTER}, **_HOST)
-    for k in (base.__self__.bind(x=0), base.__self__.bind_device(0, x=0)):
+    for k in (base.__self__.bind_args(x=0), base.__self__.bind_device_args(0, x=0)):
         k.__self__.check()
     assert calls == [None, 0]
 
@@ -158,7 +158,7 @@ def test_each_launcher_checks_its_own_options(monkeypatch):
 def test_bind_on_a_built_launcher_returns_an_unbuilt_one():
     base = make_launcher(store, **_HOST)
     assert base(0, 0, 1, 0, 4) is None
-    child = base.__self__.bind_device(0)
+    child = base.__self__.bind_device_args(0)
     assert child.__self__._C_module is None
     assert child(0, 1, 0, 4) is None and base(0, 0, 1, 0, 4) is None
 
@@ -192,7 +192,7 @@ def test_launcher_object_is_not_instantiable():
 def test_bind_device_true_points_at_the_method():
     launch = make_launcher(store, bind_device=True, **_HOST)
     with pytest.raises(
-        TypeError, match=r"not a flag; use k.__self__.bind_device\(ordinal\)"
+        TypeError, match=r"not a flag; use k.__self__.bind_device_args\(ordinal\)"
     ):
         launch.__self__.check()
 
@@ -208,7 +208,7 @@ def test_decoration_snapshots_mutable_arguments():
     launch = make_launcher(
         store,
         extra_annotation=annotations,
-        bind_values=values,
+        bind_args=values,
         dynamic_options=dynamic,
         **_HOST,
     )
@@ -218,7 +218,7 @@ def test_decoration_snapshots_mutable_arguments():
     assert launch(0, 0, 1, 4) is None
     option = _option(launch)
     assert option.extra_annotation == {"x": _POINTER}
-    assert option.bind_values == {"x": 0} and option.dynamic_options == ()
+    assert option.bind_args == {"x": 0} and option.dynamic_options == ()
 
 
 def test_concurrent_first_decorations_share_one_stub(kern_dir):
@@ -272,10 +272,10 @@ def _second():
 
 
 _EDITS = [
-    ("bind", (), {"x": 0}),
-    ("bind_device", (3,), {"x": 0}),
-    ("unbind", (), {}),
-    ("unbind_device", (), {}),
+    ("bind_args", (), {"x": 0}),
+    ("bind_device_args", (3,), {"x": 0}),
+    ("unbind_args", (), {}),
+    ("unbind_device_args", (), {}),
     ("replace_delayed", (_second,), {}),
     ("replace_delayed", (None,), {}),
     ("chain_delayed", (_second,), {}),
@@ -287,7 +287,7 @@ def _edit_base():
     return make_launcher(
         store,
         extra_annotation={"x": _POINTER},
-        bind_values={"x": 1},
+        bind_args={"x": 1},
         bind_device=2,
         delayed=_first,
         **_HOST,
@@ -395,14 +395,14 @@ def test_concurrent_in_place_edits_both_land():
     def bind(name):
         barrier.wait()
         for i in range(200):
-            k.__self__._bind(**{f"{name}{i}": i})
+            k.__self__._bind_args(**{f"{name}{i}": i})
 
     threads = [threading.Thread(target=bind, args=(n,)) for n in ("a", "b")]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert len(_option(k).bind_values or {}) == 400
+    assert len(_option(k).bind_args or {}) == 400
 
 
 def test_in_place_edit_racing_the_first_call():
@@ -414,14 +414,14 @@ def test_in_place_edit_racing_the_first_call():
         return _HOST
 
     k = make_launcher(
-        store, extra_annotation={"x": _POINTER}, bind_values={"x": 0}, delayed=delayed
+        store, extra_annotation={"x": _POINTER}, bind_args={"x": 0}, delayed=delayed
     )
     errors = []
 
     def edit():
         started.wait()
         try:
-            k.__self__._bind(x=8)
+            k.__self__._bind_args(x=8)
         except RuntimeError as error:
             errors.append(str(error))
 
@@ -430,4 +430,4 @@ def test_in_place_edit_racing_the_first_call():
     assert k(0, 0, 1, 4) is None
     t.join()
     assert len(errors) == 1 and "options are fixed" in errors[0]
-    assert _option(k).bind_values == {"x": 0}  # what the module was built from
+    assert _option(k).bind_args == {"x": 0}  # what the module was built from

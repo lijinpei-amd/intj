@@ -180,7 +180,7 @@ class Argument(Annotation):
         specialize: `AUTO`, `NEVER`, `Assume(...)` or `Exactly(...)`.
         value: A value baked into the launcher, removing the parameter from
             the public call.
-        bind_value: Binds the value later through `bind()`; exclusive with
+        bind_value: Binds the value later through `bind_args()`; exclusive with
             `value`.
         ptr_range: Measures a passed tensor's pointer range as Triton does:
             when the tensor has a `ptr_range` attribute, `ptr_range()` decides
@@ -304,6 +304,9 @@ class CanonicalAnnotation:
     key_fields: tuple[CacheKeyField, ...] = ()
     #: assigned by an autotune/heuristics layer: never passed, never keyed
     tuned: bool = False
+    #: a tl.constexpr named in `dynamic_options`: passed and keyed with the
+    #: dynamic values, not among the kernel arguments
+    dynamic: bool = False
     #: a caller var an autotune layer keys on: keyed by its exact value
     exact_key: bool = False
     #: the type comes from a Triton annotation (`x: float`): values convert
@@ -834,7 +837,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                     if modes[_FACT_NAMES.index(field)] == "assume"
                 )
             elif bind_value is not None:
-                # a bound value is unknown until bind(), after the module is built
+                # a bound value is unknown until bind_args(), after the module is built
                 applicable = types if types is not None else ("i32", "*fp32")
                 if any(
                     mode == "auto" and any(_applicable(ty, field) for ty in applicable)

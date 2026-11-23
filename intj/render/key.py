@@ -112,7 +112,7 @@ class RenderKey:
     # Explicit pointer names -> live torch ScalarType codes. Their compact key
     # indices still come from the runtime ABI table, in every access mode.
     pointer_types: tuple[tuple[str, int], ...] = ()
-    grid_arg: int | None = None
+    grid_arg_num: int | None = None
     grid_py_mode: bool = False
     grid_cpp_source: str = ""
     grid_extra: tuple[str, ...] = ()

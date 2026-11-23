@@ -268,9 +268,9 @@ def main(iters=20000, batches=7, no_gpu=False):
                 else {}
             )
             launcher = (
-                factory.__self__.bind_device(ordinal, **values)
+                factory.__self__.bind_device_args(ordinal, **values)
                 if fixed_device
-                else factory.__self__.bind(**values)
+                else factory.__self__.bind_args(**values)
             )
             bind_ms = (time.perf_counter_ns() - start) / 1e6
         else:

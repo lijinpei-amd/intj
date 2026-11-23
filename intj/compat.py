@@ -50,7 +50,7 @@ def _make(
 ) -> Any:
     return make_launcher(
         kernel,
-        grid_arg=dimensions,
+        grid_arg_num=dimensions,
         options=dict(options),
         extra_annotation=_annotations(baked, wrapped_types),
         bind_device=device,

@@ -317,7 +317,7 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% endfor %}
   int np = 0;
 {% if auto_decode %}
-{% for p in params %}
+{% for p in params if p.decoded %}
 {% if p.constexpr %}
 {{ decode_auto_constexpr(p) }}
 {% else %}
@@ -956,13 +956,18 @@ static PyObject *intj_fill(intj_state *st, intj_bound_launcher *bound,
 {% if tuned_meta %}
 static PyObject *intj_tuned_grid_py_launch(intj_state *st, intj_bound_launcher *bound,
                                            const intj_final *copy, uint64_t stream,
-                                           PyObject *const *args, uint64_t *vals, int np) {
+                                           PyObject *const *dyn, PyObject *const *args,
+                                           uint64_t *vals, int np) {
+{% if not ndyn %}  (void)dyn;
+{% endif %}
   PyObject *meta = PyDict_New();
   if (!meta)
     return NULL;
 {% for p in params %}
 {% if p.call_index is not none %}
   if (PyDict_SetItemString(meta, intj_param_names[{{ p.index }}], args[{{ p.call_index }}]) != 0) goto fail;
+{% elif p.dyn_slot is not none %}
+  if (PyDict_SetItemString(meta, intj_param_names[{{ p.index }}], dyn[{{ p.dyn_slot }}]) != 0) goto fail;
 {% elif p.annotation.tuned %}
   if (PyDict_SetItemString(meta, intj_param_names[{{ p.index }}],
                            PyTuple_GET_ITEM(copy->meta, {{ p.meta_slot }})) != 0) goto fail;
@@ -1063,7 +1068,7 @@ static PyObject *intj_call(intj_state *st,
   uint32_t gx = 1, gy = 1, gz = 1;
 {% if grid_eval == 'dims' %}
   uint32_t *dims[3] = {&gx, &gy, &gz};
-  for (int i = 0; i < {{ grid_arg }}; i++) {
+  for (int i = 0; i < {{ grid_arg_num }}; i++) {
     if (intj_grid_dim(args[i], dims[i]) != 0)
       return NULL;
   }
@@ -1082,7 +1087,7 @@ static PyObject *intj_call(intj_state *st,
     return NULL;
 {% for p in params %}
   if (PyDict_SetItemString(meta, intj_param_names[{{ p.index }}],
-                           {% if p.call_index is not none %}kargs[{{ p.call_index }}]{% else %}PyTuple_GET_ITEM(bound->grid_hidden, {{ p.hidden_slot }}){% endif %}) != 0) {
+                           {% if p.call_index is not none %}kargs[{{ p.call_index }}]{% elif p.dyn_slot is not none %}dyn[{{ p.dyn_slot }}]{% else %}PyTuple_GET_ITEM(bound->grid_hidden, {{ p.hidden_slot }}){% endif %}) != 0) {
     Py_DECREF(meta);
     return NULL;
   }
@@ -1144,7 +1149,7 @@ static PyObject *intj_call(intj_state *st,
   Py_XINCREF(copy.k.compiled);
 {% endif %}
   INTJ_RWUNLOCK(&bound->lock);
-  PyObject *result = intj_tuned_grid_py_launch(st, bound, &copy, stream, kargs, vals, np);
+  PyObject *result = intj_tuned_grid_py_launch(st, bound, &copy, stream, dyn, kargs, vals, np);
   Py_XDECREF(copy.meta);
 {% if return_compiled %}
   Py_XDECREF(copy.k.compiled);

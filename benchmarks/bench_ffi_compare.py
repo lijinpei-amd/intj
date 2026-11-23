@@ -223,7 +223,7 @@ def sweep(counts: list[int], iters: int, batches: int) -> None:
                     kernel,
                     extra_annotation=annotation,
                     torch_access_mode=mode,
-                ).__self__.bind_device(device)
+                ).__self__.bind_device_args(device)
                 assert launch.__self__.spec_key(0, *args) == (b"", count)
                 cases.append(
                     (count, f"INTJ {mode.value} kernel", launch, (stream, (1,), *args))
@@ -278,7 +278,7 @@ def main(iters: int, batches: int) -> None:
     grid = (1,)
     packed_nop = tvm_ffi.get_global_func("testing.nop")
     intj_launch = make_launcher(empty_kernel)
-    intj_bound = make_launcher(empty_kernel).__self__.bind_device(device)
+    intj_bound = make_launcher(empty_kernel).__self__.bind_device_args(device)
     annotation = {
         **{
             name: Argument(type=tl.pointer_type(tl.float32), specialize=NEVER)
@@ -290,7 +290,7 @@ def main(iters: int, batches: int) -> None:
     intj_mixed = make_launcher(mixed_kernel, extra_annotation=annotation)
     intj_mixed_bound = make_launcher(
         mixed_kernel, extra_annotation=annotation
-    ).__self__.bind_device(device)
+    ).__self__.bind_device_args(device)
     mixed_args = (*tensors, 1, 1.5)
     mixed_converted = (*converted, 1, 1.5)
     other_args = (*(tensor[1:] for tensor in tensors), 7, 2.0)

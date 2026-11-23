@@ -35,7 +35,12 @@ def _cache_key_fields(
     annotation: CanonicalAnnotation,
 ) -> tuple[CacheKeyField, ...]:
     """Returns the unplaced key fields `annotation` contributes to the spec key."""
-    if annotation.tuned or annotation.baked_value or annotation.bind_value is not None:
+    if (
+        annotation.tuned
+        or annotation.dynamic
+        or annotation.baked_value
+        or annotation.bind_value is not None
+    ):
         return ()
     types = annotation.types
     if annotation.kind == "constexpr":
@@ -143,6 +148,7 @@ def call_layout(resolved: Sequence[ResolvedParam]) -> tuple[Param, ...]:
             not annotation.baked_value
             and annotation.bind_value is None
             and not annotation.tuned
+            and not annotation.dynamic
         )
         slot = None
         if public and _object_capable(annotation):

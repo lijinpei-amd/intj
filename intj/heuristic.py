@@ -289,6 +289,9 @@ class _Emitter:
 
     def input(self, node: ast.expr) -> tuple[str, Source] | None:
         key = _subscript_key(node, self.h.arg, self.h.where)
+        if key is not None and key not in self.sources:
+            # a dynamic value: C reads the heuristic's inputs from the kernel arguments
+            raise self.fail(node, f"cannot read dynamic option {key!r}")
         return None if key is None else (key, self.sources[key])
 
     def tensor_arg(self, node: ast.expr, what: str) -> tuple[str, int]:

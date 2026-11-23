@@ -29,8 +29,8 @@ def write_programs(out, X, Y):
 
 
 @pytest.mark.parametrize("dimensions,shape", [(1, (3,)), (2, (3, 2)), (3, (3, 2, 4))])
-def test_grid_arg_passes_each_requested_dimension(dimensions, shape):
-    launcher = make_launcher(write_programs, grid_arg=dimensions)
+def test_grid_arg_num_passes_each_requested_dimension(dimensions, shape):
+    launcher = make_launcher(write_programs, grid_arg_num=dimensions)
     out = torch.zeros(24, device="cuda", dtype=torch.int32)
     launcher(
         torch.cuda.current_device(),
@@ -46,14 +46,14 @@ def test_grid_arg_passes_each_requested_dimension(dimensions, shape):
     torch.testing.assert_close(out[count:], torch.zeros_like(out[count:]))
 
 
-def test_decorator_factory_form_matches_call_form_with_grid_arg():
+def test_decorator_factory_form_matches_call_form_with_grid_arg_num():
     """The decorator-factory form builds the same launcher as the call form.
 
-    `@make_launcher(grid_arg=1)` on a stacked def builds the same launcher as
-    `make_launcher(kernel, grid_arg=1)`.
+    `@make_launcher(grid_arg_num=1)` on a stacked def builds the same launcher as
+    `make_launcher(kernel, grid_arg_num=1)`.
     """
 
-    @make_launcher(grid_arg=1)
+    @make_launcher(grid_arg_num=1)
     @triton.jit
     def deco_write_programs(out, X, Y):
         x = tl.program_id(0)
@@ -75,12 +75,12 @@ def test_decorator_factory_form_matches_call_form_with_grid_arg():
     torch.testing.assert_close(out[3:], torch.zeros_like(out[3:]))
 
 
-def test_grid_arg_zero_skips_launch_and_argument_decode():
-    launcher = make_launcher(write_programs, grid_arg=2, no_gpu=True)
+def test_grid_arg_num_zero_skips_launch_and_argument_decode():
+    launcher = make_launcher(write_programs, grid_arg_num=2, no_gpu=True)
     assert launcher(0, 0, 0, 3, object(), object(), object()) is None
-    fixed = make_launcher(write_programs, grid_arg=3, no_gpu=True).__self__.bind_device(
-        0
-    )
+    fixed = make_launcher(
+        write_programs, grid_arg_num=3, no_gpu=True
+    ).__self__.bind_device_args(0)
     fixed.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(fixed).parameters) == (
         "stream",
@@ -97,11 +97,12 @@ def test_grid_arg_zero_skips_launch_and_argument_decode():
 def test_grid_modes_validate_options_and_keep_separate_modules():
     assert callable(make_launcher(write_programs, dynamic_options=(), no_gpu=True))
     for value in (0, 4, True, 1.0, "2"):
-        with pytest.raises(ValueError, match="grid_arg must be 1, 2, or 3"):
-            make_launcher(write_programs, grid_arg=value, no_gpu=True).__self__.check()  # pyright: ignore[reportArgumentType]
+        with pytest.raises(ValueError, match="grid_arg_num must be 1, 2, or 3"):
+            launch = make_launcher(write_programs, grid_arg_num=value, no_gpu=True)  # pyright: ignore[reportArgumentType]
+            launch.__self__.check()
     for modes in (
-        {"grid_arg": 1, "grid_cpp": compiled_grid},
-        {"grid_arg": 2, "grid_py": lambda meta: (1,)},
+        {"grid_arg_num": 1, "grid_cpp": compiled_grid},
+        {"grid_arg_num": 2, "grid_py": lambda meta: (1,)},
         {"grid_cpp": compiled_grid, "grid_py": lambda meta: (1,)},
     ):
         with pytest.raises(ValueError, match="choose only one"):
@@ -118,8 +119,8 @@ def test_grid_modes_validate_options_and_keep_separate_modules():
     first = make_launcher(write_programs, grid_cpp=first_grid, no_gpu=True)
     again = make_launcher(write_programs, grid_cpp=first_grid, no_gpu=True)
     second = make_launcher(write_programs, grid_cpp=second_grid, no_gpu=True)
-    one_dim = make_launcher(write_programs, grid_arg=1, no_gpu=True)
-    two_dim = make_launcher(write_programs, grid_arg=2, no_gpu=True)
+    one_dim = make_launcher(write_programs, grid_arg_num=1, no_gpu=True)
+    two_dim = make_launcher(write_programs, grid_arg_num=2, no_gpu=True)
     assert module_of(first) is module_of(again)
     assert (
         len({id(module_of(launch)) for launch in (first, second, one_dim, two_dim)})
@@ -202,7 +203,7 @@ def test_grid_py_receives_baked_and_bound_values():
             "X": Constexpr(value=3),
         },
     )
-    launch = factory.__self__.bind_device(0, out=0)
+    launch = factory.__self__.bind_device_args(0, out=0)
     launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters) == ("stream", "Y")
     assert launch(0, 2) is None
@@ -319,7 +320,7 @@ def test_grid_cpp_fixed_device_reuses_baked_value_and_prepends_extra():
             "X": Constexpr(value=3),
         },
     )
-    launch = factory.__self__.bind_device(0, out=0)
+    launch = factory.__self__.bind_device_args(0, out=0)
     launch.__self__.build()  # the build sets the signature
     assert tuple(inspect.signature(launch).parameters) == ("stream", "cap", "Y")
     assert launch(0, 7, 4) is None  # 3 + 4 - 7 = 0
@@ -333,7 +334,7 @@ def test_grid_controls_do_not_change_kernel_specialization():
         return (min(X, cap),)
 
     cpp = make_launcher(write_programs, grid_cpp=grid, no_gpu=True)
-    explicit = make_launcher(write_programs, grid_arg=1, no_gpu=True)
+    explicit = make_launcher(write_programs, grid_arg_num=1, no_gpu=True)
     for launcher, calls in ((cpp, (1, 2)), (explicit, (1, 2))):
         misses = []
 
@@ -353,9 +354,9 @@ def test_cuda_grid_modes_compile_without_cuda_gpu(tmp_path):
     from intj.render.build import build
 
     launchers = {
-        "grid_arg": make_launcher(
+        "grid_arg_num": make_launcher(
             write_programs,
-            grid_arg=2,
+            grid_arg_num=2,
             no_gpu=True,
             torch_access_mode=TorchAccessMode.INTERPRETER,
         ),

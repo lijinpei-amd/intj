@@ -116,7 +116,7 @@ def test_bound_no_map_keeps_kernel_alive_until_bound_handle_is_released():
             "value": Argument(type=tl.int32, specialize=NEVER),
         },
     )
-    bound = factory.__self__.bind_device(device, x=x)
+    bound = factory.__self__.bind_device_args(device, x=x)
 
     built = module_of(bound)
     assert any(
@@ -392,7 +392,7 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
         ),
     )
     if fixed_device:
-        bound = factory.__self__.bind_device(device, x=x)
+        bound = factory.__self__.bind_device_args(device, x=x)
         native = bound
         owner = bound.__self__
 
@@ -447,7 +447,7 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
             "value": Argument(type=tl.int32, specialize=NEVER),
         },
     )
-    bound = factory.__self__.bind_device(torch.cuda.current_device(), x=x)
+    bound = factory.__self__.bind_device_args(torch.cuda.current_device(), x=x)
     built = module_of(bound)
     module = next(
         module
