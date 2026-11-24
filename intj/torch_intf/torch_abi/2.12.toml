@@ -1,4 +1,5 @@
-# Verified torch ABIs, one table per torch major.minor.
+# Verified torch ABIs for one torch major.minor: one table for its releases,
+# named major.minor, and one per pre-release build, named by its exact version.
 #
 # Never write an entry by hand.  Run `python -m intj.tools.abi_detect` on
 # the target torch and paste what it prints: every number is measured against

@@ -91,10 +91,10 @@ def _build(
         f"-I{_RUNTIME}",
         f"-I{include}",
         f"-I{sysconfig.get_paths()['include']}",
-        *(f"-I{d}" for d in toolchain["include_dirs"]),
+        *(f"-I{d}" for d in toolchain.include_dirs),
     ]
-    if toolchain["archives"]:
-        command += ["-Wl,--start-group", *toolchain["archives"], "-Wl,--end-group"]
+    if toolchain.archives:
+        command += ["-Wl,--start-group", *toolchain.archives, "-Wl,--end-group"]
     command += [*libraries, "-lpthread", f"-lpython{sysconfig.get_python_version()}"]
     command += [f"-L{sysconfig.get_config_var('LIBDIR')}"]
     return subprocess.run(command, capture_output=True, text=True)

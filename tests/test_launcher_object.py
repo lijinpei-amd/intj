@@ -115,7 +115,7 @@ def test_check_refuses_triton_interpret_before_provisioning(monkeypatch):
     from intj.render import deps as render_deps
 
     provisioned = []
-    monkeypatch.setattr(render_deps, "_provision", provisioned.append)
+    monkeypatch.setattr(render_deps, "provision", provisioned.append)
     with knobs.runtime.scope():
         knobs.runtime.interpret = True
         launch = make_launcher(store, **_HOST)  # decoration refuses nothing

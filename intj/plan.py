@@ -182,7 +182,7 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
         else {k: v for k, v in live_knobs().items() if k not in dynamic}
     )
     # GPU-free but may reach the network: after every refusal above, never on a build
-    render_deps._provision(option.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
+    render_deps.provision(option.kernel_cache)
     return BuildPlan(
         option=option,
         jit_func=kernel,

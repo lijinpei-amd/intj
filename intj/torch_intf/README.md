@@ -12,8 +12,10 @@ And these details depend on pytorch version, and different pytorch interface mod
 - INTERPRETER calls Torch for the pointer and size, with one checked direct read of the THPDtype code.
 
 For the ABI table used by RUNTIME_SHIM, one TOML file per Torch major.minor
-version is included in `torch_abi/` (for example, `torch_abi/2.14.toml`). To rebuild
-or verify the table, there are two ways:
+version is included in `torch_abi/` (for example, `torch_abi/2.14.toml`). It
+holds a `["2.14"]` table that every 2.14 release reads, and may hold tables for
+pre-release builds (`["2.14.0.dev20260804+rocm7.1"]`), each read only by that
+exact build. To rebuild or verify the table, there are two ways:
 
 - Through runtime detection on a supported CPython build, see [tools/abi_detect.py](../tools/abi_detect.py). This method doesn't need to compile and run a C++ extension.
 - Through compile and run detection, see [tools/cpp_detect.py](../tools/cpp_detect.py). This method compiles some C++ files using pytorch C++ headers, then runs the resulting binary and outputs the needed info.

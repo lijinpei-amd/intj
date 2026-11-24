@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -247,17 +248,29 @@ def _compile_so_bytes(src: str, name: str, flags: Mapping[str, Any]) -> bytes:
         return binary.read_bytes()
 
 
-def _runtime_header_flag() -> str:
-    """Returns a define that makes triton's compile cache key on the runtime headers.
+def _headers_flag(key: RenderKey) -> str:
+    """Returns a define that makes triton's compile cache key on the headers a build reads.
 
-    `_compile_so` keys on the source bytes plus the *names* of the include
-    directories, not on the contents of the headers found there.  So an edit to
-    a runtime header moves intj's own `RenderKey` digest, intj re-renders, and
-    triton then serves the object it compiled from the previous headers.  Feeding
-    the digest in as a define puts it in triton's key too.
+    `compile_so_from_src` keys on the source bytes, the platform and the flags
+    as strings: the *names* of the include directories, not the headers found
+    there.  So when a header changes in place -- an edit to intj's runtime,
+    `pip install -U torch` under STATIC_COMPILE, a reinstalled triton with its
+    driver headers -- intj's `RenderKey` digest moves, intj re-renders the same
+    source, and triton serves the object it compiled against the old headers:
+    for STATIC_COMPILE, the old torch's `TensorImpl` offsets, read without a
+    crash.  Hashing what identifies those headers into a define puts it in
+    triton's key too.
+
+    Reads only fields set before `digest_flags` runs; `compiler` and
+    `build_flags` are filled in from it.
     """
-    digest = hashlib.sha256(runtime_headers()).hexdigest()[:16]
-    return f"-DINTJRUNTIME_HEADER=0x{digest}"
+    identity = [
+        hashlib.sha256(runtime_headers()).hexdigest(),
+        key.torch_version,
+        list(key.triton),
+    ]
+    digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]
+    return f"-DINTJ_HEADERS=0x{digest}"
 
 
 def build_flags(key: RenderKey) -> dict[str, Any]:
@@ -322,7 +335,7 @@ def digest_flags(key: RenderKey) -> dict[str, Any]:
     flags: dict[str, Any] = {
         "include_dirs": [str(RUNTIME), str(PYTHON_INTF), *key.cache_include_dirs],
         "ccflags": [
-            _runtime_header_flag(),
+            _headers_flag(key),
             f"-DINTJ_CACHE_{key.kernel_cache.upper()}",
         ],
     }

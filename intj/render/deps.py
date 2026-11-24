@@ -83,7 +83,21 @@ _BUILD_COST = "~30 s on a big machine, minutes on a few cores"
 _INSTALL_FAILED: dict[KernelCache, Exception] = {}
 
 
-def _provision(cache: KernelCache) -> dict[str, tuple[str, ...]]:  # pyright: ignore[reportUnusedFunction]  # shared with checks and module builds
+@dataclasses.dataclass(frozen=True)
+class Toolchain:
+    """What a module built against a kernel cache's map needs from it."""
+
+    include_dirs: tuple[str, ...] = ()
+    library_dirs: tuple[str, ...] = ()
+    #: static (or shared) libraries, linked as a group
+    archives: tuple[str, ...] = ()
+
+
+#: `INTJ`'s: its map is intj's own header
+_NOTHING = Toolchain()
+
+
+def provision(cache: KernelCache) -> Toolchain:
     """Returns the toolchain for `cache`, fetching and building it the first time.
 
     Called by `check()` after its GPU-free refusals; module building then
@@ -139,14 +153,15 @@ _SOURCES: dict[KernelCache, Dependency] = {
 }
 
 
-def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
+def toolchain_for(cache: KernelCache) -> Toolchain | None:
     """Returns include and library directories for `cache`, or None if not provisioned.
 
     Only intj's own cache directory is consulted; `install` is what puts
-    anything there.
+    anything there.  Reads without the install lock: `install` makes a tree
+    visible only once it is complete, and removes one by renaming it away first.
     """
     if cache is KernelCache.INTJ:
-        return {"include_dirs": (), "library_dirs": (), "archives": ()}
+        return _NOTHING
 
     source = _SOURCES[cache]
     root = _source_root(cache)
@@ -154,7 +169,7 @@ def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
         return None
     include = str((root / source.include).resolve())
     if not source.builds:
-        return {"include_dirs": (include,), "library_dirs": (), "archives": ()}
+        return Toolchain(include_dirs=(include,))
 
     # the marker, not the archives: a build in flight has emitted some of its 90
     # libraries, and linking against that set fails with undefined absl symbols
@@ -163,14 +178,14 @@ def toolchain_for(cache: KernelCache) -> dict[str, tuple[str, ...]] | None:
     archives = _archives(root / "build")
     if not archives:
         return None
-    return {
-        "include_dirs": (include,),
-        "library_dirs": (str(root / "build"),),
-        "archives": archives,
-    }
+    return Toolchain(
+        include_dirs=(include,),
+        library_dirs=(str(root / "build"),),
+        archives=archives,
+    )
 
 
-def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, ...]]:
+def install(cache: KernelCache, *, force: bool = False) -> Toolchain:
     """Downloads (and builds, for abseil) `cache` into intj's cache directory.
 
     Idempotent: an existing
@@ -194,13 +209,13 @@ def install(cache: KernelCache, *, force: bool = False) -> dict[str, tuple[str, 
         tarfile.TarError: The downloaded tarball is bad.
     """
     if cache is KernelCache.INTJ:
-        return {"include_dirs": (), "library_dirs": (), "archives": ()}
+        return _NOTHING
 
     source = _SOURCES[cache]
     root = _source_root(cache)
     with _install_lock(cache):
         if force:
-            shutil.rmtree(root, ignore_errors=True)
+            _discard(root)
         if not (root / source.marker).exists():
             _announce(f"downloading {cache.value} {source.version} to {root}")
             _unpack(source, root)
@@ -282,8 +297,18 @@ def _unpack(source: Dependency, root: Path) -> None:
     A kill leaves nothing behind.
 
     Raises:
-        RuntimeError: The download does not match the pinned checksum.
+        RuntimeError: This python's `tarfile` has no extraction filters, or
+            the download does not match the pinned checksum.
     """
+    # Filters are 3.12's, backported to 3.8.17, 3.9.17, 3.10.12 and 3.11.4;
+    # without one, `filter=` is a TypeError, and leaving it out lets a member
+    # name write outside the tree.
+    if not hasattr(tarfile, "data_filter"):
+        raise RuntimeError(
+            f"intj: python {'%d.%d.%d' % sys.version_info[:3]}'s tarfile cannot "
+            "extract safely (no extraction filters); use python 3.8.17, 3.9.17, "
+            "3.10.12, 3.11.4 or later"
+        )
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root.parent) as scratch:
         archive = Path(scratch) / "source.tar.gz"
@@ -303,8 +328,17 @@ def _unpack(source: Dependency, root: Path) -> None:
         (inner,) = (Path(scratch) / "tree").iterdir()
         # rename(2) onto a non-empty directory is ENOTEMPTY, so clear whatever an
         # interrupted install left: the caller already found no marker there.
-        shutil.rmtree(root, ignore_errors=True)
+        _discard(root)
         os.replace(inner, root)
+
+
+def _discard(tree: Path) -> None:
+    # renamed out of `toolchain_for`'s sight first: `rmtree` in place leaves,
+    # while it runs or after a kill, markers that outlive the files they vouch for
+    scratch = Path(tempfile.mkdtemp(dir=tree.parent, prefix=f".{tree.name}."))
+    with contextlib.suppress(FileNotFoundError):
+        os.replace(tree, scratch / "tree")
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _cmake_build(root: Path) -> None:
@@ -370,9 +404,9 @@ def main(argv: list[str] | None = None) -> int:
             print(unavailable_message(cache, error), file=sys.stderr)
             return 1
         print(f"intj: {cache.value} {_SOURCES[cache].version} in {_source_root(cache)}")
-        print(f"  include {toolchain['include_dirs'][0]}")
-        if toolchain["archives"]:
+        print(f"  include {toolchain.include_dirs[0]}")
+        if toolchain.archives:
             print(
-                f"  {len(toolchain['archives'])} libraries in {toolchain['library_dirs'][0]}"
+                f"  {len(toolchain.archives)} libraries in {toolchain.library_dirs[0]}"
             )
     return 0

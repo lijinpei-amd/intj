@@ -23,10 +23,13 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import pathlib
+import shutil
 import struct
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import threading
 import time
 import weakref
@@ -102,8 +105,8 @@ def test_versioned_abi_files_are_loaded_together(tmp_path):
         "s_nbytes": 48,
     }
     assert _load_abi(tmp_path) == {
-        (2, 9): (offsets, {0: ("uint8", 1), 1: ("int8", 1)}),
-        (2, 10): (offsets, {0: ("uint8", 1), 1: ("int8", 1)}),
+        "2.9": (offsets, {0: ("uint8", 1), 1: ("int8", 1)}),
+        "2.10": (offsets, {0: ("uint8", 1), 1: ("int8", 1)}),
     }
 
 
@@ -117,6 +120,12 @@ def test_versioned_abi_files_are_loaded_together(tmp_path):
         {"02.9.toml": _ABI_ENTRY},
         {"2.9.toml": _ABI_ENTRY.replace('"2.9"', '"02.9"')},
         {"2.9.toml": _ABI_ENTRY + _ABI_ENTRY.replace('"2.9"', '"2.10"')},
+        # a release is recorded once, by major.minor
+        {"2.9.toml": _ABI_ENTRY.replace('"2.9"', '"2.9.0"')},
+        {"2.9.toml": _ABI_ENTRY.replace('"2.9"', '"2.9.0+cpu"')},
+        # a pre-release of another minor, or not a version at all
+        {"2.9.toml": _ABI_ENTRY.replace('"2.9"', '"2.10.0rc1"')},
+        {"2.9.toml": _ABI_ENTRY.replace('"2.9"', '"2.9.0 rc1"')},
     ],
 )
 def test_versioned_abi_files_refuse_bad_layout_data(tmp_path, files):
@@ -126,6 +135,94 @@ def test_versioned_abi_files_refuse_bad_layout_data(tmp_path, files):
         (tmp_path / name).write_text(content)
     with pytest.raises(ValueError, match=str(tmp_path)):
         _load_abi(tmp_path)
+
+
+def test_pre_release_tables_share_their_minor_file(tmp_path):
+    from intj.torch_intf.torch_abi import _load_abi
+
+    nightly = "2.9.0.dev20250801+cpu"
+    (tmp_path / "2.9.toml").write_text(
+        _ABI_ENTRY + _ABI_ENTRY.replace('"2.9"', f'"{nightly}"')
+    )
+    assert set(_load_abi(tmp_path)) == {"2.9", nightly}
+
+
+@pytest.mark.parametrize(
+    "version, table",
+    [
+        ("2.14.0+rocm7.2", "2.14"),
+        ("2.14.1+cu130", "2.14"),
+        ("2.14.0.dev20260804+rocm7.1", "2.14.0.dev20260804+rocm7.1"),
+        ("2.14.0a0+gitdeadbee", "2.14.0a0+gitdeadbee"),
+        ("2.14.0rc1", "2.14.0rc1"),
+    ],
+)
+def test_abi_table_name(version, table):
+    from intj.torch_intf.torch_abi import abi_table_name
+
+    assert abi_table_name(version) == table
+
+
+@contextlib.contextmanager
+def _running_torch(monkeypatch, version, dtypes_of):
+    # as if torch were `version`, with the dtypes of table `dtypes_of`
+    from intj.torch_intf import torch_abi as abi
+
+    monkeypatch.setattr(torch, "__version__", version)
+    monkeypatch.setattr(abi, "live_dtypes", lambda: abi._DTYPES[dtypes_of])
+    caches = (abi.torch_version, abi.itemsize_table, abi.layout_for)
+    for cache in caches:
+        cache.cache_clear()
+    try:
+        yield abi
+    finally:  # the caches outlive the monkeypatch; every later test reads them
+        for cache in caches:
+            cache.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "version, release, found",
+    [
+        ("2.14.1+cu130", "2.14", True),
+        ("2.14.0rc1", "2.14", False),
+        ("2.14.0a0+gitdeadbee", "2.14", False),
+        ("2.13.0.dev20260301+cpu", "2.13", False),
+    ],
+)
+def test_pre_release_torch_gets_no_release_layout(monkeypatch, version, release, found):
+    """A nightly, a source build or a candidate reads only a table for its exact build.
+
+    Its dtypes matching the release's is no proof its offsets do.
+    """
+    with _running_torch(monkeypatch, version, release) as abi:
+        assert abi.torch_version() == version
+        assert (abi.layout_for() is not None) == found
+
+
+def test_pre_release_torch_gets_its_exact_table(monkeypatch):
+    nightly = "2.14.0.dev20260804+rocm7.1"
+    with _running_torch(monkeypatch, nightly, nightly) as abi:
+        assert abi.layout_for() is not None
+
+
+@pytest.mark.parametrize("version", ["2.14.0rc1", "2.14.1+cu130"])
+def test_abi_detect_names_the_table_the_torch_is_looked_up_by(
+    monkeypatch, capsys, version
+):
+    from intj.tools import abi_detect
+    from intj.torch_intf import torch_abi as abi
+
+    measured = abi.TensorABI(itemsize=b"", **dict.fromkeys(abi.OFFSETS, 0))
+    monkeypatch.setattr(abi_detect, "probe_layout", lambda _: measured)
+    monkeypatch.setattr(abi_detect, "live_dtypes", lambda: {0: ("uint8", 1)})
+    monkeypatch.setattr(torch, "__version__", version)
+    abi.torch_version.cache_clear()
+    try:
+        abi_detect._main()
+    finally:
+        abi.torch_version.cache_clear()
+    out = capsys.readouterr().out.splitlines()
+    assert out[1] == f'["{abi.abi_table_name(version)}"]'
 
 
 #: x: tensor, n: int, m: do_not_specialize int, f: float, flag: bool, BLOCK: constexpr
@@ -253,7 +350,7 @@ def _key(mode: TorchAccessMode, driver_path: str = "") -> RenderKey:
         compiler=(),
         build_flags=(),
         ext_suffix=None,
-        intj_version=(0, 0),
+        intj_sources="",
         global_values=(),
     )
 
@@ -324,13 +421,13 @@ def _f32(v: float) -> int:
 @pytest.mark.parametrize(
     "head, version, expected",
     [
-        (16, (2, 9), 8),
-        (32, (2, 9), 8),
-        (16, (2, 10), 0),
-        (32, (2, 10), 0),
-        (65535, (2, 9), None),
-        (65535, (2, 10), 0),
-        (65536, (2, 10), None),
+        (16, "2.9", 8),
+        (32, "2.9", 8),
+        (16, "2.10", 0),
+        (32, "2.10", 0),
+        (65535, "2.9", None),
+        (65535, "2.10", 0),
+        (65536, "2.10", None),
     ],
 )
 def test_runtime_shim_cdata_is_header_relative(monkeypatch, head, version, expected):
@@ -354,7 +451,7 @@ def test_runtime_shim_refuses_32_bit_pointer_layout(monkeypatch):
     monkeypatch.setattr(abi, "itemsize_table", lambda _version: b"\x01" * NDTYPES)
     abi.layout_for.cache_clear()
     try:
-        assert abi.layout_for((2, 10)) is None
+        assert abi.layout_for("2.10") is None
     finally:
         abi.layout_for.cache_clear()
 
@@ -512,6 +609,70 @@ def test_build_flags_add_cpp_extension_includes_to_digest_flags(monkeypatch):
     }
     assert flags["library_dirs"] == ["/l"]
     assert "-Wl,-rpath,/l" in flags["ccflags"]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"torch_version": "2.14.1+rocm7.2"},
+        {"torch_version": "2.14.0.dev20260805+rocm7.1"},
+        {"triton": ("3.8.0", 1, 2.0)},
+    ],
+)
+def test_triton_compile_cache_keys_on_the_headers_a_build_reads(monkeypatch, changed):
+    """An in-place upgrade of torch or triton must not get the old object back.
+
+    Triton caches `compile_so_from_src` on the source and the flags as
+    strings, so whatever names the headers has to reach one or the other:
+    the two keys here render the same C against the same include paths.
+    """
+    monkeypatch.setattr(build, "cxx_lib_dirs", lambda: ("/l",))
+    monkeypatch.setattr(build, "cxx_toolchain", lambda: (["/i"], ["/l"]))
+    compiled = []
+
+    def compile_so_bytes(src, name, flags):
+        compiled.append((src, name, flags))
+        return b""
+
+    monkeypatch.setattr(build, "_compile_so_bytes", compile_so_bytes)
+    monkeypatch.setattr(build, "_install", lambda *_: None)
+    key = dataclasses.replace(
+        _key(TorchAccessMode.STATIC_COMPILE), torch_version="2.14.0+rocm7.2"
+    )
+    for k in (key, dataclasses.replace(key, **changed)):
+        build.build(pathlib.Path("unused.so"), k)
+    assert compiled[0][0] == compiled[1][0]  # the same source...
+    assert compiled[0] != compiled[1]  # ...so the flags tell them apart
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("2.14.0+rocm7.2", "2.14.1+rocm7.2"),
+        ("2.14.0.dev20260804+rocm7.1", "2.14.0.dev20260805+rocm7.1"),
+        ("2.14.0+rocm7.2", "2.14.0+cu130"),
+    ],
+)
+def test_static_compile_keys_on_the_full_torch_version(monkeypatch, old, new):
+    """What STATIC_COMPILE's key records tells every pair of torch builds apart."""
+    seen = []
+    for version in (old, new):
+        with _running_torch(monkeypatch, version, "2.14") as abi:
+            seen.append(abi.torch_version())
+    assert seen == [old, new]
+
+
+def test_render_code_edits_move_the_module_digest(tmp_path):
+    """The key covers intj's Python, not only its version, template and headers."""
+    package = tmp_path / "intj"
+    shutil.copytree(
+        render_module.PACKAGE, package, ignore=shutil.ignore_patterns("__pycache__")
+    )
+    before = render_module.sources_digest(package)
+    assert before == render_module.intj_sources()
+    context = package / "render" / "context.py"
+    context.write_text(context.read_text() + "# a fix\n")
+    assert render_module.sources_digest(package) != before
 
 
 def test_runtime_shim_rejects_rebased_cdata_overflow(built, launch):
@@ -1527,3 +1688,95 @@ def test_ordinary_miss_gets_stream_and_grid_controls(built, stub_module):
     args = _args()
     assert launch(*args) is None
     assert calls == [(_CALL[0], _CALL[1], (1, 1, 1), len(args) - len(_CALL))]
+
+
+@pytest.fixture
+def fake_tsl(tmp_path, monkeypatch):
+    """Points KernelCache.TSL at a local tarball, unpacked into `tmp_path/deps`."""
+    import hashlib
+
+    from intj.kernel_cache import KernelCache
+    from intj.render import deps
+
+    tree = tmp_path / "src" / "robin-map-1.0"
+    for header in ("robin_map.h", "robin_set.h"):
+        (tree / "include" / "tsl").mkdir(parents=True, exist_ok=True)
+        (tree / "include" / "tsl" / header).write_text("")
+    archive = tmp_path / "robin-map-1.0.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(tree, arcname=tree.name)
+    monkeypatch.setitem(
+        deps._SOURCES,
+        KernelCache.TSL,
+        deps.Dependency(
+            version="1.0",
+            url=archive.as_uri(),
+            sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+            marker="include/tsl/robin_map.h",
+            include="include",
+        ),
+    )
+    monkeypatch.setattr(deps, "_deps_root", lambda: tmp_path / "deps")
+    monkeypatch.setattr(deps, "_INSTALL_FAILED", {})
+    return KernelCache.TSL
+
+
+_FILTERS = pytest.mark.skipif(
+    not hasattr(tarfile, "data_filter"), reason="tarfile has no extraction filters"
+)
+
+
+@_FILTERS
+def test_kernel_cache_installs_and_reinstalls(fake_tsl):
+    from intj.render import deps
+
+    assert deps.toolchain_for(fake_tsl) is None
+    first = deps.provision(fake_tsl)
+    assert pathlib.Path(first.include_dirs[0], "tsl", "robin_map.h").exists()
+    assert deps.install(fake_tsl, force=True) == first
+    # nothing but the tree and the lock: discarded trees leave no scratch behind
+    assert sorted(p.name for p in deps._deps_root().iterdir()) == [
+        ".tsl.lock",
+        "tsl-1.0",
+    ]
+
+
+@_FILTERS
+def test_force_reinstall_never_shows_a_half_deleted_tree(fake_tsl, monkeypatch):
+    """`toolchain_for` reads without the lock, so a tree must vanish at once."""
+    from intj.render import deps
+
+    deps.install(fake_tsl)
+    seen = []
+    rmtree = shutil.rmtree
+
+    def deleting(path, *args, **kwargs):
+        for header in pathlib.Path(path).rglob("robin_set.h"):
+            header.unlink()
+            # what a reader sees once the first file is gone
+            seen.append(deps.toolchain_for(fake_tsl))
+        rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(deps.shutil, "rmtree", deleting)
+    deps.install(fake_tsl, force=True)
+    assert seen == [None]
+    assert deps.toolchain_for(fake_tsl) is not None
+
+
+def test_tarfile_without_filters_is_an_install_error(fake_tsl, monkeypatch):
+    """Before 3.10.12 / 3.11.4 `filter=` is a TypeError; never extract without it."""
+    from intj.errors import UnsupportedKernel
+    from intj.render import deps
+
+    extractall = tarfile.TarFile.extractall
+
+    def unfiltered(self, path=".", members=None, *, numeric_owner=False, **kwargs):
+        if kwargs:
+            raise TypeError(f"extractall() got an unexpected keyword argument {kwargs}")
+        return extractall(self, path, members, numeric_owner=numeric_owner)
+
+    monkeypatch.delattr(tarfile, "data_filter", raising=False)
+    monkeypatch.setattr(tarfile.TarFile, "extractall", unfiltered)
+    with pytest.raises(UnsupportedKernel, match="extraction filters"):
+        deps.provision(fake_tsl)
+    assert deps.toolchain_for(fake_tsl) is None

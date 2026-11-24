@@ -2687,7 +2687,7 @@ def test_no_gpu_rejects_real_backend_options(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning was reached")
 
-    monkeypatch.setattr(render_deps, "_provision", forbidden)
+    monkeypatch.setattr(render_deps, "provision", forbidden)
     with pytest.raises(UnsupportedKernel, match="no_gpu.*options"):
         make_launcher(scale, no_gpu=True, options={"num_warps": 8}).__self__.check()
 
@@ -2697,7 +2697,7 @@ def test_binding_refusals_come_before_provisioning(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("provisioning was reached before a GPU-free refusal")
 
-    monkeypatch.setattr(render_deps, "_provision", forbidden)
+    monkeypatch.setattr(render_deps, "provision", forbidden)
     k = make_launcher(scale, bind_device=-1)  # pyright: ignore[reportArgumentType]
     with pytest.raises(TypeError, match="device ordinal"):
         k.__self__.check()
@@ -5015,7 +5015,7 @@ def _make_render_key(**overrides):
         compiler=("gcc", "13"),
         build_flags=(),
         ext_suffix=".so",
-        intj_version=(0, 1),
+        intj_sources="s",
         global_values=(),
     )
     return RenderKey(**{**fields, **overrides})
@@ -5031,15 +5031,6 @@ def test_package_version_has_one_source():
     assert intj.__version__ == "0.1.0"
 
 
-def test_render_key_uses_major_minor_version_only(monkeypatch):
-    monkeypatch.setattr(render_module, "__version__", "7.8.9")
-    assert render_module._cache_version() == (7, 8)
-    monkeypatch.setattr(render_module, "__version__", "7.8.10")
-    assert render_module._cache_version() == (7, 8)
-    monkeypatch.setattr(render_module, "__version__", "7.9.0")
-    assert render_module._cache_version() == (7, 9)
-
-
 @pytest.mark.parametrize(
     "cache,language",
     [
@@ -5053,11 +5044,7 @@ def test_render_key_tracks_cache_compiler_language(
 ):
 
     keys = []
-    monkeypatch.setattr(
-        render_deps,
-        "_provision",
-        lambda _: {"include_dirs": (), "archives": ()},
-    )
+    monkeypatch.setattr(render_deps, "provision", lambda _: render_deps.Toolchain())
 
     class Captured(Exception):
         pass
@@ -5079,6 +5066,7 @@ def test_render_key_tracks_cache_compiler_language(
         )
     assert len(keys) == 1
     assert keys[0].compiler == compiler_identity(language)
+    assert keys[0].intj_sources == render_module.intj_sources()
     assert ("-fvisibility=hidden" in keys[0].build_flags) == (language == "c++")
 
 
@@ -5270,11 +5258,7 @@ def test_kernel_cache_choice_reaches_the_digest():
 def test_kernel_cache_is_installed_on_demand(monkeypatch):
     """An unprovisioned backend installs itself, and its toolchain is what builds."""
     calls: list[KernelCache] = []
-    toolchain = {
-        "include_dirs": ("/nowhere/include",),
-        "library_dirs": (),
-        "archives": (),
-    }
+    toolchain = render_deps.Toolchain(include_dirs=("/nowhere/include",))
     # installed once calls is non-empty, like the real complete-tree check
     monkeypatch.setattr(
         "intj.render.deps.toolchain_for", lambda cache: toolchain if calls else None
@@ -5304,7 +5288,7 @@ def test_kernel_cache_is_installed_on_demand(monkeypatch):
         module_of(launch)
     # the requested backend, and what install returned actually reaches the build
     assert calls == [KernelCache.TSL]
-    assert keys[-1].cache_include_dirs == toolchain["include_dirs"]
+    assert keys[-1].cache_include_dirs == toolchain.include_dirs
 
 
 def test_kernel_cache_install_failure_is_reported_once(monkeypatch):
@@ -5907,9 +5891,14 @@ def test_recorded_dtypes_match_this_torch():
     when they no longer agree -- so this failing is what a silent fall back to
     another mode on a torch intj thinks it supports looks like before it happens.
     """
-    from intj.torch_intf.torch_abi import _DTYPES, live_dtypes, torch_version
+    from intj.torch_intf.torch_abi import (
+        _DTYPES,
+        abi_table_name,
+        live_dtypes,
+        torch_version,
+    )
 
-    recorded = _DTYPES.get(torch_version())
+    recorded = _DTYPES.get(abi_table_name(torch_version()))
     assert recorded is not None, "no stanza for the torch the suite is running against"
     assert recorded == live_dtypes(), (
         "intj/torch_intf/torch_abi/ is stale; regenerate with `python -m intj.tools.abi_detect`"
@@ -5923,7 +5912,7 @@ def test_abi_file_parses_and_refuses_broken_entries():
     offsets = "".join(f"{f} = {i}\n" for i, f in enumerate(OFFSETS))
     good = '["2.9"]\n' + offsets + 'dtypes = [["uint8", 1], ["int8", 1]]\n'
     assert _parse_abi(good, "2.9.toml") == {
-        (2, 9): (
+        "2.9": (
             {f: i for i, f in enumerate(OFFSETS)},
             {0: ("uint8", 1), 1: ("int8", 1)},
         )
@@ -6411,7 +6400,7 @@ def test_only_static_compile_module_is_keyed_on_the_torch_version(monkeypatch):
         ).parent.parent.name
 
     before = {m: digest_dir(m) for m in ACCESS_MODES}
-    monkeypatch.setattr(render_module, "torch_version", lambda: (99, 99))
+    monkeypatch.setattr(render_module, "torch_version", lambda: "99.99.0")
     after = {m: digest_dir(m) for m in ACCESS_MODES}
 
     assert after[TorchAccessMode.RUNTIME_SHIM] == before[TorchAccessMode.RUNTIME_SHIM]

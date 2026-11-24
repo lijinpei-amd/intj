@@ -71,6 +71,11 @@ and serializes to JSON (what `RenderKey.digest()` hashes). A list field anywhere
 compares fine and blows up on `hash()`; `test_value_types_compare_hash_and_serialize`
 guards that.
 
+The digest covers intj's own Python by content (`intj_sources`), so a renderer
+change needs no version bump. A build goes through triton's compile cache, which
+sees only the source and the flags as strings: anything else the binary depends on,
+such as the contents of a header, reaches a flag (`build._headers_flag`).
+
 ## Backends are data, not branches
 
 Everything backend-specific lives in a `Backend` subclass in `backend.py`
@@ -168,7 +173,8 @@ demand, once, after every GPU-free refusal it could have made instead
 (target-dependent ones wait for the build), and announces it on stderr;
 `python -m intj.kernel_cache <name>` does the same thing ahead of time. A flock
 keeps it to one installer per machine, and a tree is only visible to
-`toolchain_for` once it is complete. Anything that reaches the network belongs
+`toolchain_for` once it is complete, and renamed out of its sight before it is
+deleted. Anything that reaches the network belongs
 on that slow path, never on a launch.
 
 ## triton and torch are imported on first use, through `_imports`

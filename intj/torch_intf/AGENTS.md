@@ -15,6 +15,10 @@ kernel a pointer built from it. So:
 - No verified layout found is an error: raise, naming the torch version and how to
   add an entry. Never fall back silently, and never fill a gap with a nearby
   version's entry.
+- A release reads its major.minor's table; any other build (a nightly, a source
+  build, a release candidate) reads only a table recorded for its exact
+  `torch.__version__` (`abi_table_name`). Its dtypes matching the release's
+  proves nothing about its offsets.
 
 ## The generator checks what STATIC_COMPILE assumes
 
@@ -27,9 +31,13 @@ the same treatment: checked in `intj.tools.cpp_detect`, not at load.
 
 ## The ABI version files are a trust boundary
 
-Each `torch_abi/<major>.<minor>.toml` contains exactly the matching version
-table, with its measured offsets and dtypes together. The parser rejects malformed
-input with a `ValueError` naming the file, never skips it.
+Each `torch_abi/<major>.<minor>.toml` contains tables of that major.minor
+only: at most one for its releases, named `"major.minor"`, and one per
+pre-release build, named by its exact version, each with its measured offsets
+and dtypes together. `abi_detect` prints the name the running torch is looked up
+by. The parser rejects malformed input with a `ValueError` naming the file,
+never skips it. CI pins releases only (`ci/image.py` reads release tables), so a
+pre-release table is checked only on a machine running that build.
 
 ## Import torch and triton on demand
 

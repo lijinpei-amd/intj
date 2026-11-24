@@ -13,6 +13,7 @@ import dataclasses
 import enum
 import functools
 import pathlib
+import re
 import sys
 from typing import Any
 
@@ -122,10 +123,11 @@ def itemsize_bytes(dtypes: dict[int, tuple[str, int]]) -> bytes:
 
 
 @functools.lru_cache(maxsize=4)
-def itemsize_table(version: tuple[int, int] | None = None) -> bytes | None:
+def itemsize_table(version: str | None = None) -> bytes | None:
     """Returns the recorded dtype -> element size table for `version`, or None.
 
-    `version` defaults to the running torch's. None both when intj has no entry for
+    `version` is a torch version, the running torch's by default; see
+    `abi_table_name` for which table describes it. None both when intj has no entry for
     this torch and when it has one the running torch disagrees with.  The
     disagreement matters as much as the absence: the offsets in the same entry were
     measured against *that* set of dtypes, and a torch that has since renamed,
@@ -133,7 +135,7 @@ def itemsize_table(version: tuple[int, int] | None = None) -> bytes | None:
     missing table rules out `RUNTIME_SHIM`; `INTERPRETER` needs no TensorImpl
     layout.
     """
-    recorded = _DTYPES.get(version or torch_version())
+    recorded = _DTYPES.get(abi_table_name(version or torch_version()))
     if recorded is None or recorded != live_dtypes():
         return None
     return itemsize_bytes(recorded)
@@ -192,7 +194,7 @@ def dtype_index_table() -> bytes:
     return bytes(table)
 
 
-#: The verified torch ABIs, as one data file per version beside this module.
+#: The verified torch ABIs, as one data file per torch major.minor beside this module.
 #:
 #: Every number in them must be *measured*, never reasoned about: run
 #: `python -m intj.tools.abi_detect` on the target torch and paste what it
@@ -204,16 +206,49 @@ _ABI_DIR = pathlib.Path(__file__).with_name("torch_abi")
 OFFSETS = tuple(f.name for f in dataclasses.fields(TensorABI) if f.name != "itemsize")
 
 
+def abi_table_name(version: str) -> str:
+    """Returns the name of the `torch_abi/` table that may describe torch `version`.
+
+    A release's is its `major.minor`: every release of a minor shares one
+    measured layout, which its recorded dtypes then confirm or refuse
+    (`2.14.0+rocm7.2` and `2.14.1+cu130` both read `"2.14"`).  Anything else --
+    a nightly `2.14.0.dev20260804+rocm7.1`, a source build `2.14.0a0+gitdeadbee`, a
+    release candidate `2.14.0rc1` -- is its own table, named by its exact
+    version: its layout can move any day before the release, and the release's
+    entry was never measured on it.
+    """
+    release = re.fullmatch(
+        r"(\d+)\.(\d+)(?:\.\d+)*", version.partition("+")[0], re.ASCII
+    )
+    if release is None:
+        return version
+    return "%d.%d" % (int(release[1]), int(release[2]))
+
+
+def _table_minor(name: str) -> str | None:
+    # None unless `name` is what `abi_table_name` produces: a canonical
+    # major.minor, or a non-release's exact version.  Not `"2.14.0"`: a
+    # release is recorded once, as `"2.14"`.
+    found = re.fullmatch(
+        r"(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.[0-9A-Za-z.+_-]+)?", name, re.ASCII
+    )
+    if found is None or abi_table_name(name) != name:
+        return None
+    return f"{found[1]}.{found[2]}"
+
+
 def _parse_abi(
     text: str,
     source: str,
-) -> dict[tuple[int, int], tuple[dict[str, int], dict[int, tuple[str, int]]]]:
-    """Parses ABI text into offsets and dtypes, naming `source` in errors.
+) -> dict[str, tuple[dict[str, int], dict[int, tuple[str, int]]]]:
+    """Parses ABI text into offsets and dtypes per table name, naming `source` in errors.
 
-    Each `["major.minor"]` table holds the offsets plus a `dtypes` list indexed
-    by code. The file is pasted by hand, so anything off-shape raises rather than being
-    skipped: a skipped entry is a torch intj silently stops supporting, and a
-    misread one is offsets it reads through.
+    Each table, named as `abi_table_name` names it (`["2.14"]` for the
+    releases, `["2.14.0.dev20260804+rocm7.1"]` for that one nightly), holds the
+    offsets plus a `dtypes` list indexed by code. The file is pasted by hand,
+    so anything off-shape raises rather than being skipped: a skipped entry is
+    a torch intj silently stops supporting, and a misread one is offsets it
+    reads through.
 
     Raises:
         ValueError: `text` does not parse or an entry is off-shape.
@@ -226,15 +261,13 @@ def _parse_abi(
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise bad(f"does not parse: {e}") from None
-    table: dict[tuple[int, int], tuple[dict[str, int], dict[int, tuple[str, int]]]] = {}
+    table: dict[str, tuple[dict[str, int], dict[int, tuple[str, int]]]] = {}
     for version, entry in doc.items():
-        major, _, minor = version.partition(".")
-        if not (
-            major.isdigit()
-            and minor.isdigit()
-            and version == "%d.%d" % (int(major), int(minor))
-        ):
-            raise bad(f"has {version!r} where a major.minor version belongs")
+        if _table_minor(version) is None:
+            raise bad(
+                f"has {version!r} where a release's major.minor, or a "
+                "pre-release's exact version, belongs"
+            )
         if not isinstance(entry, dict) or set(entry) != {*OFFSETS, "dtypes"}:
             raise bad(
                 f"[{version!r}] must have exactly {', '.join(OFFSETS)} and dtypes"
@@ -259,7 +292,7 @@ def _parse_abi(
             raise bad(
                 f"[{version!r}] dtypes must be at most {NDTYPES} [name, size] pairs"
             )
-        table[(int(major), int(minor))] = (
+        table[version] = (
             offsets,
             {code: (name, size) for code, (name, size) in enumerate(dtypes)},
         )
@@ -268,17 +301,17 @@ def _parse_abi(
 
 def _load_abi(
     directory: pathlib.Path,
-) -> dict[tuple[int, int], tuple[dict[str, int], dict[int, tuple[str, int]]]]:
-    """Loads one verified ABI per version file, refusing missing or misnamed data."""
+) -> dict[str, tuple[dict[str, int], dict[int, tuple[str, int]]]]:
+    """Loads every verified ABI, one file per major.minor, refusing missing or misnamed data."""
     paths = sorted(directory.glob("*.toml"))
     if not paths:
         raise ValueError(f"intj: {directory} has no ABI version files")
-    table: dict[tuple[int, int], tuple[dict[str, int], dict[int, tuple[str, int]]]] = {}
+    table: dict[str, tuple[dict[str, int], dict[int, tuple[str, int]]]] = {}
     for path in paths:
         entry = _parse_abi(path.read_text(), str(path))
-        if len(entry) != 1 or path.stem != "%d.%d" % next(iter(entry)):
+        if not entry or any(_table_minor(name) != path.stem for name in entry):
             raise ValueError(
-                f"intj: {path} must contain one major.minor table matching its filename"
+                f"intj: {path} must contain only tables of the major.minor in its filename"
             )
         table.update(entry)
     return table
@@ -289,16 +322,17 @@ _LAYOUTS = {v: offsets for v, (offsets, _) in _ABI.items()}
 _DTYPES = {v: dtypes for v, (_, dtypes) in _ABI.items()}
 
 
-def supported_versions() -> list[tuple[int, int]]:
-    """Returns every torch (major, minor) with a recorded layout, sorted."""
-    return sorted(_LAYOUTS)
+def supported_versions() -> list[str]:
+    """Returns every table name with a recorded layout, in version order."""
+    return sorted(_LAYOUTS, key=lambda name: (*map(int, name.split(".")[:2]), name))
 
 
 @functools.lru_cache(maxsize=4)
-def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
-    """Returns the layout for `version`, or None if intj has no verified entry.
+def layout_for(version: str | None = None) -> TensorABI | None:
+    """Returns the layout for torch `version`, or None if intj has no verified entry.
 
-    `version` defaults to the running torch's. None rather than a guess: a wrong
+    `version` defaults to the running torch's; `abi_table_name` says which
+    table describes it. None rather than a guess: a wrong
     offset cannot raise, it reads whatever happens to be at that address and hands
     the kernel a pointer built from it. An entry whose `dtypes` no longer describe
     the running torch counts as no entry at all -- see `itemsize_table`. The
@@ -308,7 +342,7 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
     if ctypes.sizeof(ctypes.c_void_p) != 8:  # every recorded Torch layout is 64-bit
         return None
     version = version or torch_version()
-    offsets = _LAYOUTS.get(version)
+    offsets = _LAYOUTS.get(abi_table_name(version))
     items = itemsize_table(version)
     if offsets is None or items is None:
         return None
@@ -321,11 +355,7 @@ def layout_for(version: tuple[int, int] | None = None) -> TensorABI | None:
 
 
 @functools.lru_cache(maxsize=1)
-def torch_version() -> tuple[int, int]:
-    """Returns the running torch's (major, minor)."""
+def torch_version() -> str:
+    """Returns the running torch's full version, pre-release and local parts included."""
     _imports.ensure_torch_imported()
-    torch = _imports.torch
-
-    major, _, rest = torch.__version__.partition(".")
-    minor = rest.partition(".")[0]
-    return (int(major), int(minor))
+    return str(_imports.torch.__version__)

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
+import os
 import sysconfig
 import threading
 import types
@@ -17,7 +19,6 @@ from typing import TYPE_CHECKING, Any
 
 from .. import _imports
 from .. import backend as backends
-from .._version import __version__
 from ..compile_options import refuse_unknown_options, resolve
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
@@ -82,13 +83,14 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
     nwords = max(layout.nwords, 1) if tuning is not None else layout.nwords
     # check() provisioned already: this is the idempotent, no-network
     # lookup of the toolchain it installed
-    cache_toolchain = deps._provision(b.option.kernel_cache)  # pyright: ignore[reportPrivateUsage]  # checked toolchain
+    cache_toolchain = deps.provision(b.option.kernel_cache)
     # the kernel's own name, unless python allows something C does not
     module_name = b.jit_func.__name__
     if not (module_name.isidentifier() and module_name.isascii()):
         module_name = "kernel"
-    # The rendered source is a pure function of the template, the runtime header
-    # and the fields it reads, so hash those rather than the render itself.
+    # The rendered source is a pure function of the template, the runtime header,
+    # intj's Python and the fields it reads, so hash those rather than the render
+    # itself.
     key = RenderKey(
         module_name=module_name,
         kernel_repr=get_full_name(b.jit_func),
@@ -113,8 +115,8 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         torch_version=None,
         cxx_abi=None,
         kernel_cache=b.option.kernel_cache.value,
-        cache_include_dirs=cache_toolchain["include_dirs"],
-        cache_archives=cache_toolchain["archives"],
+        cache_include_dirs=cache_toolchain.include_dirs,
+        cache_archives=cache_toolchain.archives,
         python_version=cpython_abi.python_version(),
         free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
         cpython_static_compile_header=_verified_cpython_header(),
@@ -140,7 +142,7 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         compiler=(),
         build_flags=(),
         ext_suffix=sysconfig.get_config_var("EXT_SUFFIX"),
-        intj_version=_cache_version(),
+        intj_sources=intj_sources(),
         global_values=b.global_values,
     )
 
@@ -207,9 +209,38 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         return loaded(confirmed)
 
 
-def _cache_version() -> tuple[int, int]:
-    major, minor, *_ = __version__.split(".")
-    return int(major), int(minor)
+#: intj's own package directory, whose Python sources `intj_sources` hashes
+PACKAGE = Path(__file__).parent.parent
+
+
+@functools.lru_cache(maxsize=1)
+def intj_sources() -> str:
+    """Returns `sources_digest(PACKAGE)`, computed once per process."""
+    return sources_digest(PACKAGE)
+
+
+def sources_digest(root: Path) -> str:
+    """Returns a hash of every Python source under `root`, by path and content.
+
+    The key hashes the template and the headers by content, but the Python that
+    turns a key into C -- `render/context.py`, `specialization.py`,
+    `scalar_types.py` and what they import -- would otherwise be covered by
+    intj's version alone, so a fixed renderer would keep loading the module
+    its broken predecessor built.  All of intj, rather than a list of the
+    files that render: a list goes stale the day a render helper moves.
+    """
+    digest = hashlib.sha256()
+    # os.walk, not rglob: `Path.relative_to` alone costs ~1 ms over intj's files
+    for directory, subdirs, files in os.walk(root):
+        subdirs[:] = sorted(d for d in subdirs if d != "__pycache__")
+        prefix = os.path.relpath(directory, root)
+        for name in sorted(f for f in files if f.endswith(".py")):
+            with open(os.path.join(directory, name), "rb") as source:
+                content = source.read()
+            for part in (f"{prefix}/{name}".encode(), content):
+                digest.update(len(part).to_bytes(8, "little"))
+                digest.update(part)
+    return digest.hexdigest()
 
 
 def _cxx_abi() -> int:
@@ -301,18 +332,14 @@ def _resolve_torch_access_mode(
 
 def _unverified_torch_message() -> str:
     return (
-        f"intj: no verified tensor layout for torch {_torch_version_string()} "
-        f"(have {', '.join('%d.%d' % v for v in supported_versions())}), or its "
+        f"intj: no verified tensor layout for torch {torch_version()} "
+        f"(have {', '.join(supported_versions())}; a pre-release or source build "
+        "needs a table for its exact version), or its "
         "dtypes no longer match the recorded entry, or CPython's object header "
         "makes the tensor offset unrepresentable; pass "
-        "torch_access_mode=TorchAccessMode.INTERPRETER, or add a version file to intj/torch_intf/torch_abi/ "
+        "torch_access_mode=TorchAccessMode.INTERPRETER, or add a table to intj/torch_intf/torch_abi/ "
         "with `python -m intj.tools.abi_detect` on this torch version"
     )
-
-
-def _torch_version_string() -> str:
-    _imports.ensure_torch_imported()
-    return str(_imports.torch.__version__)
 
 
 _LOADED: dict[RenderKey, types.ModuleType] = {}

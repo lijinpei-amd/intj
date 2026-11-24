@@ -194,8 +194,11 @@ facts, bakes values, or marks values for binding. See
 
 How the module reads a tensor's pointer, dtype and storage size, as an
 `intj.TorchAccessMode`: `RUNTIME_SHIM` (recorded field offsets for verified
-torch versions), `STATIC_COMPILE` (offsets from torch's C++ headers; rebuilt
-when torch changes) or `INTERPRETER` (through Python calls; slowest). None
+torch versions: any release of a recorded major.minor, but a nightly, source
+build or release candidate only where its exact version is recorded),
+`STATIC_COMPILE` (offsets from torch's C++ headers; rebuilt when the torch
+version changes, pre-release and local parts included) or `INTERPRETER`
+(through Python calls; slowest). None
 selects `STATIC_COMPILE` if a C++ compiler and torch's headers are present,
 else `RUNTIME_SHIM` if the running torch is verified, else `INTERPRETER`.
 
@@ -206,7 +209,11 @@ The hash map behind the kernel cache, as an `intj.KernelCache`: `INTJ`
 (`absl::flat_hash_map`). `TSL` and `ABSL` compile the module as C++, and are
 downloaded at a pinned version (abseil also built) into
 `$TRITON_HOME/.triton/intj/deps/` on first use; `python -m intj.kernel_cache
-all` does that ahead of time.
+all` does that ahead of time, and `--force` reinstalls, renaming the old tree
+away before deleting it so no launcher sees it half-deleted. Unpacking needs
+`tarfile` extraction filters (Python 3.8.17, 3.9.17, 3.10.12, 3.11.4, 3.12 or
+later); an older interpreter refuses `TSL` and `ABSL` with `UnsupportedKernel`
+(tested by removing the filters, untested on such an interpreter).
 
 #### `no_gpu`
 
@@ -801,5 +808,9 @@ are untested with per-launcher compiler construction.
 
 The digest covers the kernel source (`cache_key`), the parameter
 table (including `do_not_specialize*`, which `cache_key` does not cover), the target,
-the canonicalized options, intj's own `runtime/` bytes, the triton build, the compiler,
-and `EXT_SUFFIX`. `rm -rf $TRITON_HOME/.triton/intj` clears every intj artifact.
+the canonicalized options, intj's own Python sources and `runtime/` bytes, the triton
+build, the compiler, `EXT_SUFFIX`, and for `STATIC_COMPILE` the full torch version.
+A build compiles through triton's own cache, which keys on the source and the flags
+as strings; a define hashing the runtime headers, the torch version and the triton
+build keeps an in-place upgrade of torch or triton from getting the old object back.
+`rm -rf $TRITON_HOME/.triton/intj` clears every intj artifact.

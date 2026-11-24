@@ -18,6 +18,7 @@ from ..python_intf.cpython_abi import pyobject_size
 from ..torch_intf.torch_abi import (
     OFFSETS,
     TensorABI,
+    abi_table_name,
     dtype_code,
     itemsize_bytes,
     live_dtypes,
@@ -213,7 +214,11 @@ def _expected(t: Any) -> tuple[int, int, int]:
 
 
 def _main() -> None:
-    """Prints the running Torch entry for its `torch_abi/<major>.<minor>.toml`."""
+    """Prints the running Torch entry for its `torch_abi/<major>.<minor>.toml`.
+
+    The table is named as the running torch is looked up: a release by its
+    `major.minor`, any other build by its exact version (`abi_table_name`).
+    """
     _imports.ensure_torch_imported()
     torch = _imports.torch
 
@@ -234,7 +239,7 @@ def _main() -> None:
         )
 
     print(f"# torch {torch.__version__}, x86-64")
-    print('["%d.%d"]' % torch_version())
+    print(f'["{abi_table_name(torch_version())}"]')
     for f in OFFSETS:
         print(f"{f} = {getattr(layout, f)}")
     print("dtypes = [  # indexed by at::ScalarType code")

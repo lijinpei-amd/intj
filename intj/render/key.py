@@ -69,7 +69,9 @@ class RenderKey:
         str, ...
     ]  # changes to compiler flags invalidate cached .so files
     ext_suffix: str | None
-    intj_version: tuple[int, int]
+    #: `render.module.intj_sources()`: intj's Python sources, by content.  The
+    #: render is written in them, and the version is one of them.
+    intj_sources: str
     #: `assume_constant_globals=True`: the globals the kernel reads, by value.
     #: triton's `cache_key` hashes only the `tl.constexpr` ones; a plain global
     #: (a tuple read by a `constexpr_function`) would otherwise let two
@@ -97,10 +99,12 @@ class RenderKey:
     #: because the module is built against it.
     cache_include_dirs: tuple[str, ...]
     cache_archives: tuple[str, ...]
-    #: STATIC_COMPILE only: what the binary was compiled against. The other modes
-    #: discover everything at load, so their `.so` is torch-version-independent
-    #: and these stay None -- which is what keeps them out of the digest.
-    torch_version: tuple[int, int] | None
+    #: STATIC_COMPILE only: what the binary was compiled against -- the full
+    #: `torch.__version__`, since a nightly or a patch release can move what the
+    #: headers declare. The other modes discover everything at load, so their
+    #: `.so` is torch-version-independent and these stay None -- which is what
+    #: keeps them out of the digest.
+    torch_version: str | None
     cxx_abi: int | None
     #: The interpreter the module is built for and loaded into.  Every mode reads
     #: CPython internals (see intj/python_intf), so a module is never shared
