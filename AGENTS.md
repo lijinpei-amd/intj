@@ -177,12 +177,13 @@ on that slow path, never on a launch.
 function calls `_imports.ensure_triton_imported()` (or `ensure_torch_imported()`),
 then reads the cached name as `_imports.knobs`, `_imports.torch`, ... -- never
 `from ._imports import knobs`, which copies the None it starts as. A new name goes
-in `_imports.py`. Three imports stay local, each commented: Gluon's runtime and
-`torch.utils.cpp_extension` cost tens of ms, and `triton.backends.amd` is absent
-from a triton built without it. `test_importing_intj_imports_neither_triton_nor_torch`
-guards the rule. Only a build imports `cpp_extension`: `cxx_lib_dirs` decides the
-access mode and the digest without it wherever it can be certain. Where it then
-cannot import, the build raises `CppExtensionUnavailable` and the launcher
+in `_imports.py`. Three modules are imported locally, each site commented:
+Gluon's runtime and `torch.utils.cpp_extension` cost tens of ms, and
+`triton.backends.amd` is absent from a triton built without it.
+`test_importing_intj_imports_neither_triton_nor_torch` guards the rule. Only a
+build and `tools/cpp_detect.py` import `cpp_extension`: `cxx_lib_dirs` decides
+the access mode and the digest without it wherever it can be certain. Where it
+then cannot import, the build raises `CppExtensionUnavailable` and the launcher
 chooses again from `cxx_toolchain`, as `check()` would have.
 `triton.runtime.interpreter` (~4 ms) is never imported: only code that imported
 it can hold an `InterpretedFunction`, so `_imports.interpreted_function()` reads

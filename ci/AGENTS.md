@@ -24,7 +24,7 @@ Ninja has no command-line variables, so scripts read the environment:
 | `typecheck` | pyright |
 | `wheel` | builds `ci/out/dist/intj-*.whl` (clears old ones) |
 | `install` | editable: `pip install -e .`; wheel: (re)installs the one wheel in `ci/out/dist` |
-| `test-cpu` | GPU-free tests |
+| `test-cpu` | GPU-free tests: the files `test-cpu.sh` lists (only the triton-free ones without triton), minus tests marked `gpu` |
 | `test-gpu` | the full suite |
 | `bench-host`, `bench-gpu` | `bench_launch.py`, output in `ci/out/bench/` |
 | `matrix` | writes `ci/out/matrix.json` for the workflows, with the cells not yet published |
@@ -40,6 +40,11 @@ target as separate invocations.
   `py`, so the mode decides what `import intj` means. Wheel mode runs
   `$PYTHON -I` from `ci/out/run/` and refuses an intj outside site-packages.
 - A new check is a script plus a `build` line, then a workflow step calling it.
+- A test that needs a GPU, in a file `test-cpu.sh` lists, is marked
+  `@pytest.mark.gpu`; one that needs triton, in a triton-free file, calls
+  `pytest.importorskip("triton")`. A new GPU-free test file goes in that list.
+  `test_launcher.py` and `test_tuned.py` stay out: collecting them queries the
+  GPU (`knob_helpers`).
 - Anything that goes into an image is under `ci/dockerfiles/`: every file there
   feeds the tag hash.
 - A published tag is never rebuilt; to refresh base images and unpinned

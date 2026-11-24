@@ -19,7 +19,7 @@ the launcher is compiled as C++.
 | File | Responsibility |
 | --- | --- |
 | [cpython_abi.py](cpython_abi.py) | Records supported Python versions, selects the header, and reads the interpreter's object header size. |
-| [cpython_abi.h](cpython_abi.h) | Implements scalar readers, compatibility shims, and the module mutex. |
+| [cpython_abi.h](cpython_abi.h) | Implements scalar readers and compatibility shims. |
 
 The checker, [tools/check.py](../tools/check.py), compiles the header and
 compares its results with the running interpreter.
@@ -179,8 +179,8 @@ This matrix covers the `INTERPRETER` tensor reader and `RUNTIME_SHIM` where a
 verified Torch layout exists, including free-threaded builds. `STATIC_COMPILE`
 is covered separately in [test_launcher.py](../../tests/test_launcher.py).
 The matrix does not exercise Triton compilation or GPU execution; the full
-launcher is not tested below Python 3.10 because `triton>=3.8` has no wheel for
-those interpreters.
+launcher is not tested below Python 3.10 because no Triton intj accepts
+(`triton>=3.7`) has a wheel for those interpreters.
 
 ## Adding a Python version
 

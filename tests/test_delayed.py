@@ -115,6 +115,7 @@ def test_concurrent_first_calls_run_it_once_per_launcher(siblings):
     assert errors == [] and calls == [1] * (8 if siblings else 1)
 
 
+@pytest.mark.gpu
 def test_results_enter_module_identity():
     def launcher(warps):
         return make_launcher(store, delayed=lambda: {"options": {"num_warps": warps}})

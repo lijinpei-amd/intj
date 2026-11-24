@@ -65,6 +65,7 @@ def python_annotated_int(x, out, n: int):
     tl.store(out + i, value + 1, i < n)
 
 
+@pytest.mark.gpu
 def test_launch_binds_keywords_default_and_compile_option():
     x = torch.arange(129, device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -72,6 +73,7 @@ def test_launch_binds_keywords_default_and_compile_option():
     torch.testing.assert_close(out, x + 1)
 
 
+@pytest.mark.gpu
 def test_launch_calls_python_grid_with_current_named_values():
     x = torch.arange(65, device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -86,6 +88,7 @@ def test_launch_calls_python_grid_with_current_named_values():
     assert seen == [(65, 64)]
 
 
+@pytest.mark.gpu
 def test_launch_bakes_dtype_constexpr():
     x = torch.tensor([1.001, -2.003], device="cuda", dtype=torch.float32)
     out = torch.empty_like(x)
@@ -97,6 +100,7 @@ def test_launch_bakes_dtype_constexpr():
     assert not torch.equal(first, out)
 
 
+@pytest.mark.gpu
 def test_launch_bakes_string_constexpr():
     x = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -106,6 +110,7 @@ def test_launch_bakes_string_constexpr():
     torch.testing.assert_close(out, x)
 
 
+@pytest.mark.gpu
 def test_launch_bakes_jit_function_constexpr():
     x = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -115,6 +120,7 @@ def test_launch_bakes_jit_function_constexpr():
     torch.testing.assert_close(out, x - 1)
 
 
+@pytest.mark.gpu
 def test_launch_accepts_python_int_annotation_like_triton():
     x = torch.tensor([2.0, 3.0], device="cuda")
     out = torch.empty_like(x)
@@ -199,6 +205,7 @@ def test_launch_or_interpret_runs_real_triton_interpreter():
         torch.testing.assert_close(out, x + 1)
 
 
+@pytest.mark.gpu
 def test_launch_or_interpret_uses_native_launcher_in_compiled_mode():
     import intj.compat as compat
     from triton import knobs
@@ -213,6 +220,7 @@ def test_launch_or_interpret_uses_native_launcher_in_compiled_mode():
     torch.testing.assert_close(out, x + 1)
 
 
+@pytest.mark.gpu
 def test_launch_returns_cached_compiled_kernel_when_requested():
     x = torch.arange(32, device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -226,6 +234,7 @@ def test_launch_returns_cached_compiled_kernel_when_requested():
     torch.testing.assert_close(out, x + 1)
 
 
+@pytest.mark.gpu
 def test_launch_returns_compiled_kernel_for_python_grid():
     x = torch.arange(32, device="cuda", dtype=torch.int32)
     out = torch.empty_like(x)
@@ -369,6 +378,7 @@ def test_fpsan_knob_change_reselects_compat_launcher(monkeypatch):
         compat._cached.cache_clear()
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("hook_name", ["launch_enter_hook", "launch_exit_hook"])
 def test_cached_launch_refuses_active_triton_hook(monkeypatch, hook_name):
     import intj.compat as compat
@@ -397,6 +407,7 @@ def test_launch_rejects_unpinned_cpu_tensor_before_gpu_driver_lookup():
         launch(unused_pointer, (1,), x)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     "wrap",
     [
@@ -414,6 +425,7 @@ def warps_tag(out, num_warps: tl.constexpr):
     tl.store(out + tl.arange(0, 64), tl.full([64], num_warps, tl.int32))
 
 
+@pytest.mark.gpu
 def test_keyword_naming_a_parameter_and_an_option_sets_both():
     """A keyword naming both a parameter and a compile option sets both.
 

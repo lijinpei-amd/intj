@@ -101,6 +101,7 @@ PyMODINIT_FUNC PyInit__intj_int_probe(void) {
 
 
 def test_host_launcher_builds_with_installed_triton(tmp_path):
+    pytest.importorskip("triton")
     import torch
 
     from intj import TorchAccessMode, make_launcher

@@ -34,7 +34,8 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
   `>=3.10,<3.15`. So `make_launcher` and the compile callback are only exercised
   from 3.10 to 3.14t: the CI cells `manylinux_2_28-py3.8`, `manylinux_2_28-py3.9`
   and `alma9-py3.9` are `"gpu": false`, build without triton, and run only
-  `tests/test_runtime.py` (as does `tests/run_python_matrix.sh` below 3.10).
+  the triton-free tests (`tests/run_python_matrix.sh` runs only
+  `tests/test_runtime.py` on every version).
   The same bound leaves the 3.15/3.15t torch pins untested with triton.
 - **Develop a Torch and CPython interface spec.** Define the binary data each
   interface reads, supported versions and build variants, how those facts are
@@ -42,8 +43,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 
 ## Coverage (all currently refused loudly)
 
-- Parameter annotations (`extra_annotation`), including non-constexpr annotated
-  parameters, which change arity (an annotated `== 1` int stays a kernel param).
 - **Tuple / namedtuple arguments and tuple constexprs.** `ARG_TUPLE` recursion in the decoder and
   the key; ~41 Triton-test entries pass tuples. aiter's last one, `attn_res`'s
   `res`, became 16 pointer parameters, one launcher per `L2` bucket.
@@ -120,8 +119,6 @@ Ranked. Each line is a known gap in the committed code, not a wishlist.
 - **Measure compact-int decoding.** Compare the existing inline CPython helpers
   with a direct `lv_tag`/`ob_digit[0]` path on supported builds; use custom
   decoding only if it is faster and passes `intj/tools/check.py`.
-- Single-entry inline cache in front of the hash map (~2-3 ns, ~100% hit in a
-  steady-state loop).
 - Annotated fast paths: pinning a parameter's type skips the generic classifier
   (~185 ns vs ~275 ns measured upstream on a 10-arg kernel).
 - Tuned launches decode arguments on the generic path; the auto-decode macros do

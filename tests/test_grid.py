@@ -28,6 +28,7 @@ def write_programs(out, X, Y):
     tl.store(out + x + X * (y + Y * z), 1)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("dimensions,shape", [(1, (3,)), (2, (3, 2)), (3, (3, 2, 4))])
 def test_grid_arg_num_passes_each_requested_dimension(dimensions, shape):
     launcher = make_launcher(write_programs, grid_arg_num=dimensions)
@@ -46,6 +47,7 @@ def test_grid_arg_num_passes_each_requested_dimension(dimensions, shape):
     torch.testing.assert_close(out[count:], torch.zeros_like(out[count:]))
 
 
+@pytest.mark.gpu
 def test_decorator_factory_form_matches_call_form_with_grid_arg_num():
     """The decorator-factory form builds the same launcher as the call form.
 
@@ -210,6 +212,7 @@ def test_grid_py_receives_baked_and_bound_values():
     assert seen == [{"out": 0, "X": 3, "Y": 2}]
 
 
+@pytest.mark.gpu
 def test_grid_py_gpu_dimensions_and_exception():
     def grid(meta):
         assert isinstance(meta["out"], torch.Tensor)
@@ -239,6 +242,7 @@ def compiled_grid(X: int, Y: int, *, cap: int, active: bool):
     return (min(tiles, cap), Y if active else 1)
 
 
+@pytest.mark.gpu
 def test_grid_cpp_uses_reused_and_extra_arguments_without_python_callback():
     launcher = make_launcher(write_programs, grid_cpp=compiled_grid)
     out = torch.zeros(6, device="cuda", dtype=torch.int32)

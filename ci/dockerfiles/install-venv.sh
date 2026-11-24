@@ -10,6 +10,6 @@ if [ -n "$TRITON" ]; then
   "$pip" uninstall -y triton pytorch-triton-rocm || true
   "$pip" install "triton==$TRITON"
 fi
-# numpy: triton.runtime.interpreter imports it unconditionally, and
-# make_launcher imports that module on every call.
+# numpy: triton.runtime.interpreter imports it unconditionally, and the
+# TRITON_INTERPRET tests import that module (intj itself never does).
 "$pip" install jinja2 "tomli; python_version < '3.11'" pytest ninja pre-commit "pyright[nodejs]" numpy

@@ -6,23 +6,24 @@
 from intj import KernelCache, TorchAccessMode, make_launcher
 
 launcher = make_launcher(
-    jit_func,              # a @triton.jit function
+    jit_func,              # a @triton.jit function, positional; omit it for a decorator
+    # every argument below is keyword-only
     options=None,          # triton compile options, e.g. {"num_warps": 8}
     dynamic_options=(),    # compile options / knobs.<group>.<name> passed per call
     bind_device=None,      # a device ordinal: the launcher takes no device argument
     bind_args=None,        # bound parameter name -> value
-    grid_arg_num=None,     # keyword-only: 1, 2, or 3 separate grid dimensions
-    grid_cpp=None,         # keyword-only: annotated def compiled into the extension
-    grid_py=None,          # keyword-only: Python callback evaluated on each launch
+    grid_arg_num=None,     # 1, 2, or 3 separate grid dimensions
+    grid_cpp=None,         # annotated def compiled into the extension
+    grid_py=None,          # Python callback evaluated on each launch
     extra_annotation=None, # parameter name -> annotation or shorthand
     torch_access_mode=None, # automatic; pass a TorchAccessMode to select one
     kernel_cache=KernelCache.INTJ,
     no_gpu=False,          # host decode/cache path, without GPU work
     verify_annotation=False,
-    return_compiled=False, # keyword-only: return the cached Triton CompiledKernel
-    assume_constant_globals=False, # keyword-only: accept kernels reading globals
-    ndebug=True,           # keyword-only: compile the module with NDEBUG (asserts off)
-    delayed=None,          # keyword-only: () -> more of these keywords, replacing them, run on first use
+    return_compiled=False, # return the cached Triton CompiledKernel
+    assume_constant_globals=False, # accept kernels reading globals
+    ndebug=True,           # compile the module with NDEBUG (asserts off)
+    delayed=None,          # () -> more of these keywords, replacing them, run on first use
 )
 ```
 
@@ -135,9 +136,10 @@ is:
   a `tl.constexpr` parameter named like a compile option.
 - a dynamic option: a `tl.constexpr` parameter named like a compile option and
   listed in `dynamic_options` is passed with the dynamic values instead.
-- bound: annotated `Argument(bind_value=BindValue.TENSOR)` (or `POINTER`) and
-  given through `bind_args=`, `bind_args()` or `bind_device_args()`. A bound
-  tensor's current pointer and storage are read on every call.
+- bound: annotated `Argument(specialize=NEVER, bind_value=BindValue.TENSOR)`
+  (or `POINTER`, or another `specialize` that leaves no fact `AUTO`) and given
+  through `bind_args=`, `bind_args()` or `bind_device_args()`. See
+  [Bound values](#bound-values).
 
 Each value is decoded and keyed as Triton would specialize it. See
 [Argument annotations](#argument-annotations).
@@ -474,7 +476,7 @@ These annotations behave specially:
 
 A **fact** is one property Triton can specialize a parameter on.
 `Argument(specialize=...)` takes one of these policies; anything else raises
-`ValueError` at `check()`:
+`TypeError` when the `Argument` is constructed:
 
 | policy | listed facts | other facts |
 |---|---|---|
@@ -548,6 +550,81 @@ measured. It applies wherever intj measures the range (an `AUTO` fact on AMD,
 or an assumed one under `verify_annotation=True`); on a parameter whose range is
 never measured (a non-pointer, `NEVER`, `do_not_specialize`, a baked or bound
 value) it raises at `check()`.
+
+### Bound values
+
+A bound parameter leaves the call: its value comes once from `bind_args=`,
+`bind_args(**values)` or `bind_device_args(ordinal, **values)`. Annotate it with
+`bind_value`:
+
+- `BindValue.TENSOR` takes an exact `torch.Tensor` or `torch.nn.Parameter`, or
+  `None`, keeps it alive, and reads its current pointer and storage on every
+  call. Without a pointer `type`, the bound tensor fixes the dtype, and a bound
+  `None` compiles as a constexpr `None`; `type=None` accepts only `None`.
+- `BindValue.POINTER` needs exactly one explicit pointer type
+  (`type=tl.pointer_type(tl.float32)`) and takes an int address, `None`, a
+  tensor, or an object with `data_ptr()`. The address is read once, at
+  binding, and an object is kept alive.
+
+The module is built before the value is known, so no fact that applies may be
+`AUTO`: use `specialize=NEVER` or `Exactly(...)`. The default, a fact left
+`AUTO`, or `POINTER` without one pointer type raises `ValueError` at
+`check()`; a bound value missing from `bind_args` raises `TypeError` there.
+
+```python
+@triton.jit
+def k(x, out, n, BLOCK: tl.constexpr): ...
+
+launcher = make_launcher(k, extra_annotation={
+    "x": Argument(specialize=NEVER, bind_value=BindValue.TENSOR),
+})
+bound = launcher.__self__.bind_args(x=x)
+bound(device, stream, grid, out, n, 128)          # x is not passed
+
+fixed = launcher.__self__.bind_device_args(device, x=x)
+fixed(stream, grid, out, n, 128)
+```
+
+The other modes hold a bound tensor's Python object; `STATIC_COMPILE` holds an
+`at::Tensor` copy, which the garbage collector cannot see through. There, if
+the tensor's Python object refers back to the launcher, the cycle keeps both
+alive until that reference is cleared (`tensor.bound = None`); untested.
+
+## Triton-style migration bridge: `intj.compat`
+
+`intj.compat.launch(kernel, grid, /, *args, return_compiled=False, **kwargs)`
+launches a plain `@triton.jit` function as `kernel[grid](*args, **kwargs)`
+would: kernel arguments by position or keyword, parameter defaults applied,
+and any other keyword as a compile option. `grid` is an int, a 1–3 element
+tuple/list, or a callable given the kernel's values as a `meta` dict:
+
+```python
+from intj.compat import launch
+
+launch(kernel, (triton.cdiv(n, BLOCK),), out, n=n, BLOCK=BLOCK, num_warps=4)
+```
+
+Each call binds the Python arguments and reads the current device and stream,
+then reuses a launcher it cached for that kernel and those options; call
+`make_launcher` yourself for hot loops. A `str`, `tl.dtype` or JIT-function
+constexpr is baked into the launcher it selects, and a `TensorWrapper`
+(`triton.reinterpret`) passes its base tensor typed as the wrapper's dtype. As
+in Triton, a keyword naming both a `tl.constexpr` parameter and a compile
+option (`num_warps=8` for a `num_warps: tl.constexpr` kernel) sets both.
+`return_compiled=True` returns the cached Triton `CompiledKernel`.
+
+Nothing falls back to Triton: it raises `UnsupportedKernel` for what
+`make_launcher` refuses, for `@triton.autotune` and `@triton.heuristics`
+wrappers (give those to `make_launcher`, see
+[Autotune and heuristics](#autotune-and-heuristics)), and while a Triton launch
+enter or exit hook is registered, checked on every call. An unpinned CPU tensor
+raises `ValueError`. It cannot pass `assume_constant_globals`, so a kernel that
+reads globals stays refused. Two modes run Triton itself, by design: Triton's
+compile-warmup test mode, and `intj.compat.launch_or_interpret`, which takes
+the same arguments and calls `kernel[grid]` while Triton's interpreter is on.
+
+Launchers from `make_launcher` never run Triton's launch hooks; leave
+hook-sensitive launches on Triton.
 
 ## Not supported
 

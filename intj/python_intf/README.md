@@ -47,8 +47,9 @@ interpreter's header size. At module load, the compiled setter adds its own
 
 ## Free-threaded Builds
 
-On a free-threaded build, `Py_GIL_DISABLED` selects a `PyMutex` to protect
-kernel-cache reads and updates and the compile-callback reference. The lock
+On a free-threaded build, each launcher's kernel cache and memos are guarded
+by its own `intj_rwlock`, a pthread rwlock defined in
+[`runtime/intj_launcher_base.h`](../runtime/intj_launcher_base.h). The lock
 operations compile away in a GIL build. On supported x86-64 builds, the
 compile-time `sizeof(PyObject)` is 32 bytes with free threading and 16 bytes
 with the GIL, shifting the `cdata` field accordingly.

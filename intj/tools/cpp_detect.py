@@ -137,6 +137,7 @@ def measure() -> tuple[dict[str, int], dict[str, int], dict[int, int]]:
         subprocess.CalledProcessError: The probe does not build.
     """
     _imports.ensure_torch_imported()
+    # not cached with torch: importing it costs ~55 ms
     from torch.utils import cpp_extension
 
     includes, libs = cpp_extension.include_paths(), cpp_extension.library_paths()

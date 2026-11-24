@@ -21,6 +21,9 @@ version = {attr = "intj._version.__version__"}
 [tool.setuptools.package-data]
 intj = ["runtime/*", "render/*.jinja", "python_intf/*.h", "torch_intf/torch_abi/*.toml"]
 
+[tool.pytest.ini_options]
+markers = ["gpu: needs a GPU; `ninja -C ci test-cpu` deselects it"]
+
 [tool.pyright]
 pythonVersion = "3.8"
 include = ["intj", "tests", "benchmarks"]

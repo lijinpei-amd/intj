@@ -1,5 +1,6 @@
 /* CPython internals for the verified 3.8 to 3.14 layouts.  PY_VERSION_HEX
- * selects the int layout at compile time; Py_GIL_DISABLED selects the lock.
+ * selects the int layout at compile time.  The free-threaded lock is
+ * intj_rwlock, in runtime/intj_launcher_base.h.
  * Needs INTJ_ALWAYS_INLINE / INTJ_LIKELY / INTJ_UNLIKELY defined first.
  */
 #pragma once
