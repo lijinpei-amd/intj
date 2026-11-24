@@ -15,6 +15,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 
 CI = pathlib.Path(__file__).resolve().parent
 TORCH_ABI = CI.parent / "intj" / "torch_intf" / "torch_abi"
@@ -27,6 +28,8 @@ PINS = {
         "rocm": "https://download.pytorch.org/whl/rocm7.2",
     },
 }
+PUSH_ATTEMPTS = 3
+PUSH_RETRY_DELAY = 15  # seconds
 
 
 def die(message):
@@ -95,7 +98,26 @@ def push(cell, flavor):
         print("ci: %s already published" % name)
         return
     build(cell, flavor)
-    subprocess.run(["docker", "push", name], check=True)
+    # Image jobs run in parallel and cells on one base upload the same layers
+    # at once; ghcr.io can then lose one upload and refuse the manifest with
+    # "unknown blob". A second push finds the layers and writes the manifest.
+    # Before retrying, stop if another run published the tag meanwhile: a
+    # published tag is never overwritten.
+    for attempt in range(1, PUSH_ATTEMPTS + 1):
+        if subprocess.run(["docker", "push", name]).returncode == 0:
+            return
+        if attempt < PUSH_ATTEMPTS:
+            # flush: docker writes to the log unbuffered, a pipe buffers this.
+            print(
+                "ci: push of %s failed (attempt %d of %d), retrying"
+                % (name, attempt, PUSH_ATTEMPTS),
+                flush=True,
+            )
+            time.sleep(PUSH_RETRY_DELAY)
+            if published(name):
+                print("ci: %s published by another run" % name)
+                return
+    die("docker push %s failed %d times" % (name, PUSH_ATTEMPTS))
 
 
 MODES = ("interpreter", "runtime_shim", "static_compile")

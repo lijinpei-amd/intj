@@ -69,3 +69,7 @@ target as separate invocations.
   Node 24) and provide `docker`, `ninja` and `python3`
   (`gpu.yml` runs `image.py` and `ninja` directly on the host, outside a
   container).
+- `image.py push`'s retry on a failed `docker push` (ghcr.io's "unknown blob"
+  when parallel image jobs upload shared layers) is untested: no CI run has
+  hit it yet. It narrows, but cannot close, the window in which two runs on
+  different refs both push one unpublished tag.
