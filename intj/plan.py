@@ -13,7 +13,7 @@ import inspect
 import os
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from . import _imports
 from .annotation import (
@@ -23,7 +23,13 @@ from .annotation import (
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
     _merge_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
-from .compile_options import FORBIDDEN_OPTIONS, KNOB_OVERWRITES, KNOBS, live_knobs
+from .compile_options import (
+    FORBIDDEN_OPTIONS,
+    KNOB_OVERWRITES,
+    KNOBS,
+    live_knobs,
+    refuse_compile_hooks,
+)
 from .errors import UnsupportedKernel
 from .kernel_cache import KernelCache
 from .options import MakeLauncherOption
@@ -63,7 +69,7 @@ class Grid:
         hidden: `grid_py`'s fixed values: the bound and baked parameters'.
     """
 
-    mode: str
+    mode: Literal["object", "dims", "cpp", "py"]
     dims: int | None = None
     code: GridCode | None = None
     fn: Any = None
@@ -113,7 +119,8 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
 
     Raises:
         UnsupportedKernel: The kernel or an option is outside intj's scope,
-            or the kernel cache's library cannot be provisioned.
+            a Triton compile hook is set, or the kernel cache's library
+            cannot be provisioned.
         TypeError: A malformed option, or bind_device/bind_args that do not
             fit the kernel.
         ValueError: A malformed grid option.
@@ -129,6 +136,8 @@ def build_plan(option: MakeLauncherOption) -> BuildPlan:
     kernel, chain = _checked_kernel(option)
     options = dict(sorted((option.options or {}).items()))
     kernel = _check_kernel(kernel, options, option.assume_constant_globals)
+    if not option.no_gpu:  # a host build compiles nothing
+        refuse_compile_hooks()
     global_values = _global_values(kernel) if option.assume_constant_globals else ()
     baked_options = _baked_options(options, kernel, option.extra_annotation)
     resolved, tuned = _annotate(option, kernel, chain, options, baked_options)

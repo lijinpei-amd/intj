@@ -320,7 +320,9 @@ k(device, stream, grid, True, x, out, n, 128)     # and pass the same value
 
 Refused at `check()`: an unknown knob path, a repeated name, a name also in
 `options=` (for a knob, the option it feeds), `device`, `stream`,
-`device_type`, `warp_size`, a name an autotune config sets, and `no_gpu=True`.
+`device_type`, `warp_size`, `instrumentation_mode` and
+`fpsan_homomorphic_casts` (a knob overwrites each: declare its knob path
+instead), a name an autotune config sets, and `no_gpu=True`.
 An unknown compile option is refused on the first call. A `tl.constexpr`
 option parameter named here is keyed exactly, takes no annotation but
 `tl.constexpr`, and cannot also be baked.
@@ -380,13 +382,16 @@ On a miss, Triton tunes and launches through intj: pruning, `reset_to_zero`,
 `restore_value`, `do_bench` and disk caching all run as usual, and
 `best_config`, `bench_time` and `configs_timings` are copied back to your
 tuners. On a hit, intj launches without calling Triton or any heuristic
-written in Python. `Config.pre_hook` therefore runs on misses only.
+written in Python. Triton runs a `Config.pre_hook` before every launch, so a
+config with one is refused at `check()`.
 
 intj keys a hit on:
 
-- the exact value of every caller argument an autotune layer keys on
-  (`int`, `bool`, or `float` by its fp64 bits; a tensor there raises
-  `TypeError` at the call);
+- the exact value of every caller argument an autotune layer keys on, for
+  every layer, outer ones included (`int`, `bool`, or `float` by its fp64
+  bits). As in Triton, an autotune layer with a single config keys on
+  nothing. A tensor key is refused with `UnsupportedKernel`: at `check()`
+  when annotated as a tensor or pointer, else at the call;
 - the result of every heuristic that reads a caller argument nothing else
   keys. Those heuristics are compiled to C, which accepts ints and bools, `+ - * // %`,
   comparisons, `and/or/not`, conditional expressions, `min`, `max`,
@@ -411,19 +416,20 @@ Grids:
   result that is compiled to C (refused at `check()`; use `grid_py`,
   which sees every value in `meta`). Its grid is computed after the lookup,
   and a zero-volume result skips the launch.
-- With the default grid or `grid_arg_num`, a zero-volume grid on a miss raises
-  `ValueError("intj: cannot tune on a zero-volume grid")`, even with
-  `return_compiled=True`.
+- With the default grid or `grid_arg_num`, a zero-volume grid skips the
+  launch. With `return_compiled=True`, which would still compile, a miss on
+  one raises `ValueError("intj: cannot tune on a zero-volume grid")` instead.
 
 Refused with `UnsupportedKernel`: `no_gpu=True`, bound values,
 `extra_annotation` or `options` naming a tuned value, configs with
-`num_ctas != 1`, layers assigning a runtime (non-constexpr) parameter, a
+`num_ctas != 1` or a `pre_hook`, layers assigning a runtime (non-constexpr) parameter, a
 name assigned twice (including two nested `@triton.autotune` layers, which
 Triton itself cannot run), a heuristic or autotune key reading a value an
 inner layer assigns, heuristics outside the subset above, and a tuned value
 read by C that is not an `int` or `bool` (autotune config values at
-`check()`, heuristic results on the miss). Each bound launcher (every
-`bind_args()`/`bind_device_args()`) owns its own tuner caches and tunes again.
+`check()`, heuristic results on the miss). Each launcher
+`bind_device_args(ordinal)` returns owns its own tuner caches and tunes
+again; `bind_args()` binds values, which are refused.
 Free-threaded Python builds are compile-untested.
 
 ## Argument annotations
@@ -661,6 +667,11 @@ first launch that hits it:
 - Kernels that read global variables (triton revalidates those on every launch;
   intj does not, so it refuses instead of silently launching a stale kernel),
   unless `assume_constant_globals=True` promises they never change.
+- Triton's compile hooks `knobs.runtime.add_stages_inspection_hook`,
+  `jit_cache_hook` and `jit_post_compile_hook`: intj neither keys its kernels
+  on them nor calls them. Refused at `check()` and before every compile
+  (`intj.compat.launch`: every call); a hook set later does not stop the
+  launches of kernels already compiled.
 - Kernels with pre-run hooks, `num_ctas > 1`, cooperative launches, or non-zero
   global/profile scratch.
 

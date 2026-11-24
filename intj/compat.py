@@ -12,7 +12,7 @@ from typing import Any
 
 from . import _imports
 from .annotation import Argument, Constexpr
-from .compile_options import live_knobs
+from .compile_options import live_knobs, refuse_compile_hooks
 from .errors import UnsupportedKernel
 from .launcher import make_launcher
 
@@ -152,8 +152,8 @@ def launch(
         Whatever the underlying launcher returns.
 
     Raises:
-        UnsupportedKernel: `kernel` is not a `JITFunction`, Triton launch hooks
-            are active, or the launcher refuses the kernel.
+        UnsupportedKernel: `kernel` is not a `JITFunction`, Triton launch or
+            compile hooks are active, or the launcher refuses the kernel.
         TypeError: `grid` has an unsupported type.
         ValueError: `grid` has the wrong rank, or a pointer argument is an
             unpinned CPU tensor.
@@ -168,6 +168,8 @@ def launch(
     # HookChain is truthy even when no callbacks are registered.
     if any(getattr(hook, "calls", hook) for hook in hooks):
         raise UnsupportedKernel("intj: active Triton launch hooks are not supported")
+    # every call: a cached launcher's hit would not see a hook set since
+    refuse_compile_hooks()
     if not isinstance(kernel, _imports.JITFunction):
         raise UnsupportedKernel(
             f"intj: expected a @triton.jit function, got {type(kernel).__name__}"

@@ -75,7 +75,7 @@ from intj import specialization
 from intj.render import module as render_module
 from intj.render.deps import INSTALL_ERRORS, install
 from intj.render.build import build, compiler_identity
-from intj.render.key import DynamicSlot, RenderKey
+from intj.render.key import DynamicSlot, RenderKey, TuningRender
 from intj.tools.abi_detect import probe_layout
 from intj.torch_intf.torch_abi import (
     NDTYPES,
@@ -3260,6 +3260,24 @@ def test_compile_override_is_private_and_restores_built_launcher(power_kernel):
     assert calls == [2]
 
 
+@pytest.mark.parametrize("hook", compile_options.COMPILE_HOOKS)
+def test_a_compile_hook_set_after_the_build_refuses_the_next_compile(monkeypatch, hook):
+    from triton import knobs
+
+    launch = make_launcher(scale, grid_arg_num=1)
+    out = torch.zeros(4, device="cuda", dtype=torch.float32)
+    device, stream = (
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+    launch(device, stream, 1, out, out, 4, 1.0, 4)
+    monkeypatch.setattr(knobs.runtime, hook, lambda *args, **kwargs: None)
+    launch(device, stream, 1, out, out, 4, 1.0, 4)  # a hit compiles nothing
+    with pytest.raises(UnsupportedKernel, match=f"knobs.runtime.{hook}"):
+        launch(device, stream, 1, out, out, 4, 1.0, 8)
+    torch.cuda.synchronize()
+
+
 def test_cached_build_is_reused_without_rendering(monkeypatch):
     """A dict miss with the .so already on disk must not render or compile again."""
     import intj.render.build as render_build
@@ -5064,12 +5082,25 @@ def test_render_key_tracks_cache_compiler_language(
     assert ("-fvisibility=hidden" in keys[0].build_flags) == (language == "c++")
 
 
+_TUNING = TuningRender(
+    levels=2,
+    computed=(1, 1),
+    computed_fields=((0, 8),),
+    computed_names=("EVEN", "ALIGNED"),
+    deps=(1, 0),
+    dep_names=("BLOCK",),
+    meta_names=("BLOCK",),
+    source="",
+)
+
+
 @pytest.mark.parametrize(
     "differing",
     [
         {"nwords": 5},
         {"dynamic": (DynamicSlot("num_warps", 8, 16, 0),)},
         {"cache_key": "d"},
+        {"tuning": dataclasses.replace(_TUNING, dep_names=("SPLIT",))},
     ],
 )
 def test_value_types_compare_hash_and_serialize(differing):
@@ -5077,7 +5108,7 @@ def test_value_types_compare_hash_and_serialize(differing):
 
     A list field anywhere in it would compare fine and raise on hash().
     """
-    build = _make_render_key
+    build = functools.partial(_make_render_key, tuning=_TUNING)
     one, same, other = build(), build(), build(**differing)
     assert one == same and one != other
     assert hash(one) == hash(same) and hash(one) != hash(other)

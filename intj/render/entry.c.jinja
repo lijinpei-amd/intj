@@ -446,8 +446,14 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% endif %}
 {% if p.exact is not none %}
   if (INTJ_UNLIKELY({{ d }}.kind == INTJ_VALUE_TENSOR)) {
-    PyErr_Format(PyExc_TypeError, "intj: autotune key '%s' must be a scalar, not a tensor",
-                 intj_param_names[{{ i }}]);
+    PyObject *errors = PyImport_ImportModule("intj.errors");
+    PyObject *unsupported = errors ? PyObject_GetAttrString(errors, "UnsupportedKernel") : NULL;
+    Py_XDECREF(errors);
+    if (unsupported) {
+      PyErr_Format(unsupported, "intj: autotune key '%s' must be a scalar, not a tensor",
+                   intj_param_names[{{ i }}]);
+      Py_DECREF(unsupported);
+    }
     return -1;
   }
 {{ key_accumulate(p.exact_kind, d ~ '.kind') }}

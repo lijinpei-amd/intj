@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from . import _imports
 from .errors import UnsupportedKernel
@@ -36,7 +36,7 @@ class Knob:
 
     path: str
     option: str
-    combine: str
+    combine: Literal["or", "overwrite"]
     default: object
 
 
@@ -65,6 +65,35 @@ KNOB_OVERWRITES = {k.option: k.path for k in KNOBS if k.combine == "overwrite"}
 
 #: options a launch fixes itself; never `options=` or `dynamic_options`
 FORBIDDEN_OPTIONS = ("device", "stream", "device_type", "warp_size")
+
+#: `knobs.runtime` hooks on Triton's compile that intj neither keys nor calls:
+#: the stages hook changes the binary, the JIT cache hook can veto a compile,
+#: and the post-compile hook expects a call after each one.
+COMPILE_HOOKS = (
+    "add_stages_inspection_hook",
+    "jit_cache_hook",
+    "jit_post_compile_hook",
+)
+
+
+def refuse_compile_hooks() -> None:
+    """Refuses the `COMPILE_HOOKS` that are set; checked before every compile.
+
+    Raises:
+        UnsupportedKernel: One is set.
+    """
+    _imports.ensure_triton_imported()
+    runtime = _imports.knobs.runtime
+    active = [
+        f"knobs.runtime.{n}"
+        for n in COMPILE_HOOKS
+        if getattr(runtime, n, None) is not None
+    ]
+    if active:
+        raise UnsupportedKernel(
+            f"intj: Triton compile hook(s) {', '.join(active)} are not "
+            "supported: intj neither keys its kernels on them nor calls them"
+        )
 
 
 def live_knobs() -> dict[str, object]:

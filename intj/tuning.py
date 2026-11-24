@@ -2,7 +2,9 @@
 
 `analyze` gives every name a role, visiting layers from the outermost inward:
 
-- an *exact key*: a caller var an autotune layer keys on, keyed by its value;
+- an *exact key*: a caller var an autotune layer keys on, keyed by its value
+  for every layer (Triton reads an autotuner's key only with two or more
+  configs);
 - a *dependent* value: fixed by keys at or below its level, stored in that
   level's cache record;
 - a *computed* key: a heuristic reading a caller var nothing keys, lowered to C
@@ -15,12 +17,13 @@ import copy
 import dataclasses
 import inspect
 import threading
+import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
 from . import backend as backends
-from .annotation import ResolvedParam
+from .annotation import CanonicalAnnotation, ResolvedParam
 from .compile_options import resolve
 from .compiler import KernelCompiler, record
 from .errors import UnsupportedKernel
@@ -131,16 +134,24 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
             )
         assigned.add(name)
 
-    def assigns(layer: Any) -> set[str]:
+    def assigns(layer: Any) -> dict[str, None]:  # in first-use order
         if type(layer) is _imports.Autotuner:
-            return {str(n) for config in layer.configs for n in config.all_kwargs()}
-        return set(layer.values)
+            return {str(n): None for c in layer.configs for n in c.all_kwargs()}
+        return dict.fromkeys(layer.values)
+
+    def keys(layer: Any) -> list[str]:
+        # Triton reads the key only to choose among configs, and filters it
+        # to parameter names
+        if type(layer) is not _imports.Autotuner or len(layer.configs) == 1:
+            return []
+        return [key for key in layer.keys if key in params]
 
     # inner_assigned[i]: names the layers inside layers[i] assign. An outer
     # layer runs first, so it cannot read them (Triton cannot either).
     inner_assigned: list[set[str]] = [set() for _ in layers]
     for i in range(len(layers) - 2, -1, -1):
-        inner_assigned[i] = inner_assigned[i + 1] | assigns(layers[i + 1])
+        inner_assigned[i] = inner_assigned[i + 1] | set(assigns(layers[i + 1]))
+    assigned_anywhere = inner_assigned[0] | set(assigns(layers[0]))
 
     def check_not_inner(name: str, read: str, i: int) -> None:
         if read in inner_assigned[i]:
@@ -148,23 +159,21 @@ def analyze(kernel: Any, fixed: Iterable[str] = ()) -> TuningPlan:
                 f"intj: {name} reads {read!r}, which an inner layer assigns"
             )
 
+    # A caller var's value is known before any layer runs, so an autotune key
+    # makes it exact for every layer, outer ones included.
+    for layer in layers:
+        for key in keys(layer):
+            if key not in assigned_anywhere and not info[key][0]:
+                info[key] = (True, 0, 0)
+                exact_keys.append(key)
+
     for i, layer in enumerate(layers):
         if type(layer) is _imports.Autotuner:
             level = 0
-            for key in layer.keys:
-                if key not in params:
-                    continue  # Triton filters keys to parameter names too
+            for key in keys(layer):
                 check_not_inner("the autotune key", key, i)
-                exact, _, known = info[key]
-                if not exact:
-                    info[key] = (True, known, known)
-                    exact_keys.append(key)
                 level = max(level, info[key][1])
-            names: dict[str, None] = {}
-            for config in layer.configs:
-                for name in config.all_kwargs():
-                    names[str(name)] = None
-            for name in names:
+            for name in assigns(layer):
                 assign(name, "autotune")
                 info[name] = (True, level, level + 1)
                 dependent.append(Dependent(name, level))
@@ -227,8 +236,9 @@ def plan_tuning(
     the first call.
 
     Raises:
-        UnsupportedKernel: `no_gpu`, a bound parameter, `extra_annotation` or
-            `options` naming a tuned value, or a config with `num_ctas > 1`.
+        UnsupportedKernel: `no_gpu`, a bound parameter, an autotune key that
+            is a tensor, `extra_annotation` or `options` naming a tuned value,
+            or a config with a `pre_hook` or `num_ctas > 1`.
     """
     if no_gpu:
         raise UnsupportedKernel(
@@ -239,6 +249,17 @@ def plan_tuning(
         if p.annotation.bind_value is not None:
             raise UnsupportedKernel(
                 f"intj: bound parameter {p.name!r} cannot be tuned over"
+            )
+        if p.name in plan.exact_keys and _is_tensor(p.annotation):
+            raise UnsupportedKernel(
+                f"intj: autotune key {p.name!r} is a tensor; intj keys only scalars"
+            )
+    tuners = [layer for layer in plan.layers if type(layer) is _imports.Autotuner]
+    for config in [config for tuner in tuners for config in tuner.configs]:
+        if config.pre_hook is not None:
+            raise UnsupportedKernel(
+                f"intj: autotune config {{{config}}} has a pre_hook; Triton "
+                "runs it before every launch, but a cache hit calls no Python"
             )
     clash = sorted(set(extra_annotation or {}) & plan.tuned)
     if clash:
@@ -263,6 +284,12 @@ def plan_tuning(
         for p in resolved
     )
     return Tuned(plan), marked
+
+
+def _is_tensor(a: CanonicalAnnotation) -> bool:
+    # annotated a tensor, or a pointer whenever it is not None
+    allowed = [ty for ty in a.types or () if ty is not None]
+    return a.tensor_only or bool(allowed) and all(ty.startswith("*") for ty in allowed)
 
 
 def _config_options(
@@ -345,7 +372,10 @@ def tuning_render(
         if p.annotation.baked_value:
             sources[p.name] = Source("fixed", value=p.baked)
         elif not p.annotation.tuned and not p.annotation.dynamic:
-            sources[p.name] = Source("arg", by_name[p.name].call_index or 0)
+            index = by_name[p.name].call_index
+            # public: plan_tuning refuses bound parameters
+            assert index is not None, f"{p.name!r} is not in the call"
+            sources[p.name] = Source("arg", index)
     for slot, name in enumerate(dep_names):
         sources[name] = Source("dep", slot)
     for slot, c in enumerate(computed):
@@ -371,30 +401,6 @@ def tuning_render(
         else (),
         source=source,
     )
-
-
-@dataclasses.dataclass(frozen=True)
-class TunedGrid:
-    """The grid the miss path hands Triton, per launcher grid mode."""
-
-    mode: str  # "dims" | "cpp" | "py"
-    fn: Any = None
-    positional: tuple[str, ...] = ()
-    extras: tuple[str, ...] = ()
-
-
-def tuned_grid(grid: Grid) -> TunedGrid:
-    if grid.mode == "py":
-        return TunedGrid("py", grid.fn)
-    if grid.code is not None:
-        code = getattr(grid.fn, "__code__")
-        return TunedGrid(
-            "cpp",
-            grid.fn,
-            tuple(code.co_varnames[: code.co_argcount]),
-            grid.code.extras,
-        )
-    return TunedGrid("dims")
 
 
 class _Shim:
@@ -467,35 +473,34 @@ def _private_chain(layers: tuple[Any, ...], shim: _Shim) -> list[Any]:
 
 
 def _rebind_default_hooks(tuner: Any) -> None:
-    """Rebuilds `tuner`'s default reset_to_zero/restore_value hooks over `tuner`.
+    """Rebinds `tuner`'s default reset_to_zero/restore_value hooks to `tuner`.
 
-    Triton's default hooks close over the tuner they were built for; a copy's
-    hooks would write the user's tuner. They are rebuilt as `Autotuner.__init__`
-    does. User hooks stay as given.
+    `Autotuner.__init__` builds them as closures over its `self`, so a copy's
+    would write the user's tuner. Each becomes Triton's own code over a fresh
+    `self` cell. User hooks stay as given.
+
+    Raises:
+        UnsupportedKernel: A default hook closes over more than its tuner, so
+            this Triton's hooks are not the ones intj can rebind.
     """
-    if not tuner.user_defined_pre_hook and (tuner.reset_to_zero or tuner.restore_value):
-
-        def pre_hook(kwargs: dict[str, Any], reset_only: bool = False) -> None:
-            for name in tuner.reset_to_zero:
-                if kwargs[name] is not None:
-                    kwargs[name].zero_()
-            if not reset_only:
-                tuner.restore_copies = {
-                    name: kwargs[name].clone()
-                    for name in tuner.restore_value
-                    if kwargs[name] is not None
-                }
-
-        tuner.pre_hook = pre_hook
-    if not tuner.user_defined_post_hook and tuner.restore_value:
-
-        def post_hook(kwargs: dict[str, Any], exception: Any) -> None:
-            del exception
-            for name, value in tuner.restore_copies.items():
-                kwargs[name].copy_(value)
-            tuner.restore_copies = {}
-
-        tuner.post_hook = post_hook
+    for name, user in (
+        ("pre_hook", tuner.user_defined_pre_hook),
+        ("post_hook", tuner.user_defined_post_hook),
+    ):
+        hook = getattr(tuner, name)
+        code = hook.__code__
+        if user or not code.co_freevars:  # the user's, or Triton's no-op
+            continue
+        if code.co_freevars != ("self",):
+            raise UnsupportedKernel(
+                f"intj: this Triton's default autotune {name} closes over "
+                f"{code.co_freevars}; intj can only rebind one over the tuner"
+            )
+        cell = types.CellType(tuner)
+        rebound = types.FunctionType(
+            code, hook.__globals__, hook.__name__, hook.__defaults__, (cell,)
+        )
+        setattr(tuner, name, rebound)
 
 
 def _copy_back(originals: tuple[Any, ...], private: list[Any]) -> None:
@@ -525,10 +530,10 @@ class TunedCompileState:
     def __init__(
         self,
         plan: TuningPlan,
-        resolved: tuple[Any, ...],
+        resolved: tuple[ResolvedParam, ...],
         options: Mapping[str, Any],
-        grid: TunedGrid,
-        render: Any,
+        grid: Grid,
+        render: TuningRender,
         knob_values: Mapping[str, object],
         dynamic: Sequence[str] = (),
     ) -> None:
@@ -618,19 +623,23 @@ class TunedCompileState:
             if name in self.plan.tuned:
                 break
             prefix.append(named.pop(name))
-        if self.grid.mode == "dims":
-            if not all(controls):
-                raise ValueError("intj: cannot tune on a zero-volume grid")
-            triton_grid: Any = controls
-        elif self.grid.mode == "cpp":
-            extras = dict(zip(self.grid.extras, controls))
+        grid = self.grid
+        if grid.mode == "cpp":
+            assert grid.code is not None
+            extras = dict(zip(grid.code.extras, controls))
+            code = grid.fn.__code__
+            positional = code.co_varnames[: code.co_argcount]
 
             def cpp_grid(meta: dict[str, Any]) -> Any:
-                return self.grid.fn(*[meta[n] for n in self.grid.positional], **extras)
+                return grid.fn(*[meta[n] for n in positional], **extras)
 
-            triton_grid = cpp_grid
+            triton_grid: Any = cpp_grid
+        elif grid.mode == "py":
+            triton_grid = grid.fn
         else:
-            triton_grid = self.grid.fn
+            if not all(controls):
+                raise ValueError("intj: cannot tune on a zero-volume grid")
+            triton_grid = controls
         self.shim.reset()
         try:
             # option values reach every config through the shim's kwargs
@@ -698,7 +707,7 @@ class TunedLauncher(Launcher):
             b.tuned.plan,
             b.params,
             dict(b.compile_options),
-            tuned_grid(b.grid),
+            b.grid,
             b.tuned.render,
             b.knob_values,
             b.dynamic,

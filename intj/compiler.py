@@ -282,6 +282,7 @@ class KernelCompiler:
         with self._lock:
             kernel = self._compiled.get(key)
             if kernel is None:
+                compile_options.refuse_compile_hooks()  # set since the build
                 load = self._load if self._load is not None else triton_load
                 fresh = load(
                     self.jit_func, identity.compiler_input, self.target, canonical

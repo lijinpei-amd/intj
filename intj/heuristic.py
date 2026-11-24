@@ -14,7 +14,7 @@ import json
 import linecache
 import types
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from . import _imports
 
@@ -210,7 +210,7 @@ _COMPARE: dict[type[ast.cmpop], str] = {
 class Source:
     """Where a heuristic input comes from in C."""
 
-    kind: str  # "arg" | "fixed" | "dep" | "comp"
+    kind: Literal["arg", "fixed", "dep", "comp"]
     index: int = 0  # args index, dep slot or comp slot
     value: object = None  # fixed: the baked value
 

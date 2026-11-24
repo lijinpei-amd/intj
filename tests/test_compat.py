@@ -401,6 +401,28 @@ def test_cached_launch_refuses_active_triton_hook(monkeypatch, hook_name):
         compat._cached.cache_clear()
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "hook_name",
+    ["add_stages_inspection_hook", "jit_cache_hook", "jit_post_compile_hook"],
+)
+def test_cached_launch_refuses_a_compile_hook_set_after_it(monkeypatch, hook_name):
+    """A cached launcher's hit would keep the binary compiled without the hook."""
+    import intj.compat as compat
+    from triton import knobs
+
+    compat._cached.cache_clear()
+    x = torch.arange(32, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(x)
+    try:
+        compat.launch(add_one, (1,), x, out, 32)
+        monkeypatch.setattr(knobs.runtime, hook_name, lambda *args, **kwargs: None)
+        with pytest.raises(UnsupportedKernel, match=f"knobs.runtime.{hook_name}"):
+            compat.launch(add_one, (1,), x, out, 32)
+    finally:
+        compat._cached.cache_clear()
+
+
 def test_launch_rejects_unpinned_cpu_tensor_before_gpu_driver_lookup():
     x = torch.empty(1024)
     with pytest.raises(ValueError, match="cannot be accessed from Triton"):

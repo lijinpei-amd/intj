@@ -98,3 +98,22 @@ def test_compat_keys_on_every_knob_in_the_table(monkeypatch):
         old = getattr(owner, name)
         monkeypatch.setattr(owner, name, "on" if isinstance(old, str) else not old)
         assert compat._knob_key() != before, knob.path
+
+
+@pytest.mark.parametrize("hook", compile_options.COMPILE_HOOKS)
+def test_a_compile_hook_is_refused_at_check(monkeypatch, hook):
+    import triton
+    import triton.language as tl
+
+    from intj import make_launcher
+
+    @triton.jit
+    def k(x, BLOCK: tl.constexpr):
+        pass
+
+    monkeypatch.setattr(knobs.runtime, hook, lambda *args, **kwargs: None)
+    with pytest.raises(UnsupportedKernel, match=f"knobs.runtime.{hook}"):
+        make_launcher(k).__self__.check()
+    with pytest.raises(UnsupportedKernel, match=f"knobs.runtime.{hook}"):
+        compat.launch(k, (1,), None, 32)
+    make_launcher(k, no_gpu=True).__self__.check()  # compiles nothing

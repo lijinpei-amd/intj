@@ -1,7 +1,9 @@
 # pyright: standard
 """Autotuned and heuristic kernels through make_launcher, on the GPU."""
 
+import dataclasses
 import gc
+import math
 import threading
 import weakref
 
@@ -456,8 +458,41 @@ def test_autotune_key_refuses_a_tensor_at_call():
     kernel = triton.autotune(configs=configs(), key=["n"])(tagged)
     launch = make_launcher(kernel, grid_arg_num=1)
     device, stream = controls()
-    with pytest.raises(TypeError, match="autotune key 'n'"):
+    with pytest.raises(UnsupportedKernel, match="autotune key 'n'"):
         launch(device, stream, 1, x, x, x)
+
+
+def test_tuning_on_a_zero_volume_grid_is_refused():
+    x = torch.zeros(64, device="cuda", dtype=torch.int32)
+    kernel = triton.autotune(configs=configs(), key=["n"])(tagged)
+    skips = make_launcher(kernel, grid_arg_num=1)
+    assert skips(*controls(), 0, x, x, 16) is None  # never reaches the miss
+    launch = make_launcher(kernel, grid_arg_num=1, return_compiled=True)
+    with pytest.raises(ValueError, match="cannot tune on a zero-volume grid"):
+        launch(*controls(), 0, x, x, 16)
+    assert not launch.__self__.key_chain(controls()[0], x, x, 16)[1]
+
+
+def test_a_single_config_autotuner_misses_once_across_key_values(monkeypatch):
+    import intj.tuning as tuning_mod
+
+    misses = []
+    original = tuning_mod.TunedCompileState.run
+
+    def counting(self, *args, **kwargs):
+        misses.append(args[0])
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(tuning_mod.TunedCompileState, "run", counting)
+    kernel = triton.autotune(configs=configs()[:1], key=["n"])(tagged)
+    launch = make_launcher(kernel, grid_cpp=grid)
+    x = torch.ones(256, device="cuda", dtype=torch.int32)
+    out = torch.zeros_like(x)
+    for n in (32, 64, 96, 128):  # one spec key: divisible by 16
+        launch(*controls(), x, out, n)
+    torch.cuda.synchronize()
+    assert len(misses) == 1, "Triton does not key a single config"
+    assert int(out[127].item()) == 2
 
 
 @pytest.mark.parametrize(
@@ -917,20 +952,35 @@ def check_tuned_invariant(make_kernel, cases, dynamic=(), dyn_values=((),)):
                 )
 
 
-def _invariant_kernel():
-    """Returns `aligned_tag` under a heuristic and a deterministic autotuner."""
+def _first_config_wins(call, quantiles):
+    return [1.0, 1.0, 1.0]
 
-    def bench(call, quantiles):  # first config wins, deterministically
-        return [1.0, 1.0, 1.0]
 
+def _invariant_kernel(aligned=lambda a: a["stride"] % a["BLOCK"] == 0):
+    """Returns `aligned_tag` under a heuristic and a deterministic autotuner.
+
+    The default ALIGNED reads a tuned value, so it is keyed at level 1.
+    """
     return triton.autotune(
         configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
         key=["N"],
-        do_bench=bench,
-    )(
-        triton.heuristics({"ALIGNED": lambda a: a["stride"] % a["BLOCK"] == 0})(
-            aligned_tag
-        )
+        do_bench=_first_config_wins,
+    )(triton.heuristics({"ALIGNED": aligned})(aligned_tag))
+
+
+def _level0_kernel():
+    """Returns `aligned_tag` with ALIGNED over caller values: keyed at level 0."""
+    return _invariant_kernel(lambda a: a["stride"] % 32 == 0)
+
+
+def _outer_heuristic_kernel():
+    """Returns `aligned_tag` with a Python-only heuristic outside the autotuner."""
+    return triton.heuristics({"ALIGNED": lambda a: math.log2(a["N"]) > 3})(
+        triton.autotune(
+            configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
+            key=["N"],
+            do_bench=_first_config_wins,
+        )(aligned_tag)
     )
 
 
@@ -938,16 +988,22 @@ def _invariant_cases():
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     out = torch.zeros_like(x)
     half = torch.zeros(1, device="cuda", dtype=torch.float16)
+    # strides 16 and 32 share a spec key but not ALIGNED
     return [
         {"x": t, "out": out, "N": n, "stride": s}
         for t in (x, half)
         for n in (1, 8, 16, 17, 2**31)
-        for s in (0, 32, 33, 64)
+        for s in (0, 16, 32, 33, 64)
     ]
 
 
-def test_tuned_key_chain_is_never_coarser_than_triton():
-    check_tuned_invariant(_invariant_kernel, _invariant_cases())
+@pytest.mark.parametrize(
+    "make_kernel",
+    [_invariant_kernel, _level0_kernel, _outer_heuristic_kernel],
+    ids=["level1", "level0", "outer_heuristic"],
+)
+def test_tuned_key_chain_is_never_coarser_than_triton(make_kernel):
+    check_tuned_invariant(make_kernel, _invariant_cases())
 
 
 def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
@@ -957,6 +1013,42 @@ def test_tuned_invariant_catches_a_dropped_exact_key(monkeypatch):
         return tuple(f for f in original(a) if f.kind not in ("exact", "exact_kind"))
 
     monkeypatch.setattr(specialization, "_cache_key_fields", without_exact)
+    with pytest.raises(AssertionError, match="collides"):
+        check_tuned_invariant(_invariant_kernel, _invariant_cases())
+
+
+def test_tuned_invariant_catches_a_dropped_level0_computed_key(monkeypatch):
+    from intj import plan
+
+    original = plan.key_layout
+
+    def without_computed(*args, **kwargs):
+        layout = original(*args, **kwargs)
+        return dataclasses.replace(layout, computed_fields=())
+
+    monkeypatch.setattr(plan, "key_layout", without_computed)
+    with pytest.raises(AssertionError, match="collides"):
+        check_tuned_invariant(_level0_kernel, _invariant_cases())
+
+
+def test_tuned_invariant_catches_a_dropped_deeper_computed_key(monkeypatch):
+    """A level-1 computed key stored in its parent's record instead of keyed."""
+    from intj import tuning
+
+    original = tuning.analyze
+
+    def stored(kernel, fixed=()):
+        p = original(kernel, fixed)
+        assert [c.level for c in p.computed] == [1], "the fixture keys at level 1"
+        (c,) = p.computed
+        return dataclasses.replace(
+            p,
+            dependent=(*p.dependent, tuning.Dependent(c.name, 0)),
+            computed=(),
+            levels=1,
+        )
+
+    monkeypatch.setattr(tuning, "analyze", stored)
     with pytest.raises(AssertionError, match="collides"):
         check_tuned_invariant(_invariant_kernel, _invariant_cases())
 
@@ -1021,11 +1113,12 @@ def aligned_act(
     tl.store(out, v)
 
 
-# waves_per_eu is a compile option, debug a knob feeding one,
-# disable_line_info a knob feeding none (keyed only through the knob values),
-# use_buffer_ops a knob feeding HIP's pointer specialization
+# enable_fp_fusion is a compile option of every backend, debug a knob feeding
+# one, disable_line_info a knob feeding none (keyed only through the knob
+# values), use_buffer_ops a knob feeding HIP's pointer specialization (and
+# none elsewhere)
 _TUNED_DYNAMIC = (
-    "waves_per_eu",
+    "enable_fp_fusion",
     "knobs.runtime.debug",
     "knobs.compilation.disable_line_info",
     "knobs.amd.use_buffer_ops",
@@ -1033,12 +1126,14 @@ _TUNED_DYNAMIC = (
 # a base and one flip per value: dropping any one value from the key collides
 # its flip with the base, which Triton tells apart
 _TUNED_DYN_VALUES = [
-    (1, False, False, False),
-    (2, False, False, False),
-    (1, True, False, False),
-    (1, False, True, False),
-    (1, False, False, True),
+    (True, False, False, False),
+    (False, False, False, False),
+    (True, True, False, False),
+    (True, False, True, False),
+    (True, False, False, True),
 ]
+# a HIP-only compile option, prepended to the above on HIP
+_HIP_DYNAMIC = "waves_per_eu"
 
 
 def _dynamic_invariant_kernel():
@@ -1068,22 +1163,28 @@ def _dynamic_invariant_cases():
     ]
 
 
-def _check_dynamic_tuned_invariant():
+def _check_dynamic_tuned_invariant(hip=False):
+    dynamic, values = _TUNED_DYNAMIC, _TUNED_DYN_VALUES
+    if hip:
+        dynamic = (_HIP_DYNAMIC, *dynamic)
+        values = [(1, *v) for v in values] + [(2, *values[0])]
     check_tuned_invariant(
-        _dynamic_invariant_kernel,
-        _dynamic_invariant_cases(),
-        _TUNED_DYNAMIC,
-        _TUNED_DYN_VALUES,
+        _dynamic_invariant_kernel, _dynamic_invariant_cases(), dynamic, values
     )
 
 
-@needs_hip
 def test_tuned_dynamic_values_are_never_coarser_than_triton():
     _check_dynamic_tuned_invariant()
 
 
 @needs_hip
-@pytest.mark.parametrize("dropped", _TUNED_DYNAMIC)
+def test_tuned_hip_dynamic_values_are_never_coarser_than_triton():
+    _check_dynamic_tuned_invariant(hip=True)
+
+
+@pytest.mark.parametrize(
+    "dropped", [*_TUNED_DYNAMIC, pytest.param(_HIP_DYNAMIC, marks=needs_hip)]
+)
 def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
 
     original = specialization._dynamic_key_fields
@@ -1093,10 +1194,9 @@ def test_tuned_invariant_catches_a_dropped_dynamic_value(monkeypatch, dropped):
         lambda name: () if name == dropped else original(name),
     )
     with pytest.raises(AssertionError, match="collides"):
-        _check_dynamic_tuned_invariant()
+        _check_dynamic_tuned_invariant(hip=dropped == _HIP_DYNAMIC)
 
 
-@needs_hip
 def test_tuned_invariant_catches_a_dropped_object_id(monkeypatch):
     from intj import launcher as launcher_mod
 
@@ -1340,3 +1440,7 @@ def test_a_chain_gets_a_tuned_launcher_and_its_copies_keep_it():
     plain(device, stream, (1,), x, out, 16, 1, 32)
     assert type(launch.__self__._compile_state) is TunedCompileState
     assert type(plain.__self__._compile_state) is KernelCompiler
+    tuned = len(bench.calls)
+    copies[0](stream, x, out, 16)
+    torch.cuda.synchronize()
+    assert len(bench.calls) == 2 * tuned, "a copy owns its tuner caches"

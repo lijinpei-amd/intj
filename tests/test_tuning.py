@@ -1,10 +1,14 @@
 # pyright: standard
-"""Role assignment for autotune and heuristics layers; nothing here launches."""
+"""Role assignment and refusals for autotune and heuristics layers; nothing here launches."""
+
+import math
 
 import pytest
+import torch
 import triton
 import triton.language as tl
 
+from intj import Argument, make_launcher
 from intj.heuristic import HeuristicError, parse_heuristic
 from intj.launcher import UnsupportedKernel
 from intj.tuning import Computed, Dependent, analyze
@@ -26,6 +30,8 @@ def strided(x, N, stride, BLOCK: tl.constexpr, ALIGNED: tl.constexpr):
 def evens(x, N, EVEN_N: tl.constexpr):
     pass
 
+
+BLOCKS = [triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})]
 
 CONFIGS_K = [
     triton.Config({"BLOCK_K": 32, "SPLIT_K": 1}),
@@ -76,9 +82,7 @@ def test_heuristic_over_caller_var_is_a_level_zero_key():
 
 def test_heuristics_outside_autotune_feed_its_key():
     kernel = triton.heuristics({"EVEN_N": lambda a: a["N"] % 2 == 0})(
-        triton.autotune(configs=[triton.Config({"BLOCK": 32})], key=["EVEN_N"])(
-            strided_even
-        )
+        triton.autotune(configs=BLOCKS, key=["EVEN_N"])(strided_even)
     )
     plan = analyze(kernel)
     assert [(c.name, c.level) for c in plan.computed] == [("EVEN_N", 0)]
@@ -181,12 +185,96 @@ def test_heuristic_calling_triton_is_located_and_lowered():
         lambda: triton.heuristics({"ALIGNED": lambda a: a["N"] % a["BLOCK"] == 0})(
             triton.autotune(configs=[triton.Config({"BLOCK": 64})], key=["N"])(strided)
         ),
-        lambda: triton.autotune(
-            configs=[triton.Config({"BLOCK": 64})], key=["ALIGNED"]
-        )(triton.heuristics({"ALIGNED": lambda a: a["N"] % 2 == 0})(strided)),
+        lambda: triton.autotune(configs=BLOCKS, key=["ALIGNED"])(
+            triton.heuristics({"ALIGNED": lambda a: a["N"] % 2 == 0})(strided)
+        ),
     ],
     ids=["heuristic", "autotune_key"],
 )
 def test_refuses_reading_a_value_an_inner_layer_assigns(build):
     with pytest.raises(UnsupportedKernel, match="inner layer"):
         analyze(build())
+
+
+@triton.jit
+def logged(x, N, BLOCK: tl.constexpr, LOG_N: tl.constexpr):
+    pass
+
+
+# C cannot lower it: it runs in Python, so what it reads must be keyed
+LOG_N = {"LOG_N": lambda a: math.ceil(math.log2(a["N"]))}
+
+
+@pytest.mark.parametrize("outer", ["heuristics", "autotune"])
+def test_an_autotune_key_is_exact_for_every_layer(outer):
+    heuristics = triton.heuristics(LOG_N)
+    autotune = triton.autotune(configs=BLOCKS, key=["N"])
+    if outer == "heuristics":
+        kernel = heuristics(autotune(logged))
+    else:
+        kernel = autotune(heuristics(logged))
+    plan = analyze(kernel)
+    assert plan.exact_keys == ("N",)
+    assert plan.computed == ()
+    assert Dependent("LOG_N", 0) in plan.dependent
+    make_launcher(kernel, grid_arg_num=1).__self__.check()
+
+
+def test_a_single_config_autotuner_keys_nothing():
+    # Triton reads the key only to choose among configs
+    plan = analyze(triton.autotune(configs=BLOCKS[:1], key=["N"])(strided))
+    assert plan.exact_keys == ()
+    assert plan.dependent[0] == Dependent("BLOCK", 0)
+    inner = triton.heuristics({"ALIGNED": lambda a: a["N"] % 2 == 0})(strided)
+    analyze(triton.autotune(configs=BLOCKS[:1], key=["ALIGNED"])(inner))
+
+
+@pytest.mark.parametrize("others", [0, 1])
+def test_a_config_pre_hook_is_refused(others):
+    hooked = triton.Config({"BLOCK": 32}, pre_hook=lambda nargs: None)
+    configs = [hooked, *BLOCKS[1 : 1 + others]]
+    kernel = triton.autotune(configs=configs, key=["N"])(strided)
+    with pytest.raises(UnsupportedKernel, match=r"\{BLOCK: 32.*\} has a pre_hook"):
+        make_launcher(kernel, grid_arg_num=1).__self__.check()
+
+
+def test_a_tuner_pre_hook_runs_only_while_benchmarking_so_is_kept():
+    kernel = triton.autotune(
+        configs=BLOCKS, key=["N"], pre_hook=lambda nargs, reset_only=False: None
+    )(strided)
+    make_launcher(kernel, grid_arg_num=1).__self__.check()
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        Argument(type=tl.pointer_type(tl.int32)),
+        Argument(type=(tl.pointer_type(tl.int32), None)),
+    ],
+    ids=["pointer", "optional_pointer"],
+)
+def test_an_autotune_key_annotated_a_tensor_is_refused_at_check(annotation):
+    kernel = triton.autotune(configs=BLOCKS, key=["x"])(strided)
+    with pytest.raises(UnsupportedKernel, match="autotune key 'x' is a tensor"):
+        make_launcher(
+            kernel, grid_arg_num=1, extra_annotation={"x": annotation}
+        ).__self__.check()
+    make_launcher(kernel, grid_arg_num=1).__self__.check()  # refused at the call
+
+
+def test_private_chain_rebinds_triton_default_hooks_to_the_copy():
+    # Triton's own reset/restore closures, over the copy: this fails once
+    # Triton's default hooks close over anything but their tuner
+    from intj.tuning import _private_chain, _Shim
+
+    tuner = triton.autotune(
+        configs=BLOCKS, key=["N"], reset_to_zero=["x"], restore_value=["stride"]
+    )(strided)
+    (copy,) = _private_chain((tuner,), _Shim(strided, lambda values, options: None))
+    x, stride = torch.ones(2), torch.full((2,), 7.0)
+    copy.pre_hook({"x": x, "stride": stride})
+    assert x.tolist() == [0.0, 0.0]
+    assert "restore_copies" not in tuner.__dict__
+    stride.fill_(1.0)
+    copy.post_hook({"x": x, "stride": stride}, None)
+    assert stride.tolist() == [7.0, 7.0] and copy.restore_copies == {}
