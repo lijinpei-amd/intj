@@ -25,7 +25,6 @@ build: Any = None
 ASTSource: Any = None
 make_backend: Any = None
 JITFunction: Any = None
-MockTensor: Any = None
 TensorWrapper: Any = None
 Autotuner: Any = None
 Heuristics: Any = None
@@ -49,7 +48,7 @@ def ensure_triton_imported() -> None:
             again.
     """
     global triton, knobs, tl, driver, build, ASTSource, make_backend
-    global JITFunction, MockTensor, TensorWrapper, Autotuner, Heuristics
+    global JITFunction, TensorWrapper, Autotuner, Heuristics
     global canonicalize_dtype, type_canonicalisation_dict
     global native_specialize_impl, cdiv, is_compile_warmup
     if triton is not None:
@@ -67,7 +66,7 @@ def ensure_triton_imported() -> None:
     from triton.runtime import build
     from triton.runtime.autotuner import Autotuner, Heuristics
     from triton.runtime.driver import driver
-    from triton.runtime.jit import JITFunction, MockTensor, TensorWrapper
+    from triton.runtime.jit import JITFunction, TensorWrapper
 
     try:
         from triton._compile_warmup_state import is_compile_warmup  # pyright: ignore[reportMissingImports]  # optional Triton test runtime

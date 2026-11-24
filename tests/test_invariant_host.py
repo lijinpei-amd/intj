@@ -7,6 +7,10 @@ tensors. Each case runs under two backend pairs: the host driver keying no
 pointer range against CUDA's rules, and the host driver keying it (as HIP's
 backend does) against HIP's.
 
+Most cases check the key against intj's own compiler input, which cannot see
+a wrong model of Triton; the `*_as_tritons_binder_*` tests check both the key
+and the compiler input against Triton's binder itself.
+
 `test_launcher.py::test_spec_key_is_never_coarser_than_triton` still runs on a
 GPU, against Triton's own per-device binder; dynamic options and tuned chains
 need a GPU too (`no_gpu=True` refuses both).
@@ -15,6 +19,8 @@ need a GPU too (`no_gpu=True` refuses both).
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
+import operator
 import random
 from types import SimpleNamespace
 
@@ -28,6 +34,7 @@ import triton.language as tl  # noqa: E402
 from triton import knobs  # noqa: E402
 from triton.backends.compiler import GPUTarget  # noqa: E402
 from triton.compiler import make_backend  # noqa: E402
+from triton.runtime.jit import create_function_from_signature  # noqa: E402
 
 from intj import (  # noqa: E402
     AUTO,
@@ -41,8 +48,14 @@ from intj import (  # noqa: E402
 )
 from intj import backend as backends  # noqa: E402
 from intj import specialization  # noqa: E402
-from intj.annotation import Aligned, EqualTo, PointerRange, _merge_annotations  # noqa: E402
-from intj.scalar_types import fits, triton_name  # noqa: E402
+from intj.annotation import (  # noqa: E402
+    Aligned,
+    EqualTo,
+    PointerRange,
+    _merge_annotations,
+    canonical_value,
+)
+from intj.scalar_types import fits, is_pointer, triton_name  # noqa: E402
 from intj.specialization import call_layout, compiler_input  # noqa: E402
 
 REFUSALS = (TypeError, ValueError, OverflowError)
@@ -451,8 +464,8 @@ def _likely_fits(value, a):
         value is None
         if ty is None
         else tensor and triton_name(value.dtype) == ty[1:]
-        if ty.startswith("*")
-        else not tensor and fits(value, ty, a.kind)
+        if is_pointer(ty)
+        else not tensor and fits(value, ty)
         for ty in a.types
     ):
         return False
@@ -536,3 +549,242 @@ def test_host_invariant_catches_an_unkeyed_pointer_range(monkeypatch, tensors):
     hip = make_backend(PAIRS["range-hip"][1])
     with pytest.raises(AssertionError, match="collides"):
         check(axpy, None, axpy_cases(tensors, optional=False), hip)
+
+
+# Triton reads a pointer type only from an annotation object, which this
+# module's postponed annotations are not: the typed kernels live in a source
+# of their own.
+TYPED_KERNELS = """
+import triton
+import triton.language as tl
+
+@triton.jit
+def typed_pointer(p: tl.pointer_type(tl.float32)):
+    pass
+
+@triton.jit(do_not_specialize_on_alignment=["p"])
+def typed_pointer_dnsa(p: tl.pointer_type(tl.float32)):
+    pass
+
+@triton.jit
+def typed_int(n: int):
+    pass
+
+@triton.jit
+def typed_i8(n: tl.int8):
+    pass
+
+@triton.jit
+def typed_u64(n: tl.uint64):
+    pass
+
+@triton.jit(do_not_specialize=["n"])
+def typed_int_dns(n: int):
+    pass
+
+@triton.jit
+def typed_bool(b: bool):
+    pass
+
+@triton.jit
+def typed_float(f: float):
+    pass
+"""
+
+
+@pytest.fixture(scope="module")
+def typed(tmp_path_factory):
+    path = tmp_path_factory.mktemp("typed") / "typed_kernels.py"
+    path.write_text(TYPED_KERNELS)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 stubs lack it
+    return module
+
+
+def binder_case(typed, case):
+    """Returns the kernel, its extra annotation, and the kernel whose binder is the truth.
+
+    `Argument(type=...)` means what Triton's own annotation of that type does.
+    """
+    if case == "argument_pointer":
+        extra = {"p": Argument(type=tl.pointer_type(tl.float32))}
+        return one_pointer, extra, typed.typed_pointer
+    if case == "untyped":
+        return one_pointer, None, one_pointer
+    jit = getattr(typed, case)
+    return jit, None, jit
+
+
+BINDER_CASES = (
+    "typed_pointer",
+    "typed_pointer_dnsa",
+    "argument_pointer",
+    "typed_int",
+    "typed_i8",
+    "typed_u64",
+    "typed_int_dns",
+    "typed_bool",
+    "typed_float",
+    "untyped",
+)
+
+
+def binder_values(tensors):
+    """One-argument calls: tensors, int addresses, scalars and 0-dim tensors."""
+    base = tensors.base
+    # 0-dim int tensors whose value and address disagree on divisibility
+    buf = torch.tensor([16, 17, 16, 17], dtype=torch.int64)
+    values = [
+        *tensors.values,
+        base.data_ptr(),
+        base.data_ptr() + 4,
+        *(0, 1, 16, 17, -16, 2**31, 2**63, 2**64 - 16),
+        None,
+        True,
+        False,
+        *(0.0, 1.5),
+        *(buf[i] for i in range(4)),
+        torch.tensor(17),
+        torch.tensor(1),
+    ]
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - torch without numpy
+        pass
+    else:
+        values += [np.int64(16), np.int64(17)]
+    return [(value,) for value in values]
+
+
+INT_NAMES = {f"{sign}{bits}" for sign in "iu" for bits in (8, 16, 32, 64)}
+
+
+def launched(jit, args):
+    """`args` as a launch passes them.
+
+    A Triton-typed integer is converted as its C decode does (`__index__`, or
+    `__int__` before Python 3.10). Triton's binder specializes a 0-dim tensor
+    there by its address, which it never launches; intj by the integer it does.
+    """
+
+    def convert(value):
+        if type(value) in (int, bool):
+            return value
+        return (
+            operator.index(value) if hasattr(type(value), "__index__") else int(value)
+        )
+
+    return tuple(
+        convert(value) if param.annotation_type in INT_NAMES else value
+        for param, value in zip(jit.params, args)
+    )
+
+
+def tritons_binder(jit, backend):
+    """Returns Triton's specialization of a launch: types, constants and attrs."""
+    binder = create_function_from_signature(jit.signature, jit.params, backend)
+
+    def specialize(args):
+        _, spec, _ = binder(*launched(jit, args))
+        types = tuple(ty for ty, _ in spec)
+        constants = tuple(
+            ((i,), canonical_value(args[i]))
+            for i, ty in enumerate(types)
+            if ty == "constexpr"
+        )
+        attrs = tuple(
+            ((i,), tuple((name, amount) for name, amount in backend.parse_attr(desc)))
+            for i, (ty, desc) in enumerate(spec)
+            if ty != "constexpr" and isinstance(desc, str) and backend.parse_attr(desc)
+        )
+        return types, constants, attrs
+
+    return specialize
+
+
+def check_binder(jit, extra, reference, cases, truth):
+    """Asserts every case a host launcher of `jit` accepts keys and compiles as Triton.
+
+    Triton's binder for `reference` is the truth: one intj key never covers
+    two of its specializations, and intj's compiler input is what it gives.
+
+    Returns:
+        How many cases were keyed (the rest were refused).
+    """
+    launch = make_launcher(
+        jit,
+        extra_annotation=extra,
+        no_gpu=True,
+        torch_access_mode=TorchAccessMode.RUNTIME_SHIM,
+    )
+    params = call_layout(_merge_annotations(jit, extra))
+    specialize = tritons_binder(reference, truth)
+    seen, keyed = {}, 0
+    for args in cases:
+        try:
+            key, _ = launch.__self__.spec_key(0, *args)
+        except REFUSALS:
+            continue  # refused: nothing launches
+        keyed += 1
+        spec = specialize(args)
+        assert seen.setdefault(key, spec) == spec, f"intj key collides for {args!r}"
+        source = compiler_input(jit, params, args, truth)
+        ours = (
+            tuple(ty for _, ty in source.signature),
+            source.constants,
+            source.attrs,
+        )
+        assert ours == spec, f"intj compiles unlike Triton for {args!r}"
+    return keyed
+
+
+@pytest.mark.parametrize("case", BINDER_CASES)
+def test_keys_and_compiles_as_tritons_binder_specializes(case, typed, tensors, truth):
+    """Typed pointers and integers given every value Triton's binder takes."""
+    jit, extra, reference = binder_case(typed, case)
+    assert check_binder(jit, extra, reference, binder_values(tensors), truth) > 10
+
+
+def test_host_invariant_catches_a_typed_int_compiled_from_its_object(
+    monkeypatch, typed, tensors, truth
+):
+    """A 0-dim tensor compiled by its address, not the integer launched."""
+    monkeypatch.setattr(specialization, "_launched_int", lambda value: value)
+    jit = typed.typed_int
+    with pytest.raises(AssertionError, match="unlike Triton"):
+        check_binder(jit, None, jit, binder_values(tensors), truth)
+
+
+def test_host_invariant_catches_a_wrong_model_of_triton(monkeypatch, typed, tensors):
+    """An int address given a pointer range, which Triton never gives one.
+
+    The key is right, so the compiler input agrees with itself under each
+    key; only Triton's binder tells it is wrong.
+    """
+    monkeypatch.setattr(backends, "HOST", PointerRangeHost())
+    hip = make_backend(PAIRS["range-hip"][1])
+    original = specialization._triton_specialize
+
+    def ranged_ints(value, **kwargs):
+        ty, desc = original(value, **kwargs)
+        return ty, desc + "S" if type(value) is int and isinstance(desc, str) else desc
+
+    monkeypatch.setattr(specialization, "_triton_specialize", ranged_ints)
+    jit = typed.typed_pointer
+    with pytest.raises(AssertionError, match="unlike Triton"):
+        check_binder(jit, None, jit, binder_values(tensors), hip)
+
+
+def test_host_invariant_catches_an_unkeyed_range_against_tritons_binder(
+    monkeypatch, typed, tensors
+):
+    if len(tensors.values) < 5:
+        pytest.skip("no address space for a > 2 GiB tensor")
+    # HIP's rules, but a host driver that does not key the range bit
+    monkeypatch.setattr(backends, "HOST", backends.HostBackend())
+    hip = make_backend(PAIRS["range-hip"][1])
+    jit = typed.typed_pointer
+    with pytest.raises(AssertionError, match="collides"):
+        check_binder(jit, None, jit, binder_values(tensors), hip)

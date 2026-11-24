@@ -490,11 +490,21 @@ An omitted `type` is not `None`: an untyped `None` is a constexpr, as in
 Triton. A bare constexpr keeps Triton's Python value; a typed one checks that
 the value fits.
 
+A pointer type keeps the facts Triton gives the value itself, as its binder
+does for `x: tl.pointer_type(...)`: a tensor's data pointer can be aligned and
+its storage under 2 GiB, an int address can only be aligned, and `None`, a
+bool or a float has neither.
+
+A baked `Argument(value=...)` is checked as `verify_annotation` checks a
+passed value: against one declared type, range included, so
+`type=tl.float32, value=1e39` is refused; else against the type Triton infers,
+which a union must list, and where any float is an fp32.
+
 These annotations behave specially:
 
 | written | accepts | behavior |
 |---|---|---|
-| a type Triton recognizes (`n: int`, `tl.int64`, `"tl.int64"`, ...) | what Triton's launcher converts: `3` into a `float` is `3.0`; `2.5` into an `int` raises `TypeError`; beyond 64 bits raises `OverflowError`; narrower integers truncate | equal-to-1 fact is `NEVER`, as in Triton; `verify_annotation` adds no check |
+| a type Triton recognizes (`n: int`, `tl.int64`, `"tl.int64"`, ...) | what Triton's launcher converts: `3` into a `float` is `3.0`; `2.5` into an `int` raises `TypeError`; beyond 64 bits raises `OverflowError`; narrower integers truncate | equal-to-1 fact is `NEVER`, as in Triton; `verify_annotation` adds no check. A signed integer takes what has `__index__` (a 0-dim int tensor, a numpy int) and specializes on the integer it launches, where Triton's binder reads a tensor's address |
 | `torch.Tensor`, `tl.tensor` | an exact `torch.Tensor` or `torch.nn.Parameter`; anything else raises `TypeError` | specializes like an unannotated tensor; combines with a pointer type, conflicts with a constexpr, a scalar or `None` type, a baked value or a binding |
 | `torch.Tensor \| None`, `Optional[...]`, `Union[..., None]` | the same, or `None` | `None` is keyed as Triton keys an unannotated `None` |
 
@@ -521,7 +531,8 @@ sets it. Each fact then ends up in one mode:
 | assumed | always; a promise unless `verify_annotation=True` | no | listed in `Assume` or `Exactly` |
 | `NEVER` | never | no | `NEVER`, `Exactly`'s unlisted facts, `do_not_specialize` |
 
-A set mode conflicts with a different one set elsewhere:
+A set mode conflicts with a different one set elsewhere, except that `AUTO`,
+which means what Triton would do, takes a decorator flag's `NEVER`:
 
 ```python
 @triton.jit(do_not_specialize_on_alignment=["x"])
@@ -530,8 +541,11 @@ def k(x, n): ...
 # fine: Assume leaves Aligned(16) unset, so it takes NEVER from the decorator
 make_launcher(k, extra_annotation={"x": Argument(specialize=Assume(PointerRange(32)))})
 
-# ValueError at check(): AUTO sets Aligned(16), which the decorator sets to NEVER
+# fine too: AUTO's Aligned(16) is NEVER, as in Triton
 make_launcher(k, extra_annotation={"x": Argument(specialize=AUTO)})
+
+# ValueError at check(): Exactly assumes Aligned(16), which the decorator sets to NEVER
+make_launcher(k, extra_annotation={"x": Argument(specialize=Exactly(Aligned(16)))})
 ```
 
 `Assume` and `Exactly` accept only these facts (another `Fact` type or a
@@ -557,8 +571,8 @@ Each fact merges on its own, in this order:
    `check()`. `Exactly(Aligned(16))` agrees with `Assume(Aligned(16))`, but
    conflicts with `AUTO`, `NEVER` and `Assume(PointerRange(32))`.
 2. Triton's `do_not_specialize`, as `NEVER` for all three facts, and
-   `do_not_specialize_on_alignment`, as `NEVER` for `Aligned(16)`. An `AUTO` or
-   assumed mode there conflicts the same way.
+   `do_not_specialize_on_alignment`, as `NEVER` for `Aligned(16)`. An assumed
+   mode there conflicts the same way; an `AUTO` one becomes `NEVER`.
 3. A fact still unset becomes `AUTO`.
 4. A Triton-recognized type annotation (`n: int`) turns an `AUTO` `EqualTo(1)`
    into `NEVER`, as Triton does.

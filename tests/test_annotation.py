@@ -398,13 +398,13 @@ def test_equivalent_inputs_have_one_canonical_form(tmp_path):
 
 
 def test_canonical_baked_values_preserve_python_kind_and_bits(tmp_path):
-    from intj.annotation import _canonical_value, _merge_annotations
+    from intj.annotation import canonical_value, _merge_annotations
 
-    assert _canonical_value(None) == ("none",)
-    assert _canonical_value(False) == ("bool", False)
-    assert _canonical_value(0) == ("int", "0")
-    assert _canonical_value(-0.0) == ("float64", "8000000000000000")
-    assert _canonical_value(0.0) == ("float64", "0000000000000000")
+    assert canonical_value(None) == ("none",)
+    assert canonical_value(False) == ("bool", False)
+    assert canonical_value(0) == ("int", "0")
+    assert canonical_value(-0.0) == ("float64", "8000000000000000")
+    assert canonical_value(0.0) == ("float64", "0000000000000000")
     kernel = kernel_with_params(tmp_path, "x: tl.constexpr")
     no_value = _merge_annotations(kernel, None)[0].annotation
     baked_none = _merge_annotations(kernel, {"x": intj.Constexpr(value=None)})[0]
@@ -420,7 +420,7 @@ def test_canonical_baked_values_preserve_python_kind_and_bits(tmp_path):
         ("x: tl.int32", {"x": intj.Argument(type=intj.AUTO)}, "@triton.jit", "type"),
         (
             "x",
-            {"x": intj.Argument(specialize=intj.AUTO)},
+            {"x": intj.Argument(specialize=intj.Assume(intj.EqualTo(1)))},
             "@triton.jit(do_not_specialize=['x'])",
             "equal_to_one",
         ),
@@ -613,7 +613,7 @@ def test_baked_values_resolve_exact_types_and_reject_bad_facts(tmp_path):
         ("x: tl.uint8", "", intj.AUTO, 255, (("u8",), "never", "never")),
         ("x: tl.uint8", "", intj.AUTO, 16, (("u8",), "never", "assume")),
         ("x: int", "", intj.AUTO, 16, (("i32",), "never", "assume")),
-        # so do the decorator flags (an explicit AUTO would conflict with them)
+        # so do the decorator flags, an explicit AUTO included
         ("x", "do_not_specialize=['x']", None, 1, (("i32",), "never", "never")),
         ("x", "do_not_specialize=['x']", None, 0, (("i32",), "never", "never")),
         (
@@ -660,6 +660,25 @@ def test_baked_ints_resolve_auto_facts_from_their_value(
         )
         if mode == "assume"
     )
+
+
+@pytest.mark.parametrize("type_", [UNSET, (tl.float32, tl.int32)])
+def test_baked_float_takes_what_triton_passes_as_fp32(tmp_path, type_):
+    """Inferred, any float is an fp32, as Triton's launcher converts it."""
+    from intj.annotation import _merge_annotations
+
+    kernel = kernel_with_params(tmp_path, "x")
+    baked = intj.Argument(type=type_, value=1e39)
+    assert _merge_annotations(kernel, {"x": baked})[0].annotation.types == ("fp32",)
+
+
+def test_baked_float_beyond_a_declared_fp32_is_refused(tmp_path):
+    """One declared type checks its range, as verify_annotation does a passed value."""
+    from intj.annotation import _merge_annotations
+
+    kernel = kernel_with_params(tmp_path, "x")
+    with pytest.raises(ValueError, match="does not fit type"):
+        _merge_annotations(kernel, {"x": intj.Argument(type=tl.float32, value=1e39)})
 
 
 @pytest.mark.parametrize(
@@ -757,6 +776,30 @@ def test_exactly_assumes_its_facts_and_never_the_rest(
         )
         if mode == "assume"
     )
+
+
+@pytest.mark.parametrize(
+    "params,decorator,extra",
+    [
+        ("x", "do_not_specialize=['x']", {}),
+        ("x", "do_not_specialize_on_alignment=['x']", {}),
+        ("x", "do_not_specialize=['x']", {"type": tl.pointer_type(tl.float32)}),
+        ("x: tl.int32", "do_not_specialize_on_alignment=['x']", {}),
+        ("x", "do_not_specialize=['x']", {"value": 16}),
+    ],
+)
+def test_auto_is_what_the_decorator_flags_make_it(tmp_path, params, decorator, extra):
+    """AUTO means as Triton would: under a decorator flag, the flag's NEVER."""
+    from intj.annotation import _merge_annotations
+
+    kernel = kernel_with_params(tmp_path, params, f"@triton.jit({decorator})")
+
+    def resolved(specialize):
+        return _merge_annotations(
+            kernel, {"x": intj.Argument(specialize=specialize, **extra)}
+        )
+
+    assert resolved(intj.AUTO) == resolved(UNSET)
 
 
 @pytest.mark.parametrize(

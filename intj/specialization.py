@@ -10,22 +10,21 @@ parameters (`call_layout`), and what Triton is given for one call
 from __future__ import annotations
 
 import dataclasses
+import operator
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from . import _imports
 from .annotation import (
-    _FACT_NAMES,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
     CacheKeyField,
     CanonicalAnnotation,
     DeviceBinding,
     ResolvedParam,
-    _applicable,  # pyright: ignore[reportPrivateUsage]  # canonical specialization facts
-    _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
+    canonical_value,
 )
 from .render.key import DynamicSlot, Param
-from .scalar_types import key_bytes
+from .scalar_types import fact_applies, is_integer, key_bytes
 
 # triton ships no type information
 JitFunction = Any
@@ -57,15 +56,8 @@ def _cache_key_fields(
         types is None
         or len(types) > 1
         or any(
-            mode == "auto" and any(_applicable(ty, field) for ty in types)
-            for field, mode in zip(
-                _FACT_NAMES,
-                (
-                    annotation.equal_to_one,
-                    annotation.aligned_16,
-                    annotation.pointer_range_32,
-                ),
-            )
+            mode == "auto" and any(fact_applies(ty, field) for ty in types)
+            for field, mode in annotation.fact_modes()
         )
     )
     fields = (CacheKeyField("descriptor", 1),) if descriptor else ()
@@ -378,31 +370,26 @@ def compiler_input(
         if annotation.kind == "argument":
             fixed_type = annotation.types is not None and len(annotation.types) == 1
             effective = annotation.types[0] if fixed_type and annotation.types else None
-            modes = (
-                ("equal_to_one", annotation.equal_to_one),
-                ("aligned_16", annotation.aligned_16),
-                ("pointer_range_32", annotation.pointer_range_32),
-            )
-            assumed_one = annotation.equal_to_one == "assume" and _applicable(
+            modes = annotation.fact_modes()
+            if annotation.triton_typed and is_integer(effective):
+                value = _launched_int(value)
+            assumed_one = annotation.equal_to_one == "assume" and fact_applies(
                 effective, "equal_to_one"
             )
             inferred_desc = None
             if not assumed_one and (
                 not fixed_type
                 or any(
-                    mode == "auto" and _applicable(effective, field)
+                    mode == "auto" and fact_applies(effective, field)
                     for field, mode in modes
                 )
             ):
+                # A typed value keeps the facts Triton gives the value itself, as
+                # its binder does: `("*fp32",) + specialize_impl(value)[1:]`. An
+                # int address is divisible or not but has no pointer range; None
+                # and a bool have neither.
                 inference_value = value
-                if (
-                    effective is not None
-                    and effective.startswith("*")
-                    and (value is None or type(value) is int and value == 0)
-                ):
-                    # Both public null spellings have pointer 0 and storage range 0.
-                    inference_value = _imports.MockTensor(effective[1:])
-                elif _is_tensor(value):
+                if _is_tensor(value):
                     inference_value = _TensorRange(
                         value,
                         annotation,
@@ -423,7 +410,7 @@ def compiler_input(
                         else inferred
                     )
             ty = effective or "constexpr"
-            if _applicable(effective, "equal_to_one") and (
+            if fact_applies(effective, "equal_to_one") and (
                 annotation.equal_to_one == "assume"
                 or annotation.equal_to_one == "auto"
                 and value == 1
@@ -434,11 +421,9 @@ def compiler_input(
             if ty != "constexpr":
                 desc = "".join(
                     char
-                    for field, mode, char in (
-                        ("aligned_16", annotation.aligned_16, "D"),
-                        ("pointer_range_32", annotation.pointer_range_32, "S"),
-                    )
-                    if _applicable(effective, field)
+                    # aligned_16 and pointer_range_32
+                    for (field, mode), char in zip(modes[1:], "DS")
+                    if fact_applies(effective, field)
                     and (
                         mode == "assume"
                         or mode == "auto"
@@ -450,7 +435,7 @@ def compiler_input(
         signature.append((param.name, ty))
         parsed: tuple[tuple[str, int], ...] = ()
         if ty == "constexpr":
-            constants.append((path, _canonical_value(value)))
+            constants.append((path, canonical_value(value)))
             values.append((path, value))
         elif desc:
             parsed = tuple((name, amount) for name, amount in backend.parse_attr(desc))
@@ -470,11 +455,30 @@ def _lists_attrs(
 ) -> bool:
     # Triton lists a runtime parameter whose specialize_impl key is a str: not
     # under do_not_specialize, nor a bool or a float. A Triton-typed one keeps
-    # the key of its value, which is the int 1 for 1 and None for a bool or None.
-    if jit_param.do_not_specialize or not _applicable(ty, "aligned_16"):
+    # the key of its value, which is the int 1 for 1 and None for a bool, a
+    # float or None.
+    if jit_param.do_not_specialize or not fact_applies(ty, "aligned_16"):
         return False
     if annotation.triton_typed and annotation.bind_value is None:
         return not (
-            value is None or type(value) is bool or type(value) is int and value == 1
+            value is None
+            or type(value) in (bool, float)
+            or type(value) is int
+            and value == 1
         )
     return True
+
+
+def _launched_int(value: object) -> object:
+    # What a Triton-typed integer launches, which its C decode converts with
+    # PyLong_AsLongLong (or PyLong_AsUnsignedLongLong, which takes ints only):
+    # an int's own value, else `__index__`'s, or before Python 3.10 `__int__`'s
+    # for a type without `__index__`. A bool stays a bool: neither Triton nor
+    # the key derives a fact from it.
+    if value is None or type(value) is bool or type(value) is int:
+        return value
+    if isinstance(value, int):
+        return int.__index__(value)
+    if sys.version_info < (3, 10) and not hasattr(type(value), "__index__"):
+        return int(cast(Any, value))
+    return operator.index(cast(Any, value))

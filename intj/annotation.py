@@ -10,7 +10,14 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from . import _imports
-from .scalar_types import fits, is_integer, narrowness
+from .scalar_types import (
+    fact_applies,
+    fits,
+    inferred_type,
+    is_integer,
+    is_pointer,
+    narrowness,
+)
 
 if TYPE_CHECKING:
     import triton.language as tl
@@ -284,6 +291,10 @@ class DeviceBinding(str, enum.Enum):
     NOT_FIXED = "not_fixed"
 
 
+#: The specialization facts, in the order every per-fact tuple holds them.
+FACT_NAMES = ("equal_to_one", "aligned_16", "pointer_range_32")
+
+
 @dataclasses.dataclass(frozen=True)
 class CanonicalAnnotation:
     """The merged, validated annotation of one parameter, as keyed and rendered.
@@ -322,6 +333,12 @@ class CanonicalAnnotation:
     #: decides its pointer range
     ptr_range: bool = False
 
+    def fact_modes(self) -> tuple[tuple[str, str], ...]:
+        """Returns each fact's `(name, mode)`, in `FACT_NAMES` order."""
+        return tuple(
+            zip(FACT_NAMES, (self.equal_to_one, self.aligned_16, self.pointer_range_32))
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class ResolvedParam:
@@ -340,7 +357,7 @@ class ResolvedParam:
     baked: object = dataclasses.field(default=UNSET, compare=False, hash=False)
 
 
-def _canonical_value(value: object) -> tuple[object, ...]:
+def canonical_value(value: object) -> tuple[object, ...]:
     """Returns a hashable, JSON-serializable tag for a baked value.
 
     Raises:
@@ -458,7 +475,6 @@ def _merge_field(
     return left
 
 
-_FACT_NAMES = ("equal_to_one", "aligned_16", "pointer_range_32")
 _FACT_CLASSES: dict[type[Fact], tuple[str, int]] = {
     EqualTo: ("equal_to_one", 1),
     Aligned: ("aligned_16", 16),
@@ -467,7 +483,7 @@ _FACT_CLASSES: dict[type[Fact], tuple[str, int]] = {
 
 
 def _specialization_modes(value: object) -> tuple[object, object, object]:
-    """Returns the per-fact modes of a `specialize` field, in `_FACT_NAMES` order.
+    """Returns the per-fact modes of a `specialize` field, in `FACT_NAMES` order.
 
     Each mode is `"auto"`, `"never"`, `"assume"` or `UNSET`.
     """
@@ -492,7 +508,7 @@ def _specialization_modes(value: object) -> tuple[object, object, object]:
         actual = getattr(fact, "value")
         if type(actual) is not int or actual != expected:
             raise ValueError(f"intj: unsupported {field} fact")
-        modes[_FACT_NAMES.index(field)] = "assume"
+        modes[FACT_NAMES.index(field)] = "assume"
     return tuple(modes)  # type: ignore[return-value]
 
 
@@ -539,36 +555,17 @@ def _canonical_types(value: object, kind: str) -> tuple[str | None, ...] | None:
     return tuple(sorted(names, key=lambda name: (name is not None, name or "")))
 
 
-def _inferred_scalar_type(value: object) -> str | None:
-    """Returns the type Triton infers for a baked scalar.
-
-    Raises:
-        ValueError: An integer is outside Triton's scalar range.
-    """
-    if value is None:
-        return None
-    if type(value) is bool:
-        return "u1"
-    if type(value) is float:
-        return "fp32"
-    if type(value) is int:
-        if -(1 << 31) <= value < (1 << 31):
-            return "i32"
-        if -(1 << 63) <= value < (1 << 63):
-            return "i64"
-        if 0 <= value < (1 << 64):
-            return "u64"
-    raise ValueError("intj: baked integer is outside Triton's scalar range")
+def _assumed(modes: Sequence[object]) -> tuple[tuple[str, int], ...]:
+    return tuple(
+        fact for fact, mode in zip(_FACT_CLASSES.values(), modes) if mode == "assume"
+    )
 
 
-def _applicable(name: str | None, field: str) -> bool:
-    if name is None:
-        return False
-    if field == "pointer_range_32":
-        return name.startswith("*")
-    if field == "equal_to_one":
-        return is_integer(name)
-    return name.startswith("*") or is_integer(name)
+def _never(name: str, field: str, mode: object) -> str:
+    # a decorator flag's NEVER: AUTO, Triton's own behavior, takes it
+    if mode == "assume":
+        raise ValueError(f"intj: parameter {name!r} has conflicting {field}")
+    return "never"
 
 
 def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by launcher
@@ -663,20 +660,15 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             right_modes = _specialization_modes(right.specialize)
             modes = tuple(
                 _merge_field(name, field, a, b)
-                for field, a, b in zip(_FACT_NAMES, left_modes, right_modes)
+                for field, a, b in zip(FACT_NAMES, left_modes, right_modes)
             )
             if param.do_not_specialize:
                 # Triton's specialize=False suppresses the pointer-range attribute too.
                 modes = tuple(
-                    _merge_field(name, field, mode, "never")
-                    for field, mode in zip(_FACT_NAMES, modes)
+                    _never(name, field, mode) for field, mode in zip(FACT_NAMES, modes)
                 )
             if param.do_not_specialize_on_alignment:
-                modes = (
-                    modes[0],
-                    _merge_field(name, "aligned_16", modes[1], "never"),
-                    modes[2],
-                )
+                modes = (modes[0], _never(name, "aligned_16", modes[1]), modes[2])
             modes = tuple("auto" if mode is UNSET else mode for mode in modes)
             if triton_type and modes[0] == "auto":
                 # Triton's binder replaces the specialized type of a type-annotated
@@ -690,7 +682,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             or baked is not UNSET
             or bind_value is not None
             or types is not None
-            and any(ty is None or not ty.startswith("*") for ty in types)
+            and not all(is_pointer(ty) for ty in types)
         ):
             raise ValueError(
                 f"intj: parameter {name!r} is annotated as a tensor; it cannot also "
@@ -700,7 +692,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             raise ValueError(
                 f"intj: parameter {name!r} power_of_two_or_zero needs an integer type"
             )
-        tag = () if baked is UNSET else _canonical_value(baked)
+        tag = () if baked is UNSET else canonical_value(baked)
         if baked is not UNSET:
             if (
                 kind == "constexpr"
@@ -708,27 +700,28 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                 and not isinstance(baked, (_imports.tl.dtype, _imports.JITFunction))
                 and type(baked) is not str
             ):
-                _inferred_scalar_type(baked)  # Enforce Triton's scalar integer domain.
+                inferred_type(baked)  # Enforce Triton's scalar integer domain.
             if kind == "argument":
-                inferred = _inferred_scalar_type(baked)
-                if types is None:
-                    types = (inferred,)
-                elif len(types) != 1:
-                    if inferred not in types:
+                # Checked as verify_annotation checks a passed value: one declared
+                # type, range included; else the type Triton infers, which a
+                # union must list (any float is an fp32).
+                inferred = inferred_type(baked)
+                if types is None or len(types) != 1:
+                    if types is not None and inferred not in types:
                         raise ValueError(
                             f"intj: parameter {name!r} baked value has no allowed type"
                         )
                     types = (inferred,)
-                if types[0] is not None and types[0].startswith("*"):
+                elif is_pointer(types[0]):
                     raise ValueError(
                         f"intj: parameter {name!r} cannot bake a pointer value"
                     )
-                if not fits(baked, types[0], kind):
+                elif not fits(baked, types[0]):
                     raise ValueError(
                         f"intj: parameter {name!r} baked value does not fit type"
                     )
             elif types is not None:
-                matching = [ty for ty in types if fits(baked, ty, kind)]
+                matching = [ty for ty in types if fits(baked, ty)]
                 if not matching:
                     raise ValueError(
                         f"intj: parameter {name!r} baked value does not fit type"
@@ -742,22 +735,18 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                 raise ValueError(
                     f"intj: parameter {name!r} baked value is not a power of two or zero"
                 )
-        assumed = tuple(
-            (field, expected)
-            for field, expected in _FACT_CLASSES.values()
-            if modes[_FACT_NAMES.index(field)] == "assume"
-        )
+        assumed = _assumed(modes)
         if kind == "argument":
             branches = types if types is not None else ("i32", "*fp32")
             for field, _ in assumed:
-                if not any(_applicable(branch, field) for branch in branches):
+                if not any(fact_applies(branch, field) for branch in branches):
                     raise ValueError(f"intj: parameter {name!r} has dead {field} fact")
             if ptr_range and (
                 modes[2] == "never"
                 or baked is not UNSET
                 or bind_value is not None
                 or not any(
-                    _applicable(branch, "pointer_range_32") for branch in branches
+                    fact_applies(branch, "pointer_range_32") for branch in branches
                 )
             ):
                 raise ValueError(
@@ -767,8 +756,8 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             for branch in branches:
                 if (
                     branch is not None
-                    and _applicable(branch, "equal_to_one")
-                    and _applicable(branch, "aligned_16")
+                    and fact_applies(branch, "equal_to_one")
+                    and fact_applies(branch, "aligned_16")
                     and modes[0] == modes[1] == "assume"
                 ):
                     raise ValueError(
@@ -777,7 +766,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
             if baked is not UNSET:
                 assert types is not None
                 for field, _ in assumed:
-                    if _applicable(types[0], field) and (
+                    if fact_applies(types[0], field) and (
                         field == "equal_to_one"
                         and baked != 1
                         or field == "aligned_16"
@@ -792,8 +781,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                 or isinstance(raw_type, tuple)
                 or types is None
                 or len(types) != 1
-                or types[0] is None
-                or not types[0].startswith("*")
+                or not is_pointer(types[0])
             ):
                 raise ValueError(
                     f"intj: parameter {name!r} BindValue.POINTER needs exactly one explicit pointer type"
@@ -802,9 +790,7 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                 bind_value is BindValue.TENSOR
                 and types is not None
                 and (
-                    len(types) != 1
-                    or types[0] is not None
-                    and not types[0].startswith("*")
+                    len(types) != 1 or types[0] is not None and not is_pointer(types[0])
                 )
             ):
                 raise ValueError(
@@ -825,23 +811,19 @@ def _merge_annotations(  # pyright: ignore[reportUnusedFunction]  # consumed by 
                 # multiple of 16 (0 and negatives too) is divisible by 16. What the
                 # decorator flags or a Triton type annotation turn off is NEVER already.
                 one, aligned, pointer_range = modes
-                if one == "auto" and _applicable(types[0], "equal_to_one"):
+                if one == "auto" and fact_applies(types[0], "equal_to_one"):
                     one = "assume" if baked == 1 else "never"
-                if aligned == "auto" and _applicable(types[0], "aligned_16"):
+                if aligned == "auto" and fact_applies(types[0], "aligned_16"):
                     divisible = one != "assume" and cast(int, baked) % 16 == 0
                     aligned = "assume" if divisible else "never"
                 modes = (one, aligned, pointer_range)
-                assumed = tuple(
-                    (field, expected)
-                    for field, expected in _FACT_CLASSES.values()
-                    if modes[_FACT_NAMES.index(field)] == "assume"
-                )
+                assumed = _assumed(modes)
             elif bind_value is not None:
                 # a bound value is unknown until bind_args(), after the module is built
                 applicable = types if types is not None else ("i32", "*fp32")
                 if any(
-                    mode == "auto" and any(_applicable(ty, field) for ty in applicable)
-                    for field, mode in zip(_FACT_NAMES, modes)
+                    mode == "auto" and any(fact_applies(ty, field) for ty in applicable)
+                    for field, mode in zip(FACT_NAMES, modes)
                 ):
                     raise ValueError(
                         f"intj: parameter {name!r} has AUTO specialization with a bound value"

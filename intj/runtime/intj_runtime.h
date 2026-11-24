@@ -1287,6 +1287,15 @@ static INTJ_ALWAYS_INLINE int intj_integer_type(uint32_t type) {
          (type >= INTJ_B_I8 && type <= INTJ_B_U32);
 }
 
+/* Whether Triton derives facts from a decoded value whatever type it is
+ * declared: a tensor's or an int's, as `specialize_impl` does, never a bool's,
+ * a float's or None's.  Only a declared type needs asking; an inferred one
+ * follows from the value. */
+static INTJ_ALWAYS_INLINE int intj_has_facts(const intj_decoded *value) {
+  return value->kind == INTJ_VALUE_TENSOR || value->kind == INTJ_VALUE_I64 ||
+         value->kind == INTJ_VALUE_U64;
+}
+
 static INTJ_ALWAYS_INLINE uint64_t intj_pack_value(uint64_t bits,
                                                    uint32_t type) {
   if (type == INTJ_B_FP32) {

@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ..annotation import CacheKeyField, CanonicalAnnotation, DeviceBinding
-from ..scalar_types import SCALARS, is_float, is_integer, narrowness
+from ..scalar_types import SCALARS, is_float, is_integer, is_pointer, narrowness
 from .key import DynamicSlot, Param, RenderKey, TuningRender
 
 ENTRY_TEMPLATE = Path(__file__).parent / "entry.c.jinja"
@@ -100,9 +100,8 @@ class ParamView:
     #: "bound_tensor", "constexpr_memo", "constexpr", "tensor", "typed_float",
     #: "typed_int" or "argument"
     decoder: str
-    #: a scalar Triton annotation: the value converts the way Triton's
-    #: launcher extracts it
-    typed: str | None
+    #: a scalar Triton annotation of an unsigned type: the value converts the
+    #: way Triton's launcher extracts it
     typed_unsigned: bool
     #: baked arguments: the value's INTJ_VALUE_<kind>, and its bits as written
     baked_tag: str | None
@@ -514,7 +513,7 @@ def _levels(tuning: TuningRender | None) -> tuple[Level, ...]:
 def _type_code(ty: str | None, codes: Mapping[str, int]) -> TypeCode:
     if ty is None:
         return TypeCode("none", "NONE", "")
-    if ty.startswith("*"):
+    if is_pointer(ty):
         return TypeCode("pointer", "", "", codes.get(ty))
     scalar = SCALARS[ty]
     return TypeCode(scalar.kind, ty.upper(), str(scalar.bits))
@@ -547,7 +546,7 @@ def _param_view(
         and types is not None
         and len(types) == 1
         and types[0] is not None
-        and not types[0].startswith("*")
+        and not is_pointer(types[0])
         else None
     )
     baked_tag = str(a.baked_value[0]) if a.baked_value and not constexpr else None
@@ -582,7 +581,6 @@ def _param_view(
         constexpr=constexpr,
         decoded=not a.tuned and not a.dynamic and (not constexpr or not a.baked_value),
         decoder=_decoder(p, typed),
-        typed=typed,
         typed_unsigned=typed is not None and typed.startswith("u"),
         baked_tag=baked_tag,
         baked_kind={
@@ -677,7 +675,7 @@ def _checks(
             allowed = tuple(
                 _type_code(ty, codes)
                 for ty in a.types
-                if ty is None or not ty.startswith("*") or ty in codes
+                if not is_pointer(ty) or ty in codes
             )
             checks.append(
                 Check("allowlist", "type allowlist", "TypeError", None, allowed)
@@ -687,8 +685,8 @@ def _checks(
             checks.append(Check("integer_kind", "integer type", "ValueError"))
         checks.append(Check("power_of_two", "power_of_two_or_zero", "ValueError"))
     if a.kind == "argument":
-        for fact in ("equal_to_one", "aligned_16", "pointer_range_32"):
-            if getattr(a, fact) == "assume":
+        for fact, mode in a.fact_modes():
+            if mode == "assume":
                 checks.append(Check(fact, fact, "ValueError"))
     return tuple(checks)
 

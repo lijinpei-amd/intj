@@ -422,13 +422,14 @@ static INTJ_ALWAYS_INLINE int intj_pack(intj_state *st, PyObject *const *dyn,
 {% endif %}
   {
 {% if p.align_code %}
-    if (({{ d }}.bits & 15u) == 0{{ ' && ' ~ d ~ '.kind != INTJ_VALUE_BOOL' if p.typed is not none else '' }}) {
+    if (({{ d }}.bits & 15u) == 0{{ ' && intj_has_facts(&' ~ d ~ ')' if p.fixed_type is not none else '' }}) {
       if (type_{{ i }} < INTJ_B_I32) code_{{ i }} |= 2u;
       else if (intj_integer_type(type_{{ i }})) code_{{ i }} |= 1u;
     }
 {% endif %}
 {% if p.range_code %}
-    if (type_{{ i }} < INTJ_B_I32 && {{ d }}.storage_nbytes <= 2147483647LL)
+    if (type_{{ i }} < INTJ_B_I32 && {{ d }}.kind == INTJ_VALUE_TENSOR &&
+        {{ d }}.storage_nbytes <= 2147483647LL)
       code_{{ i }} |= 1u;
 {% endif %}
     if (type_{{ i }} != INTJ_B_NONE)

@@ -11,9 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from . import _imports, launcher_base
-from .annotation import (
-    _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
-)
+from .annotation import canonical_value
 from .compiler import KernelCompiler
 from .compiler import override_compile as override_compile
 from .errors import UnsupportedKernel as UnsupportedKernel
@@ -613,7 +611,7 @@ class _Interner:
 
     def __call__(self, value: object) -> int | None:
         try:
-            canonical = _canonical_value(value)
+            canonical = canonical_value(value)
         except ValueError:
             return None  # C raises the TypeError, naming the parameter
         found = self._ids.get(canonical)

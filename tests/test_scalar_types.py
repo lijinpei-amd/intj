@@ -3,7 +3,16 @@
 
 import pytest
 
-from intj.scalar_types import fits, is_float, is_integer, key_bytes, narrowness
+from intj.scalar_types import (
+    fact_applies,
+    fits,
+    inferred_type,
+    is_float,
+    is_integer,
+    is_pointer,
+    key_bytes,
+    narrowness,
+)
 
 
 def test_integers_are_the_signed_and_unsigned_widths_only():
@@ -38,25 +47,66 @@ def test_narrowness_keeps_the_rendered_type_test_order():
 
 
 @pytest.mark.parametrize(
-    "value, name, kind, expected",
+    "value, name, expected",
     [
-        (-128, "i8", "argument", True),
-        (128, "i8", "argument", False),
-        (-1, "u8", "argument", False),
-        (255, "u8", "argument", True),
-        (1, "u1", "argument", False),  # a bool only
-        (True, "u1", "argument", True),
-        (True, "i32", "argument", False),
-        (0.1, "fp32", "argument", True),  # an argument rounds
-        (0.1, "fp32", "constexpr", False),  # a constexpr must be exact
-        (0.5, "fp32", "constexpr", True),
-        (1e39, "fp32", "argument", False),
-        (1e39, "fp64", "constexpr", True),
-        (1, "fp64", "argument", False),
-        (0, "*fp32", "argument", False),
-        (None, None, "argument", True),
-        (0, None, "argument", False),
+        (-128, "i8", True),
+        (128, "i8", False),
+        (-1, "u8", False),
+        (255, "u8", True),
+        (1, "u1", False),  # a bool only
+        (True, "u1", True),
+        (True, "i32", False),
+        (-(2**63), "i64", True),
+        (2**63, "i64", False),
+        (0.1, "fp32", True),  # rounds
+        (float("inf"), "fp32", True),
+        (float("nan"), "fp32", True),
+        # beyond fp32's largest, as verify_annotation's range check refuses it
+        (1e39, "fp32", False),
+        (float.fromhex("0x1.fffffe0000001p+127"), "fp32", False),
+        (float.fromhex("0x1.fffffep+127"), "fp32", True),
+        (1e39, "fp64", True),
+        (1, "fp64", False),
+        (0, "*fp32", False),
+        (None, None, True),
+        (0, None, False),
     ],
 )
-def test_fits(value, name, kind, expected):
-    assert fits(value, name, kind) is expected
+def test_fits(value, name, expected):
+    assert fits(value, name) is expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, None),
+        (True, "u1"),
+        (1e39, "fp32"),  # any float, as Triton's launcher converts it
+        (-(2**31), "i32"),
+        (2**31, "i64"),
+        (-(2**63), "i64"),
+        (2**63, "u64"),
+        (2**64 - 1, "u64"),
+    ],
+)
+def test_inferred_type(value, expected):
+    assert inferred_type(value) == expected
+
+
+@pytest.mark.parametrize("value", [2**64, -(2**63) - 1, "s"])
+def test_inferred_type_refuses_what_triton_cannot_pass(value):
+    with pytest.raises(ValueError, match="outside Triton's scalar range"):
+        inferred_type(value)
+
+
+def test_facts_apply_by_kind():
+    names = ("u1", "i8", "u64", "fp32", "*fp16", None)
+    assert [n for n in names if is_pointer(n)] == ["*fp16"]
+    assert {
+        fact: [n for n in names if fact_applies(n, fact)]
+        for fact in ("equal_to_one", "aligned_16", "pointer_range_32")
+    } == {
+        "equal_to_one": ["i8", "u64"],
+        "aligned_16": ["i8", "u64", "*fp16"],
+        "pointer_range_32": ["*fp16"],
+    }

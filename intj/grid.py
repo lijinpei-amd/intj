@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 from . import _imports
+from .scalar_types import fits
 
 if TYPE_CHECKING:
     from .render.key import Param
@@ -206,7 +207,7 @@ def compile_grid(
                         arg, f"grid_cpp baked parameter {name!r} has the wrong type"
                     )
                 scalar = cast(int, value)
-                if kind == "int" and not -(1 << 63) <= scalar < (1 << 63):
+                if kind == "int" and not fits(scalar, "i64"):
                     raise fail(
                         arg, f"grid_cpp baked parameter {name!r} is outside int64"
                     )
@@ -218,7 +219,7 @@ def compile_grid(
         """Emits C for `node` and returns its temp and kind ("int" or "bool")."""
         if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
             value = int(cast(int, node.value))
-            if type(node.value) is int and not -(1 << 63) <= value < (1 << 63):
+            if type(node.value) is int and not fits(value, "i64"):
                 raise fail(node, "grid_cpp integer literal is outside int64")
             var = temp()
             lines.append(

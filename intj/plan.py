@@ -20,7 +20,7 @@ from .annotation import (
     Constexpr,
     DeviceBinding,
     ResolvedParam,
-    _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
+    canonical_value,
     _merge_annotations,  # pyright: ignore[reportPrivateUsage]  # private merge before target lookup
 )
 from .compile_options import (
@@ -657,7 +657,7 @@ def _check_kernel(
 def _canonical_global(value: object) -> tuple[object, ...]:
     """Canonicalizes one global's value for the `RenderKey`.
 
-    Beyond `_canonical_value`: tl.constexpr wrappers, tuples, enum members (by
+    Beyond `canonical_value`: tl.constexpr wrappers, tuples, enum members (by
     name) and classes (by qualified name).
 
     Raises:
@@ -689,7 +689,7 @@ def _canonical_global(value: object) -> tuple[object, ...]:
         # holds the source using it, and replacing the class is the caller's
         # promise not to (ClassGlobalWarning says so)
         return ("class", value.__module__, value.__qualname__)
-    return _canonical_value(value)
+    return canonical_value(value)
 
 
 def _class_globals(canonical: tuple[object, ...]) -> Iterator[tuple[str, str, str]]:
