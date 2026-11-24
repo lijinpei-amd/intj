@@ -29,6 +29,16 @@ struct intj_THPVariable {
 #endif
 };
 
+/* The TensorImpl* slot, which a runtime layout's `cdata` names: a MaybeOwned
+ * keeps its Tensor in a union after an `isBorrowed_` flag. */
+#if INTJ_CDATA_IS_MAYBE_OWNED
+#define INTJ_CDATA_IMPL_OFFSET                                                 \
+  (offsetof(intj_THPVariable, cdata) + sizeof(c10::MaybeOwned<at::Tensor>) -   \
+   sizeof(at::Tensor))
+#else
+#define INTJ_CDATA_IMPL_OFFSET offsetof(intj_THPVariable, cdata)
+#endif
+
 static inline const at::Tensor &intj_cdata(PyObject *o) {
 #if INTJ_CDATA_IS_MAYBE_OWNED
   return *((intj_THPVariable *)o)->cdata;

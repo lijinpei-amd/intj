@@ -1678,11 +1678,11 @@ static PyObject *intj_set_torch_abi(PyObject *self, PyObject *const *args,
       return NULL;
     }
     size_t absolute = (size_t)relative + sizeof(PyObject);
-    if (absolute != offsetof(intj_THPVariable, cdata)) {
+    if (absolute != INTJ_CDATA_IMPL_OFFSET) {
       PyErr_Format(PyExc_RuntimeError,
                    "intj: STATIC_COMPILE expects tensor cdata at offset %zu, "
                    "but this torch has it at %zu",
-                   (size_t)offsetof(intj_THPVariable, cdata), absolute);
+                   (size_t)INTJ_CDATA_IMPL_OFFSET, absolute);
       return NULL;
     }
   }
