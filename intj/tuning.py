@@ -30,6 +30,7 @@ from .errors import UnsupportedKernel
 from .heuristic import Heuristic, HeuristicError, Source, lower, parse_heuristic
 from .launcher import Launcher
 from .render.key import Param, TuningRender
+from .scalar_types import is_pointer
 
 if TYPE_CHECKING:
     from .plan import BuildPlan, Grid
@@ -289,7 +290,7 @@ def plan_tuning(
 def _is_tensor(a: CanonicalAnnotation) -> bool:
     # annotated a tensor, or a pointer whenever it is not None
     allowed = [ty for ty in a.types or () if ty is not None]
-    return a.tensor_only or bool(allowed) and all(ty.startswith("*") for ty in allowed)
+    return a.tensor_only or bool(allowed) and all(is_pointer(ty) for ty in allowed)
 
 
 def _config_options(
@@ -381,7 +382,7 @@ def tuning_render(
     for slot, c in enumerate(computed):
         sources[c.name] = Source("comp", slot)
     try:
-        source = lower([(c.heuristic, c.level) for c in computed], sources, levels)
+        lowered = lower([(c.heuristic, c.level) for c in computed], sources, levels)
     except HeuristicError as error:
         raise UnsupportedKernel(f"intj: {error}") from error
     return TuningRender(
@@ -399,7 +400,7 @@ def tuning_render(
         meta_names=tuple(p.name for p in resolved if p.annotation.tuned)
         if grid_py is not None
         else (),
-        source=source,
+        lowered=lowered,
     )
 
 

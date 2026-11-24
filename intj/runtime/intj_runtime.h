@@ -179,50 +179,6 @@ static INTJ_ALWAYS_INLINE int intj_grid_next_pow2(int64_t n, int64_t *out) {
   return intj_grid_add(x, 1, out);
 }
 
-/* Tensor attributes a heuristic may read, through the interpreter: rare, and
- * off the hit path's shape readers on purpose (ponytail: numel/size/stride
- * come from TensorImpl directly if a tuned launch profiles hot here). */
-static inline int intj_heur_tensor(PyObject *o, PyTypeObject *tensor,
-                                   PyTypeObject *param, const char *name,
-                                   const char *method, int has_index,
-                                   long index, int64_t *out) {
-  if (Py_TYPE(o) != tensor && Py_TYPE(o) != param) {
-    PyErr_Format(PyExc_TypeError,
-                 "intj: heuristic reads '%s.%s' but '%s' is a %s", name, method,
-                 name, Py_TYPE(o)->tp_name);
-    return -1;
-  }
-  PyObject *r = has_index ? PyObject_CallMethod(o, method, "l", index)
-                          : PyObject_CallMethod(o, method, NULL);
-  if (!r)
-    return -1;
-  int rc = 0;
-  if (r == Py_True || r == Py_False)
-    *out = r == Py_True;
-  else if (!PyLong_CheckExact(r) || intj_as_i64(r, out) != 0)
-    rc = intj_grid_overflow();
-  Py_DECREF(r);
-  return rc;
-}
-
-/* dtype objects are torch singletons, so their addresses compare as identity. */
-static inline int intj_heur_dtype(PyObject *o, PyTypeObject *tensor,
-                                  PyTypeObject *param, const char *name,
-                                  int64_t *out) {
-  if (Py_TYPE(o) != tensor && Py_TYPE(o) != param) {
-    PyErr_Format(PyExc_TypeError,
-                 "intj: heuristic reads '%s.dtype' but '%s' is a %s", name,
-                 name, Py_TYPE(o)->tp_name);
-    return -1;
-  }
-  PyObject *d = PyObject_GetAttrString(o, "dtype");
-  if (!d)
-    return -1;
-  *out = (int64_t)(uintptr_t)d;
-  Py_DECREF(d);
-  return 0;
-}
-
 static INTJ_ALWAYS_INLINE int intj_grid_output(int64_t value, uint32_t *out) {
   if (INTJ_UNLIKELY(value < 0 || (uint64_t)value >= UINT64_C(4294967296))) {
     PyErr_SetString(PyExc_ValueError,
@@ -231,45 +187,6 @@ static INTJ_ALWAYS_INLINE int intj_grid_output(int64_t value, uint32_t *out) {
   }
   *out = (uint32_t)value;
   return 0;
-}
-
-/* Objects a GC traverse visits, collected under the read lock.  A visitor can
- * reenter Python and grow the cache, so the visits happen after the lock is
- * released, with every object kept alive through the last visit. */
-typedef struct {
-  PyObject **items;
-  size_t n, cap;
-} intj_snapshot;
-
-static inline int intj_snapshot_add(intj_snapshot *s, PyObject *o) {
-  if (!o)
-    return 0;
-  if (s->n == s->cap) {
-    size_t cap = s->cap ? 2 * s->cap : 16;
-    PyObject **items =
-        (PyObject **)PyMem_RawRealloc(s->items, cap * sizeof(*items));
-    if (!items)
-      return -1;
-    s->items = items;
-    s->cap = cap;
-  }
-  s->items[s->n++] = Py_NewRef(o);
-  return 0;
-}
-
-static inline int intj_snapshot_visit(intj_snapshot *s, int failed,
-                                      visitproc visit, void *arg) {
-  int result = 0;
-  if (failed) {
-    PyErr_NoMemory();
-    result = -1;
-  }
-  for (size_t i = 0; !result && i < s->n; i++)
-    result = visit(s->items[i], arg);
-  for (size_t i = 0; i < s->n; i++)
-    Py_DECREF(s->items[i]);
-  PyMem_RawFree(s->items);
-  return result;
 }
 
 /* intj reads three things off a tensor: the data pointer, the dtype (as an
@@ -302,6 +219,66 @@ typedef struct {
   uint8_t dtype_index[INTJ_NDTYPES];
   int ready; /* _set_torch_abi has run */
 } intj_torch_abi;
+
+/* What reading a tensor argument needs: the two exact types one may have,
+ * and the torch ABI.  Written once, while the module loads. */
+typedef struct {
+  PyTypeObject *tensor_type; /* torch.Tensor */
+  PyTypeObject *param_type;  /* torch.nn.Parameter */
+  intj_torch_abi abi;
+} intj_torch;
+
+static INTJ_ALWAYS_INLINE int intj_is_tensor(const intj_torch *t, PyObject *o) {
+  return Py_TYPE(o) == t->tensor_type || Py_TYPE(o) == t->param_type;
+}
+
+/* Tensor attributes a heuristic may read, through the interpreter: rare, and
+ * off the hit path's shape readers on purpose (ponytail: numel/size/stride
+ * come from TensorImpl directly if a tuned launch profiles hot here). */
+static inline int intj_heur_tensor(PyObject *o, const intj_torch *t,
+                                   const char *name, const char *method,
+                                   int has_index, long index, int64_t *out) {
+  if (!intj_is_tensor(t, o)) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: heuristic reads '%s.%s' but '%s' is a %s", name, method,
+                 name, Py_TYPE(o)->tp_name);
+    return -1;
+  }
+  PyObject *r = has_index ? PyObject_CallMethod(o, method, "l", index)
+                          : PyObject_CallMethod(o, method, NULL);
+  if (!r)
+    return -1;
+  int rc = 0;
+  if (r == Py_True || r == Py_False)
+    *out = r == Py_True;
+  else if (!PyLong_CheckExact(r)) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: heuristic reads '%s.%s', which returned a %s, not an "
+                 "int",
+                 name, method, Py_TYPE(r)->tp_name);
+    rc = -1;
+  } else if (intj_as_i64(r, out) != 0)
+    rc = intj_grid_overflow();
+  Py_DECREF(r);
+  return rc;
+}
+
+/* dtype objects are torch singletons, so their addresses compare as identity. */
+static inline int intj_heur_dtype(PyObject *o, const intj_torch *t,
+                                  const char *name, int64_t *out) {
+  if (!intj_is_tensor(t, o)) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: heuristic reads '%s.dtype' but '%s' is a %s", name,
+                 name, Py_TYPE(o)->tp_name);
+    return -1;
+  }
+  PyObject *d = PyObject_GetAttrString(o, "dtype");
+  if (!d)
+    return -1;
+  *out = (int64_t)(uintptr_t)d;
+  Py_DECREF(d);
+  return 0;
+}
 
 #ifdef INTJ_TORCH_ACCESS_STATIC_COMPILE
 #include <c10/core/StorageImpl.h>
@@ -804,12 +781,11 @@ intj_decode_tensor_checked(const intj_torch_abi *abi, PyObject *o,
   return intj_finish_tensor(abi, dtype, pname, out);
 }
 
-static INTJ_ALWAYS_INLINE int
-intj_decode_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                   PyTypeObject *param_type, PyObject *o, int want_size,
-                   int none_ok, const char *pname, intj_decoded *out) {
-  PyTypeObject *type = Py_TYPE(o);
-  if (INTJ_UNLIKELY(type != tensor_type && type != param_type)) {
+static INTJ_ALWAYS_INLINE int intj_decode_tensor(const intj_torch *t,
+                                                 PyObject *o, int want_size,
+                                                 int none_ok, const char *pname,
+                                                 intj_decoded *out) {
+  if (INTJ_UNLIKELY(!intj_is_tensor(t, o))) {
     if (none_ok && o == Py_None) {
       memset(out, 0, sizeof(*out));
       out->kind = INTJ_VALUE_NONE;
@@ -818,17 +794,50 @@ intj_decode_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
     intj_not_a_tensor(o, pname, none_ok);
     return -1;
   }
-  return intj_decode_tensor_checked(abi, o, want_size, pname, out);
+  return intj_decode_tensor_checked(&t->abi, o, want_size, pname, out);
 }
 
-static INTJ_ALWAYS_INLINE int
-intj_decode_argument(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                     PyTypeObject *param_type, PyObject *o, int want_size,
-                     const char *pname, intj_decoded *out) {
-  PyTypeObject *type = Py_TYPE(o);
-  if (type != tensor_type && type != param_type)
+static INTJ_ALWAYS_INLINE int intj_decode_argument(const intj_torch *t,
+                                                   PyObject *o, int want_size,
+                                                   const char *pname,
+                                                   intj_decoded *out) {
+  if (!intj_is_tensor(t, o))
     return intj_decode_constexpr(o, pname, out);
-  return intj_decode_tensor_checked(abi, o, want_size, pname, out);
+  return intj_decode_tensor_checked(&t->abi, o, want_size, pname, out);
+}
+
+/* What Triton's launcher refuses as an address, where it extracts a pointer
+ * parameter with PyLong_AsUnsignedLongLong: a float (TypeError) and a
+ * negative int (OverflowError).  Anything else that decoded -- None, a bool
+ * or a non-negative int -- launches as its bits. */
+static INTJ_ALWAYS_INLINE int intj_check_address(const intj_decoded *value,
+                                                 const char *pname) {
+  if (INTJ_UNLIKELY(value->kind == INTJ_VALUE_FP64)) {
+    PyErr_Format(PyExc_TypeError,
+                 "intj: pointer argument '%s' must be a tensor, an int "
+                 "address or None, not float",
+                 pname);
+    return -1;
+  }
+  if (INTJ_UNLIKELY(value->kind == INTJ_VALUE_I64 &&
+                    (int64_t)value->bits < 0)) {
+    PyErr_Format(PyExc_OverflowError,
+                 "intj: pointer argument '%s' is a negative address", pname);
+    return -1;
+  }
+  return 0;
+}
+
+/* A parameter declared a pointer: a tensor, or an address as Triton's
+ * launcher takes one. */
+static INTJ_ALWAYS_INLINE int
+intj_decode_pointer_argument(const intj_torch *t, PyObject *o, int want_size,
+                             const char *pname, intj_decoded *out) {
+  if (intj_is_tensor(t, o))
+    return intj_decode_tensor_checked(&t->abi, o, want_size, pname, out);
+  if (INTJ_UNLIKELY(intj_decode_constexpr(o, pname, out) != 0))
+    return -1;
+  return intj_check_address(out, pname);
 }
 
 #ifndef INTJ_NBOUND
@@ -866,6 +875,68 @@ typedef struct {
   uint64_t id;
   uint64_t tag;
 } intj_objent;
+/* Every reference the launcher's kernel cache and object table own, listed
+ * for GC as they are stored.  Borrowed: the records and the table hold the
+ * references, until release drops them all.
+ *
+ * A traverse reads `n` under the read lock and then visits the first `n`
+ * entries unlocked, without allocating.  So an allocation failure cannot make
+ * GC miss a cached CompiledKernel and finalize it while the cache can still
+ * launch it, and a visitor may reenter Python and store records meanwhile:
+ * entries are only appended, chunks never move, and a chunk's link is written
+ * before any entry past it is counted.  Appended under the write lock, after
+ * `reserve` has allocated what the appends need; an insert it cannot reserve
+ * for fails instead.  Free-threaded, a GC traverse runs with the world
+ * stopped, never inside one of the launcher's critical sections. */
+#define INTJ_REFS_PER_CHUNK 31
+typedef struct intj_refchunk {
+  struct intj_refchunk *next;
+  PyObject *items[INTJ_REFS_PER_CHUNK];
+} intj_refchunk;
+typedef struct {
+  intj_refchunk *head; /* NULL until the first entry */
+  intj_refchunk *tail;
+  intj_refchunk *spare; /* the next chunk, allocated ahead by reserve */
+  size_t n;
+} intj_refs;
+
+/* Room for `k` (at most a chunk) appends that do not allocate: 0, or -1 when
+ * it cannot allocate.  Under the write lock. */
+static inline int intj_refs_reserve(intj_refs *r, size_t k) {
+  size_t room =
+      r->n ? INTJ_REFS_PER_CHUNK - 1 - (r->n - 1) % INTJ_REFS_PER_CHUNK : 0;
+  if (k <= room || r->spare)
+    return 0;
+  r->spare = (intj_refchunk *)PyMem_RawCalloc(1, sizeof(intj_refchunk));
+  return r->spare ? 0 : -1;
+}
+
+/* Appends `o`, borrowed, into room `reserve` made.  Under the write lock. */
+static inline void intj_refs_push(intj_refs *r, PyObject *o) {
+  size_t at = r->n % INTJ_REFS_PER_CHUNK;
+  if (at == 0) { /* the tail is full, or there is none yet */
+    intj_refchunk *c = r->spare;
+    r->spare = NULL;
+    if (r->tail)
+      r->tail->next = c;
+    else
+      r->head = c;
+    r->tail = c;
+  }
+  r->tail->items[at] = o;
+  r->n++;
+}
+
+static inline void intj_refs_free(intj_refs *r) {
+  for (intj_refchunk *c = r->head; c;) {
+    intj_refchunk *next = c->next;
+    PyMem_RawFree(c);
+    c = next;
+  }
+  PyMem_RawFree(r->spare);
+  memset(r, 0, sizeof(*r));
+}
+
 typedef struct {
   intj_objent *e; /* NULL until the first insert */
   size_t mask;    /* capacity - 1, a power of two */
@@ -878,7 +949,6 @@ typedef struct {
 struct intj_launcher_state {
   void *st;               /* the module's intj_state */
   int64_t device_ordinal; /* bind_device only */
-  int32_t device_handle;  /* bind_device only */
   int32_t cache_ready;
   uint64_t cache[3]; /* opaque intj_cache storage, only ever accessed as one */
   void *
@@ -894,7 +964,23 @@ struct intj_launcher_state {
   uint64_t pointer_bits[INTJ_BOUND_SLOTS];
   void *tensors[INTJ_BOUND_SLOTS]; /* at::Tensor * in STATIC_COMPILE */
   intj_objtab objtab;
+  intj_refs refs; /* what the cache and objtab own, for GC */
 };
+
+/* Visits every reference `refs` lists; see intj_refs. */
+static inline int intj_refs_visit(intj_bound_launcher *bound, visitproc visit,
+                                  void *arg) {
+  INTJ_RDLOCK(&bound->lock);
+  const intj_refchunk *c = bound->refs.head;
+  size_t n = bound->refs.n;
+  INTJ_RWUNLOCK(&bound->lock);
+  for (size_t i = 0; i < n; i++) {
+    if (i && i % INTJ_REFS_PER_CHUNK == 0)
+      c = c->next;
+    Py_VISIT(c->items[i % INTJ_REFS_PER_CHUNK]);
+  }
+  return 0;
+}
 static_assert(offsetof(struct intj_launcher_state, fixed_kernel) +
                       sizeof(void *) <=
                   64,
@@ -929,13 +1015,14 @@ static inline intj_objent *intj_objtab_find(const intj_objtab *t, uint64_t tag,
   }
 }
 
-/* Record (tag, key) -> id, taking the reference `key`; 0 when not taken (the
- * key is already there, or growing failed: still correct, the interner keeps
- * answering).  Under the write lock; allocates, runs no Python.  Load stays
- * at most one half, so a probe always ends on an empty slot. */
-static inline int intj_objtab_add(intj_objtab *t, uint64_t tag, Py_hash_t hash,
-                                  PyObject *key, uint64_t id) {
-  if (intj_objtab_find(t, tag, hash, key))
+/* Record (tag, key) -> id, taking the reference `key` and listing it in
+ * `refs`; 0 when not taken (the key is already there, or growing failed:
+ * still correct, the interner keeps answering).  Under the write lock;
+ * allocates, runs no Python.  Load stays at most one half, so a probe always
+ * ends on an empty slot. */
+static inline int intj_objtab_add(intj_objtab *t, intj_refs *refs, uint64_t tag,
+                                  Py_hash_t hash, PyObject *key, uint64_t id) {
+  if (intj_objtab_find(t, tag, hash, key) || intj_refs_reserve(refs, 1) != 0)
     return 0;
   size_t cap = t->e ? t->mask + 1 : 0;
   if (2 * (t->n + 1) > cap) {
@@ -963,23 +1050,8 @@ static inline int intj_objtab_add(intj_objtab *t, uint64_t tag, Py_hash_t hash,
   t->e[i].id = id;
   t->e[i].tag = tag;
   t->n++;
+  intj_refs_push(refs, key);
   return 1;
-}
-
-/* The table's references, visited as the kernel cache's are: collected under
- * the read lock (a concurrent insert can grow and free the entry array), then
- * visited after the unlock. */
-static inline int intj_objtab_traverse(intj_bound_launcher *bound,
-                                       intj_objtab *t, visitproc visit,
-                                       void *arg) {
-  intj_snapshot s = {NULL, 0, 0};
-  INTJ_RDLOCK(&bound->lock);
-  int failed = intj_snapshot_add(&s, t->dtype_type);
-  for (size_t i = 0; !failed && t->e && i <= t->mask; i++)
-    if (t->e[i].tag != INTJ_OBJ_EMPTY)
-      failed = intj_snapshot_add(&s, t->e[i].ref);
-  INTJ_RWUNLOCK(&bound->lock);
-  return intj_snapshot_visit(&s, failed, visit, arg);
 }
 
 static inline void intj_objtab_clear(intj_objtab *t) {
@@ -1010,9 +1082,10 @@ static inline void intj_object_remember(intj_bound_launcher *bound,
   PyObject *old = memo->obj;
   memo->obj = o;
   memo->id = value;
-  if (same && intj_objtab_add(t, INTJ_OBJ_SAME, intj_pointer_hash(o), o, value))
+  if (same && intj_objtab_add(t, &bound->refs, INTJ_OBJ_SAME,
+                              intj_pointer_hash(o), o, value))
     same = 0;
-  if (key && intj_objtab_add(t, tag, hash, key, value))
+  if (key && intj_objtab_add(t, &bound->refs, tag, hash, key, value))
     key = NULL;
   INTJ_RWUNLOCK(&bound->lock);
   if (same)
@@ -1146,11 +1219,9 @@ static INTJ_ALWAYS_INLINE int intj_decode_value(PyObject *o, const char *pname,
 #define INTJ_BOUND_CACHE_OF(b) ((intj_cache *)(void *)(b)->cache)
 
 static inline int intj_bind_tensor(intj_bound_launcher *bound, int index,
-                                   PyObject *value, PyTypeObject *tensor_type,
-                                   PyTypeObject *param_type,
+                                   PyObject *value, const intj_torch *t,
                                    const char *pname) {
-  if (value != Py_None && Py_TYPE(value) != tensor_type &&
-      Py_TYPE(value) != param_type) {
+  if (value != Py_None && !intj_is_tensor(t, value)) {
     PyErr_Format(PyExc_TypeError,
                  "intj: bound tensor '%s' must be a tensor or None", pname);
     return -1;
@@ -1171,8 +1242,7 @@ static inline int intj_bind_tensor(intj_bound_launcher *bound, int index,
 }
 
 static INTJ_ALWAYS_INLINE int
-intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
-                         PyTypeObject *param_type, intj_bound_launcher *bound,
+intj_decode_bound_tensor(const intj_torch *t, intj_bound_launcher *bound,
                          int index, int want_size, const char *pname,
                          intj_decoded *out) {
 #if defined(INTJ_TORCH_ACCESS_STATIC_COMPILE)
@@ -1183,29 +1253,25 @@ intj_decode_bound_tensor(const intj_torch_abi *abi, PyTypeObject *tensor_type,
     return 0;
   }
   int32_t dtype = -1;
-  if (INTJ_UNLIKELY(intj_read_cxx_tensor(abi, *tensor, &out->pointer, &dtype,
-                                         want_size,
+  if (INTJ_UNLIKELY(intj_read_cxx_tensor(&t->abi, *tensor, &out->pointer,
+                                         &dtype, want_size,
                                          &out->storage_nbytes) != 0)) {
     intj_note_param(pname);
     return -1;
   }
-  return intj_finish_tensor(abi, dtype, pname, out);
+  return intj_finish_tensor(&t->abi, dtype, pname, out);
 #else
-  return intj_decode_argument(abi, tensor_type, param_type,
-                              bound->owners[index], want_size, pname, out);
+  return intj_decode_argument(t, bound->owners[index], want_size, pname, out);
 #endif
 }
 
 /* A POINTER is decoded only during bind. Addresses carry no allocation range. */
-static inline int intj_decode_pointer(const intj_torch_abi *abi,
-                                      PyTypeObject *tensor_type,
-                                      PyTypeObject *param_type, PyObject *value,
+static inline int intj_decode_pointer(const intj_torch *t, PyObject *value,
                                       const char *pname, intj_decoded *out) {
-  if (Py_TYPE(value) == tensor_type || Py_TYPE(value) == param_type)
-    return intj_decode_argument(abi, tensor_type, param_type, value, 0, pname,
-                                out);
+  if (intj_is_tensor(t, value))
+    return intj_decode_argument(t, value, 0, pname, out);
   if (value == Py_None || PyLong_CheckExact(value))
-    return intj_decode_constexpr(value, pname, out);
+    return intj_decode_pointer_argument(t, value, 0, pname, out);
   PyObject *address = PyObject_CallMethodNoArgs(value, intj_str_data_ptr);
   if (!address) {
     if (PyErr_ExceptionMatches(PyExc_AttributeError))
@@ -1222,7 +1288,7 @@ static inline int intj_decode_pointer(const intj_torch_abi *abi,
                  pname);
     return -1;
   }
-  int rc = intj_decode_constexpr(address, pname, out);
+  int rc = intj_decode_pointer_argument(t, address, 0, pname, out);
   Py_DECREF(address);
   return rc;
 }
@@ -1308,14 +1374,8 @@ static INTJ_ALWAYS_INLINE uint64_t intj_pack_value(uint64_t bits,
 }
 
 /* Keys are little endian, independent of the host's byte order. */
-#define INTJ_KEY_STORE(WIDTH)                                                  \
-  static INTJ_ALWAYS_INLINE void intj_key_store##WIDTH(                        \
-      void *out, uint##WIDTH##_t value) {                                      \
-    if (PY_BIG_ENDIAN)                                                         \
-      value = __builtin_bswap##WIDTH(value);                                   \
-    memcpy(out, &value, sizeof(value));                                        \
-  }
-INTJ_KEY_STORE(16)
-INTJ_KEY_STORE(32)
-INTJ_KEY_STORE(64)
-#undef INTJ_KEY_STORE
+static INTJ_ALWAYS_INLINE void intj_key_store64(void *out, uint64_t value) {
+  if (PY_BIG_ENDIAN)
+    value = __builtin_bswap64(value);
+  memcpy(out, &value, sizeof(value));
+}

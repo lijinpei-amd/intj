@@ -297,7 +297,8 @@ def traversal_helpers(tmp_path_factory):
     `traverse_count(owner, trigger, callback)` counts visited objects of
     `trigger`'s type and calls `callback` once when `trigger` is visited;
     `traverse_fail(owner, trigger)` fails the traversal with 77 at the first such
-    object.
+    object; `traverse_count_without_memory(owner, trigger)` counts them while
+    every allocation fails.
     """
     path = tmp_path_factory.mktemp("visit")
     source = path / "visit.c"
@@ -345,6 +346,38 @@ static int fail_on_owner(PyObject *object, void *opaque) {
 int traverse_fail(PyObject *owner, PyObject *trigger) {
   return Py_TYPE(owner)->tp_traverse(owner, fail_on_owner, trigger);
 }
+
+static void *no_malloc(void *ctx, size_t size) { return NULL; }
+static void *no_calloc(void *ctx, size_t count, size_t size) { return NULL; }
+static void *no_realloc(void *ctx, void *ptr, size_t size) { return NULL; }
+static void saved_free(void *ctx, void *ptr) {
+  PyMemAllocatorEx *saved = (PyMemAllocatorEx *)ctx;
+  saved->free(saved->ctx, ptr);
+}
+
+static int count_owner(PyObject *object, void *opaque) {
+  visit_context *context = (visit_context *)opaque;
+  if (Py_TYPE(object) == Py_TYPE(context->trigger))
+    context->seen++;
+  return 0;
+}
+
+int traverse_count_without_memory(PyObject *owner, PyObject *trigger) {
+  static const PyMemAllocatorDomain domains[3] = {
+      PYMEM_DOMAIN_RAW, PYMEM_DOMAIN_MEM, PYMEM_DOMAIN_OBJ};
+  PyMemAllocatorEx saved[3], failing[3];
+  for (int i = 0; i < 3; i++) {
+    PyMem_GetAllocator(domains[i], &saved[i]);
+    failing[i] = (PyMemAllocatorEx){&saved[i], no_malloc, no_calloc,
+                                    no_realloc, saved_free};
+    PyMem_SetAllocator(domains[i], &failing[i]);
+  }
+  visit_context context = {trigger, NULL, 0, 0};
+  int rc = Py_TYPE(owner)->tp_traverse(owner, count_owner, &context);
+  for (int i = 0; i < 3; i++)
+    PyMem_SetAllocator(domains[i], &saved[i]);
+  return rc ? -1 : context.seen;
+}
 """
     )
     subprocess.run(
@@ -364,12 +397,14 @@ int traverse_fail(PyObject *owner, PyObject *trigger) {
     lib.traverse_count.restype = ctypes.c_int
     lib.traverse_fail.argtypes = [ctypes.py_object] * 2
     lib.traverse_fail.restype = ctypes.c_int
+    lib.traverse_count_without_memory.argtypes = [ctypes.py_object] * 2
+    lib.traverse_count_without_memory.restype = ctypes.c_int
     return lib
 
 
 @pytest.mark.parametrize("cache", list(KernelCache), ids=lambda cache: cache.value)
 @pytest.mark.parametrize("fixed_device", [False, True], ids=["module", "bound"])
-def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
+def test_cache_traversal_survives_no_memory_and_a_visitor_that_reenters(
     traversal_helpers, fixed_device, cache
 ):
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -423,6 +458,9 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
     refcounts = [sys.getrefcount(value) for value in owners]
     assert traversal_helpers.traverse_fail(owner, owners[0]) == 77
     assert [sys.getrefcount(value) for value in owners] == refcounts
+    # GC visits every cached reference even when it cannot allocate: a missed
+    # one looks unreachable and is finalized while the cache still holds it
+    assert traversal_helpers.traverse_count_without_memory(owner, owners[0]) == 8
 
     def grow_cache():
         for value in range(8, 32):
@@ -432,7 +470,7 @@ def test_cache_traversal_uses_a_snapshot_when_a_visitor_reenters(
     assert len(owners) == 32
 
 
-def test_bound_no_map_compiled_reference_is_gc_traversed():
+def test_bound_no_map_compiled_reference_is_gc_traversed(traversal_helpers):
 
     x = torch.zeros(1, device="cuda", dtype=torch.int32)
     factory = make_launcher(
@@ -468,6 +506,7 @@ def test_bound_no_map_compiled_reference_is_gc_traversed():
     override_compile(bound, compile_fake)
     result = bound(torch.cuda.current_stream().cuda_stream, (0,), 9)
     assert result is owner
+    assert traversal_helpers.traverse_count_without_memory(bound.__self__, owner) == 1
     override_compile(bound, lambda *_args: None)
     del result, owner, compile_fake, bound
 

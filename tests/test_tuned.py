@@ -868,6 +868,17 @@ def test_lowered_tensor_heuristic_matches_python(h):
     _check_lowered(h, [(x, y, 1, 2) for x, y in pairs])
 
 
+def test_lowered_tensor_method_returning_a_non_int_raises_type_error(monkeypatch):
+    h = triton.heuristics({"K": lambda a: a["x"].element_size()})
+    launch = make_launcher(h(lowered))
+    monkeypatch.setattr(torch.Tensor, "element_size", lambda self: 2.5)
+    out = torch.zeros(1, device="cuda", dtype=torch.int32)
+    x = torch.zeros(8, device="cuda")
+    device, stream = controls()
+    with pytest.raises(TypeError, match=r"'x.element_size', which returned a float"):
+        launch(device, stream, 1, out, x, x, 1, 2)
+
+
 def _reference(kernel, args_by_name, dynamic=None):
     """Returns what Triton itself decides for these arguments, options and knobs.
 

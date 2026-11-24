@@ -22,7 +22,7 @@ from .. import backend as backends
 from ..compile_options import refuse_unknown_options, resolve
 from ..errors import UnsupportedKernel
 from ..python_intf import cpython_abi
-from ..scalar_types import triton_name
+from ..scalar_types import is_pointer, triton_name
 from ..torch_intf.torch_abi import (
     TorchAccessMode,
     dtype_index_table,
@@ -123,7 +123,7 @@ def _build_module(b: BuildPlan, stub: types.ModuleType) -> types.ModuleType:  # 
         pointer_types=_pointer_types(params),
         grid_arg_num=b.grid.dims,
         grid_py_mode=b.grid.mode == "py",
-        grid_cpp_source=b.grid.code.source if b.grid.code else "",
+        grid_cpp=b.grid.code.steps if b.grid.code else None,
         grid_extra=b.grid.code.extras if b.grid.code else (),
         return_compiled=b.option.return_compiled,
         ndebug=b.option.ndebug,
@@ -259,7 +259,7 @@ def _pointer_types(params: Sequence[Param]) -> tuple[tuple[str, int], ...]:
         ty[1:]
         for p in params
         for ty in p.annotation.types or ()
-        if ty is not None and ty.startswith("*")
+        if ty is not None and is_pointer(ty)
     }
     if not wanted:
         return ()

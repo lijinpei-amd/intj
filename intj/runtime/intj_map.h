@@ -204,17 +204,6 @@ static inline int intj_kernel_live(const intj_kernel *k) {
     INTJ_MEMO_STORE(&m->last, (P##_slot *)NULL);                               \
     return &s->val;                                                            \
   }                                                                            \
-  static inline int P##_each(const P *m, int (*fn)(V *, void *), void *ctx) {  \
-    if (!m->slots)                                                             \
-      return 0;                                                                \
-    for (uint32_t i = 0; i <= m->mask; i++)                                    \
-      if (V##_live(&m->slots[i].val)) {                                        \
-        int r = fn(&m->slots[i].val, ctx);                                     \
-        if (r)                                                                 \
-          return r;                                                            \
-      }                                                                        \
-    return 0;                                                                  \
-  }                                                                            \
   /* Detach before releasing: a CompiledKernel finalizer may reenter GC. */    \
   static inline void P##_free(P *m, void (*release)(V *)) {                    \
     P##_slot *slots = m->slots;                                                \
@@ -303,17 +292,6 @@ struct intj_key_hash {
     } catch (...) {                                                             \
       return NULL;                                                              \
     }                                                                           \
-  }                                                                             \
-  static inline int intj_cache_each(const intj_cache *c,                        \
-                                    int (*fn)(V *, void *), void *ctx) {        \
-    if (!c->map)                                                                \
-      return 0;                                                                 \
-    for (const auto &e : *c->map) {                                             \
-      int r = fn(const_cast<V *>(&e.second), ctx);                              \
-      if (r)                                                                    \
-        return r;                                                               \
-    }                                                                           \
-    return 0;                                                                   \
   }                                                                             \
   static inline void intj_cache_free(intj_cache *c, void (*release)(V *)) {     \
     intj_cache_map *map = c->map;                                               \

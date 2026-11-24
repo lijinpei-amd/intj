@@ -1,7 +1,7 @@
 """Reading and lowering of `@triton.heuristics` functions.
 
 Finds which names each heuristic reads, and lowers the ones keyed at run time
-to C.
+to the steps entry.c.jinja writes as C.
 """
 
 from __future__ import annotations
@@ -10,13 +10,13 @@ import ast
 import builtins
 import dataclasses
 import inspect
-import json
 import linecache
 import types
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
 from . import _imports
+from .render.key import Operand, Step
 
 # Python 3.8 wraps a subscript's index in ast.Index; later versions do not.
 _INDEX: Any = getattr(ast, "Index", ())
@@ -197,12 +197,12 @@ _ARITH: dict[type[ast.operator], str] = {
     ast.Mod: "mod",
 }
 _COMPARE: dict[type[ast.cmpop], str] = {
-    ast.Eq: "==",
-    ast.NotEq: "!=",
-    ast.Lt: "<",
-    ast.LtE: "<=",
-    ast.Gt: ">",
-    ast.GtE: ">=",
+    ast.Eq: "eq",
+    ast.NotEq: "ne",
+    ast.Lt: "lt",
+    ast.LtE: "le",
+    ast.Gt: "gt",
+    ast.GtE: "ge",
 }
 
 
@@ -219,48 +219,49 @@ def lower(
     computed: Sequence[tuple[Heuristic, int]],
     sources: Mapping[str, Source],
     levels: int,
-) -> str:
-    """Lowers `computed` to one `intj_tuned_level_<n>` C function per level.
+) -> tuple[tuple[Step, ...], ...]:
+    """Lowers `computed` to the steps of each level's `intj_tuned_level_<n>`.
 
-    Each function writes (value, is_bool) pairs to `comp`.
+    Each level writes (value, is_bool) pairs to `comp`.
 
     `computed` is level-major; its position is the comp slot.  Every read of a
     tensor attribute sits behind the short-circuit it has in Python.
     """
-    out: list[str] = []
+    out: list[tuple[Step, ...]] = []
     for level in range(levels):
-        lines = [
-            f"static int intj_tuned_level_{level}(intj_state *st, PyObject *const *args, "
-            "const int64_t *dep, int64_t *comp) {",
-            "  (void)st; (void)args; (void)dep; (void)comp;",
-        ]
-        serial = [
-            0
-        ]  # temp names: deterministic, since the source is in the module digest
+        steps: list[Step] = []
+        serial = [0]  # temp numbers: deterministic, since steps are in the digest
         for slot, (h, at) in enumerate(computed):
             if at != level:
                 continue
-            emitter = _Emitter(h, sources, lines, serial)
-            value, is_bool = emitter.emit(h.expr, "  ")
-            lines.append(
-                f"  comp[{2 * slot}] = {value}; comp[{2 * slot + 1}] = {is_bool};"
+            value, is_bool = _Emitter(h, sources, serial).emit(h.expr, steps)
+            steps.append(
+                Step(
+                    "assign",
+                    Operand("comp", 2 * slot),
+                    Operand("comp", 2 * slot + 1),
+                    value,
+                    is_bool,
+                )
             )
-        lines += ["  return 0;", "}"]
-        out.append("\n".join(lines))
-    return "\n\n".join(out)
+        out.append(tuple(steps))
+    return tuple(out)
+
+
+_ZERO = Operand("int", 0)
+_ONE = Operand("int", 1)
 
 
 class _Emitter:
-    """Lowers one heuristic's expression to C lines appended to a shared list."""
+    """Lowers one heuristic's expression to steps appended to a caller's list."""
 
     def __init__(
         self,
         h: Heuristic,
         sources: Mapping[str, Source],
-        lines: list[str],
         serial: list[int],
     ):
-        self.h, self.sources, self.lines, self.serial = h, sources, lines, serial
+        self.h, self.sources, self.serial = h, sources, serial
         namespace = h.fn.__globals__
         self.builtins_ok = {
             name: namespace.get(name, getattr(builtins, name)) is fn
@@ -272,20 +273,20 @@ class _Emitter:
     def fail(self, node: ast.AST, message: str) -> HeuristicError:
         return HeuristicError(f"{self.h.where}: heuristic {self.h.name!r}: {message}")
 
-    def temp(self) -> str:
+    def temp(self) -> Operand:
         self.serial[0] += 1
-        return f"hv_{self.serial[0]}"
+        return Operand("temp", self.serial[0])
 
-    def pair(self, indent: str) -> tuple[str, str]:
+    def pair(self, steps: list[Step]) -> tuple[Operand, Operand]:
         v, b = self.temp(), self.temp()
-        self.lines.append(f"{indent}int64_t {v} = 0, {b} = 0;")
+        steps.append(Step("declare", v, b, _ZERO, _ZERO))
         return v, b
 
-    def fixed_kind(self, indent: str, is_bool: bool) -> tuple[str, str]:
+    def fixed_kind(self, steps: list[Step], is_bool: bool) -> tuple[Operand, Operand]:
         """Returns a temp for a result whose kind the syntax decides."""
         v = self.temp()
-        self.lines.append(f"{indent}int64_t {v} = 0;")
-        return v, "1" if is_bool else "0"
+        steps.append(Step("declare", v, a=_ZERO))
+        return v, _ONE if is_bool else _ZERO
 
     def input(self, node: ast.expr) -> tuple[str, Source] | None:
         key = _subscript_key(node, self.h.arg, self.h.where)
@@ -300,8 +301,8 @@ class _Emitter:
             raise self.fail(node, f"{what} needs a caller tensor argument")
         return found[0], found[1].index
 
-    def emit(self, node: ast.expr, indent: str) -> tuple[str, str]:
-        """Emits C for `node` and returns its (value, is_bool) C expressions.
+    def emit(self, node: ast.expr, steps: list[Step]) -> tuple[Operand, Operand]:
+        """Appends the steps for `node` and returns its (value, is_bool) operands.
 
         Raises:
             HeuristicError: `node` is outside the subset intj lowers.
@@ -310,125 +311,124 @@ class _Emitter:
         if found is not None:
             name, source = found
             if source.kind == "arg":
-                v, b = self.pair(indent)
-                self.lines.append(
-                    f"{indent}if (intj_heur_arg(args[{source.index}], {json.dumps(name)}, &{v}, &{b}) != 0) return -1;"
+                v, b = self.pair(steps)
+                steps.append(
+                    Step("heur_arg", v, b, Operand("arg", source.index), name=name)
                 )
                 return v, b
             if source.kind == "fixed":
                 if type(source.value) not in (int, bool):
                     raise self.fail(node, f"baked {name!r} must be an int or bool")
-                return str(int(cast(int, source.value))), "1" if type(
-                    source.value
-                ) is bool else "0"
-            array = "dep" if source.kind == "dep" else "comp"
-            return f"{array}[{2 * source.index}]", f"{array}[{2 * source.index + 1}]"
+                is_bool = type(source.value) is bool
+                return Operand("int", int(cast(int, source.value))), (
+                    _ONE if is_bool else _ZERO
+                )
+            return (
+                Operand(source.kind, 2 * source.index),
+                Operand(source.kind, 2 * source.index + 1),
+            )
         if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
             value = int(cast(int, node.value))
             if not -(1 << 63) < value < (1 << 63):
                 raise self.fail(node, "integer literal is outside int64")
-            return str(value), "1" if type(node.value) is bool else "0"
+            return Operand("int", value), _ONE if type(node.value) is bool else _ZERO
         if isinstance(node, ast.BinOp):
             op = _ARITH.get(type(node.op))
             if op is None:
                 raise self.fail(node, "unsupported operator")
-            left, _ = self.emit(node.left, indent)
-            right, _ = self.emit(node.right, indent)
-            v, b = self.fixed_kind(indent, False)
-            self.lines.append(
-                f"{indent}if (intj_grid_{op}({left}, {right}, &{v}) != 0) return -1;"
-            )
+            left, _ = self.emit(node.left, steps)
+            right, _ = self.emit(node.right, steps)
+            v, b = self.fixed_kind(steps, False)
+            steps.append(Step("checked", v, a=left, b=right, fn=op))
             return v, b
         if isinstance(node, ast.UnaryOp):
-            operand, operand_bool = self.emit(node.operand, indent)
-            v, b = self.fixed_kind(indent, isinstance(node.op, ast.Not))
+            operand, _ = self.emit(node.operand, steps)
+            v, b = self.fixed_kind(steps, isinstance(node.op, ast.Not))
             if isinstance(node.op, ast.Not):
-                self.lines.append(f"{indent}{v} = !{operand};")
+                steps.append(Step("not", v, a=operand))
             elif isinstance(node.op, ast.USub):
-                self.lines.append(
-                    f"{indent}if (intj_grid_sub(0, {operand}, &{v}) != 0) return -1;"
-                )
+                steps.append(Step("checked", v, a=_ZERO, b=operand, fn="sub"))
             elif isinstance(node.op, ast.UAdd):
-                self.lines.append(f"{indent}{v} = {operand};")
+                steps.append(Step("assign", v, a=operand))
             else:
                 raise self.fail(node, "unsupported operator")
-            del operand_bool
             return v, b
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1:
                 raise self.fail(node, "chained comparisons are not supported")
             op, right_node = node.ops[0], node.comparators[0]
-            v, b = self.fixed_kind(indent, True)
+            v, b = self.fixed_kind(steps, True)
             if isinstance(op, (ast.Is, ast.IsNot)):
                 found = self.input(node.left)
                 if found is None or not (
                     isinstance(right_node, ast.Constant) and right_node.value is None
                 ):
                     raise self.fail(node, "`is` only compares an input with None")
-                name, source = found
-                negate = "!" if isinstance(op, ast.IsNot) else ""
-                test = (
-                    f"args[{source.index}] == Py_None"
+                source = found[1]
+                tested = (
+                    Operand("arg", source.index)
                     if source.kind == "arg"
-                    else (
-                        "1" if source.kind == "fixed" and source.value is None else "0"
-                    )
+                    else _ONE
+                    if source.kind == "fixed" and source.value is None
+                    else _ZERO
                 )
-                del name
-                self.lines.append(f"{indent}{v} = {negate}({test});")
+                steps.append(
+                    Step("is_none", v, a=tested, negate=isinstance(op, ast.IsNot))
+                )
                 return v, b
-            symbol = _COMPARE.get(type(op))
-            if symbol is None:
+            compare = _COMPARE.get(type(op))
+            if compare is None:
                 raise self.fail(node, "unsupported comparison")
             if _is_dtype(node.left) or _is_dtype(right_node):
-                if symbol not in ("==", "!=") or not (
+                if compare not in ("eq", "ne") or not (
                     _is_dtype(node.left) and _is_dtype(right_node)
                 ):
                     raise self.fail(
                         node, ".dtype only compares with another .dtype by == or !="
                     )
                 left, right = (
-                    self.dtype(node.left, indent),
-                    self.dtype(right_node, indent),
+                    self.dtype(node.left, steps),
+                    self.dtype(right_node, steps),
                 )
             else:
-                left, _ = self.emit(node.left, indent)
-                right, _ = self.emit(right_node, indent)
-            self.lines.append(f"{indent}{v} = {left} {symbol} {right};")
+                left, _ = self.emit(node.left, steps)
+                right, _ = self.emit(right_node, steps)
+            steps.append(Step("compare", v, a=left, b=right, fn=compare))
             return v, b
         if isinstance(node, ast.BoolOp):
-            v, b = self.pair(indent)
-            first, first_bool = self.emit(node.values[0], indent)
-            self.lines.append(f"{indent}{v} = {first}; {b} = {first_bool};")
-            test = f"{v}" if isinstance(node.op, ast.And) else f"!{v}"
-            depth = indent
+            v, b = self.pair(steps)
+            first, first_bool = self.emit(node.values[0], steps)
+            steps.append(Step("assign", v, b, first, first_bool))
+            # `a and b and c`: each later operand, nested in its predecessor's test
+            blocks: list[list[Step]] = []
             for value in node.values[1:]:
-                self.lines.append(f"{depth}if ({test}) {{")
-                inner = depth + "  "
-                nv, nb = self.emit(value, inner)
-                self.lines.append(f"{inner}{v} = {nv}; {b} = {nb};")
-                depth = inner
-            for _ in node.values[1:]:
-                depth = depth[:-2]
-                self.lines.append(f"{depth}}}")
+                then: list[Step] = []
+                nv, nb = self.emit(value, then)
+                then.append(Step("assign", v, b, nv, nb))
+                blocks.append(then)
+            nested: tuple[Step, ...] = ()
+            for then in reversed(blocks):
+                negate = isinstance(node.op, ast.Or)
+                nested = (Step("if", a=v, negate=negate, then=(*then, *nested)),)
+            steps += nested
             return v, b
         if isinstance(node, ast.IfExp):
-            v, b = self.pair(indent)
-            test, _ = self.emit(node.test, indent)
-            self.lines.append(f"{indent}if ({test}) {{")
-            yes, yes_bool = self.emit(node.body, indent + "  ")
-            self.lines.append(f"{indent}  {v} = {yes}; {b} = {yes_bool};")
-            self.lines.append(f"{indent}}} else {{")
-            no, no_bool = self.emit(node.orelse, indent + "  ")
-            self.lines.append(f"{indent}  {v} = {no}; {b} = {no_bool};")
-            self.lines.append(f"{indent}}}")
+            v, b = self.pair(steps)
+            test, _ = self.emit(node.test, steps)
+            yes: list[Step] = []
+            yes_value, yes_bool = self.emit(node.body, yes)
+            yes.append(Step("assign", v, b, yes_value, yes_bool))
+            no: list[Step] = []
+            no_value, no_bool = self.emit(node.orelse, no)
+            no.append(Step("assign", v, b, no_value, no_bool))
+            steps.append(Step("if", a=test, then=tuple(yes), orelse=tuple(no)))
             return v, b
         if isinstance(node, ast.Subscript) and _is_attr(node.value, "shape"):
             index = node.slice
             if isinstance(index, _INDEX):
                 index = index.value  # pyright: ignore[reportAttributeAccessIssue]  # 3.8 ast.Index
             return self.tensor_call(
-                cast(ast.Attribute, node.value).value, "size", [index], node, indent
+                cast(ast.Attribute, node.value).value, "size", [index], node, steps
             )
         if isinstance(node, ast.Call) and not node.keywords:
             func = node.func
@@ -439,14 +439,12 @@ class _Emitter:
             ):
                 if not self.builtins_ok[func.id]:
                     raise self.fail(node, f"{func.id} must resolve to the builtin")
-                a, a_bool = self.emit(node.args[0], indent)
-                c, c_bool = self.emit(node.args[1], indent)
-                v, b = self.pair(indent)
-                op = "<" if func.id == "min" else ">"
+                a, a_bool = self.emit(node.args[0], steps)
+                c, c_bool = self.emit(node.args[1], steps)
+                v, b = self.pair(steps)
                 # Python returns the first argument unless the second beats it.
-                self.lines.append(
-                    f"{indent}if ({c} {op} {a}) {{ {v} = {c}; {b} = {c_bool}; }} else {{ {v} = {a}; {b} = {a_bool}; }}"
-                )
+                fn = "lt" if func.id == "min" else "gt"
+                steps.append(Step("pick", v, b, a, a_bool, c, c_bool, fn=fn))
                 return v, b
             if (
                 isinstance(func, ast.Attribute)
@@ -461,17 +459,14 @@ class _Emitter:
                     raise self.fail(
                         node, f"triton.{func.attr} takes {arity} argument(s)"
                     )
-                operands = [self.emit(arg, indent)[0] for arg in node.args]
-                v, b = self.fixed_kind(indent, False)
-                helper = (
-                    "intj_grid_cdiv" if func.attr == "cdiv" else "intj_grid_next_pow2"
-                )
-                self.lines.append(
-                    f"{indent}if ({helper}({', '.join(operands)}, &{v}) != 0) return -1;"
-                )
+                operands = [self.emit(arg, steps)[0] for arg in node.args]
+                v, b = self.fixed_kind(steps, False)
+                fn = "cdiv" if func.attr == "cdiv" else "next_pow2"
+                second = operands[1] if arity == 2 else None
+                steps.append(Step("checked", v, a=operands[0], b=second, fn=fn))
                 return v, b
             if isinstance(func, ast.Attribute) and func.attr in _TENSOR_METHODS:
-                return self.tensor_call(func.value, func.attr, node.args, node, indent)
+                return self.tensor_call(func.value, func.attr, node.args, node, steps)
         raise self.fail(
             node,
             f"unsupported {type(node).__name__} call"
@@ -485,33 +480,37 @@ class _Emitter:
         method: str,
         args: Sequence[ast.expr],
         node: ast.AST,
-        indent: str,
-    ) -> tuple[str, str]:
-        """Emits a call of tensor method `method` on the caller tensor `target`."""
+        steps: list[Step],
+    ) -> tuple[Operand, Operand]:
+        """Appends a call of tensor method `method` on the caller tensor `target`."""
         name, index = self.tensor_arg(target, f".{method}")
         takes_index = _TENSOR_METHODS[method]
         if len(args) != int(takes_index):
             raise self.fail(node, f".{method} takes {int(takes_index)} argument(s)")
-        literal = 0
+        literal = None
         if takes_index:
             arg = args[0]
             if not (isinstance(arg, ast.Constant) and type(arg.value) is int):
                 raise self.fail(node, f".{method} needs a literal int index")
-            literal = int(arg.value)
-        v, b = self.fixed_kind(indent, method == "is_contiguous")
-        self.lines.append(
-            f"{indent}if (intj_heur_tensor(args[{index}], st->tensor_type, st->param_type, "
-            f"{json.dumps(name)}, {json.dumps(method)}, {int(takes_index)}, {literal}L, &{v}) != 0) return -1;"
+            literal = Operand("int", int(arg.value))
+        v, b = self.fixed_kind(steps, method == "is_contiguous")
+        steps.append(
+            Step(
+                "heur_tensor",
+                v,
+                a=Operand("arg", index),
+                b=literal,
+                fn=method,
+                name=name,
+            )
         )
         return v, b
 
-    def dtype(self, node: ast.expr, indent: str) -> str:
+    def dtype(self, node: ast.expr, steps: list[Step]) -> Operand:
         name, index = self.tensor_arg(cast(ast.Attribute, node).value, ".dtype")
         v = self.temp()
-        self.lines.append(f"{indent}int64_t {v};")
-        self.lines.append(
-            f"{indent}if (intj_heur_dtype(args[{index}], st->tensor_type, st->param_type, {json.dumps(name)}, &{v}) != 0) return -1;"
-        )
+        steps.append(Step("declare", v))
+        steps.append(Step("heur_dtype", v, a=Operand("arg", index), name=name))
         return v
 
 

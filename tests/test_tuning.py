@@ -176,7 +176,8 @@ def test_heuristic_calling_triton_is_located_and_lowered():
     # differently from the lambda's node compiled alone.
     h = parse_heuristic("K", lambda a: triton.cdiv(a["N"], 2))
     assert h.inputs == ("N",)
-    assert "intj_grid_cdiv" in lower([(h, 0)], {"N": Source("arg", 0)}, 1)
+    (steps,) = lower([(h, 0)], {"N": Source("arg", 0)}, 1)
+    assert any(s.op == "checked" and s.fn == "cdiv" for s in steps)
 
 
 @pytest.mark.parametrize(

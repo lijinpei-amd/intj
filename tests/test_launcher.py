@@ -578,7 +578,7 @@ def test_bind_device_no_map_compiles_once_and_has_no_hash_lookup(
             "static const char *const intj_computed_names"
         )
     ]
-    assert "#define INTJ_HAS_KEY 0" in source
+    assert "#define INTJ_KEY_BYTES 0" in source
     assert "intj_hash(" not in call_body + walk_body
     assert "intj_cache_get(" not in call_body + walk_body
     assert "intj_cache_put(" not in call_body
@@ -760,7 +760,7 @@ def test_bind_device_cuda_template_backend_branches_compile(
     assert binary.is_file()
     source = binary.with_suffix(".c").read_text()
     assert f'intj_dlsym(gpu, "{backend.device_symbol}")' in source
-    assert "st->device_get(&bound->device_handle," in source
+    assert "st->device_get(&handle," in source
 
 
 def test_bind_device_resolves_without_changing_current_and_checks_first_compile(
@@ -2378,7 +2378,8 @@ def test_checked_ordinary_pointer_null_and_dtype(pointer_kernel, mode):
         assert launch(0, 0, 1, value) is None
         assert launch.__self__.spec_key(0, value)[1] == 1
     for value in (True, 1, -1, 0.0, torch.empty(4, dtype=torch.int32)):
-        with pytest.raises((TypeError, ValueError), match="x"):
+        # -1 is no address at all: OverflowError, as Triton's launcher raises
+        with pytest.raises((TypeError, ValueError, OverflowError), match="x"):
             launch(0, 0, 1, value)
 
 
@@ -5078,7 +5079,7 @@ _TUNING = TuningRender(
     deps=(1, 0),
     dep_names=("BLOCK",),
     meta_names=("BLOCK",),
-    source="",
+    lowered=((), ()),
 )
 
 

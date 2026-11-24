@@ -1,4 +1,5 @@
-"""Lowering of the supported annotated grid function subset to C."""
+"""Lowering of the supported annotated grid function subset to the steps
+entry.c.jinja writes as C."""
 
 from __future__ import annotations
 
@@ -6,13 +7,13 @@ import ast
 import builtins
 import dataclasses
 import inspect
-import json
 import textwrap
 import types
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 from . import _imports
+from .render.key import Operand, Step
 from .scalar_types import fits
 
 if TYPE_CHECKING:
@@ -32,11 +33,12 @@ class GridCode:
     Attributes:
         extras: The keyword-only grid parameters that are not kernel
             parameters, in the order the evaluator reads them.
-        source: The C source of the evaluator.
+        steps: The evaluator's body; it reads tuned values from `dep` when
+            the launcher is tuned.
     """
 
     extras: tuple[str, ...]
-    source: str
+    steps: tuple[Step, ...]
 
 
 def compile_grid(
@@ -146,52 +148,59 @@ def compile_grid(
         fn.__globals__.get("triton") is triton and triton.cdiv is _imports.cdiv
     )
 
-    lines = [
-        "static int intj_eval_grid(PyObject *const *args, "
-        + ("const int64_t *dep, " if deps is not None else "")
-        + "uint32_t dims[3]) {"
-    ]
-    if deps is not None:
-        lines.append("  (void)dep;")
-    bound: dict[str, tuple[str, str]] = {}
+    steps: list[Step] = []
+    bound: dict[str, tuple[Operand, str]] = {}
     serial = 0
 
-    def temp() -> str:
+    def temp() -> Operand:
         nonlocal serial
-        name = f"gv_{serial}"
         serial += 1
-        return name
+        return Operand("temp", serial - 1)
+
+    def literal(value: int) -> Operand:
+        return Operand("int64_min") if value == -(1 << 63) else Operand("int", value)
 
     for arg in ordered_args:
         name = arg.arg
         kind = kinds[name]
         var = temp()
         if name in extras:
-            index = extras.index(name)
-            lines.append(f"  int64_t {var};")
-            lines.append(
-                f"  if (intj_grid_input_{kind}(args[{index}], {json.dumps(name)}, &{var}) != 0) return -1;"
+            steps.append(Step("declare", var))
+            steps.append(
+                Step(
+                    "grid_input",
+                    var,
+                    a=Operand("arg", extras.index(name)),
+                    fn=kind,
+                    name=name,
+                )
             )
         else:
             param = by_name[name]
             if deps is not None and name in deps:
                 slot = deps[name]
-                lines.append(f"  int64_t {var};")
-                lines.append(
-                    f"  if (intj_grid_input_dep(dep[{2 * slot}], dep[{2 * slot + 1}], "
-                    f"{1 if kind == 'bool' else 0}, {json.dumps(name)}, &{var}) != 0) return -1;"
+                steps.append(Step("declare", var))
+                steps.append(
+                    Step(
+                        "grid_input_dep",
+                        var,
+                        a=Operand("dep", 2 * slot),
+                        b=Operand("dep", 2 * slot + 1),
+                        fn=kind,
+                        name=name,
+                    )
                 )
             elif param.annotation.dynamic:
                 index = len(extras) + list(dynamic).index(name)
-                lines.append(f"  int64_t {var};")
-                lines.append(
-                    f"  if (intj_grid_input_{kind}(args[{index}], {json.dumps(name)}, &{var}) != 0) return -1;"
+                steps.append(Step("declare", var))
+                steps.append(
+                    Step("grid_input", var, a=Operand("arg", index), fn=kind, name=name)
                 )
             elif param.call_index is not None:
                 index = len(extras) + len(dynamic) + param.call_index
-                lines.append(f"  int64_t {var};")
-                lines.append(
-                    f"  if (intj_grid_input_{kind}(args[{index}], {json.dumps(name)}, &{var}) != 0) return -1;"
+                steps.append(Step("declare", var))
+                steps.append(
+                    Step("grid_input", var, a=Operand("arg", index), fn=kind, name=name)
                 )
             elif param.annotation.bind_value is not None:
                 raise fail(arg, f"grid_cpp cannot read bound parameter {name!r}")
@@ -211,20 +220,20 @@ def compile_grid(
                     raise fail(
                         arg, f"grid_cpp baked parameter {name!r} is outside int64"
                     )
-                literal = "INT64_MIN" if scalar == -(1 << 63) else str(int(scalar))
-                lines.append(f"  int64_t {var} = {literal};")
+                steps.append(Step("declare", var, a=literal(int(scalar))))
         bound[name] = var, kind
 
-    def emit(node: ast.AST, indent: str = "  ") -> tuple[str, str]:
-        """Emits C for `node` and returns its temp and kind ("int" or "bool")."""
+    def emit(node: ast.AST, out: list[Step]) -> tuple[Operand, str]:
+        """Appends the steps for `node` to `out`; returns its temp and kind.
+
+        The kind is "int" or "bool".
+        """
         if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
             value = int(cast(int, node.value))
             if type(node.value) is int and not fits(value, "i64"):
                 raise fail(node, "grid_cpp integer literal is outside int64")
             var = temp()
-            lines.append(
-                f"{indent}int64_t {var} = {'INT64_MIN' if value == -(1 << 63) else value};"
-            )
+            out.append(Step("declare", var, a=literal(value)))
             return var, "bool" if type(node.value) is bool else "int"
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             if node.id not in bound:
@@ -239,16 +248,14 @@ def compile_grid(
                 and node.operand.value == 1 << 63
             ):
                 var = temp()
-                lines.append(f"{indent}int64_t {var} = INT64_MIN;")
+                out.append(Step("declare", var, a=Operand("int64_min")))
                 return var, "int"
-            operand, _ = emit(node.operand, indent)
+            operand, _ = emit(node.operand, out)
             if isinstance(node.op, ast.UAdd):
                 return operand, "int"
             var = temp()
-            lines.append(f"{indent}int64_t {var};")
-            lines.append(
-                f"{indent}if (intj_grid_sub(0, {operand}, &{var}) != 0) return -1;"
-            )
+            out.append(Step("declare", var))
+            out.append(Step("checked", var, a=Operand("int", 0), b=operand, fn="sub"))
             return var, "int"
         if isinstance(node, ast.BinOp):
             operations: dict[type[ast.operator], str] = {
@@ -260,13 +267,11 @@ def compile_grid(
             operation = operations.get(type(node.op))
             if operation is None:
                 raise fail(node, "grid_cpp unsupported arithmetic operator")
-            left, _ = emit(node.left, indent)
-            right, _ = emit(node.right, indent)
+            left, _ = emit(node.left, out)
+            right, _ = emit(node.right, out)
             var = temp()
-            lines.append(f"{indent}int64_t {var};")
-            lines.append(
-                f"{indent}if (intj_grid_{operation}({left}, {right}, &{var}) != 0) return -1;"
-            )
+            out.append(Step("declare", var))
+            out.append(Step("checked", var, a=left, b=right, fn=operation))
             return var, "int"
         if isinstance(node, ast.Call) and len(node.args) == 2 and not node.keywords:
             if isinstance(node.func, ast.Name) and node.func.id == "min":
@@ -284,30 +289,30 @@ def compile_grid(
                 operation = "cdiv"
             else:
                 raise fail(node, "grid_cpp unsupported call")
-            left, left_kind = emit(node.args[0], indent)
-            right, right_kind = emit(node.args[1], indent)
+            left, left_kind = emit(node.args[0], out)
+            right, right_kind = emit(node.args[1], out)
             if left_kind != "int" or right_kind != "int":
                 raise fail(node, f"grid_cpp {operation} needs integer operands")
             var = temp()
-            lines.append(f"{indent}int64_t {var};")
+            out.append(Step("declare", var))
             if operation == "min":
-                lines.append(f"{indent}{var} = {left} < {right} ? {left} : {right};")
+                out.append(Step("min", var, a=left, b=right))
             else:
-                lines.append(
-                    f"{indent}if (intj_grid_cdiv({left}, {right}, &{var}) != 0) return -1;"
-                )
+                out.append(Step("checked", var, a=left, b=right, fn="cdiv"))
             return var, "int"
         if isinstance(node, ast.IfExp):
-            test, _ = emit(node.test, indent)
+            test, _ = emit(node.test, out)
             var = temp()
-            lines.append(f"{indent}int64_t {var};")
-            lines.append(f"{indent}if ({test}) {{")
-            yes, yes_kind = emit(node.body, indent + "  ")
-            lines.append(f"{indent}  {var} = {yes};")
-            lines.append(f"{indent}}} else {{")
-            no, no_kind = emit(node.orelse, indent + "  ")
-            lines.append(f"{indent}  {var} = {no};")
-            lines.append(f"{indent}}}")
+            out.append(Step("declare", var))
+            yes_steps: list[Step] = []
+            yes, yes_kind = emit(node.body, yes_steps)
+            yes_steps.append(Step("assign", var, a=yes))
+            no_steps: list[Step] = []
+            no, no_kind = emit(node.orelse, no_steps)
+            no_steps.append(Step("assign", var, a=no))
+            out.append(
+                Step("if", a=test, then=tuple(yes_steps), orelse=tuple(no_steps))
+            )
             if yes_kind != no_kind:
                 raise fail(
                     node, "grid_cpp conditional branches need the same scalar type"
@@ -333,15 +338,14 @@ def compile_grid(
         ):
             raise fail(statement, "grid_cpp supports only simple local assignments")
         target = statement.targets[0].id
-        value = emit(statement.value)
+        value = emit(statement.value, steps)
         bound[target] = value
     result = statements[-1].value
     if not isinstance(result, (ast.Tuple, ast.List)) or not 1 <= len(result.elts) <= 3:
         raise fail(statements[-1], "grid_cpp must return a 1-3 element tuple or list")
-    dimensions = [emit(element) for element in result.elts]
+    dimensions = [emit(element, steps) for element in result.elts]
     for i, (var, kind) in enumerate(dimensions):
         if kind != "int":
             raise fail(result.elts[i], "grid_cpp dimensions must be integers")
-        lines.append(f"  if (intj_grid_output({var}, &dims[{i}]) != 0) return -1;")
-    lines.extend(("  return 0;", "}"))
-    return GridCode(tuple(extras), "\n".join(lines))
+        steps.append(Step("grid_output", a=var, index=i))
+    return GridCode(tuple(extras), tuple(steps))

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ..annotation import CacheKeyField, CanonicalAnnotation, DeviceBinding
 from ..scalar_types import SCALARS, is_float, is_integer, is_pointer, narrowness
-from .key import DynamicSlot, Param, RenderKey, TuningRender
+from .key import DynamicSlot, Param, RenderKey, Step, TuningRender
 
 ENTRY_TEMPLATE = Path(__file__).parent / "entry.c.jinja"
 
@@ -92,14 +92,18 @@ class ParamView:
     index: int
     call_index: int | None
     memo: int | None
-    annotation: CanonicalAnnotation
     constexpr: bool
     #: `intj_pack` decodes it: tuned values and baked constexprs are never seen
     decoded: bool
     #: which reader decodes it on the generic path: "baked", "bound_pointer",
-    #: "bound_tensor", "constexpr_memo", "constexpr", "tensor", "typed_float",
-    #: "typed_int" or "argument"
+    #: "bound_tensor", "constexpr_memo", "constexpr", "tensor", "pointer"
+    #: (declared one pointer type: refuses what Triton's launcher refuses as
+    #: an address), "typed_float", "typed_int" or "argument"
     decoder: str
+    tensor_only: bool  # it takes only a tensor ...
+    none_ok: bool  # ... or None
+    #: keys its power-of-two-or-zero code, from the value's magnitude and sign
+    pow2_code: bool
     #: a scalar Triton annotation of an unsigned type: the value converts the
     #: way Triton's launcher extracts it
     typed_unsigned: bool
@@ -199,7 +203,7 @@ class RenderContext:
     cpython_static_compile_header: str
     grid_arg_num: int | None
     grid_py_mode: bool
-    grid_cpp_source: str
+    grid_cpp: tuple[Step, ...] | None  # `grid_cpp`, lowered
     return_compiled: bool
     ndebug: bool
     tuning: TuningRender | None
@@ -229,8 +233,7 @@ class RenderContext:
     torch_access_name: str
     guarded: bool  # can recurse into Python, so takes the recursion guard
     launch_guard: bool  # a zero-volume grid reaches the launch
-    traverse_cache: bool  # GC visits the kernel cache
-    traverse_fixed: bool  # GC visits the fixed kernel
+    final_refs: int  # references a final record owns: its CompiledKernel, meta
     auto_decode: bool  # the inlined, unannotated decode
     auto_parts: tuple[AutoPart, ...]
     device_write: KeyWrite | None
@@ -266,7 +269,7 @@ class RenderContext:
         fixed_device = key.device_binding == DeviceBinding.FIXED
         grid_mode = (
             "cpp"
-            if key.grid_cpp_source
+            if key.grid_cpp is not None
             else "py"
             if key.grid_py_mode
             else "object"
@@ -344,7 +347,7 @@ class RenderContext:
             cpython_static_compile_header=key.cpython_static_compile_header,
             grid_arg_num=key.grid_arg_num,
             grid_py_mode=key.grid_py_mode,
-            grid_cpp_source=key.grid_cpp_source,
+            grid_cpp=key.grid_cpp,
             return_compiled=key.return_compiled,
             ndebug=key.ndebug,
             tuning=tuning,
@@ -369,8 +372,7 @@ class RenderContext:
             torch_access_name=key.torch_access_mode.upper(),
             guarded=fixed_device or bool(bound) or key.grid_py_mode or tuned,
             launch_guard=key.return_compiled or (grid_mode == "cpp" and tuned),
-            traverse_cache=(key.return_compiled or tuned_meta) and key.nwords > 0,
-            traverse_fixed=key.return_compiled and fixed_device,
+            final_refs=int(key.return_compiled) + int(tuned_meta),
             auto_decode=auto_decode,
             auto_parts=_auto_parts(key) if auto_decode else (),
             device_write=None
@@ -577,10 +579,12 @@ def _param_view(
         index=p.index,
         call_index=p.call_index,
         memo=p.memo,
-        annotation=a,
         constexpr=constexpr,
         decoded=not a.tuned and not a.dynamic and (not constexpr or not a.baked_value),
         decoder=_decoder(p, typed),
+        tensor_only=a.tensor_only,
+        none_ok=a.none_ok,
+        pow2_code=a.power_of_two_or_zero,
         typed_unsigned=typed is not None and typed.startswith("u"),
         baked_tag=baked_tag,
         baked_kind={
@@ -601,7 +605,7 @@ def _param_view(
         )
         if type_from == "choices"
         else (),
-        checks=_checks(a, typed, verify, codes),
+        checks=_checks(a, verify, codes),
         bound_checks=_bound_checks(a, verify, codes),
         one_code=a.equal_to_one != "never",
         one_tests_value=a.equal_to_one == "auto",
@@ -635,6 +639,8 @@ def _decoder(p: Param, typed: str | None) -> str:
         return "constexpr_memo" if p.memo is not None else "constexpr"
     if a.tensor_only:
         return "tensor"
+    if a.types is not None and len(a.types) == 1 and is_pointer(a.types[0]):
+        return "pointer"
     if is_float(typed):
         return "typed_float"
     return "typed_int" if typed is not None else "argument"
@@ -642,7 +648,6 @@ def _decoder(p: Param, typed: str | None) -> str:
 
 def _checks(
     a: CanonicalAnnotation,
-    typed: str | None,
     verify: bool,
     codes: Mapping[str, int],
 ) -> tuple[Check, ...]:
@@ -652,8 +657,9 @@ def _checks(
     checks: list[Check] = []
     type_error = "ValueError" if a.power_of_two_or_zero else "TypeError"
     range_error = "ValueError" if a.power_of_two_or_zero else "OverflowError"
-    # a Triton-typed value was already converted by Triton's own rules
-    if a.types is not None and typed is None:
+    # a Triton-typed value takes what Triton's launcher converts, a pointer
+    # type included: any address, and a tensor of any dtype
+    if a.types is not None and not a.triton_typed:
         if len(a.types) == 1:
             ty = a.types[0]
             code = _type_code(ty, codes)

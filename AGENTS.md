@@ -44,7 +44,8 @@ invariant (key fields, call and key layout, compiler input) live in
 key width, narrowness order, whether a value fits it, a torch dtype's name) in
 `scalar_types.py`. Compile options live in `compile_options.py`: the knob
 table (`KNOBS`, read by both launchers and compat's launcher key), parameter-fed
-and forbidden options, and `resolve`, the one merge (base, then a call's
+and forbidden options, the Triton compile hooks intj refuses (`COMPILE_HOOKS`),
+and `resolve`, the one merge (base, then a call's
 overlay, then knobs) and canonicalization every compile, module key and config
 check goes through. Checked dependency provisioning is in `render/deps.py`, and
 `UnsupportedKernel` in `errors.py` (re-exported by `launcher.py`, as is
@@ -58,7 +59,9 @@ and choice (which decoder, which checks, the order of type tests) is a
 boolean, a `none` test, or one field against a literal, loops, interpolates, and
 spells C names (`{% set d = 'decoded_' ~ i %}`). It does no arithmetic and uses no
 filters, list building or `namespace`. A change to the template that needs a new
-value adds a field.
+value adds a field. Python expressions lowered to C (`grid_cpp`, computed
+heuristics) reach it as `key.Step` lists, which the recursive `lowered` macro
+writes.
 
 To check that a refactor of either side renders the same C, pickle the `RenderKey`s
 a test run builds (wrap `intj.render.build.build`), then compare the old and new
@@ -151,14 +154,16 @@ walk, so `key_chain` works on both. A cache hit skips this method.
 
 ## The kernel cache is swappable, and intj's own is the default
 
-`intj_cache_{init,lookup,get,put,each,free}`, instantiated by
+`intj_cache_{init,lookup,get,put,free}`, instantiated by
 `INTJ_DEFINE_CACHE(V)` in `runtime/intj_map.h`, is the whole interface; the entry
 template never names an implementation. Every backend stores records by value,
 so a record pointer is valid only while the launcher's read lock is held; `lookup`
 checks a one-entry memo before hashing or probing, and a put clears it. A
 backend owns the records it is given (`intj_cache_free` hands each to a release
 function) and must not let an exception escape -- the C++ maps throw where intj
-returns NULL. Every value stored by `INTJ_DEFINE_MAP` must read as occupied
+returns NULL. GC never iterates a backend: a stored record's references are
+listed in the launcher's `intj_refs` (`runtime/intj_runtime.h`), whose
+traverse cannot fail. Every value stored by `INTJ_DEFINE_MAP` must read as occupied
 (a non-null pointer, or `block_dim >= 1`); a zeroed slot is what "empty" means,
 so a value type or insert path that can store all-zero-but-live breaks every
 map. Map-only

@@ -405,9 +405,9 @@ intj keys a hit on:
   `triton.cdiv`, `triton.next_power_of_2`, `x is None`, and
   `.numel() .size(i) .shape[i] .stride(i) .dim() .element_size()
   .is_contiguous() .data_ptr() .dtype` on tensor arguments. Scalar inputs must be `int` or
-  `bool` at runtime (`TypeError` otherwise, e.g. for a `float`). Tensor
-  attribute reads go through the interpreter, so they cost more than scalar
-  reads.
+  `bool` at runtime (`TypeError` otherwise, e.g. for a `float`), and so must
+  what a tensor method returns. Tensor attribute reads go through the
+  interpreter, so they cost more than scalar reads.
 
 Every other heuristic -- one that reads only autotune keys, tuned values or
 baked values -- runs in Python on a miss only, and its result is stored per
@@ -492,8 +492,12 @@ the value fits.
 
 A pointer type keeps the facts Triton gives the value itself, as its binder
 does for `x: tl.pointer_type(...)`: a tensor's data pointer can be aligned and
-its storage under 2 GiB, an int address can only be aligned, and `None`, a
-bool or a float has neither.
+its storage under 2 GiB, an int address can only be aligned, and `None` or a
+bool has neither. What Triton's launcher refuses as an address is refused
+whether or not `verify_annotation` is on: a float raises `TypeError` and a
+negative int `OverflowError`. Under `verify_annotation=True`,
+`Argument(type=tl.pointer_type(...))` also refuses a nonzero int and a tensor
+of another dtype; a Triton annotation does not (see below).
 
 A baked `Argument(value=...)` is checked as `verify_annotation` checks a
 passed value: against one declared type, range included, so
@@ -504,7 +508,7 @@ These annotations behave specially:
 
 | written | accepts | behavior |
 |---|---|---|
-| a type Triton recognizes (`n: int`, `tl.int64`, `"tl.int64"`, ...) | what Triton's launcher converts: `3` into a `float` is `3.0`; `2.5` into an `int` raises `TypeError`; beyond 64 bits raises `OverflowError`; narrower integers truncate | equal-to-1 fact is `NEVER`, as in Triton; `verify_annotation` adds no check. A signed integer takes what has `__index__` (a 0-dim int tensor, a numpy int) and specializes on the integer it launches, where Triton's binder reads a tensor's address |
+| a type Triton recognizes (`n: int`, `tl.int64`, `"tl.int64"`, `x: tl.pointer_type(tl.float32)`, ...) | what Triton's launcher converts: `3` into a `float` is `3.0`; `2.5` into an `int` raises `TypeError`; beyond 64 bits raises `OverflowError`; narrower integers truncate; a pointer takes a tensor of any dtype, `None` or a non-negative int address | equal-to-1 fact is `NEVER`, as in Triton; `verify_annotation` adds no check. A signed integer takes what has `__index__` (a 0-dim int tensor, a numpy int) and specializes on the integer it launches, where Triton's binder reads a tensor's address |
 | `torch.Tensor`, `tl.tensor` | an exact `torch.Tensor` or `torch.nn.Parameter`; anything else raises `TypeError` | specializes like an unannotated tensor; combines with a pointer type, conflicts with a constexpr, a scalar or `None` type, a baked value or a binding |
 | `torch.Tensor \| None`, `Optional[...]`, `Union[..., None]` | the same, or `None` | `None` is keyed as Triton keys an unannotated `None` |
 
@@ -602,8 +606,8 @@ A bound parameter leaves the call: its value comes once from `bind_args=`,
   call. Without a pointer `type`, the bound tensor fixes the dtype, and a bound
   `None` compiles as a constexpr `None`; `type=None` accepts only `None`.
 - `BindValue.POINTER` needs exactly one explicit pointer type
-  (`type=tl.pointer_type(tl.float32)`) and takes an int address, `None`, a
-  tensor, or an object with `data_ptr()`. The address is read once, at
+  (`type=tl.pointer_type(tl.float32)`) and takes a non-negative int address,
+  `None`, a tensor, or an object with `data_ptr()`. The address is read once, at
   binding, and an object is kept alive.
 
 The module is built before the value is known, so no fact that applies may be

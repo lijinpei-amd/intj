@@ -747,6 +747,52 @@ def test_keys_and_compiles_as_tritons_binder_specializes(case, typed, tensors, t
     assert check_binder(jit, extra, reference, binder_values(tensors), truth) > 10
 
 
+@pytest.mark.parametrize("verify", [False, True], ids=["trusted", "verified"])
+@pytest.mark.parametrize("case", ["typed_pointer", "argument_pointer"])
+def test_pointer_refuses_what_tritons_launcher_refuses(case, verify, typed):
+    """A float or a negative int is no address: Triton's launcher raises."""
+    jit, extra, _ = binder_case(typed, case)
+    launch = make_launcher(
+        jit,
+        extra_annotation=extra,
+        no_gpu=True,
+        verify_annotation=verify,
+        torch_access_mode=TorchAccessMode.RUNTIME_SHIM,
+    )
+    with pytest.raises(TypeError, match="not float"):
+        launch.__self__.spec_key(0, 1.5)
+    with pytest.raises(OverflowError, match="negative address"):
+        launch.__self__.spec_key(0, -16)
+    if case == "typed_pointer" or not verify:  # else only 0 is an address
+        launch.__self__.spec_key(0, 2**64 - 16)  # Triton launches it unsigned
+
+
+def test_verify_adds_no_check_to_a_triton_typed_pointer(typed, tensors):
+    """It takes what Triton does: an int address, a tensor of any dtype."""
+
+    def keys(verify, values):
+        launch = make_launcher(
+            typed.typed_pointer,
+            no_gpu=True,
+            verify_annotation=verify,
+            torch_access_mode=TorchAccessMode.RUNTIME_SHIM,
+        )
+        out = []
+        for value in values:
+            try:
+                out.append(launch.__self__.spec_key(0, value))
+            except REFUSALS as error:
+                out.append(type(error))
+        return out
+
+    values = [value for (value,) in binder_values(tensors)]
+    assert keys(True, values) == keys(False, values)
+    float16 = tensors.values[2]
+    assert float16.dtype == torch.float16
+    for refused in keys(True, [float16, tensors.base.data_ptr() + 4]):
+        assert not isinstance(refused, type)
+
+
 def test_host_invariant_catches_a_typed_int_compiled_from_its_object(
     monkeypatch, typed, tensors, truth
 ):

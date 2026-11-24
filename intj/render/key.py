@@ -22,6 +22,56 @@ class Param:
 
 
 @dataclasses.dataclass(frozen=True)
+class Operand:
+    """A value a lowered `Step` reads or writes."""
+
+    #: "temp" (a step's result), "int" (a literal), "int64_min", "arg" (a
+    #: call argument), or "dep" or "comp" (a slot of that array)
+    kind: str
+    index: int = 0  # the temp's number, the literal, the argument or the slot
+
+
+@dataclasses.dataclass(frozen=True)
+class Step:
+    """One statement of a lowered `grid_cpp` or heuristic.
+
+    `heuristic.lower` and `grid.compile_grid` lower Python expressions to
+    steps; the `lowered` macro in entry.c.jinja writes each as C.  `op` says
+    what it does and which fields it reads:
+
+    - "declare": `out` (`= a`), and `out2 = b` if set.
+    - "assign": `out = a`, and `out2 = b` if set.
+    - "not": `out = !a`.  "compare": `out = a <fn> b`, `fn` one of "eq",
+      "ne", "lt", "le", "gt", "ge".  "min": the smaller of `a` and `b`.
+    - "is_none": whether `a` (an "arg", else a 0/1 "int") is None; `negate`.
+    - "pick": Python's `min` (`fn` "lt") or `max` ("gt") of values `a` and
+      `c`, whose kinds are `b` and `d`, into `out` and `out2`.
+    - "checked": `out = intj_grid_<fn>(a[, b])`, Python's integer arithmetic.
+    - "heur_arg": the int or bool argument `a`, named `name`, into the value
+      `out` and its kind `out2`.  "heur_tensor": tensor `a`'s method `fn`,
+      with the literal index `b` if set.  "heur_dtype": tensor `a`'s dtype.
+    - "grid_input": argument `a`, named `name`, as an `fn` ("int" or "bool").
+      "grid_input_dep": the tuned value `a` of kind `b`, as an `fn`.
+    - "grid_output": `a` as grid dimension `index`.
+    - "if": `then` if `a` (not `a`, under `negate`), else `orelse` if set.
+    """
+
+    op: str
+    out: Operand | None = None
+    out2: Operand | None = None
+    a: Operand | None = None
+    b: Operand | None = None
+    c: Operand | None = None
+    d: Operand | None = None
+    fn: str = ""
+    name: str = ""
+    index: int = 0
+    negate: bool = False
+    then: tuple[Step, ...] = ()
+    orelse: tuple[Step, ...] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class TuningRender:
     """What the render needs of an autotune/heuristics launcher."""
 
@@ -33,7 +83,8 @@ class TuningRender:
     deps: tuple[int, ...]  # dependent values C reads, stored per level
     dep_names: tuple[str, ...]  # level-major; the callback's `deps`
     meta_names: tuple[str, ...]  # grid_py: tuned parameters, declaration order
-    source: str  # generated `intj_tuned_level_<n>` functions
+    #: each level's computed keys, lowered: its `intj_tuned_level_<n>`
+    lowered: tuple[tuple[Step, ...], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,7 +169,7 @@ class RenderKey:
     pointer_types: tuple[tuple[str, int], ...] = ()
     grid_arg_num: int | None = None
     grid_py_mode: bool = False
-    grid_cpp_source: str = ""
+    grid_cpp: tuple[Step, ...] | None = None  # `grid_cpp`, lowered
     grid_extra: tuple[str, ...] = ()
     return_compiled: bool = False
     ndebug: bool = True  # NDEBUG for the whole translation unit
