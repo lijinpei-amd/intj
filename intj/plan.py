@@ -106,9 +106,10 @@ def is_chain(kernel: object) -> bool:
 def build_plan(option: MakeLauncherOption) -> BuildPlan:
     """Runs every GPU-free check on `option` and returns what the build needs.
 
-    In order: the option's own values; the kernel; its annotations and tuning
-    plan; `dynamic_options` and `options=`; the grid; the Torch access mode;
-    warnings; bound values; then provisioning, which may reach the network.
+    In order: the option's own values; `TRITON_INTERPRET=1` and the kernel;
+    its annotations and tuning plan; `dynamic_options` and `options=`; the
+    grid; the Torch access mode; warnings; bound values; then provisioning,
+    which may reach the network.
 
     Raises:
         UnsupportedKernel: The kernel or an option is outside intj's scope,
@@ -266,16 +267,19 @@ def _check_values(option: MakeLauncherOption) -> tuple[str, ...]:
 def _checked_kernel(option: MakeLauncherOption) -> tuple[JitFunction, Any]:
     """Returns the kernel under any autotune/heuristics chain, and the chain."""
     _imports.ensure_triton_imported()
+    # Decoration never gets here, so a module-level `@make_launcher` still
+    # imports under the interpreter; check() and the first call refuse.
+    if _imports.knobs.runtime.interpret:
+        raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
     render_module._verified_cpython_header()  # pyright: ignore[reportPrivateUsage]  # shared ABI check
     chain = kernel = option.jit_func
     while is_chain(kernel):
         kernel = kernel.fn
     interpreted = _imports.interpreted_function()
     if interpreted is not None and isinstance(kernel, interpreted):
-        # `@triton.jit` under `TRITON_INTERPRET=1` returns an InterpretedFunction,
-        # not a JITFunction: it has none of the attributes the analysis below
-        # needs.  Decoration never gets here, so a module-level `@make_launcher`
-        # still imports under the interpreter; this is the first call's refusal.
+        # decorated under `TRITON_INTERPRET=1` and called with it off:
+        # `@triton.jit` returned an InterpretedFunction, not a JITFunction,
+        # with none of the attributes the analysis below needs
         raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
     return kernel, chain
 

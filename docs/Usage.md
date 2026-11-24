@@ -61,10 +61,16 @@ k.spec_key(device, *dynamic_options, *kernel_args)  # debug: (key bytes, nparams
 k.key_chain(device, *dynamic_options, *kernel_args) # debug: ((key bytes, ...), found); builds first
 ```
 
-The methods returning a new launcher return it unbuilt and validate nothing.
+The methods returning a new launcher return it unbuilt. They raise
+`TypeError` only for a `replace_delayed` or `chain_delayed` argument that is
+not callable; the new launcher's `check()` or first call validates the rest.
 Each has an in-place twin with a leading underscore (`_bind_args()`, ...) that
-edits this launcher instead and raises `RuntimeError` once it is built. Call
-`make_launcher` once, outside any hot loop.
+edits this launcher instead and raises `RuntimeError` once it is built, except
+`_resolve_delayed()`, which then does nothing: a built launcher has no
+`delayed` left. The bind methods edit the explicit `bind_device` and
+`bind_args`: a `delayed` that returns either still replaces the edited value
+whole when the launcher is built. Call `make_launcher` once, outside any hot
+loop.
 
 ### Device and stream
 
@@ -161,12 +167,16 @@ def k(...): ...
 It may return any keyword but `jit_func` and `delayed`, `dynamic_options`, the
 grid options and `bind_args` included. Each one it returns replaces the
 explicit one whole (a returned `options` dict is not merged into the
-decorator's), entering module identity the same way.
+decorator's, nor a `bind_args` into what `bind_args()` merged), entering
+module identity the same way.
 
 Each launcher calls it on its first call (`check()` calls it too, storing
 nothing); once built, `launcher.__self__.options` holds the result, with
 `delayed=None`. A result that is not a mapping of `make_launcher` keywords
-raises `TypeError`.
+raises `TypeError`. It may call or check another launcher, waiting if another
+thread is building that one; calling or checking the launcher being built, or
+a wait that would deadlock (two builds each waiting on the other), raises
+`RuntimeError`.
 
 `replace_delayed(fn)` swaps it, `chain_delayed(fn)` runs `fn` after it with
 `fn`'s keywords winning, and `resolve_delayed()` calls it now; each returns a
@@ -262,11 +272,14 @@ aid, and builds a separate module.
 
 ### Build on first call
 
-To avoid unnecessary work at module import time, `make_launcher` only records
-its keywords, as a `MakeLauncherOption`. The launcher is only built when first
-called: it calls `delayed`, validates arguments and annotations, analyzes an
-autotune/heuristics chain, lowers `grid_cpp`, renders the launcher source code
-from a Jinja template, and builds it. Then the launcher is used to cache and
+To avoid unnecessary work at module import time, `make_launcher` records its
+keywords, as a `MakeLauncherOption`, and checks nothing about the kernel; it
+touches no GPU and imports no torch. Its first call in a process also imports
+triton and loads `_intj_launcher_base`, the kernel-free C base every launcher
+uses, compiling it with the host C compiler unless cached. The launcher is
+only built when first called: it calls `delayed`, validates arguments and
+annotations, analyzes an autotune/heuristics chain, lowers `grid_cpp`, renders
+the launcher source code from a Jinja template, and builds it. Then the launcher is used to cache and
 launch kernels.
 
 To run the same checks the launcher build would, without building, call

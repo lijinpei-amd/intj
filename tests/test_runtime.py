@@ -1139,6 +1139,90 @@ def test_call_during_build_is_refused(built, stub_module):
     assert seen and "while it was being built" in seen[0]
 
 
+@pytest.mark.parametrize("failure", ["raises", "malformed"])
+def test_a_failure_after_init_unpublishes_and_the_next_call_retries(
+    built, stub_module, failure
+):
+    """A build failing once `_init` published the state block releases it.
+
+    Otherwise every retry's `_init` would refuse a half-built launcher.
+    """
+    module, _, _ = built
+    interners = []
+
+    def tracked():
+        interner = _interner()
+        interners.append(weakref.ref(interner))
+        return interner
+
+    def build(header):
+        address = _init_launcher(module, header, _compile_state(built[2]), tracked())
+        if len(interners) > 1:
+            return _built(address)
+        if failure == "raises":
+            raise KeyboardInterrupt  # say, a Ctrl-C right after `_init` returned
+        return address, None, "not bytes"
+
+    launch = _new_launcher(stub_module, None, build)
+    with pytest.raises(KeyboardInterrupt if failure == "raises" else TypeError):
+        launch(*_args())
+    h = launch.__self__
+    assert not h._C_built and h._C_module is None
+    assert interners[0]() is None  # the published state block was released
+    assert launch(*_args()) is None and len(interners) == 2
+    assert h._C_module is module
+
+
+def test_a_build_waits_on_another_launchers_lock_outside_a_cycle(stub_module):
+    """A thread holding one build lock waits on another held by a thread waiting on none."""
+    first = _new_launcher(stub_module, "first", print).__self__
+    second = _new_launcher(stub_module, "second", print).__self__
+    held = threading.Event()
+
+    def hold_second():
+        held.set()
+        time.sleep(0.1)  # the main thread reaches `second` meanwhile
+
+    holder = threading.Thread(target=second._C_locked, args=(hold_second,))
+    holder.start()
+    held.wait()
+    assert first._C_locked(lambda: second._C_locked(lambda: 7)) == 7
+    holder.join()
+
+
+def test_a_wait_cycle_between_build_locks_is_refused_once(stub_module):
+    """Two threads each holding one build lock and taking the other's.
+
+    The second to try would close a cycle and is refused; the first then
+    waits for the refused one's lock and gets it.
+    """
+    launchers = [_new_launcher(stub_module, n, print).__self__ for n in "ab"]
+    both_hold = threading.Barrier(2, timeout=10)
+    results, errors = [], []
+
+    def run(mine, other):
+        def cross():
+            both_hold.wait()
+            return other._C_locked(lambda: mine._C_options)
+
+        try:
+            results.append(mine._C_locked(cross))
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    threads = [
+        threading.Thread(target=run, args=pair, daemon=True)
+        for pair in (launchers, launchers[::-1])
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads), "deadlocked"
+    assert len(results) == 1 and results[0] in ("a", "b")
+    assert len(errors) == 1 and "would deadlock" in errors[0]
+
+
 @pytest.mark.parametrize("subclass", [False, True], ids=["base", "subclass"])
 def test_unbuilt_and_built_launchers_are_collected(built, stub_module, subclass):
     module, _, _ = built

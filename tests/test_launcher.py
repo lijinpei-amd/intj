@@ -59,7 +59,6 @@ from intj.launcher import (
     UnsupportedKernel,
     module_of,
     override_compile,
-    triton_specialization,
 )
 from knob_helpers import (
     ON_HIP,
@@ -67,6 +66,7 @@ from knob_helpers import (
     live_knob_values,
     needs_hip,
     needs_pointer_range,
+    triton_specialization,
 )
 from intj.kernel_cache import KernelCache
 from intj.python_intf import cpython_abi
@@ -5743,8 +5743,9 @@ def test_launcher_built_with_interpret_off_keeps_launching_if_turned_on_later(
 ):
     """A built launcher keeps launching after interpret is turned on.
 
-    The interpreter refusal lives only in `_build` (the first call): once the
-    module is swapped in, a later call never reads the knob again.
+    The interpreter refusal lives only in the build plan (`check()` and the
+    first call): once the module is swapped in, a later call never reads the
+    knob again.
     """
     from triton import knobs
 

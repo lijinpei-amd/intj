@@ -16,7 +16,7 @@ import triton.language as tl
 
 from intj import MakeLauncherOption, compiler, make_launcher
 from intj.annotation import NEVER, Argument, BindValue, Constexpr
-from intj.launcher import Launcher
+from intj.launcher import Launcher, UnsupportedKernel
 from intj.options import OPTION_FIELDS, MakeLauncherKwargs
 from intj.torch_intf.torch_abi import TorchAccessMode
 
@@ -52,8 +52,12 @@ def test_unknown_keyword_fails_at_decoration():
 
 
 def test_compile_state_is_published_only_after_initialization(monkeypatch):
+    from intj import _imports
     from intj.render import module as render_module
 
+    # torch's first import keeps its importer's frames, and so the build's
+    # compile state, alive: run alone, this file's first build would import it
+    _imports.ensure_torch_imported()
     launch = make_launcher(store, **_HOST)
     h = launch.__self__
     assert not hasattr(h, "_compile_state")
@@ -103,6 +107,24 @@ def kern_dir(tmp_path):
         )
     )
     return tmp_path
+
+
+def test_check_refuses_triton_interpret_before_provisioning(monkeypatch):
+    from triton import knobs
+
+    from intj.render import deps as render_deps
+
+    provisioned = []
+    monkeypatch.setattr(render_deps, "_provision", provisioned.append)
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = True
+        launch = make_launcher(store, **_HOST)  # decoration refuses nothing
+        for run in (launch.__self__.check, lambda: launch(0, 0, 1, 0, 4)):
+            with pytest.raises(UnsupportedKernel, match="TRITON_INTERPRET=1"):
+                run()
+        assert provisioned == []
+    launch.__self__.check()
+    assert len(provisioned) == 1
 
 
 def test_decoration_imports_no_torch(kern_dir):
@@ -341,25 +363,29 @@ def test_resolve_and_chain_delayed():
     assert _option(k.__self__.replace_delayed(None)).delayed is None
 
 
-def test_resolve_delayed_is_a_no_op_when_built_between_its_check_and_its_edit(
-    monkeypatch,
-):
-    k = make_launcher(store, delayed=_first, **_HOST)
-    stale = _option(k)
-    assert stale.delayed is not None
-    k.__self__.build()  # the other thread's build, landing after the check below
-    cls = type(k.__self__)  # the process's `Launcher` over the C base
-    real = cls._C_options  # the C member's descriptor
-    reads = []
+def test_resolve_delayed_racing_the_first_call_does_nothing():
+    started, calls, errors = threading.Event(), [], []
 
-    def options(self):
-        reads.append(None)
-        return stale if len(reads) == 1 else real.__get__(self, cls)
+    def delayed():
+        calls.append(None)
+        started.set()
+        time.sleep(0.2)  # the other thread's resolve waits on the build lock
+        return _HOST
 
-    monkeypatch.setattr(cls, "_C_options", property(options))
-    k.__self__._resolve_delayed()  # sees `delayed`, then the edit finds it built
-    assert len(reads) == 2
-    monkeypatch.undo()
+    k = make_launcher(store, delayed=delayed)
+
+    def resolve():
+        started.wait()
+        try:
+            k.__self__._resolve_delayed()  # finds it built: nothing to resolve
+        except BaseException as error:  # noqa: BLE001  report, do not hang
+            errors.append(error)
+
+    t = threading.Thread(target=resolve)
+    t.start()
+    assert k(0, 0, 1, 0, 4) is None
+    t.join()
+    assert errors == [] and len(calls) == 1
     assert _option(k).delayed is None
 
 

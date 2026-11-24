@@ -6,20 +6,14 @@ import dataclasses
 import functools
 import threading
 import types
-from collections.abc import (
-    Callable,
-    Iterable,
-    Mapping,
-)
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from . import _imports, launcher_base
-from . import backend as backends
 from .annotation import (
     _canonical_value,  # pyright: ignore[reportPrivateUsage]  # tagged compiler constants
 )
-from .compile_options import knob_options, live_knobs
 from .compiler import KernelCompiler
 from .compiler import override_compile as override_compile
 from .errors import UnsupportedKernel as UnsupportedKernel
@@ -143,6 +137,8 @@ class Launcher:
     def _bind_args(self, /, **values: object) -> None:
         """Merges `values` into this launcher's `bind_args`; `bind_args` copies instead.
 
+        A `bind_args` that `delayed` returns still replaces the result whole.
+
         Raises:
             RuntimeError: The launcher is built.
         """
@@ -158,13 +154,17 @@ class Launcher:
         Validates nothing: a missing, unknown or mistyped value fails in the
         new launcher's `check()`.  A bound tensor takes an exact
         `torch.Tensor`, `torch.nn.Parameter`, or None.
+
+        This edits the explicit keyword: a `bind_args` that `delayed` returns
+        replaces the merged mapping whole when the launcher is built.
         """
-        k = self._copy()
-        k.__self__._bind_args(**values)
-        return k
+        return self._copy_with(lambda k: k._bind_args(**values))
 
     def _bind_device_args(self, ordinal: int | None, /, **values: object) -> None:
         """Fixes this launcher to device `ordinal` in place; see `bind_device_args`.
+
+        A `bind_device` or `bind_args` that `delayed` returns still replaces
+        the edited one whole.
 
         Raises:
             RuntimeError: The launcher is built.
@@ -183,30 +183,42 @@ class Launcher:
         It is called as `(stream, grid, ...)` and owns a separate kernel
         cache, or one kernel when no dynamic specialization key remains.
         None is `unbind_device_args()`.
+
+        This edits the explicit keywords: a `bind_device` or `bind_args` that
+        `delayed` returns replaces the edited one whole when the launcher is
+        built, so the launcher is then fixed to the device `delayed` names.
         """
-        k = self._copy()
-        k.__self__._bind_device_args(ordinal, **values)
-        return k
+        return self._copy_with(lambda k: k._bind_device_args(ordinal, **values))
 
     def _unbind_args(self) -> None:
-        """Drops this launcher's bound values in place; `unbind_args` copies instead."""
+        """Drops this launcher's bound values in place; `unbind_args` copies instead.
+
+        A `bind_args` that `delayed` returns still applies.
+        """
         self._edit_options(lambda o: dataclasses.replace(o, bind_args=None))
 
     def unbind_args(self) -> LaunchFunction:
-        """Returns a new launcher with no bound values."""
-        k = self._copy()
-        k.__self__._unbind_args()
-        return k
+        """Returns a new launcher with no bound values.
+
+        This edits the explicit keyword: a `bind_args` that `delayed` returns
+        still applies when the launcher is built.
+        """
+        return self._copy_with(lambda k: k._unbind_args())
 
     def _unbind_device_args(self) -> None:
-        """Makes this launcher take the device per call; `unbind_device_args` copies instead."""
+        """Makes this launcher take the device per call; `unbind_device_args` copies instead.
+
+        A `bind_device` that `delayed` returns still applies.
+        """
         self._edit_options(lambda o: dataclasses.replace(o, bind_device=None))
 
     def unbind_device_args(self) -> LaunchFunction:
-        """Returns a new launcher that takes the device per call."""
-        k = self._copy()
-        k.__self__._unbind_device_args()
-        return k
+        """Returns a new launcher that takes the device per call.
+
+        This edits the explicit keyword: a `bind_device` that `delayed`
+        returns still applies when the launcher is built.
+        """
+        return self._copy_with(lambda k: k._unbind_device_args())
 
     def _replace_delayed(self, fn: Callable[[], Mapping[str, Any]] | None, /) -> None:
         """Sets this launcher's `delayed` to `fn` (None drops it); `replace_delayed` copies instead.
@@ -224,10 +236,12 @@ class Launcher:
     def replace_delayed(
         self, fn: Callable[[], Mapping[str, Any]] | None, /
     ) -> LaunchFunction:
-        """Returns a new launcher whose `delayed` is `fn`; None drops it."""
-        k = self._copy()
-        k.__self__._replace_delayed(fn)
-        return k
+        """Returns a new launcher whose `delayed` is `fn`; None drops it.
+
+        Raises:
+            TypeError: `fn` is neither None nor callable.
+        """
+        return self._copy_with(lambda k: k._replace_delayed(fn))
 
     def _chain_delayed(self, fn: Callable[[], Mapping[str, Any]], /) -> None:
         """Chains `fn` after this launcher's `delayed`; `chain_delayed` copies instead.
@@ -243,34 +257,30 @@ class Launcher:
         )
 
     def chain_delayed(self, fn: Callable[[], Mapping[str, Any]], /) -> LaunchFunction:
-        """Returns a new launcher whose `delayed` also runs `fn`, whose keywords win."""
-        k = self._copy()
-        k.__self__._chain_delayed(fn)
-        return k
+        """Returns a new launcher whose `delayed` also runs `fn`, whose keywords win.
+
+        Raises:
+            TypeError: `fn` is not callable.
+        """
+        return self._copy_with(lambda k: k._chain_delayed(fn))
 
     def _resolve_delayed(self) -> None:
         """Calls `delayed` now and applies its keywords in place; `resolve_delayed` copies instead.
 
-        Does nothing when there is no `delayed`, built or not.
+        Does nothing when there is no `delayed`, built or not: a built
+        launcher's options are already resolved.
         """
-        if self._C_options.delayed is None:
-            return
-        try:
-            self._edit_options(_resolved)
-        except RuntimeError:
-            # another thread built it after the check above: a built launcher
-            # holds resolved options, so there is nothing left to resolve
-            if self._C_options.delayed is not None:
-                raise
+        self._edit_options(lambda o: None if o.delayed is None else _resolved(o))
 
     def resolve_delayed(self) -> LaunchFunction:
         """Returns a new launcher with `delayed` called now and its keywords applied."""
-        k = self._copy()
-        k.__self__._resolve_delayed()
-        return k
+        return self._copy_with(lambda k: k._resolve_delayed())
 
-    def _copy(self) -> LaunchFunction:
-        return _new_launcher(self._C_options)
+    def _copy_with(self, edit: Callable[[Launcher], None]) -> LaunchFunction:
+        # the copying edits' body: an unbuilt copy, edited by the in-place form
+        k = _unbuilt_launcher(self._C_options)
+        edit(k.__self__)
+        return k
 
     def _dry_run(self) -> None:
         # check()'s body, under the build lock: a first call may have built it since
@@ -278,17 +288,21 @@ class Launcher:
             build_plan(_resolved(self._C_options))
 
     def _edit_options(
-        self, edit: Callable[[MakeLauncherOption], MakeLauncherOption]
+        self, edit: Callable[[MakeLauncherOption], MakeLauncherOption | None]
     ) -> None:
-        # the `_foo` edits' body: options = edit(options) under the build lock
-        def body() -> MakeLauncherOption:
+        # the `_foo` edits' body, under the build lock: options = edit(options),
+        # refused once built; an edit returning None changes nothing, built or not
+        def body() -> MakeLauncherOption | None:
+            old = self._C_options
+            new = edit(old)
+            if new is None:
+                return None
             if self._C_built:
                 raise RuntimeError(
                     "intj: a built launcher's options are fixed; the method "
                     "without the leading underscore returns an edited copy"
                 )
-            old = self._C_options
-            self._C_set_options(edit(old))
+            self._C_set_options(new)
             # dropped by _C_locked's caller, after the unlock: finalizers run Python
             return old
 
@@ -299,23 +313,20 @@ class Launcher:
 
         `_intj_launcher_base` calls it by name, under the build lock.
 
-        Resolves `delayed`, checks, then queries the target, renders, compiles,
-        loads, and fills this launcher's state block. Returns the rendered
-        entry's address, the resolved options and the `__text_signature__`,
-        for `_intj_launcher_base` to publish and swap in.
+        Resolves `delayed`, checks (`build_plan`, as `check()` does), then
+        queries the target, renders, compiles, loads, and fills this
+        launcher's state block. Returns the rendered entry's address, the
+        resolved options and the `__text_signature__`, for
+        `_intj_launcher_base` to publish and swap in; if anything fails after
+        the state block is filled, `_intj_launcher_base` releases it, so the
+        next call builds again.
 
-        `TRITON_INTERPRET=1` is refused here, on the first call: decoration
-        never runs a kernel, so a module-level decorator does not make its
-        module unimportable under the interpreter.
-        Once this call succeeds the swapped-in entry never reads the knob
-        again, so a launcher built with the interpreter off keeps launching if
-        it is turned on later.
+        `build_plan` refuses `TRITON_INTERPRET=1`. Once this call succeeds the
+        swapped-in entry never reads the knob again, so a launcher built with
+        the interpreter off keeps launching if it is turned on later.
         """
         option = _resolved(self._C_options)
         b = build_plan(option)
-        _imports.ensure_triton_imported()
-        if _imports.knobs.runtime.interpret:
-            raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
         self._check_target(b)
         module = render_module._build_module(b, _stub())  # pyright: ignore[reportPrivateUsage]  # renderer's build entry
         grid_py = (b.grid.fn, b.grid.hidden) if b.grid.mode == "py" else ()
@@ -362,7 +373,7 @@ class LaunchFunction(Protocol):
     def __call__(self, *args: Any) -> Any: ...
 
 
-def _new_launcher(options: MakeLauncherOption) -> LaunchFunction:
+def _unbuilt_launcher(options: MakeLauncherOption) -> LaunchFunction:
     stub, plain = _stub_and_type()
     # `delayed` cannot replace jit_func, so whether it is a chain is fixed now
     chain = is_chain(options.jit_func)
@@ -509,7 +520,7 @@ def make_launcher(
     if jit_func is None:
         raise TypeError("intj: make_launcher got None instead of a kernel")
     option = MakeLauncherOption(jit_func, delayed=delayed, **kwargs)
-    return _new_launcher(option)
+    return _unbuilt_launcher(option)
 
 
 _stub_loaded: tuple[types.ModuleType, type[Launcher]] | None = None
@@ -610,12 +621,3 @@ class _Interner:
             with self._lock:  # two new values must not both take len(_ids)
                 found = self._ids.setdefault(canonical, len(self._ids))
         return found
-
-
-def triton_specialization(
-    jit_func: JitFunction, args: Iterable[Any], options: Mapping[str, Any] | None = None
-) -> list[tuple[str, Any]]:
-    """Returns the `list[(type_str, key)]` triton would compute for these arguments."""
-    binder = jit_func.device_caches[backends.current_device()][4]
-    kwargs = knob_options(jit_func, options or {}, live_knobs())
-    return binder(*args, **kwargs)[1]

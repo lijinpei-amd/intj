@@ -76,7 +76,8 @@ my_kernel(
 )
 ```
 
-At line `#1`, the decorator only records the kernel and its options — nothing
+At line `#1`, the decorator records the kernel and its options (the first one
+in a process also imports triton and loads intj's kernel-free C base) — nothing
 touches the GPU, so a module-level `@make_launcher` imports on a machine with
 no visible device. On the first call at line `#2`, INTJ builds and loads the C
 extension and launches the kernel. Later calls use the native entry.

@@ -192,9 +192,11 @@ it from `sys.modules`. `test_warm_first_call_skips_unneeded_imports` guards both
 ## Refusals are loud and early
 
 Anything intj cannot do raises `UnsupportedKernel`, preferably in `check()` (at
-the latest on the first call; `make_launcher` itself only records its keywords),
-otherwise on the first cache miss. Never fall back to `JITFunction` silently — a
-silent fallback turns a 0.3 us call into a 14 us one with no signal.
+the latest on the first call; `make_launcher` itself checks nothing about the
+kernel: it records its keywords, after importing triton and loading the C
+launcher base on its first call in a process), otherwise on the first cache
+miss. Never fall back to `JITFunction` silently — a silent fallback turns a
+0.3 us call into a 14 us one with no signal.
 
 ## The invariant
 

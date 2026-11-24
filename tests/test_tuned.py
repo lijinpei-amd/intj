@@ -11,9 +11,14 @@ import triton
 import triton.language as tl
 
 from intj import NEVER, Argument, BindValue, Constexpr, make_launcher
-from intj.launcher import UnsupportedKernel, module_of, triton_specialization
+from intj.launcher import UnsupportedKernel, module_of
 from intj import compiler, specialization
-from knob_helpers import live_knob_values, needs_hip, needs_pointer_range
+from knob_helpers import (
+    live_knob_values,
+    needs_hip,
+    needs_pointer_range,
+    triton_specialization,
+)
 
 
 @triton.jit

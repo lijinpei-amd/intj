@@ -9,6 +9,7 @@
  * so references taken before the build reach the entry as well. */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <pthread.h>
 #include <string.h>
 
 #include "intj_launcher_base.h"
@@ -25,11 +26,42 @@ static PyObject *intj_launcher_base_call(PyObject *self, PyObject *const *args,
  * and may reach another launcher. */
 static _Thread_local int intj_launcher_base_held;
 
+/* The wait-for graph between build locks, under intj_launcher_base_graph.  A
+ * launcher's edge is its `build_thread`.  A thread's is a record on its stack
+ * while it waits on a build lock holding another; one holding none closes no
+ * cycle.  An edge is only added if it closes no cycle, so the graph stays
+ * acyclic and a walk along it ends. */
+typedef struct intj_launcher_base_wait {
+  unsigned long thread;
+  const intj_launcher *on;
+  struct intj_launcher_base_wait *next;
+} intj_launcher_base_wait;
+
+static pthread_mutex_t intj_launcher_base_graph = PTHREAD_MUTEX_INITIALIZER;
+static intj_launcher_base_wait *intj_launcher_base_waits;
+
+/* Under the graph lock: whether `me` waiting on `h` closes a cycle, as when
+ * h's builder waits on a lock whose builder ... waits on one `me` holds. */
+static int intj_launcher_base_closes_cycle(const intj_launcher *h,
+                                           unsigned long me) {
+  for (;;) {
+    unsigned long owner = h->build_thread;
+    if (owner == me)
+      return 1;
+    const intj_launcher_base_wait *w = intj_launcher_base_waits;
+    while (w && w->thread != owner)
+      w = w->next;
+    if (!w)
+      return 0;
+    h = w->on;
+  }
+}
+
 /* Take the build lock: 0, or -1 with an error set.  Two refusals, never a
- * wait that could deadlock: the thread holding this lock (a launcher called or
- * checked from its own build), and a thread already holding another launcher's
- * lock when this one is taken (two threads each holding one and waiting on the
- * other's would wait forever).  A thread holding none waits. */
+ * wait that would deadlock: the thread holding this lock (a launcher called or
+ * checked from its own build), and a wait that closes a cycle of threads each
+ * holding a build lock and waiting on the next one's.  Any other caller
+ * waits. */
 static int intj_launcher_base_lock(intj_launcher *h) {
   unsigned long me = PyThread_get_thread_ident();
   if (__atomic_load_n(&h->build_thread, __ATOMIC_RELAXED) == me) {
@@ -37,11 +69,24 @@ static int intj_launcher_base_lock(intj_launcher *h) {
                     "intj: a launcher was called while it was being built");
     return -1;
   }
+  intj_launcher_base_wait wait = {me, h, NULL};
+  int in_graph = 0;
   if (!PyThread_acquire_lock(h->build_lock, NOWAIT_LOCK)) {
     if (intj_launcher_base_held > 0) {
-      PyErr_SetString(PyExc_RuntimeError,
-                      "intj: a launcher was called while it was being built");
-      return -1;
+      pthread_mutex_lock(&intj_launcher_base_graph);
+      int cycle = intj_launcher_base_closes_cycle(h, me);
+      if (!cycle) {
+        wait.next = intj_launcher_base_waits;
+        intj_launcher_base_waits = &wait;
+        in_graph = 1;
+      }
+      pthread_mutex_unlock(&intj_launcher_base_graph);
+      if (cycle) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "intj: a launcher's build lock is held by a thread "
+                        "waiting on this one's: waiting would deadlock");
+        return -1;
+      }
     }
     /* detached while waiting: the build runs Python, and a free-threaded
      * stop-the-world must not wait on us */
@@ -52,20 +97,32 @@ static int intj_launcher_base_lock(intj_launcher *h) {
     // clang-format on
   }
   intj_launcher_base_held++;
+  pthread_mutex_lock(&intj_launcher_base_graph);
+  if (in_graph) {
+    intj_launcher_base_wait **p = &intj_launcher_base_waits;
+    while (*p != &wait)
+      p = &(*p)->next;
+    *p = wait.next;
+  }
   __atomic_store_n(&h->build_thread, me, __ATOMIC_RELAXED);
+  pthread_mutex_unlock(&intj_launcher_base_graph);
   return 0;
 }
 
 static void intj_launcher_base_unlock(intj_launcher *h) {
   intj_launcher_base_held--;
+  /* cleared before the release, so it never clears the next builder's */
+  pthread_mutex_lock(&intj_launcher_base_graph);
   __atomic_store_n(&h->build_thread, 0UL, __ATOMIC_RELAXED);
+  pthread_mutex_unlock(&intj_launcher_base_graph);
   PyThread_release_lock(h->build_lock);
 }
 
 /* Run `self._build_body()` once: 0, or -1 with an error set.  It returns
  * (entry address, resolved options, doc); they are published, then the entry
- * swapped in.  A failure publishes nothing and leaves the shim, so the next
- * call retries. */
+ * swapped in.  A failure leaves the shim and unpublishes what `_init` may
+ * have published before it (an exception after `_init` returned, a malformed
+ * result), so the next call retries from an unbuilt launcher. */
 static int intj_launcher_base_build(intj_launcher *h) {
   if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) != INTJ_SHIM)
     return 0;
@@ -73,6 +130,8 @@ static int intj_launcher_base_build(intj_launcher *h) {
     return -1;
   int rc = 0;
   PyObject *old = NULL;
+  void *state = NULL;
+  const intj_launcher_ops *ops = NULL;
   if (__atomic_load_n(&h->def.ml_meth, __ATOMIC_ACQUIRE) == INTJ_SHIM) {
     if (!h->options) {
       PyErr_SetString(PyExc_RuntimeError, "intj: launcher has been cleared");
@@ -94,6 +153,12 @@ static int intj_launcher_base_build(intj_launcher *h) {
           PyErr_SetString(PyExc_RuntimeError,
                           "intj: _build_body returned no entry");
         rc = -1;
+        ops = h->ops;
+        state = __atomic_exchange_n(&h->state, NULL, __ATOMIC_ACQ_REL);
+        Py_BEGIN_CRITICAL_SECTION(h);
+        old = h->module; /* dropped with the state, after the unlock */
+        h->module = NULL;
+        Py_END_CRITICAL_SECTION();
       } else {
         PyObject *options = PyTuple_GET_ITEM(result, 1);
         PyObject *doc = PyTuple_GET_ITEM(result, 2);
@@ -114,7 +179,10 @@ static int intj_launcher_base_build(intj_launcher *h) {
     }
   }
   intj_launcher_base_unlock(h);
-  Py_XDECREF(old); /* outside the lock: finalizers run Python */
+  /* outside the lock: finalizers run Python */
+  if (state)
+    ops->release(state);
+  Py_XDECREF(old);
   return rc;
 }
 

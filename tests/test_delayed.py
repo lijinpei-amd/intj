@@ -189,10 +189,9 @@ def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
     """Two siblings are first-called on two threads, each `delayed` checking the other.
 
     Each thread holds its own launcher's build lock and would wait on the
-    other's: neither may wait.
+    other's: the second to try is refused, and the first waits for its build.
     """
-    both_building = threading.Barrier(2, timeout=10)
-    both_checked, seen, errors = threading.Barrier(2, timeout=10), [], []
+    both_building, seen, errors = threading.Barrier(2, timeout=10), [], []
     mine = threading.local()
 
     def delayed():
@@ -201,7 +200,6 @@ def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
             mine.other.__self__.check()
         except RuntimeError as error:
             seen.append(str(error))
-        both_checked.wait()  # neither build ends, and frees its lock, before both checks ran
         return _HOST
 
     k1 = make_launcher(store, delayed=delayed)
@@ -224,4 +222,32 @@ def test_a_cross_first_call_of_siblings_is_refused_not_deadlocked():
         t.join(10)
     assert not any(t.is_alive() for t in threads), "deadlocked"
     assert errors == []
-    assert len(seen) == 2 and all("while it was being built" in s for s in seen)
+    assert len(seen) == 1 and "would deadlock" in seen[0]
+    assert k1.__self__._C_built and k2.__self__._C_built
+
+
+def test_a_build_checking_another_being_built_waits_for_it():
+    """`delayed` checking a launcher another thread is building waits, outside a cycle."""
+    building, checking, checked = threading.Event(), threading.Event(), []
+
+    def other_delayed():
+        building.set()
+        checking.wait(10)
+        time.sleep(0.1)  # the check below reaches this build's lock meanwhile
+        return _HOST
+
+    other = make_launcher(store, delayed=other_delayed)
+
+    def delayed():
+        checking.set()
+        other.__self__.check()
+        checked.append(None)
+        return _HOST
+
+    first = make_launcher(store, delayed=delayed)
+    builder = threading.Thread(target=other, args=(0, 0, 1, 0, 4))
+    builder.start()
+    building.wait(10)
+    assert first(0, 0, 1, 0, 4) is None
+    builder.join()
+    assert checked and other.__self__._C_built

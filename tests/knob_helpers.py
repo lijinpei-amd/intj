@@ -55,3 +55,13 @@ def live_knob_values(values):
     finally:
         for (group, name), value in before.items():
             setattr(getattr(knobs, group), name, value)
+
+
+def triton_specialization(jit_func, args, options=None):
+    """Returns the `list[(type_str, key)]` triton would compute for these arguments."""
+    from intj.backend import current_device
+    from intj.compile_options import knob_options, live_knobs
+
+    binder = jit_func.device_caches[current_device()][4]
+    kwargs = knob_options(jit_func, options or {}, live_knobs())
+    return binder(*args, **kwargs)[1]
